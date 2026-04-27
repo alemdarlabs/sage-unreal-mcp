@@ -12,6 +12,7 @@
 #include "UObject/Class.h"
 #include "UObject/SoftObjectPath.h"
 #include "UObject/UObjectGlobals.h"
+#include "UObject/UnrealType.h"
 
 #define LOCTEXT_NAMESPACE "Sage"
 
@@ -87,6 +88,66 @@ bool RejectIfPie(FSageToolDispatch::FOutcome& OutErr)
     {
         OutErr = FSageToolDispatch::FOutcome::MakeError(-32004,
             TEXT("PIE active; mutation rejected"));
+        return true;
+    }
+    return false;
+}
+
+// Reflection-based UProperty setter. Phase 1 supports primitive types; struct
+// (Vector, Rotator), object reference, and array property paths land in
+// Milestone 1.3+. Returns false if `Property`'s type is unsupported.
+bool SetUPropertyFromJson(UObject* Container,
+                          FProperty* Property,
+                          const TSharedPtr<FJsonValue>& Value)
+{
+    if (Property == nullptr || Container == nullptr || !Value.IsValid())
+    {
+        return false;
+    }
+
+    if (FBoolProperty* P = CastField<FBoolProperty>(Property))
+    {
+        P->SetPropertyValue_InContainer(Container, Value->AsBool());
+        return true;
+    }
+    if (FIntProperty* P = CastField<FIntProperty>(Property))
+    {
+        P->SetPropertyValue_InContainer(Container, static_cast<int32>(Value->AsNumber()));
+        return true;
+    }
+    if (FInt64Property* P = CastField<FInt64Property>(Property))
+    {
+        P->SetPropertyValue_InContainer(Container, static_cast<int64>(Value->AsNumber()));
+        return true;
+    }
+    if (FFloatProperty* P = CastField<FFloatProperty>(Property))
+    {
+        P->SetPropertyValue_InContainer(Container, static_cast<float>(Value->AsNumber()));
+        return true;
+    }
+    if (FDoubleProperty* P = CastField<FDoubleProperty>(Property))
+    {
+        P->SetPropertyValue_InContainer(Container, Value->AsNumber());
+        return true;
+    }
+    if (FStrProperty* P = CastField<FStrProperty>(Property))
+    {
+        P->SetPropertyValue_InContainer(Container, Value->AsString());
+        return true;
+    }
+    if (FNameProperty* P = CastField<FNameProperty>(Property))
+    {
+        P->SetPropertyValue_InContainer(Container, FName(*Value->AsString()));
+        return true;
+    }
+    if (FTextProperty* P = CastField<FTextProperty>(Property))
+    {
+        P->SetPropertyValue_InContainer(Container, FText::FromString(Value->AsString()));
+        return true;
+    }
+    if (FByteProperty* P = CastField<FByteProperty>(Property))
+    {
+        P->SetPropertyValue_InContainer(Container, static_cast<uint8>(Value->AsNumber()));
         return true;
     }
     return false;
@@ -296,6 +357,119 @@ FSageToolDispatch::FOutcome SetTransformOnGameThread(const TSharedPtr<FJsonObjec
     return FSageToolDispatch::FOutcome::MakeSuccess(Result);
 }
 
+// ---- set_visibility --------------------------------------------------------
+
+FSageToolDispatch::FOutcome SetVisibilityOnGameThread(const TSharedPtr<FJsonObject>& Args)
+{
+    if (!Args.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing args"));
+    }
+
+    FString ActorPath;
+    if (!Args->TryGetStringField(TEXT("actor_id"), ActorPath) || ActorPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor_id'"));
+    }
+    bool bHidden = false;
+    if (!Args->TryGetBoolField(TEXT("hidden"), bHidden))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'hidden' bool"));
+    }
+
+    FSageToolDispatch::FOutcome PieErr;
+    if (RejectIfPie(PieErr)) return PieErr;
+
+    AActor* Actor = ResolveActor(ActorPath);
+    if (Actor == nullptr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("actor not found: %s"), *ActorPath));
+    }
+
+    FScopedTransaction Transaction(LOCTEXT("SetVisibility", "Sage: Set Visibility"));
+    Actor->Modify();
+    Actor->SetActorHiddenInGame(bHidden);
+    Actor->SetIsTemporarilyHiddenInEditor(bHidden);
+
+    UE_LOG(LogSageBridge, Log, TEXT("Set visibility hidden=%s on %s"),
+           bHidden ? TEXT("true") : TEXT("false"), *Actor->GetPathName());
+
+    auto Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actor_id"), Actor->GetPathName());
+    Result->SetBoolField(TEXT("hidden"), bHidden);
+    return FSageToolDispatch::FOutcome::MakeSuccess(Result);
+}
+
+// ---- modify_actor_property -------------------------------------------------
+
+FSageToolDispatch::FOutcome ModifyActorPropertyOnGameThread(const TSharedPtr<FJsonObject>& Args)
+{
+    if (!Args.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing args"));
+    }
+
+    FString ActorPath;
+    if (!Args->TryGetStringField(TEXT("actor_id"), ActorPath) || ActorPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor_id'"));
+    }
+    FString PropName;
+    if (!Args->TryGetStringField(TEXT("property"), PropName) || PropName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'property'"));
+    }
+
+    const TSharedPtr<FJsonValue> ValueField = Args->Values.FindRef(TEXT("value"));
+    if (!ValueField.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'value'"));
+    }
+
+    FSageToolDispatch::FOutcome PieErr;
+    if (RejectIfPie(PieErr)) return PieErr;
+
+    AActor* Actor = ResolveActor(ActorPath);
+    if (Actor == nullptr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("actor not found: %s"), *ActorPath));
+    }
+
+    FProperty* Property = Actor->GetClass()->FindPropertyByName(*PropName);
+    if (Property == nullptr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("property not found: %s on %s"),
+                            *PropName, *Actor->GetClass()->GetName()));
+    }
+
+    FScopedTransaction Transaction(LOCTEXT("ModifyActorProperty", "Sage: Modify Actor Property"));
+    Actor->Modify();
+    Actor->PreEditChange(Property);
+
+    if (!SetUPropertyFromJson(Actor, Property, ValueField))
+    {
+        Transaction.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("unsupported property type for '%s' (got %s)"),
+                            *PropName, *Property->GetClass()->GetName()));
+    }
+
+    FPropertyChangedEvent ChangeEvent(Property);
+    Actor->PostEditChangeProperty(ChangeEvent);
+
+    UE_LOG(LogSageBridge, Log, TEXT("Modified property '%s' on %s"),
+           *PropName, *Actor->GetPathName());
+
+    auto Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("actor_id"), Actor->GetPathName());
+    Result->SetStringField(TEXT("property"), PropName);
+    Result->SetField(TEXT("value"), ValueField);
+    return FSageToolDispatch::FOutcome::MakeSuccess(Result);
+}
+
 // ---- thread marshalling ----------------------------------------------------
 
 template <typename Fn>
@@ -324,13 +498,25 @@ FSageToolDispatch::FOutcome SetTransformHandler(const TSharedPtr<FJsonObject>& A
     return RunOnGameThread([Args]() { return SetTransformOnGameThread(Args); });
 }
 
+FSageToolDispatch::FOutcome SetVisibilityHandler(const TSharedPtr<FJsonObject>& Args)
+{
+    return RunOnGameThread([Args]() { return SetVisibilityOnGameThread(Args); });
+}
+
+FSageToolDispatch::FOutcome ModifyActorPropertyHandler(const TSharedPtr<FJsonObject>& Args)
+{
+    return RunOnGameThread([Args]() { return ModifyActorPropertyOnGameThread(Args); });
+}
+
 }  // namespace
 
 void RegisterActorTools(FSageToolDispatch& Dispatch)
 {
-    Dispatch.RegisterHandler(TEXT("spawn_actor"),   &SpawnActorHandler);
-    Dispatch.RegisterHandler(TEXT("delete_actor"),  &DeleteActorHandler);
-    Dispatch.RegisterHandler(TEXT("set_transform"), &SetTransformHandler);
+    Dispatch.RegisterHandler(TEXT("spawn_actor"),            &SpawnActorHandler);
+    Dispatch.RegisterHandler(TEXT("delete_actor"),           &DeleteActorHandler);
+    Dispatch.RegisterHandler(TEXT("set_transform"),          &SetTransformHandler);
+    Dispatch.RegisterHandler(TEXT("set_visibility"),         &SetVisibilityHandler);
+    Dispatch.RegisterHandler(TEXT("modify_actor_property"),  &ModifyActorPropertyHandler);
 }
 
 }  // namespace sage::tools

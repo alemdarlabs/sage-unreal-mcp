@@ -135,22 +135,24 @@ ADR-013 (cpp-httplib seçimi) yazıldı.
 
 ---
 
-## Milestone 1.3c — Actor Mutation Tools (spawn / delete / set_transform) ✓
+## Milestone 1.3c — Actor Mutation Tools (5/5) ✓
 
-### Plugin
-- [x] `Public/Tools/SageActorTools.h` — `RegisterActorTools(FSageToolDispatch&)`
-- [x] `Private/Tools/SageActorTools.cpp` — three handlers + shared helpers:
-  - Helpers: `ResolveActor` (`StaticFindObject` + `FSoftObjectPath` fallback), `RejectIfPie` (-32004 guard), `RunOnGameThread` template (`IsInGameThread()` shortcut else `Async(EAsyncExecution::TaskGraphMainThread)` + `Future.Get()`)
-  - `spawn_actor` — `LoadClass<AActor>` + `StaticLoadClass` fallback; `UEditorActorSubsystem::SpawnActorFromClass`; FScopedTransaction with cancel-on-fail; `Modify()` + `SetActorLabel`; result `{actor_id, label, class, location}`
-  - `delete_actor` — resolve by path; `DestroyActor`; FScopedTransaction; result `{destroyed, label}`
-  - `set_transform` — partial `location`/`rotation`/`scale`; at least one required; `Modify()` + `SetActorTransform`; result `{actor_id, location, rotation, scale}`
+### Plugin (`SageActorTools.cpp`)
+- [x] Helpers: `ResolveActor`, `RejectIfPie`, `RunOnGameThread` template, `SetUPropertyFromJson` reflection setter (bool/int/int64/float/double/string/name/text/byte)
+- [x] `spawn_actor` — `UEditorActorSubsystem::SpawnActorFromClass` + FScopedTransaction + Modify + SetActorLabel
+- [x] `delete_actor` — `DestroyActor` + FScopedTransaction
+- [x] `set_transform` — partial location/rotation/scale + Modify + SetActorTransform
+- [x] `set_visibility` — SetActorHiddenInGame + SetIsTemporarilyHiddenInEditor
+- [x] `modify_actor_property` — reflection-based UProperty setter; PreEditChange/PostEditChange notifications; FScopedTransaction
 - [x] `USageBridgeSubsystem::RegisterBuiltinHandlers` → `RegisterActorTools(ToolDispatch)`
 
-### Server
-- [x] `main.cpp` — three remote tools registered with full JSON Schema:
+### Server (`main.cpp`)
+- [x] Five remote tools registered with full JSON Schema:
   - `spawn_actor` (class required; location/rotation/label optional)
   - `delete_actor` (actor_id required)
   - `set_transform` (actor_id required; location/rotation/scale 3-arrays optional, at least one)
+  - `set_visibility` (actor_id + hidden bool required)
+  - `modify_actor_property` (actor_id + property + value required; primitive types only in Phase 1)
 - [x] DRY `registerRemote` lambda helper
 
 ### Verification

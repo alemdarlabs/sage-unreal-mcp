@@ -193,6 +193,46 @@ int main() {
         .remote  = true,
     });
 
+    registerRemote(sage::mcp::Tool{
+        .name        = "set_visibility",
+        .description = "Toggle an actor's editor + game visibility "
+                       "(SetActorHiddenInGame + SetIsTemporarilyHiddenInEditor). "
+                       "FScopedTransaction wrapped. Rejects during PIE.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"actor_id", {{"type", "string"}}},
+                {"hidden",   {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"actor_id", "hidden"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "modify_actor_property",
+        .description = "Set a UProperty on an actor by name. Phase 1 supports "
+                       "primitive types (bool, int, int64, float, double, string, "
+                       "name, text, byte). Calls PreEditChange/PostEditChange so "
+                       "editor notifications fire. Wrapped in FScopedTransaction. "
+                       "Rejects during PIE.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"actor_id", {{"type", "string"}}},
+                {"property", {{"type", "string"},
+                              {"description", "UProperty name as declared in C++ (e.g. 'bHidden', 'CustomTimeDilation')"}}},
+                {"value",    {{"description", "JSON-encoded value matching the property type"}}},
+            }},
+            {"required", nlohmann::json::array({"actor_id", "property", "value"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
     // ---- HTTP+SSE transport (Claude ↔ server) ---------------------------
     sage::transport::HttpSseConfig httpCfg{
         .host            = envOr("SAGE_HTTP_HOST", "127.0.0.1"),
