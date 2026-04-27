@@ -135,6 +135,30 @@ ADR-013 (cpp-httplib seçimi) yazıldı.
 
 ---
 
+## Milestone 1.3c — Component Mutation Tools (5/5) ✓ (commit pending)
+
+### Helpers refactor
+- [x] `Private/Tools/SageToolHelpers.h` + `.cpp` — shared `detail::` namespace: ResolveActor / ResolveComponent / RejectIfPie / ParseVector3 / ParseRotator3 / Vec3ToJson / Rot3ToJson / SetUPropertyFromJson / RunOnGameThread template
+- [ ] (sonraki commit) `SageActorTools.cpp` refactor → `detail::` çağrıları — şu anda anon-namespace duplicate
+
+### Plugin (`SageComponentTools.cpp`)
+- [x] `add_component` — `LoadClass<UActorComponent>` + `NewObject` + `OnComponentCreated` + `RegisterComponent` + `AddInstanceComponent`; FScopedTransaction + Modify
+- [x] `remove_component` — `UnregisterComponent` + `RemoveInstanceComponent` + `DestroyComponent`; FScopedTransaction
+- [x] `modify_component_property` — reflection setter (detail::SetUPropertyFromJson); PreEditChange + PostEditChangeProperty
+- [x] `attach` — `USceneComponent::AttachToComponent` KeepRelativeTransform; optional socket
+- [x] `detach` — `USceneComponent::DetachFromComponent` KeepRelativeTransform
+- [x] `USageBridgeSubsystem` → `RegisterComponentTools(ToolDispatch)`
+
+### Server (`main.cpp`)
+- [x] Five remote tools registered with full JSON Schema:
+  - `add_component` (actor_id + component_class required; component_name optional)
+  - `remove_component` (component_id required)
+  - `modify_component_property` (component_id + property + value required)
+  - `attach` (child_id + parent_id required; socket optional)
+  - `detach` (child_id required)
+
+---
+
 ## Milestone 1.3c — Actor Mutation Tools (5/5) ✓
 
 ### Plugin (`SageActorTools.cpp`)

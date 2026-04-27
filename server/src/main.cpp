@@ -233,6 +233,98 @@ int main() {
         .remote  = true,
     });
 
+    // Component tools (Milestone 1.3c).
+    registerRemote(sage::mcp::Tool{
+        .name        = "add_component",
+        .description = "Attach a new UActorComponent to an actor by class. "
+                       "RegisterComponent + AddInstanceComponent under "
+                       "FScopedTransaction. Rejects during PIE.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"actor_id",        {{"type", "string"}}},
+                {"component_class", {{"type", "string"},
+                                     {"description", "UClass path (e.g. /Script/Engine.StaticMeshComponent)"}}},
+                {"component_name",  {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"actor_id", "component_class"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "remove_component",
+        .description = "Destroy an instance component by full path. "
+                       "FScopedTransaction wrapped. Rejects during PIE.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"component_id", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"component_id"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "modify_component_property",
+        .description = "Set a UProperty on a component by name. Same primitive "
+                       "set as modify_actor_property. PreEditChange/"
+                       "PostEditChange + FScopedTransaction.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"component_id", {{"type", "string"}}},
+                {"property",     {{"type", "string"}}},
+                {"value",        {{"description", "JSON value matching property type"}}},
+            }},
+            {"required", nlohmann::json::array({"component_id", "property", "value"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "attach",
+        .description = "Attach a USceneComponent child to a USceneComponent "
+                       "parent (KeepRelativeTransform). Optional 'socket' name. "
+                       "FScopedTransaction. Rejects during PIE.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"child_id",  {{"type", "string"}}},
+                {"parent_id", {{"type", "string"}}},
+                {"socket",    {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"child_id", "parent_id"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "detach",
+        .description = "Detach a USceneComponent from its parent "
+                       "(KeepRelativeTransform). FScopedTransaction. Rejects "
+                       "during PIE.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"child_id", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"child_id"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
     // ---- HTTP+SSE transport (Claude ↔ server) ---------------------------
     sage::transport::HttpSseConfig httpCfg{
         .host            = envOr("SAGE_HTTP_HOST", "127.0.0.1"),

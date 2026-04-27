@@ -4,6 +4,7 @@
 #include "SageBridge.h"
 #include "SageBridgeSettings.h"
 #include "Tools/SageActorTools.h"
+#include "Tools/SageComponentTools.h"
 
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
@@ -126,6 +127,7 @@ void USageBridgeSubsystem::RegisterBuiltinHandlers()
 
     // Domain tool handlers (Milestone 1.3c+).
     sage::tools::RegisterActorTools(ToolDispatch);
+    sage::tools::RegisterComponentTools(ToolDispatch);
 }
 
 void USageBridgeSubsystem::BuildClientFromSettings()
