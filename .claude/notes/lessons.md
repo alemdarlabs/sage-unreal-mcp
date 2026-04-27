@@ -54,6 +54,22 @@ check whether the module is loaded before calling `ISourceControlModule::Get()`
 this split — module-existence question is `FModuleManager`'s job; provider /
 state queries belong on the singleton.
 
+## UE — `ULevel::Actors` is a sparse array
+
+**Symptom**: After `delete_actor`, `get_world.actor_count` did not decrement
+(76 → 76 instead of 75). Outliner separately reported 67 / 68 / etc.
+
+**Root**: `ULevel::Actors` is a sparse `TArray<TObjectPtr<AActor>>`. Destroyed
+entries become `nullptr` rather than removed; `Num()` includes the holes.
+
+**Rule**: When surfacing actor counts (or iterating), filter null:
+```cpp
+int32 ValidCount = 0;
+for (const AActor* A : Level->Actors) if (A != nullptr) ++ValidCount;
+```
+Or use `TActorIterator<AActor>(World)` which already skips nulls + handles
+streaming sub-levels.
+
 ## UE 5.7 — `FAutomationTestFramework::StartTestByName` returns `void`
 
 **Symptom**: `error: value of type 'void' is not contextually convertible to 'bool'`

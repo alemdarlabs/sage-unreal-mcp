@@ -37,7 +37,14 @@ FSageToolDispatch::FOutcome GetWorldOnGameThread(const TSharedPtr<FJsonObject>& 
             Result->SetStringField(TEXT("map_name"),   World->GetMapName());
             if (ULevel* Level = World->GetCurrentLevel())
             {
-                Result->SetNumberField(TEXT("actor_count"), Level->Actors.Num());
+                // ULevel::Actors is a sparse array — destroyed entries become
+                // nullptr but Num() does not shrink. Iterate to count valid.
+                int32 ValidCount = 0;
+                for (const AActor* A : Level->Actors)
+                {
+                    if (A != nullptr) ++ValidCount;
+                }
+                Result->SetNumberField(TEXT("actor_count"), ValidCount);
             }
         }
     }
@@ -98,8 +105,13 @@ FSageToolDispatch::FOutcome GetCurrentLevelOnGameThread(const TSharedPtr<FJsonOb
     Result->SetStringField(TEXT("map_name"),   World->GetMapName());
     if (ULevel* Level = World->GetCurrentLevel())
     {
-        Result->SetStringField(TEXT("level_path"),  Level->GetPathName());
-        Result->SetNumberField(TEXT("actor_count"), Level->Actors.Num());
+        Result->SetStringField(TEXT("level_path"), Level->GetPathName());
+        int32 ValidCount = 0;
+        for (const AActor* A : Level->Actors)
+        {
+            if (A != nullptr) ++ValidCount;
+        }
+        Result->SetNumberField(TEXT("actor_count"), ValidCount);
     }
 
     TArray<TSharedPtr<FJsonValue>> SubLevels;
