@@ -27,6 +27,19 @@ bool FSageToolDispatch::HasHandler(const FString& ToolName) const
     return Handlers.Contains(ToolName);
 }
 
+FSageToolDispatch::FOutcome FSageToolDispatch::InvokeHandler(
+    const FString& ToolName,
+    const TSharedPtr<FJsonObject>& Args)
+{
+    const FHandler* Handler = Handlers.Find(ToolName);
+    if (Handler == nullptr)
+    {
+        return FOutcome::MakeError(-32601,
+            FString::Printf(TEXT("unknown tool: %s"), *ToolName));
+    }
+    return (*Handler)(Args);
+}
+
 bool FSageToolDispatch::HandleEnvelope(const TSharedRef<FJsonObject>& Envelope, FSendFn Send)
 {
     FString Type;

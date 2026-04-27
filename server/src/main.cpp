@@ -633,6 +633,38 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // Bulk modify (Milestone 1.4a — atomic-by-default multi-op).
+    registerRemote(sage::mcp::Tool{
+        .name        = "bulk_modify",
+        .description = "Apply a sequence of tool calls. atomic=true (default): "
+                       "all operations in one FScopedTransaction; first failure "
+                       "cancels the transaction (atomic). atomic=false: each op "
+                       "runs independently. operations: [{tool, args?}]. "
+                       "`bulk_modify` cannot be nested. Rejects during PIE.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"operations", {
+                    {"type", "array"},
+                    {"minItems", 1},
+                    {"items", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"tool", {{"type", "string"}}},
+                            {"args", {{"type", "object"}}},
+                        }},
+                        {"required", nlohmann::json::array({"tool"})},
+                    }},
+                }},
+                {"atomic", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"operations"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
     // PIE control (Milestone 1.3c → spec'te 1.7'de listelenmişti, hot path).
     registerRemote(sage::mcp::Tool{
         .name        = "run_pie",

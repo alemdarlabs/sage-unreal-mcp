@@ -5,6 +5,7 @@
 #include "SageBridgeSettings.h"
 #include "Tools/SageActorTools.h"
 #include "Tools/SageAssetTools.h"
+#include "Tools/SageBulkTools.h"
 #include "Tools/SageComponentTools.h"
 #include "Tools/SageEditorTools.h"
 #include "Tools/SageMaterialTools.h"
@@ -134,6 +135,7 @@ void USageBridgeSubsystem::RegisterBuiltinHandlers()
     sage::tools::RegisterAssetTools(ToolDispatch);
     sage::tools::RegisterEditorTools(ToolDispatch);
     sage::tools::RegisterMaterialTools(ToolDispatch);
+    sage::tools::RegisterBulkTools(ToolDispatch);
 }
 
 void USageBridgeSubsystem::BuildClientFromSettings()

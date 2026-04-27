@@ -43,6 +43,13 @@ public:
      */
     bool HandleEnvelope(const TSharedRef<FJsonObject>& Envelope, FSendFn Send);
 
+    /**
+     * Direct invocation of a registered handler — used by bulk_modify and
+     * (future) transaction-context tools that need to chain other tools'
+     * logic without going through the wire envelope.
+     */
+    FOutcome InvokeHandler(const FString& ToolName, const TSharedPtr<FJsonObject>& Args);
+
 private:
     TMap<FString, FHandler> Handlers;
 };
