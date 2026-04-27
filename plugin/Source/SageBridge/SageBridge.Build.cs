@@ -30,6 +30,13 @@ public class SageBridge : ModuleRules
             "Projects",
         });
 
+        // Live Coding ships only on Windows in UE 5.7; Mac/Linux use the
+        // cross-platform stub paths in SageCompileTools.cpp.
+        if (Target.Platform == UnrealTargetPlatform.Win64)
+        {
+            PrivateDependencyModuleNames.Add("LiveCoding");
+        }
+
         DynamicallyLoadedModuleNames.AddRange(new string[] { });
     }
 }

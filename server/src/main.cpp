@@ -633,6 +633,28 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // Compile coordination (Milestone 1.6a — Live Coding wrapper).
+    registerRemote(sage::mcp::Tool{
+        .name        = "get_live_coding_status",
+        .description = "Live Coding availability + state. Cross-platform: returns "
+                       "{available:true, ...flags} on Windows when LC module loaded; "
+                       "{available:false, reason, platform} elsewhere (UE 5.7's "
+                       "Live Coding is Windows-only).",
+        .inputSchema = noArgSchema,
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name        = "compile_and_reload",
+        .description = "Trigger Live Coding compile (Windows). Auto-enables for "
+                       "session if possible. Async fire-and-forget; poll "
+                       "get_live_coding_status to observe completion. Returns "
+                       "-32007 LiveCodingUnavailable on macOS/Linux. Full-restart "
+                       "orchestration (save→shutdown→UBT→relaunch) deferred to "
+                       "Phase 2 per ADR-009.",
+        .inputSchema = noArgSchema,
+        .handler = nullptr, .remote = true,
+    });
+
     // Optimistic locking (Milestone 1.4c).
     registerRemote(sage::mcp::Tool{
         .name        = "compare_and_set_property",
