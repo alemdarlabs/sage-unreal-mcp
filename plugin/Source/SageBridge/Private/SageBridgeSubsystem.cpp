@@ -3,6 +3,7 @@
 #include "Identity/SageEditorIdentity.h"
 #include "SageBridge.h"
 #include "SageBridgeSettings.h"
+#include "Tools/SageActorTools.h"
 
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
@@ -107,8 +108,6 @@ void USageBridgeSubsystem::HandleIncomingMessage(const FString& RawText)
 void USageBridgeSubsystem::RegisterBuiltinHandlers()
 {
     // editor.ping — round-trip echo, mirrors the mock-plugin contract.
-    // Will be replaced/augmented by domain handlers (spawn_actor, modify_*, ...)
-    // in Milestone 1.3c.
     ToolDispatch.RegisterHandler(TEXT("editor.ping"),
         [](const TSharedPtr<FJsonObject>& Args) -> FSageToolDispatch::FOutcome
         {
@@ -124,6 +123,9 @@ void USageBridgeSubsystem::RegisterBuiltinHandlers()
             }
             return FSageToolDispatch::FOutcome::MakeSuccess(Result);
         });
+
+    // Domain tool handlers (Milestone 1.3c+).
+    sage::tools::RegisterActorTools(ToolDispatch);
 }
 
 void USageBridgeSubsystem::BuildClientFromSettings()

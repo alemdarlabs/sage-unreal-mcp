@@ -97,8 +97,6 @@ int main() {
         });
 
     // Smoke-test remote tool: round-trips through the connected editor.
-    // Replaced by domain tools (spawn_actor, modify_property, ...) in
-    // Milestone 1.3c.
     {
         sage::mcp::Tool editorPing{
             .name        = "editor.ping",
@@ -114,6 +112,39 @@ int main() {
         };
         if (auto r = registry->registerTool(std::move(editorPing)); !r.has_value()) {
             spdlog::warn("Failed to register remote tool 'editor.ping'");
+        }
+    }
+
+    // Actor mutation: spawn_actor (Milestone 1.3c).
+    {
+        sage::mcp::Tool spawnActor{
+            .name        = "spawn_actor",
+            .description = "Spawn an actor in the current editor world. Wrapped in "
+                           "FScopedTransaction (undo-friendly). Rejects during PIE "
+                           "(api-spec.md §Error Codes -32004). 'class' accepts "
+                           "engine paths (/Script/Engine.StaticMeshActor) or "
+                           "Blueprint generated-class paths (/Game/.../BP_Foo.BP_Foo_C).",
+            .inputSchema = nlohmann::json{
+                {"type", "object"},
+                {"properties", {
+                    {"class",    {{"type", "string"},
+                                  {"description", "UClass path or BP generated-class path"}}},
+                    {"location", {{"type", "array"},
+                                  {"items", {{"type", "number"}}},
+                                  {"minItems", 3}, {"maxItems", 3}}},
+                    {"rotation", {{"type", "array"},
+                                  {"items", {{"type", "number"}}},
+                                  {"minItems", 3}, {"maxItems", 3}}},
+                    {"label",    {{"type", "string"}}},
+                }},
+                {"required", nlohmann::json::array({"class"})},
+                {"additionalProperties", false},
+            },
+            .handler = nullptr,
+            .remote  = true,
+        };
+        if (auto r = registry->registerTool(std::move(spawnActor)); !r.has_value()) {
+            spdlog::warn("Failed to register remote tool 'spawn_actor'");
         }
     }
 

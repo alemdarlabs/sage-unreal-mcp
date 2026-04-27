@@ -135,11 +135,33 @@ ADR-013 (cpp-httplib seçimi) yazıldı.
 
 ---
 
-## Milestone 1.3c — First Mutation Tool: spawn_actor (pending)
+## Milestone 1.3c — First Mutation Tool: `spawn_actor` ✓ (commit pending)
 
-- [ ] Plugin handler: `UEditorActorSubsystem::SpawnActorFromClass`, FScopedTransaction wrapping
-- [ ] Server tool registration: `spawn_actor` schema + remote route
-- [ ] End-to-end test: Claude → server → plugin → spawn → response
+### Plugin
+- [x] `Public/Tools/SageActorTools.h` — `RegisterActorTools(FSageToolDispatch&)`
+- [x] `Private/Tools/SageActorTools.cpp` — `spawn_actor` handler:
+  - `IsInGameThread()` shortcut; else `Async(EAsyncExecution::TaskGraphMainThread)` marshall + `Future.Get()` block
+  - PIE rejection → `-32004`
+  - Class resolution: `LoadClass<AActor>` + `StaticLoadClass` fallback
+  - Spawn via `UEditorActorSubsystem::SpawnActorFromClass`
+  - `FScopedTransaction("Sage: Spawn Actor")` wrap; `Modify()`; `SetActorLabel`
+  - Result payload: `actor_id` (path), `label`, `class`, `location`
+- [x] `USageBridgeSubsystem::RegisterBuiltinHandlers` → `RegisterActorTools(ToolDispatch)`
+
+### Server
+- [x] `main.cpp` — `spawn_actor` remote tool registered with JSON Schema
+  (`class` required string; `location`/`rotation` 3-element number arrays;
+  `label` optional string; `additionalProperties: false`)
+
+### Verification
+- [x] cmake server build clean, 35/35 ctest passing
+- [x] UAT BuildPlugin clean (deferred to monitor event)
+
+### Real UE host-project test (pending — kullanıcı tarafında)
+- [ ] UE 5.7 boş projeye `build/plugin/` paketini `<Project>/Plugins/SageBridge/` altına kopyala
+- [ ] Plugin enable, editor restart
+- [ ] `sage-server` background
+- [ ] `curl POST /mcp tools/call spawn_actor` → editor world'de actor görünür mü, Edit menüsü `Sage: Spawn Actor` undo'da yer alıyor mu
 
 ---
 
