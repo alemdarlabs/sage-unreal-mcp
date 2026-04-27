@@ -11,6 +11,8 @@
 #include "Tools/SageComponentTools.h"
 #include "Tools/SageEditorTools.h"
 #include "Tools/SageMaterialTools.h"
+#include "Tools/SageQaTools.h"
+#include "Tools/SageScmTools.h"
 #include "Tools/SageTransactionTools.h"
 
 #include "Dom/JsonObject.h"
@@ -142,6 +144,8 @@ void USageBridgeSubsystem::RegisterBuiltinHandlers()
     sage::tools::RegisterTransactionTools(ToolDispatch);
     sage::tools::RegisterCompareSetTools(ToolDispatch);
     sage::tools::RegisterCompileTools(ToolDispatch);
+    sage::tools::RegisterQaTools(ToolDispatch);
+    sage::tools::RegisterScmTools(ToolDispatch);
 }
 
 void USageBridgeSubsystem::BuildClientFromSettings()

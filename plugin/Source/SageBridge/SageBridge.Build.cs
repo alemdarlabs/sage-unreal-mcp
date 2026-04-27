@@ -25,6 +25,7 @@ public class SageBridge : ModuleRules
             "UnrealEd",
             "EditorSubsystem",
             "MaterialEditor",
+            "SourceControl",
             "Json",
             "JsonUtilities",
             "Projects",

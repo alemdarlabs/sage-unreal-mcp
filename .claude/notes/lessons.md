@@ -44,6 +44,24 @@ matched older completed output files via the glob.
 path** for the background bash invocation, not `*.output`. Pipe-to-tail does
 nothing when grep is `-q` (silent).
 
+## UE 5.7 — `ISourceControlModule` does not have a static `IsLoaded`
+
+**Symptom**: `error: no member named 'IsLoaded' in 'ISourceControlModule'; did you mean 'FChaosVDRuntimeModule::IsLoaded'?`
+
+**Rule**: Use `FModuleManager::Get().IsModuleLoaded(TEXT("SourceControl"))` to
+check whether the module is loaded before calling `ISourceControlModule::Get()`
+(which auto-loads but throws if disabled). Many UE module-singletons follow
+this split — module-existence question is `FModuleManager`'s job; provider /
+state queries belong on the singleton.
+
+## UE 5.7 — `FAutomationTestFramework::StartTestByName` returns `void`
+
+**Symptom**: `error: value of type 'void' is not contextually convertible to 'bool'`
+
+**Rule**: `StartTestByName(name, roleIndex)` is fire-and-forget; treat the
+returned value as void. Test results are reported asynchronously through
+the framework's delegates / log — there is no synchronous success bool.
+
 ## vcpkg first-time install — surprisingly fast on this machine
 
 `ixwebsocket[core,sectransp,ssl]` + zlib + dependencies took 8 seconds via

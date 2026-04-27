@@ -633,6 +633,58 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // QA / Automation Framework (Milestone 1.7).
+    registerRemote(sage::mcp::Tool{
+        .name        = "list_tests",
+        .description = "List available Automation Framework tests in Editor "
+                       "context. Optional 'filter' substring narrows results.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"filter", {{"type", "string"}}}}},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name        = "run_tests",
+        .description = "Trigger Automation Framework tests in Editor context. "
+                       "Filter substring narrows the set; tests run async — the "
+                       "tool returns the started list immediately. Result polling "
+                       "is deferred to Phase 2.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"filter", {{"type", "string"}}}}},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    // Source control (Milestone 1.7).
+    registerRemote(sage::mcp::Tool{
+        .name        = "get_source_control_state",
+        .description = "Source control module loaded/enabled state and active "
+                       "provider name (Perforce, Git, Subversion, ...). Read-only.",
+        .inputSchema = noArgSchema,
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name        = "checkout_files",
+        .description = "Check out files via the active source control provider. "
+                       "paths: array of file or asset paths. Returns provider, "
+                       "file count, and status (succeeded/failed/cancelled). "
+                       "-32005 if SCM disabled or unavailable.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"paths", {{"type", "array"}, {"items", {{"type", "string"}}},
+                           {"minItems", 1}}},
+            }},
+            {"required", nlohmann::json::array({"paths"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // Compile coordination (Milestone 1.6a — Live Coding wrapper).
     registerRemote(sage::mcp::Tool{
         .name        = "get_live_coding_status",
