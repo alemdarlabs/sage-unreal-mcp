@@ -11,6 +11,7 @@
 #include "Engine/World.h"
 #include "FileHelpers.h"
 #include "GameFramework/Actor.h"
+#include "PlayInEditorDataTypes.h"
 #include "ScopedTransaction.h"
 #include "Subsystems/EditorActorSubsystem.h"
 
@@ -249,6 +250,50 @@ FSageToolDispatch::FOutcome ClearSelectionOnGameThread(const TSharedPtr<FJsonObj
     return FSageToolDispatch::FOutcome::MakeSuccess(Result);
 }
 
+// ---- run_pie --------------------------------------------------------------
+
+FSageToolDispatch::FOutcome RunPieOnGameThread(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    if (GEditor == nullptr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
+    }
+    if (GEditor->PlayWorld != nullptr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32000, TEXT("PIE already active"));
+    }
+
+    FRequestPlaySessionParams Params;
+    GEditor->RequestPlaySession(Params);
+
+    UE_LOG(LogSageBridge, Log, TEXT("PIE start requested"));
+
+    auto Result = MakeShared<FJsonObject>();
+    Result->SetBoolField(TEXT("requested"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(Result);
+}
+
+// ---- stop_pie -------------------------------------------------------------
+
+FSageToolDispatch::FOutcome StopPieOnGameThread(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    if (GEditor == nullptr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
+    }
+    if (GEditor->PlayWorld == nullptr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32000, TEXT("PIE not active"));
+    }
+
+    GEditor->RequestEndPlayMap();
+    UE_LOG(LogSageBridge, Log, TEXT("PIE end requested"));
+
+    auto Result = MakeShared<FJsonObject>();
+    Result->SetBoolField(TEXT("requested"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(Result);
+}
+
 // ---- handlers --------------------------------------------------------------
 
 FSageToolDispatch::FOutcome GetWorldHandler(const TSharedPtr<FJsonObject>& Args)
@@ -283,6 +328,14 @@ FSageToolDispatch::FOutcome GetCurrentLevelHandler(const TSharedPtr<FJsonObject>
 {
     return detail::RunOnGameThread([Args]() { return GetCurrentLevelOnGameThread(Args); });
 }
+FSageToolDispatch::FOutcome RunPieHandler(const TSharedPtr<FJsonObject>& Args)
+{
+    return detail::RunOnGameThread([Args]() { return RunPieOnGameThread(Args); });
+}
+FSageToolDispatch::FOutcome StopPieHandler(const TSharedPtr<FJsonObject>& Args)
+{
+    return detail::RunOnGameThread([Args]() { return StopPieOnGameThread(Args); });
+}
 
 }  // namespace
 
@@ -296,6 +349,8 @@ void RegisterEditorTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("clear_selection"),      &ClearSelectionHandler);
     Dispatch.RegisterHandler(TEXT("save_level"),           &SaveLevelHandler);
     Dispatch.RegisterHandler(TEXT("get_current_level"),    &GetCurrentLevelHandler);
+    Dispatch.RegisterHandler(TEXT("run_pie"),              &RunPieHandler);
+    Dispatch.RegisterHandler(TEXT("stop_pie"),             &StopPieHandler);
 }
 
 }  // namespace sage::tools

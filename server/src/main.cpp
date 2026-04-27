@@ -536,6 +536,22 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // PIE control (Milestone 1.3c → spec'te 1.7'de listelenmişti, hot path).
+    registerRemote(sage::mcp::Tool{
+        .name        = "run_pie",
+        .description = "Start Play-In-Editor with default parameters (PIE in "
+                       "selected viewport). Errors if PIE already active.",
+        .inputSchema = noArgSchema,
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name        = "stop_pie",
+        .description = "Request end of the active PIE session "
+                       "(GEditor->RequestEndPlayMap). Errors if PIE not active.",
+        .inputSchema = noArgSchema,
+        .handler = nullptr, .remote = true,
+    });
+
     // Material parameter (Milestone 1.3c).
     registerRemote(sage::mcp::Tool{
         .name        = "modify_material_parameter",
