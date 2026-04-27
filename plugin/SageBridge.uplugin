@@ -1,0 +1,26 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "0.1.0",
+    "FriendlyName": "Sage Bridge",
+    "Description": "Sage MCP server bridge for Unreal Engine. Connects the editor to a long-lived Sage server over WebSocket; provides agent-controlled execution and intelligence-layer access.",
+    "Category": "Editor",
+    "CreatedBy": "alemdarlabs",
+    "CreatedByURL": "https://github.com/alemdarlabs",
+    "DocsURL": "https://github.com/alemdarlabs/sage-unreal-mcp",
+    "MarketplaceURL": "",
+    "SupportURL": "https://github.com/alemdarlabs/sage-unreal-mcp/issues",
+    "EnabledByDefault": false,
+    "CanContainContent": false,
+    "IsBetaVersion": true,
+    "IsExperimentalVersion": false,
+    "Installed": false,
+    "Modules": [
+        {
+            "Name": "SageBridge",
+            "Type": "Editor",
+            "LoadingPhase": "PostEngineInit",
+            "PlatformAllowList": ["Win64", "Mac", "Linux"]
+        }
+    ]
+}

@@ -18,7 +18,9 @@ Naif "proje adı" identity collision yapar; "tam path" taşımada kırılır; "P
 ## Kararlar
 
 ### 1. Slot ID Formula
-**Karar:** `slot_id = sha256(project_id || canonical_path || engine_major)`
+> **Hash algoritması ADR-014 ile Blake3'e revize edildi** (UE built-in, performans). Bileşen kompozisyonu aşağıda olduğu gibi kalır.
+
+**Karar:** `slot_id = blake3(project_id || \x00 || canonical_path || \x00 || engine_major)`  (orijinal: `sha256(...)`, ADR-014 ile değiştirildi)
 **Alternatifler:** project_id alone, canonical_path alone, hybrid (project_id + path)
 **Gerekçe:** Üç bileşen birleşince tüm gözlemlenen senaryolar doğru çözülür: aynı proje 2 instance → aynı slot; klon → ayrı slot; isim collision → ayrı slot (ProjectID farklı); engine version bump → ayrı slot (reflection metadata uyumsuz).
 

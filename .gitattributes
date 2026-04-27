@@ -1,0 +1,57 @@
+# Default: detect text vs binary, normalize to LF in repo. Working-tree LF on
+# macOS/Linux, CRLF on Windows when git's autocrlf is enabled (it isn't here —
+# we pin per-extension below).
+
+* text=auto eol=lf
+
+# ---- Shell scripts: always LF ---------------------------------------------
+*.sh   text eol=lf
+*.bash text eol=lf
+
+# ---- Windows scripts: always CRLF -----------------------------------------
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# ---- Source code: LF for portability across all platforms -----------------
+*.cpp  text eol=lf
+*.cc   text eol=lf
+*.h    text eol=lf
+*.hpp  text eol=lf
+*.inl  text eol=lf
+*.cs   text eol=lf
+*.py   text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+
+# ---- Config / docs --------------------------------------------------------
+*.json text eol=lf
+*.md   text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.cfg  text eol=lf
+*.ini  text eol=lf
+
+# ---- Unreal -------------------------------------------------------------
+*.uplugin  text eol=lf
+*.uproject text eol=lf
+
+# ---- Binaries ------------------------------------------------------------
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.bmp  binary
+*.tga  binary
+*.exr  binary
+*.ttf  binary
+*.otf  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.tar  binary
+*.7z   binary
+*.uasset binary
+*.umap   binary
