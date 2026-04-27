@@ -19,8 +19,9 @@ set_target_properties(sage-tests PROPERTIES
 # CTest integration via Catch2 test discovery
 catch_discover_tests(sage-tests)
 
-# ---- Bridge integration smoke (standalone) ----
-# Built but NOT registered with ctest — requires a running sage-server.
+# ---- Bridge integration harnesses (standalone) ----
+# Built but NOT registered with ctest — they require a running sage-server.
+
 add_executable(sage-bridge-smoke
     integration/bridge_smoke.cpp
 )
@@ -30,4 +31,15 @@ target_link_libraries(sage-bridge-smoke
             sage-warnings sage-sanitizers)
 target_compile_features(sage-bridge-smoke PRIVATE cxx_std_23)
 set_target_properties(sage-bridge-smoke PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+add_executable(sage-bridge-mock-plugin
+    integration/bridge_mock_plugin.cpp
+)
+target_link_libraries(sage-bridge-mock-plugin
+    PRIVATE ixwebsocket::ixwebsocket
+            nlohmann_json::nlohmann_json
+            sage-warnings sage-sanitizers)
+target_compile_features(sage-bridge-mock-plugin PRIVATE cxx_std_23)
+set_target_properties(sage-bridge-mock-plugin PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

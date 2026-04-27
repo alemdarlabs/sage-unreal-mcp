@@ -128,9 +128,10 @@ ADR-013 (cpp-httplib seçimi) yazıldı.
 - [ ] Tool result envelope sender (sage_tool_result mesajı)
 - [ ] BuildPlugin verify
 
-### Integration
-- [ ] Mock plugin executable — `sage-bridge-smoke --mode=mock-plugin` (extend) veya yeni binary
-- [ ] End-to-end bash smoke: HTTP POST tools/call → server → mock plugin → tool_result → MCP response
+### Integration ✓ (end-to-end mock verified)
+- [x] Mock plugin executable — `sage-bridge-mock-plugin` (standalone, ixwebsocket client, single tool_call echo)
+- [x] End-to-end smoke: `POST /mcp tools/call editor.ping` → MCPServer → registry remote → BridgeServer.dispatchTool → WS → mock plugin → tool_result → promise.set_value → MCP response. ASan+UBSan clean.
+- [x] Response payload doğrulandı: `structuredContent: {echoed_by:"mock", tool:"editor.ping", message:"hello-from-test"}`
 
 ---
 
