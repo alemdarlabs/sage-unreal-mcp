@@ -6,9 +6,11 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Editor.h"
+#include "FileHelpers.h"
 #include "ScopedTransaction.h"
 #include "Subsystems/EditorAssetSubsystem.h"
 #include "UObject/Class.h"
+#include "UObject/Package.h"
 #include "UObject/UnrealType.h"
 
 #define LOCTEXT_NAMESPACE "Sage"
@@ -256,6 +258,185 @@ FSageToolDispatch::FOutcome DeleteAssetOnGameThread(const TSharedPtr<FJsonObject
     return FSageToolDispatch::FOutcome::MakeSuccess(Result);
 }
 
+// ---- save_assets ----------------------------------------------------------
+
+FSageToolDispatch::FOutcome SaveAssetsOnGameThread(const TSharedPtr<FJsonObject>& Args)
+{
+    bool bDryRun = false;
+    if (Args.IsValid()) Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+
+    FSageToolDispatch::FOutcome SubErr;
+    UEditorAssetSubsystem* Sub = GetAssetSubsystem(SubErr);
+    if (Sub == nullptr) return SubErr;
+
+    TArray<TSharedPtr<FJsonValue>> SavedArr;
+    int32 SavedCount = 0;
+
+    const TArray<TSharedPtr<FJsonValue>>* PathsArr = nullptr;
+    if (Args.IsValid() && Args->TryGetArrayField(TEXT("paths"), PathsArr) && PathsArr != nullptr)
+    {
+        for (const TSharedPtr<FJsonValue>& V : *PathsArr)
+        {
+            const FString Path = V->AsString();
+            if (Path.IsEmpty()) continue;
+            if (bDryRun)
+            {
+                SavedArr.Add(MakeShared<FJsonValueString>(Path));
+                continue;
+            }
+            if (Sub->SaveAsset(Path, /*bOnlyIfIsDirty=*/false))
+            {
+                SavedArr.Add(MakeShared<FJsonValueString>(Path));
+                ++SavedCount;
+            }
+        }
+    }
+    else
+    {
+        TArray<UPackage*> DirtyPackages;
+        FEditorFileUtils::GetDirtyContentPackages(DirtyPackages);
+        FEditorFileUtils::GetDirtyWorldPackages(DirtyPackages);
+
+        if (bDryRun)
+        {
+            for (UPackage* Pkg : DirtyPackages)
+            {
+                if (Pkg != nullptr)
+                {
+                    SavedArr.Add(MakeShared<FJsonValueString>(Pkg->GetName()));
+                }
+            }
+        }
+        else
+        {
+            UEditorLoadingAndSavingUtils::SavePackages(DirtyPackages, /*bOnlyDirty=*/false);
+            for (UPackage* Pkg : DirtyPackages)
+            {
+                if (Pkg != nullptr)
+                {
+                    SavedArr.Add(MakeShared<FJsonValueString>(Pkg->GetName()));
+                    ++SavedCount;
+                }
+            }
+        }
+    }
+
+    UE_LOG(LogSageBridge, Log, TEXT("Saved %d package(s) (dry_run=%s)"),
+           SavedCount, bDryRun ? TEXT("yes") : TEXT("no"));
+
+    auto Result = MakeShared<FJsonObject>();
+    Result->SetArrayField(TEXT("saved"), SavedArr);
+    Result->SetNumberField(TEXT("count"), SavedArr.Num());
+    Result->SetBoolField(TEXT("dry_run"), bDryRun);
+    return FSageToolDispatch::FOutcome::MakeSuccess(Result);
+}
+
+// ---- get_dirty_assets -----------------------------------------------------
+
+FSageToolDispatch::FOutcome GetDirtyAssetsOnGameThread(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    TArray<UPackage*> DirtyPackages;
+    FEditorFileUtils::GetDirtyContentPackages(DirtyPackages);
+    FEditorFileUtils::GetDirtyWorldPackages(DirtyPackages);
+
+    TArray<TSharedPtr<FJsonValue>> Items;
+    for (UPackage* Pkg : DirtyPackages)
+    {
+        if (Pkg != nullptr)
+        {
+            Items.Add(MakeShared<FJsonValueString>(Pkg->GetName()));
+        }
+    }
+
+    auto Result = MakeShared<FJsonObject>();
+    Result->SetArrayField(TEXT("dirty"), Items);
+    Result->SetNumberField(TEXT("count"), Items.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(Result);
+}
+
+// ---- discard_changes ------------------------------------------------------
+
+FSageToolDispatch::FOutcome DiscardChangesOnGameThread(const TSharedPtr<FJsonObject>& Args)
+{
+    if (!Args.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing args"));
+    }
+    const TArray<TSharedPtr<FJsonValue>>* PathsArr = nullptr;
+    if (!Args->TryGetArrayField(TEXT("paths"), PathsArr) || PathsArr == nullptr || PathsArr->Num() == 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'paths' (non-empty array of asset/package paths)"));
+    }
+
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+
+    TArray<UPackage*> Packages;
+    Packages.Reserve(PathsArr->Num());
+    TArray<FString> NotFound;
+    for (const TSharedPtr<FJsonValue>& V : *PathsArr)
+    {
+        const FString Path = V->AsString();
+        if (Path.IsEmpty()) continue;
+        UPackage* Pkg = FindPackage(nullptr, *Path);
+        if (Pkg == nullptr)
+        {
+            Pkg = LoadPackage(nullptr, *Path, LOAD_None);
+        }
+        if (Pkg != nullptr)
+        {
+            Packages.Add(Pkg);
+        }
+        else
+        {
+            NotFound.Add(Path);
+        }
+    }
+
+    if (Packages.Num() == 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("no resolvable packages from supplied paths"));
+    }
+
+    bool bAnyReloaded = false;
+    FText ErrorMsg;
+    UEditorLoadingAndSavingUtils::ReloadPackages(Packages, bAnyReloaded, ErrorMsg,
+                                                  EReloadPackagesInteractionMode::AssumeNegative);
+
+    TArray<TSharedPtr<FJsonValue>> ReloadedArr;
+    if (bAnyReloaded)
+    {
+        // FEditorFileUtils::ReloadPackages reports a single bool, not per-package
+        // status; treat success as "all attempted packages reloaded".
+        for (UPackage* Pkg : Packages)
+        {
+            if (Pkg != nullptr) ReloadedArr.Add(MakeShared<FJsonValueString>(Pkg->GetName()));
+        }
+    }
+    TArray<TSharedPtr<FJsonValue>> NotFoundArr;
+    for (const FString& P : NotFound)
+    {
+        NotFoundArr.Add(MakeShared<FJsonValueString>(P));
+    }
+
+    UE_LOG(LogSageBridge, Log, TEXT("Discard reloaded any=%s; %d not found"),
+           bAnyReloaded ? TEXT("yes") : TEXT("no"), NotFound.Num());
+
+    auto Result = MakeShared<FJsonObject>();
+    Result->SetArrayField(TEXT("reloaded"),  ReloadedArr);
+    Result->SetArrayField(TEXT("not_found"), NotFoundArr);
+    if (!ErrorMsg.IsEmpty())
+    {
+        Result->SetStringField(TEXT("error_message"), ErrorMsg.ToString());
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(Result);
+}
+
 // ---- handlers --------------------------------------------------------------
 
 FSageToolDispatch::FOutcome ModifyAssetPropertyHandler(const TSharedPtr<FJsonObject>& Args)
@@ -278,6 +459,18 @@ FSageToolDispatch::FOutcome DeleteAssetHandler(const TSharedPtr<FJsonObject>& Ar
 {
     return detail::RunOnGameThread([Args]() { return DeleteAssetOnGameThread(Args); });
 }
+FSageToolDispatch::FOutcome SaveAssetsHandler(const TSharedPtr<FJsonObject>& Args)
+{
+    return detail::RunOnGameThread([Args]() { return SaveAssetsOnGameThread(Args); });
+}
+FSageToolDispatch::FOutcome GetDirtyAssetsHandler(const TSharedPtr<FJsonObject>& Args)
+{
+    return detail::RunOnGameThread([Args]() { return GetDirtyAssetsOnGameThread(Args); });
+}
+FSageToolDispatch::FOutcome DiscardChangesHandler(const TSharedPtr<FJsonObject>& Args)
+{
+    return detail::RunOnGameThread([Args]() { return DiscardChangesOnGameThread(Args); });
+}
 
 }  // namespace
 
@@ -288,6 +481,9 @@ void RegisterAssetTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("move_asset"),            &MoveAssetHandler);
     Dispatch.RegisterHandler(TEXT("duplicate_asset"),       &DuplicateAssetHandler);
     Dispatch.RegisterHandler(TEXT("delete_asset"),          &DeleteAssetHandler);
+    Dispatch.RegisterHandler(TEXT("save_assets"),           &SaveAssetsHandler);
+    Dispatch.RegisterHandler(TEXT("get_dirty_assets"),      &GetDirtyAssetsHandler);
+    Dispatch.RegisterHandler(TEXT("discard_changes"),       &DiscardChangesHandler);
 }
 
 }  // namespace sage::tools

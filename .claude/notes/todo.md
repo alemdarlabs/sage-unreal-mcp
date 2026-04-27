@@ -135,7 +135,7 @@ ADR-013 (cpp-httplib seçimi) yazıldı.
 
 ---
 
-## Milestone 1.3c — Asset Mutation Tools (5/5) ✓ (commit pending)
+## Milestone 1.3c — Asset Mutation Tools (8/8) ✓ (commit pending)
 
 ### Plugin (`SageAssetTools.cpp`)
 - [x] `modify_asset_property` — `UEditorAssetSubsystem::LoadAsset` + detail::SetUPropertyFromJson + MarkPackageDirty; FScopedTransaction; PIE-rejecting
@@ -143,15 +143,21 @@ ADR-013 (cpp-httplib seçimi) yazıldı.
 - [x] `move_asset` — same UE call as rename, semantic alias for cross-folder moves; FScopedTransaction
 - [x] `duplicate_asset` — `UEditorAssetSubsystem::DuplicateAsset`; returns new asset's UE path
 - [x] `delete_asset` — `UEditorAssetSubsystem::DeleteAsset`; FScopedTransaction
+- [x] `save_assets` — paths-specific or all-dirty via `UEditorLoadingAndSavingUtils::SaveDirtyPackages`; `dry_run` support
+- [x] `get_dirty_assets` — `FEditorFileUtils::GetDirty{Content,World}Packages` query; read-only
+- [x] `discard_changes` — `UEditorLoadingAndSavingUtils::ReloadPackages` with `AssumeNegative` (no UI prompt)
 - [x] `USageBridgeSubsystem` → `RegisterAssetTools(ToolDispatch)`
 
 ### Server (`main.cpp`)
-- [x] Five remote tools registered with JSON Schema:
+- [x] Eight remote tools registered with JSON Schema:
   - `modify_asset_property` (asset_path + property + value)
   - `rename_asset` (source + destination)
   - `move_asset` (source + destination)
   - `duplicate_asset` (source + destination → returns `new_asset_id`)
   - `delete_asset` (asset_path)
+  - `save_assets` (paths optional, dry_run optional)
+  - `get_dirty_assets` (no args; read-only)
+  - `discard_changes` (paths required)
 
 ---
 

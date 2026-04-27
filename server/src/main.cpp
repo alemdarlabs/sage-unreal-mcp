@@ -414,6 +414,56 @@ int main() {
         .remote  = true,
     });
 
+    registerRemote(sage::mcp::Tool{
+        .name        = "save_assets",
+        .description = "Save dirty content + world packages. With `paths` array: "
+                       "save those specific assets. Without paths: save all dirty. "
+                       "`dry_run: true` returns the would-save list without writing. "
+                       "Rejects during PIE.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"paths",   {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"dry_run", {{"type", "boolean"}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "get_dirty_assets",
+        .description = "List currently-dirty content + world packages "
+                       "(in-memory edits not yet saved to disk). Read-only.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {}},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "discard_changes",
+        .description = "Reload packages from disk, discarding in-memory edits. "
+                       "Wraps UEditorLoadingAndSavingUtils::ReloadPackages with "
+                       "AssumeNegative interaction mode (no UI prompt). Rejects "
+                       "during PIE.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"paths", {{"type", "array"}, {"items", {{"type", "string"}}},
+                           {"minItems", 1}}},
+            }},
+            {"required", nlohmann::json::array({"paths"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
     // ---- HTTP+SSE transport (Claude ↔ server) ---------------------------
     sage::transport::HttpSseConfig httpCfg{
         .host            = envOr("SAGE_HTTP_HOST", "127.0.0.1"),
