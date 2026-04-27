@@ -519,6 +519,23 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // Level tools (Milestone 1.3c).
+    registerRemote(sage::mcp::Tool{
+        .name        = "save_level",
+        .description = "Save the current editor world's level package "
+                       "(UEditorLoadingAndSavingUtils::SavePackages on the world's "
+                       "outermost package). Rejects during PIE.",
+        .inputSchema = noArgSchema,
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name        = "get_current_level",
+        .description = "Return current world's level path, map name, actor count, "
+                       "and streaming sub-level package names. Read-only.",
+        .inputSchema = noArgSchema,
+        .handler = nullptr, .remote = true,
+    });
+
     // Material parameter (Milestone 1.3c).
     registerRemote(sage::mcp::Tool{
         .name        = "modify_material_parameter",

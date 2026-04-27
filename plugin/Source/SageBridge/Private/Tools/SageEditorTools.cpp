@@ -7,7 +7,9 @@
 #include "Dom/JsonValue.h"
 #include "Editor.h"
 #include "Engine/Level.h"
+#include "Engine/LevelStreaming.h"
 #include "Engine/World.h"
+#include "FileHelpers.h"
 #include "GameFramework/Actor.h"
 #include "ScopedTransaction.h"
 #include "Subsystems/EditorActorSubsystem.h"
@@ -38,6 +40,76 @@ FSageToolDispatch::FOutcome GetWorldOnGameThread(const TSharedPtr<FJsonObject>& 
             }
         }
     }
+    return FSageToolDispatch::FOutcome::MakeSuccess(Result);
+}
+
+// ---- save_level ----------------------------------------------------------
+
+FSageToolDispatch::FOutcome SaveLevelOnGameThread(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+
+    if (GEditor == nullptr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
+    }
+    UWorld* World = GEditor->GetEditorWorldContext().World();
+    if (World == nullptr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no editor world"));
+    }
+    UPackage* Pkg = World->GetOutermost();
+    if (Pkg == nullptr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32000, TEXT("no package for world"));
+    }
+
+    const bool bWasDirty = Pkg->IsDirty();
+    const TArray<UPackage*> Packages{Pkg};
+    UEditorLoadingAndSavingUtils::SavePackages(Packages, /*bOnlyDirty=*/false);
+
+    UE_LOG(LogSageBridge, Log, TEXT("Saved level package: %s"), *Pkg->GetName());
+
+    auto Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("world_path"), World->GetPathName());
+    Result->SetStringField(TEXT("package"),    Pkg->GetName());
+    Result->SetBoolField(TEXT("was_dirty"),    bWasDirty);
+    return FSageToolDispatch::FOutcome::MakeSuccess(Result);
+}
+
+// ---- get_current_level ----------------------------------------------------
+
+FSageToolDispatch::FOutcome GetCurrentLevelOnGameThread(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    if (GEditor == nullptr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
+    }
+    UWorld* World = GEditor->GetEditorWorldContext().World();
+    if (World == nullptr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no editor world"));
+    }
+
+    auto Result = MakeShared<FJsonObject>();
+    Result->SetStringField(TEXT("world_path"), World->GetPathName());
+    Result->SetStringField(TEXT("map_name"),   World->GetMapName());
+    if (ULevel* Level = World->GetCurrentLevel())
+    {
+        Result->SetStringField(TEXT("level_path"),  Level->GetPathName());
+        Result->SetNumberField(TEXT("actor_count"), Level->Actors.Num());
+    }
+
+    TArray<TSharedPtr<FJsonValue>> SubLevels;
+    for (ULevelStreaming* Sub : World->GetStreamingLevels())
+    {
+        if (Sub != nullptr)
+        {
+            SubLevels.Add(MakeShared<FJsonValueString>(Sub->GetWorldAssetPackageName()));
+        }
+    }
+    Result->SetArrayField(TEXT("sub_levels"), SubLevels);
     return FSageToolDispatch::FOutcome::MakeSuccess(Result);
 }
 
@@ -203,6 +275,14 @@ FSageToolDispatch::FOutcome ClearSelectionHandler(const TSharedPtr<FJsonObject>&
 {
     return detail::RunOnGameThread([Args]() { return ClearSelectionOnGameThread(Args); });
 }
+FSageToolDispatch::FOutcome SaveLevelHandler(const TSharedPtr<FJsonObject>& Args)
+{
+    return detail::RunOnGameThread([Args]() { return SaveLevelOnGameThread(Args); });
+}
+FSageToolDispatch::FOutcome GetCurrentLevelHandler(const TSharedPtr<FJsonObject>& Args)
+{
+    return detail::RunOnGameThread([Args]() { return GetCurrentLevelOnGameThread(Args); });
+}
 
 }  // namespace
 
@@ -214,6 +294,8 @@ void RegisterEditorTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("get_selected_actors"),  &GetSelectedActorsHandler);
     Dispatch.RegisterHandler(TEXT("select_actors"),        &SelectActorsHandler);
     Dispatch.RegisterHandler(TEXT("clear_selection"),      &ClearSelectionHandler);
+    Dispatch.RegisterHandler(TEXT("save_level"),           &SaveLevelHandler);
+    Dispatch.RegisterHandler(TEXT("get_current_level"),    &GetCurrentLevelHandler);
 }
 
 }  // namespace sage::tools
