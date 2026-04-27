@@ -20,7 +20,7 @@ Per-layer technology choices and rationale. See [ADR-001](../decisions/adr-001-t
 | Build | CMake + vcpkg (manifest mode) | Cross-platform |
 | MCP impl | Manual | No official C++ SDK; ~1500 LOC investment |
 | HTTP server | cpp-httplib | For HTTP+SSE transport (ADR-013) |
-| WebSocket | uWebSockets | Plugin bridge; high performance |
+| WebSocket | ixwebsocket | Plugin bridge (ADR-015 — replaces uWebSockets) |
 | JSON | nlohmann/json + simdjson | Ergonomics + hot-path parse |
 | Logging | spdlog | Structured, performant |
 | Test | Catch2 | Modern macro syntax, broad ecosystem |

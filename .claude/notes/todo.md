@@ -13,7 +13,7 @@ ADR-013 (cpp-httplib seçimi) yazıldı.
 
 ---
 
-## Milestone 1.2 — Plugin Scaffolding (active)
+## Milestone 1.2 — Plugin Scaffolding ✓ (commit ffc223d)
 
 > Goal: UE plugin connects to server, sends handshake, maintains heartbeat,
 > reconnects with backoff. No tool dispatch yet (Milestone 1.3).
@@ -69,9 +69,65 @@ ADR-013 (cpp-httplib seçimi) yazıldı.
 
 ---
 
+---
+
+## Milestone 1.3a — Plugin↔Server Bridge ✓ (active commit pending)
+
+> Goal: Server tarafı WebSocket bridge endpoint'i, hello/welcome handshake,
+> heartbeat round-trip, session bookkeeping. Tool dispatch (1.3b) sonraki adım.
+
+### A. Library decision
+- [x] ADR-015 — ixwebsocket (replaces uWebSockets ADR-001 plugin bridge seçimi)
+- [x] tech-stack.md — WebSocket satırı `ixwebsocket (ADR-015)`
+
+### B. Server-side bridge
+- [x] `server/src/bridge/protocol.{h,cpp}` — wire protocol (hello, heartbeat, tool_result, event ↔ welcome, heartbeat_ack, tool_call, error), `parseType`, `parseHello`, `parseHeartbeat`, `parseToolResult`, factory functions
+- [x] `server/src/bridge/editor_session.h` — connected editor state
+- [x] `server/src/bridge/bridge_server.{h,cpp}` — ix::WebSocketServer adapter, session map (mutex), handshake + heartbeat handlers
+- [x] `server/CMakeLists.txt` — `sage-bridge` STATIC target, ixwebsocket::ixwebsocket link
+- [x] root `CMakeLists.txt` + `vcpkg.json` — ixwebsocket dep
+- [x] `server/src/main.cpp` — bridge wire-up, signal-aware shutdown, env vars (`SAGE_WS_HOST`, `SAGE_WS_PORT`)
+
+### C. Tests
+- [x] `tests/unit/test_bridge_protocol.cpp` — 8 test (parseType, parseHello happy/sad, parseHeartbeat, parseToolResult, factories)
+- [x] `tests/integration/bridge_smoke.cpp` — standalone executable, ixwebsocket client, sends hello + heartbeat, asserts welcome + heartbeat_ack
+- [x] `tests/CMakeLists.txt` — duplicate-library warning fix (sage-mcp transitive via sage-bridge)
+
+### D. Verification ✓
+- [x] vcpkg ixwebsocket[core,sectransp,ssl] install — 8 saniye
+- [x] cmake configure 9.3 s; build 11/11 clean (after dup-fix)
+- [x] ctest 31/31 PASSED (23 önceki + 8 bridge protocol)
+- [x] Smoke `sage-bridge-smoke` → connect + hello → welcome + heartbeat → heartbeat_ack → normal close (1000) — ASan/UBSan clean
+- [x] Server log doğrulama: `Bridge listening on ws://127.0.0.1:7778/bridge`, handshake detail (`slot=smoke-slot, label='smoke', engine=5.7.4`), graceful shutdown
+
+### E. Commit
+- [ ] `feat: phase 1 milestone 1.3a — plugin↔server WebSocket bridge`
+
+---
+
+## Milestone 1.3b — Tool Dispatch (pending)
+
+> Goal: Server'a `tools/call` geldiğinde plugin'e RPC route et, `std::promise<ToolResult>` ile sync future await; plugin tarafı `ToolDispatch` ile FScopedTransaction içinde çalıştırıp sonuç gönderir.
+
+- [ ] Server: pending RPC table (`std::unordered_map<TxId, std::promise<ToolResult>>`)
+- [ ] MCPServer integration: registry tool tipi "remote" → bridge route
+- [ ] Plugin: `ToolDispatch` module (gelen tool_call → registered handler dispatch)
+- [ ] Tool registration mechanism plugin-side
+- [ ] First tool: `spawn_actor` (Milestone 1.3c için altyapı)
+
+---
+
+## Milestone 1.3c — First Mutation Tool: spawn_actor (pending)
+
+- [ ] Plugin handler: `UEditorActorSubsystem::SpawnActorFromClass`, FScopedTransaction wrapping
+- [ ] Server tool registration: `spawn_actor` schema + remote route
+- [ ] End-to-end test: Claude → server → plugin → spawn → response
+
+---
+
 ## Açık Sorular / Sonraki
 
-- **Plugin runtime test** — Milestone 1.3 başında host UE projesi içinde sage-server + plugin pair test edilecek (handshake → heartbeat → server log doğrulama).
-- **License** → ADR-015 (önceden ADR-014 olarak işaret edildi, ADR-014 Blake3'e gitti). Apache-2.0 / MIT karar vermek lazım.
-- **Server-side handshake handler** — şu an MCP server WS değil HTTP+SSE; plugin bridge için ayrı WebSocket transport Milestone 1.5'te kuruluyor (lifecycle + multi-editor). Bu Milestone 1.2'de plugin tarafı tek başına derlenir.
-- **Symlink resolution** — `FSageSlotID::ResolveCanonicalPath()` şu an symlink resolve etmiyor. Phase 2 polish.
+- **Real UE host project test** — Mac üzerinde sage-server'ı çalıştırıp gerçek bir UE 5.7 projesinde plugin'i yükleyip handshake doğrulaması (kullanıcı talep etti, Milestone 1.3a sonrası test penceresi)
+- **License** → ADR-016 (Apache-2.0 önerim)
+- **Symlink resolution** — `FSageSlotID::ResolveCanonicalPath()` Phase 2 polish
+- **Plugin tarafı incoming message parse** — şu an `OnMessageReceived` raw string, parse Milestone 1.3b'de eklenir

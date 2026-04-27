@@ -9,6 +9,7 @@
     "nlohmann-json",
     "spdlog",
     "cpp-httplib",
+    "ixwebsocket",
     "catch2"
   ]
 }

@@ -41,10 +41,22 @@ target_link_libraries(sage-tools
     PUBLIC  sage-mcp
     PRIVATE sage-warnings sage-sanitizers)
 
+# ---- bridge library (plugin↔server WebSocket, ADR-015) ----
+add_library(sage-bridge STATIC
+    src/bridge/protocol.cpp
+    src/bridge/bridge_server.cpp
+)
+target_include_directories(sage-bridge
+    PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+target_compile_features(sage-bridge PUBLIC cxx_std_23)
+target_link_libraries(sage-bridge
+    PUBLIC  sage-mcp ixwebsocket::ixwebsocket
+    PRIVATE sage-warnings sage-sanitizers)
+
 # ---- executable ----
 add_executable(sage-server src/main.cpp)
 target_link_libraries(sage-server
-    PRIVATE sage-transport sage-tools
+    PRIVATE sage-transport sage-tools sage-bridge
             sage-warnings sage-sanitizers)
 set_target_properties(sage-server PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

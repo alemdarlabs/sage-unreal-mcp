@@ -1,11 +1,14 @@
 // Sage server entry point.
 //
 // Wires:
-//   ToolRegistry  ← registerBuiltins (ping)
-//   MCPServer     ← registry
-//   HTTP+SSE      ← MCPServer
+//   ToolRegistry   ← registerBuiltins (ping)
+//   MCPServer      ← registry
+//   HTTP+SSE       ← MCPServer  (Claude ↔ server, port 7777)
+//   BridgeServer   ← editor sessions (plugin ↔ server WebSocket, port 7778)
+//
 // Listens until SIGINT / SIGTERM, then graceful shutdown.
 
+#include "bridge/bridge_server.h"
 #include "mcp/server.h"
 #include "mcp/tool_registry.h"
 #include "tools/builtin.h"
@@ -18,18 +21,21 @@
 #include <csignal>
 #include <cstdlib>
 #include <memory>
-#include <stdexcept>
 #include <string>
 
 namespace {
 
-std::atomic<sage::transport::HttpSseServer*> g_runningServer{nullptr};
+std::atomic<sage::transport::HttpSseServer*> g_runningHttp{nullptr};
+std::atomic<sage::bridge::BridgeServer*>     g_runningBridge{nullptr};
 
 extern "C" void signalHandler(int signal) {
-    // Async-signal-safe: only touch atomics & call into httplib::Server::stop()
-    // which is documented as safe from a signal handler context.
-    if (auto* s = g_runningServer.load(std::memory_order_acquire)) {
-        s->stop();
+    // Async-signal-safe surface: only atomics + library stop() functions
+    // documented as safe from signal context (cpp-httplib, ixwebsocket).
+    if (auto* h = g_runningHttp.load(std::memory_order_acquire)) {
+        h->stop();
+    }
+    if (auto* b = g_runningBridge.load(std::memory_order_acquire)) {
+        b->stop();
     }
     spdlog::info("Caught signal {}; shutdown initiated", signal);
 }
@@ -70,24 +76,42 @@ int main() {
         sage::mcp::ServerInfo{.name = "sage-unreal-mcp", .version = "0.1.0"},
         registry);
 
-    sage::transport::HttpSseConfig cfg{
+    // ---- Bridge (plugin ↔ server WebSocket) -----------------------------
+    sage::bridge::BridgeConfig bridgeCfg{
+        .host     = envOr("SAGE_WS_HOST", "127.0.0.1"),
+        .port     = envIntOr("SAGE_WS_PORT", 7778),
+        .endpoint = "/bridge",
+    };
+    sage::bridge::BridgeServer bridge(bridgeCfg);
+    if (!bridge.start()) {
+        spdlog::error("Bridge failed to bind {}:{}; aborting",
+                      bridgeCfg.host, bridgeCfg.port);
+        return 1;
+    }
+    g_runningBridge.store(&bridge, std::memory_order_release);
+
+    // ---- HTTP+SSE transport (Claude ↔ server) ---------------------------
+    sage::transport::HttpSseConfig httpCfg{
         .host            = envOr("SAGE_HTTP_HOST", "127.0.0.1"),
         .port            = envIntOr("SAGE_HTTP_PORT", 7777),
         .mcpEndpoint     = "/mcp",
         .readTimeoutSec  = 30,
         .writeTimeoutSec = 30,
     };
-    sage::transport::HttpSseServer transport(mcpServer, cfg);
-    g_runningServer.store(&transport, std::memory_order_release);
+    sage::transport::HttpSseServer transport(mcpServer, httpCfg);
+    g_runningHttp.store(&transport, std::memory_order_release);
 
     std::signal(SIGINT,  &signalHandler);
     std::signal(SIGTERM, &signalHandler);
 
     const bool ok = transport.listen();
-    g_runningServer.store(nullptr, std::memory_order_release);
+
+    g_runningHttp.store(nullptr, std::memory_order_release);
+    bridge.stop();
+    g_runningBridge.store(nullptr, std::memory_order_release);
 
     if (!ok) {
-        spdlog::error("HTTP server failed to bind {}:{}", cfg.host, cfg.port);
+        spdlog::error("HTTP server failed to bind {}:{}", httpCfg.host, httpCfg.port);
         return 1;
     }
     spdlog::info("Bye");
