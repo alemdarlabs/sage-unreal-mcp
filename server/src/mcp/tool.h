@@ -24,7 +24,8 @@ struct Tool {
     std::string name;            // canonical identifier (e.g. "ping", "spawn_actor")
     std::string description;     // human-readable; agents use this to reason about applicability
     nlohmann::json inputSchema;  // JSON Schema describing params (api-spec.md §Token Optimization)
-    ToolHandler handler;
+    ToolHandler handler;         // local handler; ignored if `remote == true`
+    bool remote = false;         // route via ToolRegistry::remoteDispatcher (Milestone 1.3b)
 };
 
 }  // namespace sage::mcp

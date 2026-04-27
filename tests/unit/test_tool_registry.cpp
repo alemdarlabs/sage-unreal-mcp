@@ -106,3 +106,83 @@ TEST_CASE("ToolRegistry::list snapshots all tools", "[mcp][registry]") {
     auto items = reg.list();
     REQUIRE(items.size() == 3);
 }
+
+TEST_CASE("ToolRegistry rejects local tool with no handler", "[mcp][registry]") {
+    ToolRegistry reg;
+    Tool broken{
+        .name        = "broken",
+        .description = "missing handler",
+        .inputSchema = nlohmann::json::object(),
+        .handler     = nullptr,
+        .remote      = false,
+    };
+    auto err = reg.registerTool(std::move(broken));
+    REQUIRE_FALSE(err.has_value());
+    REQUIRE(err.error() == ToolRegistry::RegisterError::MissingHandler);
+}
+
+TEST_CASE("ToolRegistry routes remote tool via dispatcher", "[mcp][registry]") {
+    ToolRegistry reg;
+
+    Tool remote{
+        .name        = "editor.ping",
+        .description = "remote",
+        .inputSchema = nlohmann::json::object(),
+        .handler     = nullptr,
+        .remote      = true,
+    };
+    REQUIRE(reg.registerTool(std::move(remote)).has_value());
+    REQUIRE_FALSE(reg.hasRemoteDispatcher());
+
+    bool called = false;
+    reg.setRemoteDispatcher(
+        [&called](std::string_view tool, const nlohmann::json& args) -> ToolResult {
+            called = true;
+            REQUIRE(tool == "editor.ping");
+            return nlohmann::json{{"echoed", args}};
+        });
+    REQUIRE(reg.hasRemoteDispatcher());
+
+    auto outcome = reg.dispatch("editor.ping", nlohmann::json{{"message", "hi"}});
+    REQUIRE(called);
+    REQUIRE(outcome.has_value());
+    REQUIRE((*outcome)["echoed"]["message"] == "hi");
+}
+
+TEST_CASE("ToolRegistry remote without dispatcher yields InternalError",
+          "[mcp][registry]") {
+    ToolRegistry reg;
+    Tool remote{
+        .name        = "rt",
+        .description = "remote",
+        .inputSchema = nlohmann::json::object(),
+        .handler     = nullptr,
+        .remote      = true,
+    };
+    REQUIRE(reg.registerTool(std::move(remote)).has_value());
+
+    auto outcome = reg.dispatch("rt", nlohmann::json::object());
+    REQUIRE_FALSE(outcome.has_value());
+    REQUIRE(outcome.error().code == ErrorCode::InternalError);
+}
+
+TEST_CASE("ToolRegistry remote dispatcher exception → InternalError",
+          "[mcp][registry]") {
+    ToolRegistry reg;
+    Tool remote{
+        .name        = "rt",
+        .description = "throws",
+        .inputSchema = nlohmann::json::object(),
+        .handler     = nullptr,
+        .remote      = true,
+    };
+    REQUIRE(reg.registerTool(std::move(remote)).has_value());
+    reg.setRemoteDispatcher(
+        [](std::string_view, const nlohmann::json&) -> ToolResult {
+            throw std::runtime_error("dispatcher boom");
+        });
+
+    auto outcome = reg.dispatch("rt", nlohmann::json::object());
+    REQUIRE_FALSE(outcome.has_value());
+    REQUIRE(outcome.error().code == ErrorCode::InternalError);
+}

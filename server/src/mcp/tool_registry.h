@@ -19,7 +19,14 @@ public:
     enum class RegisterError {
         DuplicateName,
         InvalidName,
+        MissingHandler,  // local tool without handler
     };
+
+    // Routes a remote-tagged tool to the bridge layer (sync, blocking until
+    // plugin response or timeout). Injected by main.cpp to keep sage-mcp
+    // independent of sage-bridge.
+    using RemoteDispatcher =
+        std::function<ToolResult(std::string_view tool, const nlohmann::json& args)>;
 
     ToolRegistry() = default;
     ToolRegistry(const ToolRegistry&) = delete;
@@ -38,6 +45,9 @@ public:
     // `tools/call` semantics. Returns ErrorObject if tool absent or handler throws.
     [[nodiscard]] ToolResult dispatch(std::string_view name,
                                       const nlohmann::json& params) const;
+
+    void setRemoteDispatcher(RemoteDispatcher fn);
+    [[nodiscard]] bool hasRemoteDispatcher() const noexcept;
 
 private:
     // Heterogeneous lookup so string_view queries don't allocate a temporary string.
@@ -58,6 +68,7 @@ private:
     };
 
     std::unordered_map<std::string, Tool, StringHash, StringEq> tools_;
+    RemoteDispatcher remoteDispatcher_;
 };
 
 }  // namespace sage::mcp

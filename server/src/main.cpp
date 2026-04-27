@@ -90,6 +90,33 @@ int main() {
     }
     g_runningBridge.store(&bridge, std::memory_order_release);
 
+    // ---- Wire bridge into tool registry (remote tools route via WS) -----
+    registry->setRemoteDispatcher(
+        [&bridge](std::string_view tool, const nlohmann::json& args) {
+            return bridge.dispatchTool(tool, args);
+        });
+
+    // Smoke-test remote tool: round-trips through the connected editor.
+    // Replaced by domain tools (spawn_actor, modify_property, ...) in
+    // Milestone 1.3c.
+    {
+        sage::mcp::Tool editorPing{
+            .name        = "editor.ping",
+            .description = "Round-trips a ping through the connected editor; "
+                           "smoke test for bridge dispatch.",
+            .inputSchema = nlohmann::json{
+                {"type",       "object"},
+                {"properties", {{"message", {{"type", "string"}}}}},
+                {"additionalProperties", false},
+            },
+            .handler = nullptr,
+            .remote  = true,
+        };
+        if (auto r = registry->registerTool(std::move(editorPing)); !r.has_value()) {
+            spdlog::warn("Failed to register remote tool 'editor.ping'");
+        }
+    }
+
     // ---- HTTP+SSE transport (Claude ↔ server) ---------------------------
     sage::transport::HttpSseConfig httpCfg{
         .host            = envOr("SAGE_HTTP_HOST", "127.0.0.1"),

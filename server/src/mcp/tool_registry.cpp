@@ -24,10 +24,14 @@ std::expected<void, ToolRegistry::RegisterError> ToolRegistry::registerTool(Tool
     if (!isValidToolName(tool.name)) {
         return std::unexpected(RegisterError::InvalidName);
     }
+    if (!tool.remote && !tool.handler) {
+        return std::unexpected(RegisterError::MissingHandler);
+    }
     if (tools_.contains(tool.name)) {
         return std::unexpected(RegisterError::DuplicateName);
     }
-    spdlog::debug("Registering tool: {}", tool.name);
+    spdlog::debug("Registering tool: {} (remote={})",
+                  tool.name, tool.remote ? "yes" : "no");
     tools_.emplace(tool.name, std::move(tool));
     return {};
 }
@@ -57,6 +61,26 @@ ToolResult ToolRegistry::dispatch(std::string_view name,
         return std::unexpected(ErrorObject::fromCode(
             ErrorCode::MethodNotFound, std::string{"unknown tool: "} + std::string{name}));
     }
+
+    if (tool->remote) {
+        if (!remoteDispatcher_) {
+            return std::unexpected(ErrorObject::fromCode(
+                ErrorCode::InternalError, "remote dispatcher not configured"));
+        }
+        try {
+            return remoteDispatcher_(name, params);
+        } catch (const std::exception& ex) {
+            spdlog::error("Remote dispatcher threw for '{}': {}", name, ex.what());
+            return std::unexpected(ErrorObject::fromCode(
+                ErrorCode::InternalError,
+                std::string{"remote dispatch exception: "} + ex.what()));
+        }
+    }
+
+    if (!tool->handler) {
+        return std::unexpected(ErrorObject::fromCode(
+            ErrorCode::InternalError, "local tool has no handler"));
+    }
     try {
         return tool->handler(params);
     } catch (const std::exception& ex) {
@@ -68,6 +92,14 @@ ToolResult ToolRegistry::dispatch(std::string_view name,
         return std::unexpected(
             ErrorObject::fromCode(ErrorCode::InternalError, "tool unknown exception"));
     }
+}
+
+void ToolRegistry::setRemoteDispatcher(RemoteDispatcher fn) {
+    remoteDispatcher_ = std::move(fn);
+}
+
+bool ToolRegistry::hasRemoteDispatcher() const noexcept {
+    return static_cast<bool>(remoteDispatcher_);
 }
 
 }  // namespace sage::mcp

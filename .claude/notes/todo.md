@@ -105,15 +105,32 @@ ADR-013 (cpp-httplib seçimi) yazıldı.
 
 ---
 
-## Milestone 1.3b — Tool Dispatch (pending)
+## Milestone 1.3b — Tool Dispatch (server side ✓ / plugin side pending)
 
-> Goal: Server'a `tools/call` geldiğinde plugin'e RPC route et, `std::promise<ToolResult>` ile sync future await; plugin tarafı `ToolDispatch` ile FScopedTransaction içinde çalıştırıp sonuç gönderir.
+### Server side ✓ (commit pending)
+- [x] `Tool::remote` flag (tool.h)
+- [x] `ToolRegistry::RemoteDispatcher` + `setRemoteDispatcher` + `hasRemoteDispatcher`
+- [x] `RegisterError::MissingHandler` (local tool without handler reddedilir)
+- [x] `ToolRegistry::dispatch` remote → dispatcher delegation, exception trapping
+- [x] `BridgeServer::dispatchTool(tool, args, timeout?)` — sync, `std::promise<ToolResult>` future await, no-plugin → `EditorNotConnected`, timeout → `InternalError`
+- [x] `BridgeServer::handleToolResult` promise resolution (success/error path)
+- [x] `BridgeServer::stop` in-flight RPC'leri unblock eder
+- [x] `nextTxId()` — atomic counter, `tx-{016x}` format
+- [x] `main.cpp` wire-up: `registry.setRemoteDispatcher` → `bridge.dispatchTool`
+- [x] `editor.ping` remote tool registered (smoke target, replaced in 1.3c)
+- [x] 5 yeni unit test → **35/35 total**, ASan+UBSan clean
 
-- [ ] Server: pending RPC table (`std::unordered_map<TxId, std::promise<ToolResult>>`)
-- [ ] MCPServer integration: registry tool tipi "remote" → bridge route
-- [ ] Plugin: `ToolDispatch` module (gelen tool_call → registered handler dispatch)
-- [ ] Tool registration mechanism plugin-side
-- [ ] First tool: `spawn_actor` (Milestone 1.3c için altyapı)
+### Plugin side (pending — sonraki commit)
+- [ ] `Public/ToolDispatch/SageToolDispatch.h` — tool registration interface
+- [ ] `Private/ToolDispatch/SageToolDispatch.cpp` — incoming `tool_call` parse + handler dispatch
+- [ ] `SageWebSocketClient::OnMessageReceived` ToolDispatch'a hook
+- [ ] `SageBridgeSubsystem` ToolDispatch'i sahiplenir + `editor.ping` handler register
+- [ ] Tool result envelope sender (sage_tool_result mesajı)
+- [ ] BuildPlugin verify
+
+### Integration
+- [ ] Mock plugin executable — `sage-bridge-smoke --mode=mock-plugin` (extend) veya yeni binary
+- [ ] End-to-end bash smoke: HTTP POST tools/call → server → mock plugin → tool_result → MCP response
 
 ---
 

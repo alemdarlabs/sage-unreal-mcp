@@ -1,5 +1,7 @@
 #include "bridge/bridge_server.h"
 
+#include "mcp/error_codes.h"
+
 #include <ixwebsocket/IXConnectionState.h>
 #include <ixwebsocket/IXWebSocket.h>
 #include <ixwebsocket/IXWebSocketMessage.h>
@@ -7,6 +9,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <cstdio>
 #include <utility>
 
 namespace sage::bridge {
@@ -43,6 +46,19 @@ void BridgeServer::stop() {
     if (running_.exchange(false)) {
         spdlog::info("Bridge: stopping");
         server_->stop();
+
+        // Resolve any in-flight RPCs so awaiting threads don't hang on shutdown.
+        std::lock_guard lk(pendingMu_);
+        for (auto& [tx_id, rpc] : pending_) {
+            try {
+                rpc.promise.set_value(std::unexpected(
+                    mcp::ErrorObject::fromCode(mcp::ErrorCode::InternalError,
+                                                "bridge stopped")));
+            } catch (const std::future_error&) {
+                // promise already satisfied — ignore
+            }
+        }
+        pending_.clear();
     }
 }
 
@@ -59,6 +75,53 @@ std::vector<EditorSession> BridgeServer::snapshotSessions() const {
 std::size_t BridgeServer::sessionCount() const {
     std::lock_guard lk(sessionsMu_);
     return sessions_.size();
+}
+
+std::size_t BridgeServer::pendingCount() const {
+    std::lock_guard lk(pendingMu_);
+    return pending_.size();
+}
+
+mcp::ToolResult BridgeServer::dispatchTool(std::string_view tool,
+                                            const nlohmann::json& args) {
+    return dispatchTool(tool, args, cfg_.defaultDispatchTimeout);
+}
+
+mcp::ToolResult BridgeServer::dispatchTool(std::string_view tool,
+                                            const nlohmann::json& args,
+                                            std::chrono::milliseconds timeout) {
+    if (!running_.load()) {
+        return std::unexpected(mcp::ErrorObject::fromCode(
+            mcp::ErrorCode::InternalError, "bridge not running"));
+    }
+
+    auto clients = server_->getClients();
+    if (clients.empty()) {
+        return std::unexpected(mcp::ErrorObject::fromCode(
+            mcp::ErrorCode::EditorNotConnected, "no plugin connected"));
+    }
+    auto ws = *clients.begin();
+
+    const std::string txId = nextTxId();
+    std::future<mcp::ToolResult> future;
+    {
+        std::lock_guard lk(pendingMu_);
+        future = pending_[txId].promise.get_future();
+    }
+
+    const auto envelope = toolCallMessage(txId, std::string{tool}, args);
+    ws->send(envelope.dump());
+    spdlog::debug("Bridge: dispatched tool='{}' tx={}", tool, txId);
+
+    if (future.wait_for(timeout) != std::future_status::ready) {
+        std::lock_guard lk(pendingMu_);
+        pending_.erase(txId);
+        spdlog::warn("Bridge: tool '{}' (tx={}) timed out after {}ms",
+                     tool, txId, timeout.count());
+        return std::unexpected(mcp::ErrorObject::fromCode(
+            mcp::ErrorCode::InternalError, "tool dispatch timeout"));
+    }
+    return future.get();
 }
 
 void BridgeServer::onClientMessage(const std::shared_ptr<ix::ConnectionState>& state,
@@ -181,10 +244,48 @@ void BridgeServer::handleHeartbeat(ix::WebSocket& ws,
     ws.send(heartbeatAckMessage(hbRes->ts).dump());
 }
 
-void BridgeServer::handleToolResult(const std::string& session_id, const Json& /*payload*/) {
-    // Milestone 1.3b: route tool_result to pending RPC promise table.
-    spdlog::debug("Bridge: tool_result received (id={}) — handler pending Milestone 1.3b",
-                  session_id);
+void BridgeServer::handleToolResult(const std::string& session_id, const Json& payload) {
+    auto resRes = parseToolResult(payload);
+    if (!resRes.has_value()) {
+        spdlog::warn("Bridge: bad tool_result from id={}: {}", session_id, resRes.error());
+        return;
+    }
+    const auto& r = *resRes;
+
+    std::lock_guard lk(pendingMu_);
+    auto it = pending_.find(r.tx_id);
+    if (it == pending_.end()) {
+        spdlog::warn("Bridge: tool_result for unknown tx_id={}", r.tx_id);
+        return;
+    }
+
+    try {
+        if (r.success) {
+            it->second.promise.set_value(r.result.value_or(nlohmann::json::object()));
+        } else {
+            mcp::ErrorObject err;
+            if (r.error.has_value() && r.error->is_object()) {
+                const int code = r.error->value("code",
+                                                static_cast<int>(mcp::ErrorCode::GenericSage));
+                err.code    = static_cast<mcp::ErrorCode>(code);
+                err.message = r.error->value("message", "tool failed");
+            } else {
+                err = mcp::ErrorObject::fromCode(mcp::ErrorCode::GenericSage, "tool failed");
+            }
+            it->second.promise.set_value(std::unexpected(std::move(err)));
+        }
+    } catch (const std::future_error&) {
+        // Promise already satisfied (e.g. timeout fired) — drop result.
+        spdlog::debug("Bridge: late tool_result for tx={}; promise already satisfied", r.tx_id);
+    }
+    pending_.erase(it);
+}
+
+std::string BridgeServer::nextTxId() {
+    const auto n = txCounter_.fetch_add(1, std::memory_order_relaxed);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "tx-%016llx", static_cast<unsigned long long>(n));
+    return std::string{buf};
 }
 
 }  // namespace sage::bridge

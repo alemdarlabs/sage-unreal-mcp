@@ -2,11 +2,16 @@
 
 #include "bridge/editor_session.h"
 #include "bridge/protocol.h"
+#include "mcp/tool.h"  // mcp::ToolResult, mcp::ErrorObject
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -24,19 +29,27 @@ struct BridgeConfig {
     std::string host = "127.0.0.1";
     int port = 7778;
     std::string endpoint = "/bridge";
+    // Default deadline for sync tool dispatch when caller doesn't supply one.
+    std::chrono::milliseconds defaultDispatchTimeout{30'000};
 };
 
 // WebSocket bridge between Sage server and N Unreal Editor plugins.
 //
 // Lifecycle:
-//   1. Plugin connects (TCP + WS upgrade) → state = HANDSHAKING
+//   1. Plugin connects (TCP + WS upgrade)
 //   2. Plugin sends `hello` → server validates, registers session, replies `welcome`
 //   3. Heartbeat exchange (15s default per ADR-001 / api-spec.md)
-//   4. (Milestone 1.3b) tool_call ⇄ tool_result dispatch
+//   4. Tool dispatch: server→plugin `tool_call`, plugin→server `tool_result`
 //   5. Close → server prunes session
 //
-// Thread model: ixwebsocket spins worker threads; callbacks fire there. The
-// session map is mutex-protected; snapshot helpers copy under lock.
+// Thread model:
+//   - ixwebsocket spins worker threads; callbacks (open/close/message) fire there.
+//   - dispatchTool() is invoked from MCP request threads (cpp-httplib worker).
+//   - Both share `pending_` (mutex) and `sessions_` (mutex).
+//   - Promises bridge the two: dispatchTool() awaits future, callback resolves promise.
+//
+// Multi-editor routing (slot-aware) lands in Milestone 1.5; today dispatchTool()
+// targets the first active session.
 class BridgeServer {
 public:
     explicit BridgeServer(BridgeConfig cfg);
@@ -53,6 +66,19 @@ public:
     [[nodiscard]] const BridgeConfig& config() const noexcept { return cfg_; }
     [[nodiscard]] bool running() const noexcept { return running_.load(); }
 
+    // Synchronous tool dispatch: send `tool_call` to the first active session,
+    // block until matching `tool_result` arrives or `timeout` fires. On no
+    // active plugin, returns ErrorCode::EditorNotConnected.
+    [[nodiscard]] mcp::ToolResult dispatchTool(std::string_view tool,
+                                                const nlohmann::json& args,
+                                                std::chrono::milliseconds timeout);
+
+    // Convenience: uses BridgeConfig::defaultDispatchTimeout.
+    [[nodiscard]] mcp::ToolResult dispatchTool(std::string_view tool,
+                                                const nlohmann::json& args);
+
+    [[nodiscard]] std::size_t pendingCount() const;
+
 private:
     void onClientMessage(const std::shared_ptr<ix::ConnectionState>& state,
                          ix::WebSocket& ws,
@@ -62,12 +88,22 @@ private:
     void handleHeartbeat(ix::WebSocket& ws, const std::string& session_id, const Json& payload);
     void handleToolResult(const std::string& session_id, const Json& payload);
 
+    [[nodiscard]] std::string nextTxId();
+
+    struct PendingRpc {
+        std::promise<mcp::ToolResult> promise;
+    };
+
     BridgeConfig                                      cfg_;
     std::unique_ptr<ix::WebSocketServer>              server_;
     std::atomic<bool>                                 running_{false};
+    std::atomic<std::uint64_t>                        txCounter_{0};
 
     mutable std::mutex                                sessionsMu_;
-    std::unordered_map<std::string, EditorSession>   sessions_;  // keyed by ConnectionState id
+    std::unordered_map<std::string, EditorSession>    sessions_;  // keyed by ConnectionState id
+
+    mutable std::mutex                                pendingMu_;
+    std::unordered_map<std::string, PendingRpc>       pending_;   // keyed by tx_id
 };
 
 }  // namespace sage::bridge
