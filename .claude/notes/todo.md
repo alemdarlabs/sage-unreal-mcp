@@ -135,23 +135,23 @@ ADR-013 (cpp-httplib seçimi) yazıldı.
 
 ---
 
-## Milestone 1.3c — First Mutation Tool: `spawn_actor` ✓ (commit pending)
+## Milestone 1.3c — Actor Mutation Tools (spawn / delete / set_transform) ✓
 
 ### Plugin
 - [x] `Public/Tools/SageActorTools.h` — `RegisterActorTools(FSageToolDispatch&)`
-- [x] `Private/Tools/SageActorTools.cpp` — `spawn_actor` handler:
-  - `IsInGameThread()` shortcut; else `Async(EAsyncExecution::TaskGraphMainThread)` marshall + `Future.Get()` block
-  - PIE rejection → `-32004`
-  - Class resolution: `LoadClass<AActor>` + `StaticLoadClass` fallback
-  - Spawn via `UEditorActorSubsystem::SpawnActorFromClass`
-  - `FScopedTransaction("Sage: Spawn Actor")` wrap; `Modify()`; `SetActorLabel`
-  - Result payload: `actor_id` (path), `label`, `class`, `location`
+- [x] `Private/Tools/SageActorTools.cpp` — three handlers + shared helpers:
+  - Helpers: `ResolveActor` (`StaticFindObject` + `FSoftObjectPath` fallback), `RejectIfPie` (-32004 guard), `RunOnGameThread` template (`IsInGameThread()` shortcut else `Async(EAsyncExecution::TaskGraphMainThread)` + `Future.Get()`)
+  - `spawn_actor` — `LoadClass<AActor>` + `StaticLoadClass` fallback; `UEditorActorSubsystem::SpawnActorFromClass`; FScopedTransaction with cancel-on-fail; `Modify()` + `SetActorLabel`; result `{actor_id, label, class, location}`
+  - `delete_actor` — resolve by path; `DestroyActor`; FScopedTransaction; result `{destroyed, label}`
+  - `set_transform` — partial `location`/`rotation`/`scale`; at least one required; `Modify()` + `SetActorTransform`; result `{actor_id, location, rotation, scale}`
 - [x] `USageBridgeSubsystem::RegisterBuiltinHandlers` → `RegisterActorTools(ToolDispatch)`
 
 ### Server
-- [x] `main.cpp` — `spawn_actor` remote tool registered with JSON Schema
-  (`class` required string; `location`/`rotation` 3-element number arrays;
-  `label` optional string; `additionalProperties: false`)
+- [x] `main.cpp` — three remote tools registered with full JSON Schema:
+  - `spawn_actor` (class required; location/rotation/label optional)
+  - `delete_actor` (actor_id required)
+  - `set_transform` (actor_id required; location/rotation/scale 3-arrays optional, at least one)
+- [x] DRY `registerRemote` lambda helper
 
 ### Verification
 - [x] cmake server build clean, 35/35 ctest passing

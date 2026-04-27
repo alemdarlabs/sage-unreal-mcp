@@ -115,38 +115,83 @@ int main() {
         }
     }
 
-    // Actor mutation: spawn_actor (Milestone 1.3c).
-    {
-        sage::mcp::Tool spawnActor{
-            .name        = "spawn_actor",
-            .description = "Spawn an actor in the current editor world. Wrapped in "
-                           "FScopedTransaction (undo-friendly). Rejects during PIE "
-                           "(api-spec.md §Error Codes -32004). 'class' accepts "
-                           "engine paths (/Script/Engine.StaticMeshActor) or "
-                           "Blueprint generated-class paths (/Game/.../BP_Foo.BP_Foo_C).",
-            .inputSchema = nlohmann::json{
-                {"type", "object"},
-                {"properties", {
-                    {"class",    {{"type", "string"},
-                                  {"description", "UClass path or BP generated-class path"}}},
-                    {"location", {{"type", "array"},
-                                  {"items", {{"type", "number"}}},
-                                  {"minItems", 3}, {"maxItems", 3}}},
-                    {"rotation", {{"type", "array"},
-                                  {"items", {{"type", "number"}}},
-                                  {"minItems", 3}, {"maxItems", 3}}},
-                    {"label",    {{"type", "string"}}},
-                }},
-                {"required", nlohmann::json::array({"class"})},
-                {"additionalProperties", false},
-            },
-            .handler = nullptr,
-            .remote  = true,
-        };
-        if (auto r = registry->registerTool(std::move(spawnActor)); !r.has_value()) {
-            spdlog::warn("Failed to register remote tool 'spawn_actor'");
+    // Actor mutation tools (Milestone 1.3c).
+    auto registerRemote = [&registry](sage::mcp::Tool tool) {
+        const auto name = tool.name;
+        if (auto r = registry->registerTool(std::move(tool)); !r.has_value()) {
+            spdlog::warn("Failed to register remote tool '{}'", name);
         }
-    }
+    };
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "spawn_actor",
+        .description = "Spawn an actor in the current editor world. Wrapped in "
+                       "FScopedTransaction (undo-friendly). Rejects during PIE "
+                       "(api-spec.md §Error Codes -32004). 'class' accepts engine "
+                       "paths (/Script/Engine.StaticMeshActor) or Blueprint "
+                       "generated-class paths (/Game/.../BP_Foo.BP_Foo_C).",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"class",    {{"type", "string"},
+                              {"description", "UClass path or BP generated-class path"}}},
+                {"location", {{"type", "array"},
+                              {"items", {{"type", "number"}}},
+                              {"minItems", 3}, {"maxItems", 3}}},
+                {"rotation", {{"type", "array"},
+                              {"items", {{"type", "number"}}},
+                              {"minItems", 3}, {"maxItems", 3}}},
+                {"label",    {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"class"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "delete_actor",
+        .description = "Destroy an actor by full path. FScopedTransaction wrapped. "
+                       "Rejects during PIE (-32004).",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"actor_id", {{"type", "string"},
+                              {"description", "Full UE path returned by spawn_actor"}}},
+            }},
+            {"required", nlohmann::json::array({"actor_id"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "set_transform",
+        .description = "Update an actor's transform. At least one of "
+                       "location/rotation/scale must be provided. "
+                       "FScopedTransaction wrapped. Rejects during PIE.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"actor_id", {{"type", "string"}}},
+                {"location", {{"type", "array"},
+                              {"items", {{"type", "number"}}},
+                              {"minItems", 3}, {"maxItems", 3}}},
+                {"rotation", {{"type", "array"},
+                              {"items", {{"type", "number"}}},
+                              {"minItems", 3}, {"maxItems", 3}}},
+                {"scale",    {{"type", "array"},
+                              {"items", {{"type", "number"}}},
+                              {"minItems", 3}, {"maxItems", 3}}},
+            }},
+            {"required", nlohmann::json::array({"actor_id"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
 
     // ---- HTTP+SSE transport (Claude ↔ server) ---------------------------
     sage::transport::HttpSseConfig httpCfg{
