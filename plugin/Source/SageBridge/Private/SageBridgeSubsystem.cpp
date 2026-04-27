@@ -9,6 +9,7 @@
 #include "Tools/SageComponentTools.h"
 #include "Tools/SageEditorTools.h"
 #include "Tools/SageMaterialTools.h"
+#include "Tools/SageTransactionTools.h"
 
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
@@ -136,6 +137,7 @@ void USageBridgeSubsystem::RegisterBuiltinHandlers()
     sage::tools::RegisterEditorTools(ToolDispatch);
     sage::tools::RegisterMaterialTools(ToolDispatch);
     sage::tools::RegisterBulkTools(ToolDispatch);
+    sage::tools::RegisterTransactionTools(ToolDispatch);
 }
 
 void USageBridgeSubsystem::BuildClientFromSettings()

@@ -633,6 +633,54 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // Multi-step transactions (Milestone 1.4b).
+    registerRemote(sage::mcp::Tool{
+        .name        = "begin_transaction",
+        .description = "Open a new editor transaction. All subsequent mutations "
+                       "apply within it (their inner FScopedTransaction nests). "
+                       "Returns tx_id for commit/rollback. UTransactor is LIFO; "
+                       "balance commit/rollback in reverse order of begin.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"label", {{"type", "string"}, {"description", "Display name for Edit > Undo"}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name        = "commit_transaction",
+        .description = "Finalize an open transaction (GEditor->EndTransaction). "
+                       "tx_id must be the most recently opened tx not yet "
+                       "committed/rolled-back.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"tx_id", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"tx_id"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name        = "rollback_transaction",
+        .description = "Cancel an open transaction (GEditor->CancelTransaction). "
+                       "Reverts every mutation captured since begin_transaction.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"tx_id", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"tx_id"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name        = "get_active_transactions",
+        .description = "List currently-open Sage transactions (tx_id + UTransactor index). Read-only.",
+        .inputSchema = noArgSchema,
+        .handler = nullptr, .remote = true,
+    });
+
     // Bulk modify (Milestone 1.4a — atomic-by-default multi-op).
     registerRemote(sage::mcp::Tool{
         .name        = "bulk_modify",
