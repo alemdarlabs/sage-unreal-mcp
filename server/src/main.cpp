@@ -464,6 +464,103 @@ int main() {
         .remote  = true,
     });
 
+    // ---- Multi-editor MCP-side query/select (Milestone 1.5a) -----------
+    // Local tools — no plugin dispatch needed; query the bridge state.
+    auto sessionToJson = [](const sage::bridge::EditorSession& s) {
+        return nlohmann::json{
+            {"session_id",     s.session_id},
+            {"slot_id",        s.slot_id},
+            {"label",          s.label},
+            {"instance_id",    s.instance_id},
+            {"project_id",     s.project_id},
+            {"project_path",   s.project_path},
+            {"engine_version", s.engine_version},
+            {"pid",            s.pid},
+        };
+    };
+
+    sage::mcp::Tool listEditorsTool{
+        .name        = "list_editors",
+        .description = "List connected editor sessions (slot, label, instance, "
+                       "project, engine version, pid).",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = [&bridge, sessionToJson](const nlohmann::json&) -> sage::mcp::ToolResult {
+            const auto sessions = bridge.snapshotSessions();
+            nlohmann::json items = nlohmann::json::array();
+            for (const auto& s : sessions) items.push_back(sessionToJson(s));
+            return nlohmann::json{{"editors", items}, {"count", items.size()}};
+        },
+        .remote = false,
+    };
+    if (auto r = registry->registerTool(std::move(listEditorsTool)); !r.has_value()) {
+        spdlog::warn("Failed to register 'list_editors'");
+    }
+
+    sage::mcp::Tool getActiveEditorTool{
+        .name        = "get_active_editor",
+        .description = "Return the active-editor pointer (server-wide). "
+                       "If no active session is set, returns the only connected "
+                       "session when there is exactly one, otherwise null.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = [&bridge, sessionToJson](const nlohmann::json&) -> sage::mcp::ToolResult {
+            const auto activeId = bridge.activeSession();
+            if (!activeId.empty()) {
+                if (auto s = bridge.snapshotSession(activeId)) {
+                    return sessionToJson(*s);
+                }
+            }
+            // Fallback: if exactly one session connected, return it.
+            const auto sessions = bridge.snapshotSessions();
+            if (sessions.size() == 1) return sessionToJson(sessions.front());
+            return nlohmann::json{{"active", nullptr}, {"connected_count", sessions.size()}};
+        },
+        .remote = false,
+    };
+    if (auto r = registry->registerTool(std::move(getActiveEditorTool)); !r.has_value()) {
+        spdlog::warn("Failed to register 'get_active_editor'");
+    }
+
+    sage::mcp::Tool setActiveEditorTool{
+        .name        = "set_active_editor",
+        .description = "Set the active-editor pointer by session_id or label "
+                       "(or instance_id). Returns the resolved editor on success.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"id_or_label", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"id_or_label"})},
+            {"additionalProperties", false},
+        },
+        .handler = [&bridge, sessionToJson](const nlohmann::json& params)
+            -> sage::mcp::ToolResult {
+            if (!params.is_object() || !params.contains("id_or_label")
+                || !params["id_or_label"].is_string()) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InvalidParams, "missing 'id_or_label' string"));
+            }
+            const auto idOrLabel = params["id_or_label"].get<std::string>();
+            auto session = bridge.findByIdOrLabel(idOrLabel);
+            if (!session.has_value()) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::EditorNotConnected,
+                    std::string{"no editor matches: "} + idOrLabel));
+            }
+            bridge.setActiveSession(session->session_id);
+            return sessionToJson(*session);
+        },
+        .remote = false,
+    };
+    if (auto r = registry->registerTool(std::move(setActiveEditorTool)); !r.has_value()) {
+        spdlog::warn("Failed to register 'set_active_editor'");
+    }
+
     // ---- Editor state + selection tools (Milestone 1.3c) ---------------
     auto noArgSchema = nlohmann::json{
         {"type", "object"},

@@ -77,6 +77,36 @@ std::size_t BridgeServer::sessionCount() const {
     return sessions_.size();
 }
 
+std::optional<EditorSession> BridgeServer::snapshotSession(std::string_view sessionId) const {
+    std::lock_guard lk(sessionsMu_);
+    if (auto it = sessions_.find(std::string{sessionId}); it != sessions_.end()) {
+        return it->second;
+    }
+    return std::nullopt;
+}
+
+std::optional<EditorSession> BridgeServer::findByIdOrLabel(std::string_view idOrLabel) const {
+    std::lock_guard lk(sessionsMu_);
+    if (auto it = sessions_.find(std::string{idOrLabel}); it != sessions_.end()) {
+        return it->second;
+    }
+    for (const auto& [_, s] : sessions_) {
+        if (s.label == idOrLabel) return s;
+        if (s.instance_id == idOrLabel) return s;
+    }
+    return std::nullopt;
+}
+
+void BridgeServer::setActiveSession(std::string sessionId) {
+    std::lock_guard lk(activeMu_);
+    activeSessionId_ = std::move(sessionId);
+}
+
+std::string BridgeServer::activeSession() const {
+    std::lock_guard lk(activeMu_);
+    return activeSessionId_;
+}
+
 std::size_t BridgeServer::pendingCount() const {
     std::lock_guard lk(pendingMu_);
     return pending_.size();

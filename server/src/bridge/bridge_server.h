@@ -10,6 +10,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -62,7 +63,19 @@ public:
     void stop();
 
     [[nodiscard]] std::vector<EditorSession> snapshotSessions() const;
+    [[nodiscard]] std::optional<EditorSession> snapshotSession(std::string_view sessionId) const;
+
+    // Resolves a label or session-id to a session. Returns the matching session
+    // (label takes precedence if both ambiguous; nullopt otherwise).
+    [[nodiscard]] std::optional<EditorSession> findByIdOrLabel(std::string_view idOrLabel) const;
+
     [[nodiscard]] std::size_t sessionCount() const;
+
+    // Active session pointer (per-server, not per-MCP-client; ADR-004 §2 active
+    // editor pointer arrives in full at Milestone 1.5b).
+    void setActiveSession(std::string sessionId);
+    [[nodiscard]] std::string activeSession() const;
+
     [[nodiscard]] const BridgeConfig& config() const noexcept { return cfg_; }
     [[nodiscard]] bool running() const noexcept { return running_.load(); }
 
@@ -104,6 +117,9 @@ private:
 
     mutable std::mutex                                pendingMu_;
     std::unordered_map<std::string, PendingRpc>       pending_;   // keyed by tx_id
+
+    mutable std::mutex                                activeMu_;
+    std::string                                       activeSessionId_;
 };
 
 }  // namespace sage::bridge
