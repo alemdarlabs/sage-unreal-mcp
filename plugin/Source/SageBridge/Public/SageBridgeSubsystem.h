@@ -3,6 +3,8 @@
 #include "CoreMinimal.h"
 #include "EditorSubsystem.h"
 
+#include "ToolDispatch/SageToolDispatch.h"
+
 #include "SageBridgeSubsystem.generated.h"
 
 class FSageWebSocketClient;
@@ -11,8 +13,9 @@ class FSageWebSocketClient;
  * Lifecycle owner. Created automatically when the editor loads the plugin
  * (Type=Editor, LoadingPhase=PostEngineInit).
  *
- * Holds the WebSocket client, sends the handshake on connect, exposes
- * connection state to other plugin code (and Blueprints, for ergonomics).
+ * Holds the WebSocket client + the tool dispatch table, sends the handshake
+ * on connect, and routes incoming `tool_call` envelopes to registered
+ * handlers.
  */
 UCLASS()
 class SAGEBRIDGE_API USageBridgeSubsystem : public UEditorSubsystem
@@ -36,13 +39,20 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Sage")
     void Reconnect();
 
+    /** Tool dispatch registry. C++ extensions register handlers here. */
+    [[nodiscard]] FSageToolDispatch& GetToolDispatch() { return ToolDispatch; }
+    [[nodiscard]] const FSageToolDispatch& GetToolDispatch() const { return ToolDispatch; }
+
 private:
     void HandleConnected();
     void SendHandshake();
+    void HandleIncomingMessage(const FString& RawText);
+    void RegisterBuiltinHandlers();
 
     void BuildClientFromSettings();
 
     TSharedPtr<FSageWebSocketClient> Client;
-    FString SlotId;
-    FString Label;
+    FSageToolDispatch                ToolDispatch;
+    FString                          SlotId;
+    FString                          Label;
 };

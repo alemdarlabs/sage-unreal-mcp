@@ -120,13 +120,13 @@ ADR-013 (cpp-httplib seçimi) yazıldı.
 - [x] `editor.ping` remote tool registered (smoke target, replaced in 1.3c)
 - [x] 5 yeni unit test → **35/35 total**, ASan+UBSan clean
 
-### Plugin side (pending — sonraki commit)
-- [ ] `Public/ToolDispatch/SageToolDispatch.h` — tool registration interface
-- [ ] `Private/ToolDispatch/SageToolDispatch.cpp` — incoming `tool_call` parse + handler dispatch
-- [ ] `SageWebSocketClient::OnMessageReceived` ToolDispatch'a hook
-- [ ] `SageBridgeSubsystem` ToolDispatch'i sahiplenir + `editor.ping` handler register
-- [ ] Tool result envelope sender (sage_tool_result mesajı)
-- [ ] BuildPlugin verify
+### Plugin side ✓ (commit pending)
+- [x] `Public/ToolDispatch/SageToolDispatch.h` — `FOutcome`, `FHandler`/`FSendFn` typedefs, RegisterHandler/HasHandler/HandleEnvelope
+- [x] `Private/ToolDispatch/SageToolDispatch.cpp` — `tool_call` parse + handler dispatch + `tool_result` reply
+- [x] `USageBridgeSubsystem::HandleIncomingMessage` JSON deserialize → ToolDispatch routing
+- [x] `SageWebSocketClient::OnMessageReceived` AddUObject → subsystem hook
+- [x] `editor.ping` builtin handler — mirrors mock-plugin contract (echoes args + `echoed_by:"plugin"`)
+- [x] BuildPlugin verify — UE 5.7.4 universal (arm64+x64), 32/32 step, BUILD SUCCESSFUL, ExitCode=0, 33 s
 
 ### Integration ✓ (end-to-end mock verified)
 - [x] Mock plugin executable — `sage-bridge-mock-plugin` (standalone, ixwebsocket client, single tool_call echo)

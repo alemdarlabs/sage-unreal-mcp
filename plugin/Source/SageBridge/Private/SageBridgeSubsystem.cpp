@@ -4,6 +4,10 @@
 #include "SageBridge.h"
 #include "SageBridgeSettings.h"
 
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
+
 void USageBridgeSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
@@ -11,12 +15,14 @@ void USageBridgeSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     const USageBridgeSettings* Settings = GetDefault<USageBridgeSettings>();
     Label = Settings->GetResolvedLabel();
 
+    RegisterBuiltinHandlers();
     BuildClientFromSettings();
 
     UE_LOG(LogSageBridge, Log,
-           TEXT("SageBridgeSubsystem initialized (label='%s', auto_connect=%s)"),
+           TEXT("SageBridgeSubsystem initialized (label='%s', auto_connect=%s, handlers=%d)"),
            *Label,
-           Settings->bAutoConnect ? TEXT("yes") : TEXT("no"));
+           Settings->bAutoConnect ? TEXT("yes") : TEXT("no"),
+           ToolDispatch.NumHandlers());
 
     if (Settings->bAutoConnect)
     {
@@ -68,6 +74,58 @@ void USageBridgeSubsystem::SendHandshake()
     Client->SendJson(Id.ToHandshakeJson());
 }
 
+void USageBridgeSubsystem::HandleIncomingMessage(const FString& RawText)
+{
+    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(RawText);
+    TSharedPtr<FJsonObject> Envelope;
+    if (!FJsonSerializer::Deserialize(Reader, Envelope) || !Envelope.IsValid())
+    {
+        UE_LOG(LogSageBridge, Warning, TEXT("Bridge: malformed JSON: %s"), *RawText);
+        return;
+    }
+
+    TWeakPtr<FSageWebSocketClient> WeakClient = Client;
+    auto SendFn = [WeakClient](const TSharedRef<FJsonObject>& Reply) {
+        if (TSharedPtr<FSageWebSocketClient> Pinned = WeakClient.Pin())
+        {
+            Pinned->SendJson(Reply);
+        }
+    };
+
+    if (ToolDispatch.HandleEnvelope(Envelope.ToSharedRef(), SendFn))
+    {
+        return;
+    }
+
+    // Other envelope types (welcome / heartbeat_ack / error) just log; full
+    // connection state machine arrives in Milestone 1.5.
+    FString Type;
+    Envelope->TryGetStringField(TEXT("type"), Type);
+    UE_LOG(LogSageBridge, Verbose, TEXT("Bridge: recv type='%s'"), *Type);
+}
+
+void USageBridgeSubsystem::RegisterBuiltinHandlers()
+{
+    // editor.ping — round-trip echo, mirrors the mock-plugin contract.
+    // Will be replaced/augmented by domain handlers (spawn_actor, modify_*, ...)
+    // in Milestone 1.3c.
+    ToolDispatch.RegisterHandler(TEXT("editor.ping"),
+        [](const TSharedPtr<FJsonObject>& Args) -> FSageToolDispatch::FOutcome
+        {
+            auto Result = MakeShared<FJsonObject>();
+            Result->SetStringField(TEXT("echoed_by"), TEXT("plugin"));
+            if (Args.IsValid())
+            {
+                FString Msg;
+                if (Args->TryGetStringField(TEXT("message"), Msg))
+                {
+                    Result->SetStringField(TEXT("message"), Msg);
+                }
+            }
+            return FSageToolDispatch::FOutcome::MakeSuccess(Result);
+        });
+}
+
 void USageBridgeSubsystem::BuildClientFromSettings()
 {
     const USageBridgeSettings* Settings = GetDefault<USageBridgeSettings>();
@@ -82,4 +140,5 @@ void USageBridgeSubsystem::BuildClientFromSettings()
     Client->Configure(Cfg);
 
     Client->OnConnected.AddUObject(this, &USageBridgeSubsystem::HandleConnected);
+    Client->OnMessageReceived.AddUObject(this, &USageBridgeSubsystem::HandleIncomingMessage);
 }
