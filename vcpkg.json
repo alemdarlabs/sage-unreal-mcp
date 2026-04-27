@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "sage-unreal-mcp",
+  "version-string": "0.1.0",
+  "description": "Sage MCP server for Unreal Engine — execution + intelligence layer",
+  "homepage": "https://github.com/alemdarlabs/sage-unreal-mcp",
+  "supports": "(windows | osx | linux) & (x64 | arm64)",
+  "dependencies": [
+    "nlohmann-json",
+    "spdlog",
+    "cpp-httplib",
+    "catch2"
+  ]
+}

@@ -1,0 +1,54 @@
+# Build output
+build/
+out/
+cmake-build-*/
+
+# vcpkg
+vcpkg_installed/
+.vcpkg-root
+
+# Compile DB
+compile_commands.json
+
+# IDE / editor
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sage runtime data
+.sage-mcp/
+*.kuzu
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Unreal (plugin tarafı)
+plugin/Binaries/
+plugin/Intermediate/
+plugin/Saved/
+plugin/DerivedDataCache/
+
+# Coverage / profiling
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+coverage/
+
+# Sanitizer dumps
+*.sanitizer
+
+# Environment / secrets
+.env
+.env.local
+sage.local.toml
