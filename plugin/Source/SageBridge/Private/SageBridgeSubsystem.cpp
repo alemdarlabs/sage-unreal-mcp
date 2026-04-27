@@ -6,6 +6,7 @@
 #include "Tools/SageActorTools.h"
 #include "Tools/SageAssetTools.h"
 #include "Tools/SageBulkTools.h"
+#include "Tools/SageCompareSetTools.h"
 #include "Tools/SageComponentTools.h"
 #include "Tools/SageEditorTools.h"
 #include "Tools/SageMaterialTools.h"
@@ -138,6 +139,7 @@ void USageBridgeSubsystem::RegisterBuiltinHandlers()
     sage::tools::RegisterMaterialTools(ToolDispatch);
     sage::tools::RegisterBulkTools(ToolDispatch);
     sage::tools::RegisterTransactionTools(ToolDispatch);
+    sage::tools::RegisterCompareSetTools(ToolDispatch);
 }
 
 void USageBridgeSubsystem::BuildClientFromSettings()

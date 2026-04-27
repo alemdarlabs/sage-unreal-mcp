@@ -46,6 +46,17 @@ bool SetUPropertyFromJson(UObject* Container,
                           FProperty* Property,
                           const TSharedPtr<FJsonValue>& Value);
 
+// Reads a UProperty from Container into a JSON value. Symmetric inverse of
+// SetUPropertyFromJson — same primitive set. Returns nullptr on unsupported
+// type.
+[[nodiscard]] TSharedPtr<FJsonValue> GetUPropertyAsJson(const UObject* Container,
+                                                        const FProperty* Property);
+
+// Type-aware JSON value equality for the primitive set we round-trip.
+// Numbers compared with FMath::IsNearlyEqual; arrays/objects fall back to false.
+[[nodiscard]] bool JsonValuesEqual(const TSharedPtr<FJsonValue>& A,
+                                    const TSharedPtr<FJsonValue>& B);
+
 // ---- thread marshalling ---------------------------------------------------
 
 // Runs `Body` on the GameThread. If we're already there, calls inline;

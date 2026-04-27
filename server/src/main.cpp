@@ -633,6 +633,33 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // Optimistic locking (Milestone 1.4c).
+    registerRemote(sage::mcp::Tool{
+        .name        = "compare_and_set_property",
+        .description = "Atomic compare-and-set on a primitive UProperty across "
+                       "actor / component / asset targets. Returns -32003 "
+                       "VersionConflict if current != expected (with current "
+                       "and expected echoed in error.data). On success applies "
+                       "value within FScopedTransaction. Same primitive set as "
+                       "modify_*_property.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"target_kind", {{"type", "string"},
+                                 {"enum", nlohmann::json::array({"actor","component","asset"})}}},
+                {"target_id",   {{"type", "string"},
+                                 {"description", "UE path; for asset use /Game/.../AssetName"}}},
+                {"property",    {{"type", "string"}}},
+                {"expected",    {{"description", "Current value the agent expects"}}},
+                {"new_value",   {{"description", "Value to write if expected matches"}}},
+            }},
+            {"required", nlohmann::json::array(
+                {"target_kind","target_id","property","expected","new_value"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // Multi-step transactions (Milestone 1.4b).
     registerRemote(sage::mcp::Tool{
         .name        = "begin_transaction",

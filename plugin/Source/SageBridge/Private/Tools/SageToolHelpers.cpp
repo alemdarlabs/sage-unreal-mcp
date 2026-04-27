@@ -143,4 +143,51 @@ bool SetUPropertyFromJson(UObject* Container,
     return false;
 }
 
+TSharedPtr<FJsonValue> GetUPropertyAsJson(const UObject* Container,
+                                           const FProperty* Property)
+{
+    if (Property == nullptr || Container == nullptr) return nullptr;
+
+    if (const FBoolProperty* P = CastField<FBoolProperty>(Property))
+        return MakeShared<FJsonValueBoolean>(P->GetPropertyValue_InContainer(Container));
+    if (const FIntProperty* P = CastField<FIntProperty>(Property))
+        return MakeShared<FJsonValueNumber>(static_cast<double>(
+            P->GetPropertyValue_InContainer(Container)));
+    if (const FInt64Property* P = CastField<FInt64Property>(Property))
+        return MakeShared<FJsonValueNumber>(static_cast<double>(
+            P->GetPropertyValue_InContainer(Container)));
+    if (const FFloatProperty* P = CastField<FFloatProperty>(Property))
+        return MakeShared<FJsonValueNumber>(P->GetPropertyValue_InContainer(Container));
+    if (const FDoubleProperty* P = CastField<FDoubleProperty>(Property))
+        return MakeShared<FJsonValueNumber>(P->GetPropertyValue_InContainer(Container));
+    if (const FStrProperty* P = CastField<FStrProperty>(Property))
+        return MakeShared<FJsonValueString>(P->GetPropertyValue_InContainer(Container));
+    if (const FNameProperty* P = CastField<FNameProperty>(Property))
+        return MakeShared<FJsonValueString>(
+            P->GetPropertyValue_InContainer(Container).ToString());
+    if (const FTextProperty* P = CastField<FTextProperty>(Property))
+        return MakeShared<FJsonValueString>(
+            P->GetPropertyValue_InContainer(Container).ToString());
+    if (const FByteProperty* P = CastField<FByteProperty>(Property))
+        return MakeShared<FJsonValueNumber>(static_cast<double>(
+            P->GetPropertyValue_InContainer(Container)));
+    return nullptr;
+}
+
+bool JsonValuesEqual(const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
+{
+    const bool AValid = A.IsValid();
+    const bool BValid = B.IsValid();
+    if (!AValid || !BValid) return AValid == BValid;
+    if (A->Type != B->Type) return false;
+    switch (A->Type)
+    {
+    case EJson::Boolean: return A->AsBool() == B->AsBool();
+    case EJson::Number:  return FMath::IsNearlyEqual(A->AsNumber(), B->AsNumber());
+    case EJson::String:  return A->AsString() == B->AsString();
+    case EJson::Null:    return true;
+    default:             return false;  // Object/Array unsupported in CAS path
+    }
+}
+
 }  // namespace sage::tools::detail
