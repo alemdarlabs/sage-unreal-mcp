@@ -519,6 +519,28 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // Material parameter (Milestone 1.3c).
+    registerRemote(sage::mcp::Tool{
+        .name        = "modify_material_parameter",
+        .description = "Set a scalar (number) or vector (3/4-element array → "
+                       "FLinearColor) parameter on a UMaterialInstanceConstant. "
+                       "Backed by UMaterialEditingLibrary. FScopedTransaction. "
+                       "Rejects during PIE.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"asset_path", {{"type", "string"},
+                                {"description", "Material instance constant path"}}},
+                {"parameter",  {{"type", "string"}}},
+                {"value",      {{"description", "Number for scalar; 3-4 element array for vector (RGBA)"}}},
+            }},
+            {"required", nlohmann::json::array({"asset_path", "parameter", "value"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
     // ---- HTTP+SSE transport (Claude ↔ server) ---------------------------
     sage::transport::HttpSseConfig httpCfg{
         .host            = envOr("SAGE_HTTP_HOST", "127.0.0.1"),

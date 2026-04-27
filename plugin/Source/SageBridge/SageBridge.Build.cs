@@ -24,6 +24,7 @@ public class SageBridge : ModuleRules
         PrivateDependencyModuleNames.AddRange(new string[] {
             "UnrealEd",
             "EditorSubsystem",
+            "MaterialEditor",
             "Json",
             "JsonUtilities",
             "Projects",
