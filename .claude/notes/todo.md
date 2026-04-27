@@ -135,6 +135,22 @@ ADR-013 (cpp-httplib seçimi) yazıldı.
 
 ---
 
+## Milestone 1.3c — Editor State + Selection Tools (6) ✓ (commit pending)
+
+### Plugin (`SageEditorTools.cpp`)
+- [x] `get_world` — current editor world path / map name / current-level actor count (read-only)
+- [x] `get_pie_state` — bool active + play-world path (read-only)
+- [x] `get_viewport_state` — active viewport size (read-only)
+- [x] `get_selected_actors` — `UEditorActorSubsystem::GetSelectedLevelActors`
+- [x] `select_actors` — `UEditorActorSubsystem::SetSelectedLevelActors`; reports selected + not_found
+- [x] `clear_selection` — `UEditorActorSubsystem::SelectNothing`
+- [x] `USageBridgeSubsystem` → `RegisterEditorTools(ToolDispatch)`
+
+### Server (`main.cpp`)
+- [x] DRY `noArgSchema` for read-only tools; six tools registered
+
+---
+
 ## Milestone 1.3c — Asset Mutation Tools (8/8) ✓ (commit pending)
 
 ### Plugin (`SageAssetTools.cpp`)

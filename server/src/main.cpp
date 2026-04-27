@@ -464,6 +464,61 @@ int main() {
         .remote  = true,
     });
 
+    // ---- Editor state + selection tools (Milestone 1.3c) ---------------
+    auto noArgSchema = nlohmann::json{
+        {"type", "object"},
+        {"properties", nlohmann::json::object()},
+        {"additionalProperties", false},
+    };
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "get_world",
+        .description = "Return the current editor world: path, map name, and "
+                       "current-level actor count. Read-only.",
+        .inputSchema = noArgSchema,
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name        = "get_pie_state",
+        .description = "Whether PIE is active; if so, returns the play-world path. "
+                       "Read-only.",
+        .inputSchema = noArgSchema,
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name        = "get_viewport_state",
+        .description = "Return basic active viewport metrics (size). Read-only.",
+        .inputSchema = noArgSchema,
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name        = "get_selected_actors",
+        .description = "Return the currently selected actors as a list of UE "
+                       "paths. Read-only.",
+        .inputSchema = noArgSchema,
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name        = "select_actors",
+        .description = "Replace the editor selection with the given actor paths. "
+                       "Returns selected + not_found arrays.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"actor_ids", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+            }},
+            {"required", nlohmann::json::array({"actor_ids"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name        = "clear_selection",
+        .description = "Clear the editor's current actor selection.",
+        .inputSchema = noArgSchema,
+        .handler = nullptr, .remote = true,
+    });
+
     // ---- HTTP+SSE transport (Claude ↔ server) ---------------------------
     sage::transport::HttpSseConfig httpCfg{
         .host            = envOr("SAGE_HTTP_HOST", "127.0.0.1"),
