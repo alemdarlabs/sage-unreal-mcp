@@ -325,6 +325,95 @@ int main() {
         .remote  = true,
     });
 
+    // Asset tools (Milestone 1.3c).
+    registerRemote(sage::mcp::Tool{
+        .name        = "modify_asset_property",
+        .description = "Set a UProperty on a content-browser asset by path. "
+                       "Same primitive types as modify_actor_property. "
+                       "MarkPackageDirty + FScopedTransaction. Rejects during PIE.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"asset_path", {{"type", "string"},
+                                {"description", "Asset path like /Game/MyFolder/MyAsset"}}},
+                {"property",   {{"type", "string"}}},
+                {"value",      {{"description", "JSON value matching property type"}}},
+            }},
+            {"required", nlohmann::json::array({"asset_path", "property", "value"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "rename_asset",
+        .description = "Rename an asset within the same folder (UEditorAsset"
+                       "Subsystem::RenameAsset). FScopedTransaction. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"source",      {{"type", "string"}}},
+                {"destination", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"source", "destination"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "move_asset",
+        .description = "Move an asset to a different folder (RenameAsset under "
+                       "the hood; semantic alias of rename_asset for cross-folder "
+                       "moves). FScopedTransaction. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"source",      {{"type", "string"}}},
+                {"destination", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"source", "destination"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "duplicate_asset",
+        .description = "Duplicate an asset to a new path. Returns new asset's "
+                       "UE path in `new_asset_id`. FScopedTransaction. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"source",      {{"type", "string"}}},
+                {"destination", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"source", "destination"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "delete_asset",
+        .description = "Delete an asset by path (UEditorAssetSubsystem::"
+                       "DeleteAsset). FScopedTransaction. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"asset_path", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"asset_path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr,
+        .remote  = true,
+    });
+
     // ---- HTTP+SSE transport (Claude ↔ server) ---------------------------
     sage::transport::HttpSseConfig httpCfg{
         .host            = envOr("SAGE_HTTP_HOST", "127.0.0.1"),

@@ -135,6 +135,26 @@ ADR-013 (cpp-httplib seçimi) yazıldı.
 
 ---
 
+## Milestone 1.3c — Asset Mutation Tools (5/5) ✓ (commit pending)
+
+### Plugin (`SageAssetTools.cpp`)
+- [x] `modify_asset_property` — `UEditorAssetSubsystem::LoadAsset` + detail::SetUPropertyFromJson + MarkPackageDirty; FScopedTransaction; PIE-rejecting
+- [x] `rename_asset` — `UEditorAssetSubsystem::RenameAsset` (same folder); FScopedTransaction
+- [x] `move_asset` — same UE call as rename, semantic alias for cross-folder moves; FScopedTransaction
+- [x] `duplicate_asset` — `UEditorAssetSubsystem::DuplicateAsset`; returns new asset's UE path
+- [x] `delete_asset` — `UEditorAssetSubsystem::DeleteAsset`; FScopedTransaction
+- [x] `USageBridgeSubsystem` → `RegisterAssetTools(ToolDispatch)`
+
+### Server (`main.cpp`)
+- [x] Five remote tools registered with JSON Schema:
+  - `modify_asset_property` (asset_path + property + value)
+  - `rename_asset` (source + destination)
+  - `move_asset` (source + destination)
+  - `duplicate_asset` (source + destination → returns `new_asset_id`)
+  - `delete_asset` (asset_path)
+
+---
+
 ## Milestone 1.3c — Component Mutation Tools (5/5) ✓ (commit pending)
 
 ### Helpers refactor
