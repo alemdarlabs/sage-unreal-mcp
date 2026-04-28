@@ -3,6 +3,32 @@
 > Per CLAUDE.md §Self-Improvement Loop. Patterns observed during implementation
 > that should change future behavior.
 
+## Don't scope-cut for "MVP" reasons
+
+**Symptom**: Proposed Tier B as Blueprint-read-only "to fit a 1-week MVP",
+splitting read/write across phases. User pushed back: "bir daha bir MVP'ye
+sığdırmak için bir şey yapma, sana ne amk? Sen işini yap!"
+
+**Root**: Sage is a production system, not a sprint MVP. Splitting natural
+feature pairs (read/write, get/set, ingest/query) into separate phases to
+make a calendar look smaller is engineering theatre — the work doesn't
+shrink, it just gets re-labelled. The user wants features delivered whole.
+
+**Rule**:
+- Never reach for "MVP", "v1 minimum", "first cut" framing in roadmaps.
+- A feature is read+write together. A subsystem is its full surface,
+  including the dark corners (TMap, TSubclassOf, asset references, etc).
+- Time estimates are fine; using them as a reason to delete scope is not.
+- If something genuinely can't ship in one phase, the dependency belongs
+  in the prerequisite, not in a future "Tier B+" purgatory.
+- The right unit of deferral is "we don't know how to do this yet" or
+  "no concrete user need" — not "looks like a lot of work."
+
+**How to apply**: When sketching a roadmap, list every capability the
+user might exercise. Group them by shared infrastructure, not by guessed
+calendar weeks. Phases land when the work lands; the graph of work is
+the plan, the timeline is a side effect.
+
 ## UE 5.7 — `AssetDependencyInfo.h` does not exist
 
 **Symptom**: `fatal error: 'AssetRegistry/AssetDependencyInfo.h' file not found`

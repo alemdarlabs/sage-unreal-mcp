@@ -64,29 +64,29 @@ flowchart TB
   NOW --> P3R
   NOW --> P3CH
 
-  %% Phase 4 — UE-MCP capability parity
-  subgraph P4["Phase 4 — UE-MCP capability parity (~3 hafta plan)"]
+  %% Phase 4 — full UE-MCP capability parity (no scope cuts)
+  subgraph P4["Phase 4 — Full UE-MCP capability parity"]
     direction TB
-    P40["4.0 UProperty collections<br/>TArray · TMap · TObjectPtr · TSubclassOf"]:::todo
-    P41["4.1 Tier A — 15 quick wins<br/>reflect_class · mesh_bounds · bulk_rename ·<br/>gameplay_tags · dialog_policy"]:::todo
-    P42["4.2 Tier B — Blueprint read (10 tool)<br/>read · variables · functions · graph · execution_flow"]:::todo
-    P43["4.3 Tier C — Material graph (6 tool)<br/>read · expressions · shader_stats · create_instance"]:::todo
-    P44["4.4 Index perf (Kuzu COPY FROM)"]:::todo
-    P45["4.5 Headless test mode<br/>(filesystem-only fallback for CI)"]:::todo
+    P40["4.0 UProperty collections<br/>TArray · TMap · TSet · TObjectPtr · TSoftObjectPtr<br/>TSubclassOf · FInstancedStruct · FGameplayTag"]:::todo
+    P41["4.1 Reflection<br/>reflect_class · reflect_struct · reflect_enum<br/>list_classes · find_subclasses · find_implementers"]:::todo
+    P42["4.2 Blueprint (read + write)<br/>~50 tool · graph · variables · functions · components<br/>reparent · CDO · interfaces · compile · construction script<br/>T3D import/export"]:::todo
+    P43["4.3 Material (read + write + graph + preview)<br/>~36 tool · expressions · connections · params<br/>build_graph · render_preview · shader_stats"]:::todo
+    P45["4.5 Asset advanced<br/>mesh_bounds · collision · LOD · sockets<br/>bulk_rename · move_folder · FBX/texture import<br/>datatable · redirectors · FTS5 search"]:::todo
+    P46["4.6 Editor automation<br/>console_command · run_python · dialog policy<br/>screenshot · viewport · log filter · sequencer"]:::todo
+    P47["4.7 Project / engine introspection<br/>read_cpp_header · read_module · search_cpp<br/>engine source · INI tree · plugin enable/disable"]:::todo
+    P48["4.8 Animation<br/>AnimBP · montage · sequence · blendspace<br/>IK Rig · ControlRig · skeleton · modifiers (~56 tool)"]:::todo
+    P49["4.9 Niagara VFX<br/>system · emitter · modules · HLSL · renderer (~37 tool)"]:::todo
+    P410["4.10 AI / Gameplay<br/>physics · nav · Enhanced Input · BT · EQS<br/>StateTree · SmartObject · perception · framework (~59 tool)"]:::todo
+    P411["4.11 UMG / Widget · 4.12 PCG · 4.13 Landscape<br/>4.14 Foliage · 4.15 GAS · 4.16 Networking<br/>4.17 Audio · 4.18 Source control extras"]:::todo
+    P419["4.19 Reporting / observability<br/>report_issue · session log · metrics"]:::todo
+    P420["4.20 Headless test mode<br/>filesystem-only handlers + mock plugin coverage"]:::todo
+    P44["4.4 Index perf — Kuzu COPY FROM JSON<br/>(transversal · 30s → &lt;5s)"]:::todo
   end
-  P3CH --> P40 --> P41 --> P42 --> P43 --> P44 --> P45
-
-  %% Phase 5 — Tier D heavy lifts (on demand)
-  subgraph P5["Phase 5 — Heavy lifts (on demand only)"]
-    direction TB
-    P5A["Animation (56 tool)<br/>AnimBP · IK Rig · ControlRig · montage"]:::todo
-    P5N["Niagara (37 tool)<br/>VFX · HLSL modules · GPU shader inspect"]:::todo
-    P5G["AI/Gameplay (35 tool)<br/>BT · EQS · StateTree · SmartObject · IMC"]:::todo
-    P5L["PCG · Landscape · Foliage · GAS · Networking · UMG"]:::todo
-  end
-  P45 -.demand-driven.-> P5A
-  P45 -.demand-driven.-> P5N
-  P45 -.demand-driven.-> P5G
+  P3CH --> P40
+  P40 --> P41 & P42 & P43 & P45 & P46 & P47
+  P40 --> P48 & P49 & P410 & P411
+  P40 --> P419 & P420
+  P40 -.transversal.-> P44
 
   %% Demolar
   M17  -. "Demo 1 — execution"  .- DEMO1[/"spawn · CAS · transactions · bulk · PIE guard<br/>SageTest'te ispatlandı"/]:::done

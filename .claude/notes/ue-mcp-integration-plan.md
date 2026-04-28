@@ -1,8 +1,8 @@
 # UE-MCP → Sage Integration Roadmap
 
 > **Source:** `/Users/mahmutalemdar/Developer/alemdarlabs/ue-mcp` (TypeScript MCP server + C++ plugin, 562 actions across 19 categories, BUSL-1.1 → Apache after 4 yr).
-> **Target:** Sage Unreal MCP — currently 51 tools (Phase 1 + 2 + 3 partial).
-> **Strategy:** Identify capability gaps, prioritise integration in tiers, decide what to skip.
+> **Target:** Sage Unreal MCP — currently 52 tools (Phase 1 + 2 + 3 partial).
+> **Strategy:** Full feature parity per subsystem. No scope cuts. No "MVP cuts." Read+write together; full UProperty type coverage; every subsystem ships whole.
 
 ---
 
@@ -17,228 +17,494 @@ ue-mcp's **architectural choices we will NOT adopt:**
 - Flow YAML executor (premature; LLM agents already orchestrate)
 
 ue-mcp's **architectural choices we WILL adopt:**
-- HandlerRegistry pattern for plugin-side tool dispatch — we already have `FSageToolDispatch`
-- GameThreadExecutor — we already have `RunOnGameThread<>` template
-- JSON ↔ UProperty reflection coverage including TArray/TMap/TObjectPtr/TSubclassOf — we have primitives, missing collections (Phase 4.0 below)
-- SQLite FTS5 over assets — fits our SQLite slot store (Phase 4.x)
+- HandlerRegistry pattern — already in `FSageToolDispatch`
+- GameThreadExecutor — already in `RunOnGameThread<>`
+- JSON ↔ UProperty reflection covering TArray/TMap/TObjectPtr/TSubclassOf — partial, completing in 4.0
+- SQLite FTS5 over assets — landing alongside the SQLite slot store
 
 ---
 
-## Capability Gap Map
+## Subsystem Plan — every subsystem ships whole
 
-### 🟢 Already covered by Sage (overlap)
+Each subsystem below is one Phase 4 milestone. Every milestone delivers full read+write. Order is by infrastructure dependency, not effort estimate.
 
-| ue-mcp action | Sage equivalent |
-|---|---|
-| editor.spawn_actor | `spawn_actor` |
-| editor.delete_actor | `delete_actor` |
-| editor.set_actor_property | `modify_actor_property` |
-| asset.duplicate / rename / delete | same |
-| asset.save | `save_assets` |
-| level.save | `save_level` |
-| editor.toggle_pie | `run_pie` / `stop_pie` |
-| material.set_parameter | `modify_material_parameter` |
-| asset.get_referencers | `references_to` (richer — depth-bounded) |
-| asset.get_dependencies | `query_graph` (any traversal) |
-| build.compile_plugin | `restart_editor(build_plugin=true)` |
-| reflection.* | partial — no `reflect_class` / `reflect_struct` yet |
+### 4.0 — UProperty collections + asset reference plumbing
 
-ue-mcp's reverse-deps + dependency lookups are **inferior** to our impact_of/references_to — we have Kuzu-backed traversal, they walk the asset registry every call.
+Foundation for everything below. Without this, half the tools fail on
+`TArray<FVector>`, `TMap<FName, ...>`, `TObjectPtr<UStaticMesh>` properties.
 
-### 🔴 Genuinely missing from Sage — high value
+- TArray ↔ JSON array round-trip (set + get + per-index modify)
+- TMap ↔ JSON object round-trip (set + get + per-key modify + remove)
+- TSet ↔ JSON array round-trip (with insertion-order semantics)
+- TObjectPtr / FSoftObjectPtr asset reference resolution: accept
+  `/Game/...` paths, write proper hard-or-soft pointers, surface
+  unresolved as `null` with diagnostic
+- TSubclassOf class-path resolution: resolve `/Script/Engine.Pawn`
+  *or* `/Game/.../BP_Foo.BP_Foo_C`, validate the class is a subclass
+  of the property's `MetaClass`
+- FInstancedStruct round-trip
+- FGameplayTag / FGameplayTagContainer round-trip with tag tree validation
+- Per-element edit ops: `array_append`, `array_insert`, `array_remove_at`,
+  `array_remove_value`, `map_set`, `map_remove`, `set_add`, `set_remove`
+  for the existing modify_*_property family
 
-These would meaningfully expand what an agent can do in UE through Sage. Grouped by tier.
-
----
-
-## Tier A — Quick Wins (≤1 day each, native to existing Sage subsystems)
-
-| # | Tool | Source category | Why valuable | Effort |
-|---|---|---|---|---|
-| A1 | `reflect_class(class_path)` | reflection | "What properties does this UClass have?" — schema introspection. Pure UE reflection walk. | S |
-| A2 | `reflect_struct(struct_path)` | reflection | Same for USTRUCT. | S |
-| A3 | `reflect_enum(enum_path)` | reflection | Same for UENUM. | S |
-| A4 | `list_classes(filter?)` | reflection | Class registry listing. Sage already populates the Class node — this is just an MCP-tool wrapper around a Cypher query. | S |
-| A5 | `get_mesh_bounds(asset_path)` | asset | Static/skeletal mesh bbox + extent. Common Q for placement. | S |
-| A6 | `get_mesh_collision(asset_path)` | asset | Collision primitive count + names. | S |
-| A7 | `get_referencers(asset_path)` | asset | Already covered by `references_to` — confirm parity, document overlap. | — |
-| A8 | `bulk_rename_assets([{src,dst}])` | asset | Single FScopedTransaction across N renames — extends `rename_asset`. | S |
-| A9 | `move_folder(src, dst)` | asset | Folder-level move with redirector fixup. | S |
-| A10 | `create_gameplay_tag(name)` | gameplay | Editor-side ini write; tag tree update. | S |
-| A11 | `list_gameplay_tags(filter?)` | gameplay | Hierarchical tag listing. | S |
-| A12 | `set_dialog_policy(policy)` | misc | Auto-respond modal dialogs (critical for headless ops — UE prompts during long ops). | M |
-| A13 | `respond_to_dialog(id, choice)` | misc | Manual dialog response. | S |
-| A14 | `list_dialogs()` | misc | Pending dialog poll. | S |
-| A15 | `set_world_setting(key, value)` | level | World settings UProperty. | S |
-
-**Tier A total: 15 tools, ~3-5 days work. Doubles the discoverable surface for read-side intel.**
+**Lands as:** `SageToolHelpers` extension + new `set_property_array_op`
+tool family. Updates every existing modify_*_property tool to accept
+collection paths (`Components[2].StaticMesh`, `Tags{movement.run}`).
 
 ---
 
-## Tier B — Blueprint Introspection (1-2 weeks)
+### 4.1 — Reflection (full UClass / UStruct / UEnum surface)
 
-The single biggest gap. ue-mcp has 49 Blueprint actions; Sage has zero.
-
-| # | Tool | Notes |
-|---|---|---|
-| B1 | `bp.read(path)` | Top-level summary: parent class, components, var count, fn count, interfaces |
-| B2 | `bp.list_variables(path)` | All variables: name, type, default, access |
-| B3 | `bp.list_functions(path)` | All functions: name, signature, pure flag, access |
-| B4 | `bp.read_function_graph(path, fn_name)` | Node list + connections — agent reads BP logic |
-| B5 | `bp.get_execution_flow(path, fn_name)` | BFS traversal of exec pins from entry — easier than raw graph |
-| B6 | `bp.read_components(path)` | SCS tree: name, class, parent, default props |
-| B7 | `bp.list_node_types(filter?)` | Available BP nodes (palette query) |
-| B8 | `bp.search_nodes(path, kw)` | "Find all nodes mentioning X" |
-| B9 | `bp.compile(path)` | Trigger compile, return result + errors |
-| B10 | `bp.validate(path)` | Compile-without-output dry run |
-
-Plugin needs new handler group (`SageBlueprintTools.cpp`). Reflection-heavy: `UBlueprint`, `UEdGraph`, `UK2Node` traversal.
-
-**Tier B total: 10 tools (read-only). Write-side BP authoring (B11+) is Tier D — much harder.**
+- `reflect_class(class_path)` → name, parent, modules, flags, all
+  properties (with type/category/access/replication info), all functions
+  (signature/access/pure flag), interfaces, child classes,
+  CLASS_Native/CLASS_Abstract/CLASS_Interface flags
+- `reflect_struct(struct_path)` → all fields with full type info
+- `reflect_enum(enum_path)` → all values with display names + tooltips
+- `list_classes(filter?, base_class?, include_native, include_blueprint)`
+- `list_structs(filter?)`
+- `list_enums(filter?)`
+- `find_subclasses(class_path, max_depth?)` — extended `class_hierarchy`
+- `find_implementers(interface_path)` — classes implementing UInterface
 
 ---
 
-## Tier C — Material Graph (3-5 days, focused)
+### 4.2 — Blueprint (read + write, full)
 
-Sage has 1 material tool (`modify_material_parameter`). ue-mcp has 36, including full graph authoring.
+Blueprint is the largest UE authoring surface; full coverage is non-
+negotiable for an "AI manages projects" agent.
 
-| # | Tool | Notes |
-|---|---|---|
-| C1 | `mat.read(path)` | Material/instance summary: domain, blend mode, parameter list |
-| C2 | `mat.list_parameters(path)` | Scalar/vector/texture params with defaults |
-| C3 | `mat.list_expressions(path)` | Graph node list — class, position, connections |
-| C4 | `mat.create_instance(parent, dest)` | UMaterialInstanceConstant from a parent |
-| C5 | `mat.set_expression_value(path, node_id, value)` | Edit a constant in the graph |
-| C6 | `mat.get_shader_stats(path)` | Texture sample counts, instruction counts |
+#### Read
+- `bp.read(path)` → parent class, components, var count, fn count,
+  interfaces, generated class path, parent BP if any
+- `bp.list_variables(path)` — name, type, default, access, category,
+  tooltip, replication, instance-editable
+- `bp.list_functions(path)` — signature, access, pure flag, blueprint-
+  callable, network role, latent
+- `bp.list_local_variables(path, fn_name)`
+- `bp.read_function_graph(path, fn_name)` — node list + connections
+  + position metadata
+- `bp.read_event_graph(path)` — same for the BP's event graph
+- `bp.read_construction_script(path)` — same for the construction script
+- `bp.get_execution_flow(path, fn_name)` — BFS exec-pin traversal
+- `bp.read_components(path)` — full SCS tree including default props
+  on each component
+- `bp.list_node_types(filter?)` — palette query
+- `bp.search_nodes(path, kw)` — substring across all graphs
+- `bp.get_dependencies(path)` — all referenced classes/functions/macros
+- `bp.get_cdo_properties(path)` — class-default-object property snapshot
 
-Skip for now: `build_graph` (declarative graph spec) and `render_preview` — both heavy and niche.
+#### Write — graph editing
+- `bp.add_node(path, fn_name, node_class, position)`
+- `bp.delete_node(path, fn_name, node_id)`
+- `bp.connect_pins(path, fn_name, src_node, src_pin, dst_node, dst_pin)`
+- `bp.disconnect_pins(path, fn_name, ...)`
+- `bp.set_node_property(path, fn_name, node_id, prop, value)`
+- `bp.move_node(path, fn_name, node_id, new_pos)`
+- `bp.export_nodes_t3d(path, fn_name, node_ids?)` — bulk copy
+- `bp.import_nodes_t3d(path, fn_name, t3d, position?)` — bulk paste
+
+#### Write — variable editing
+- `bp.add_variable(path, name, type, default?, category?, access?, replication?)`
+- `bp.delete_variable(path, name)`
+- `bp.rename_variable(path, old, new)` — with reference fixup
+- `bp.set_variable_default(path, name, value)`
+- `bp.set_variable_properties(path, name, {access, category, replication, ...})`
+- `bp.add_local_variable(path, fn_name, name, type, default?)`
+- `bp.delete_local_variable(path, fn_name, name)`
+
+#### Write — function editing
+- `bp.add_function(path, name, signature)`
+- `bp.delete_function(path, name)`
+- `bp.rename_function(path, old, new)` — with caller fixup
+- `bp.set_function_properties(path, name, {access, pure, callable, network})`
+- `bp.add_function_input(path, fn_name, param_name, type, default?)`
+- `bp.add_function_output(path, fn_name, param_name, type)`
+- `bp.remove_function_param(path, fn_name, param_name)`
+
+#### Write — class shape
+- `bp.reparent(path, new_parent_class)` — change parent class with
+  member/function reconciliation
+- `bp.set_cdo_property(path, prop, value)` — write class default object
+- `bp.add_interface(path, interface_class)`
+- `bp.remove_interface(path, interface_class)`
+
+#### Write — components
+- `bp.add_bp_component(path, component_class, name, parent_socket?)` —
+  add to SCS (different from runtime `add_component`)
+- `bp.remove_bp_component(path, name)`
+- `bp.reparent_component(path, name, new_parent_socket)`
+- `bp.set_bp_component_property(path, name, prop, value)`
+
+#### Compile + diagnostics
+- `bp.compile(path)` — trigger full compile, return errors+warnings
+- `bp.validate(path)` — compile-without-output dry run
+- `bp.run_construction_script(path, location?, rotation?)` — spawn temp
+  actor, return generated component snapshot, destroy
+
+**Tally:** ~50 tools. Implements all of ue-mcp's blueprint category (49).
 
 ---
 
-## Tier D — Heavy Lift (each is its own multi-week milestone)
+### 4.3 — Material (read + write + graph authoring + preview)
 
-These deserve standalone phases when there's clear demand.
+Sage has 1 material tool (`modify_material_parameter`). ue-mcp has 36.
 
-| # | Subsystem | ue-mcp count | Why heavy |
-|---|---|---|---|
-| D1 | Animation (AnimBP, montage, IK Rig, ControlRig, blendspace) | 56 | New plugin handler group; UE animation API is large surface |
-| D2 | Niagara (system, emitter, HLSL modules, GPU shader inspect) | 37 | Editor-only API, requires NiagaraEditor module link |
-| D3 | AI / Gameplay framework (BT, EQS, StateTree, SmartObject, Perception) | 35 (subset of gameplay 59) | Multiple separate UE modules |
-| D4 | Enhanced Input system (IMC, modifiers, triggers) | ~10 | Recent UE5 surface, less mature reflection |
-| D5 | PCG (Procedural Content Generation graphs) | 23 | Brand new UE 5.4+ subsystem; volatile API |
-| D6 | Landscape (sculpt, paint, splines, heightmap) | 14 | Editor-only, needs LandscapeEditor module |
-| D7 | Foliage (types, painting, instances) | 13 | Same — FoliageEdit module |
-| D8 | GAS (Gameplay Ability System) | 18 | Plugin module — only useful if project uses GAS |
-| D9 | Networking (replication, dormancy, relevancy) | 14 | UProperty introspection — cheap to extend reflect_class |
-| D10 | Widget/UMG | 21 | UMG editor module — uncommon for AI agent use |
+#### Read
+- `mat.read(path)` — domain, blend mode, shading model, parameter list,
+  expression count, instruction count
+- `mat.list_parameters(path)` — scalar/vector/texture/static-switch
+- `mat.list_expressions(path)` — full graph node list
+- `mat.read_graph(path)` — nodes + connections + positions
+- `mat.get_shader_stats(path)` — texture samples, instructions, registers
+- `mat.export_graph(path)` — full graph as JSON spec
 
-**Recommendation:** Land Tier A + B + C first (~3 weeks). Tier D items only when a concrete user need arrives — speculative coverage of 562 actions burns engineering time on capabilities no one will discover.
+#### Write — instances
+- `mat.create(path, domain, blend_mode, shading_model)`
+- `mat.create_instance(parent, dest)` — UMaterialInstanceConstant
+- `mat.set_parameter(path, name, value)` — already covered by
+  `modify_material_parameter`; alias under mat.* namespace
+- `mat.set_static_switch(path, name, value)`
+
+#### Write — graph authoring
+- `mat.add_expression(path, expr_class, position)` — add a graph node
+- `mat.delete_expression(path, node_id)`
+- `mat.connect_expressions(path, src_node, src_output, dst_node, dst_input)`
+- `mat.disconnect(path, dst_node, dst_input)`
+- `mat.connect_to_property(path, src_node, src_output, mat_prop)` —
+  base color / metallic / roughness / emissive / normal / opacity
+- `mat.set_expression_value(path, node_id, value)` — edit a constant
+- `mat.connect_texture(path, expr_id, texture_path)`
+- `mat.set_shading_model(path, model)`
+- `mat.set_base_color(path, color)`
+- `mat.import_graph(path, json_spec)` — JSON spec → graph
+- `mat.build_graph(path, declarative_spec)` — high-level builder
+
+#### Preview + validate
+- `mat.render_preview(path, size?)` — bake base color preview PNG
+- `mat.validate(path)` — compile shader, return stats + warnings
 
 ---
 
-## Tier E — Things Sage Already Does Better
+### 4.4 — Index perf via Kuzu COPY FROM JSON
 
-| Sage capability | ue-mcp counterpart | Why Sage wins |
-|---|---|---|
-| `impact_of(asset, depth)` | asset.get_referencers | Bounded transitive traversal, Kuzu-backed; theirs walks AssetRegistry per call |
-| `references_to(asset)` | same | sub-ms response from cached graph |
-| `find_unused()` | none equivalent | Pure-graph Cypher; requires no scan |
-| `query_graph(cypher)` | none | Read-only Cypher subset with safety |
-| `class_hierarchy(class)` | reflection.list_classes | Theirs gives flat list; ours walks INHERITS_FROM tree |
-| `restart_editor` orchestrator | build.compile_plugin (Win-only LC) | Cross-platform full restart with handshake confirmation |
-| Real-time AssetRegistry delta | none | Live graph patches; ue-mcp re-scans on every query |
-| Slot-scoped per-editor isolation | none | ue-mcp is single-project per server instance |
-| `compare_and_set_property` | none | Optimistic concurrency for multi-step plans |
-| `bulk_modify(atomic=true)` | flows engine | First-class atomic multi-op without YAML scripting |
+Current ingest: 8K asset / 16K dep / 8K class ≈ 30s. Target <5s.
 
-The intelligence layer (Phase 2 graph + Phase 3 reflection) is **the differentiator**; everything else is execution-layer parity work.
+- ingestSnapshot writes per-table NDJSON files to a temp dir
+- `COPY <Table> FROM '<file>' (file_format='json')` per table
+- Edge tables COPY via two-column FROM/TO format
+- Cleanup tempdir on success
+- Falls back to current batched-CREATE if COPY rejected (older Kuzu)
+- Smoke harness measures 3-table 8K ingest end-to-end, asserts <5s
 
 ---
 
-## Skip Outright
+### 4.5 — Asset advanced (full ue-mcp asset surface)
+
+ue-mcp has 49 asset actions. Sage has 8. Closing the gap.
+
+- `get_mesh_bounds(path)` — bbox + extent (static + skeletal)
+- `get_mesh_collision(path)` — collision primitive count + names + simple/complex
+- `get_mesh_lod_info(path)` — LOD count, screen sizes, vertex counts
+- `set_mesh_nav(path, settings)` — nav-mesh-relevant flags
+- `set_sk_material_slots(path, slots)` — skeletal mesh material assignment
+- `bulk_rename_assets([{src, dst}])` — single transaction multi-rename
+- `move_folder(src, dst)` — folder move with redirector fixup
+- `import_fbx(file, dest, options)`
+- `import_texture(file, dest, options)`
+- `import_audio(file, dest, options)`
+- `create_datatable(dest, row_struct)`
+- `read_datatable(path)`
+- `set_datatable_row(path, row_name, values)`
+- `delete_datatable_row(path, row_name)`
+- `list_redirectors()`
+- `fixup_redirectors(paths)`
+- `diagnose_registry()` — disk vs memory state comparison
+- `search_assets_fts(query, top_n?)` — SQLite FTS5 over names/classes/paths
+- `reindex_fts()` — full FTS rebuild
+- `get_asset_thumbnail(path)` — base64 PNG
+- `get_asset_socket(mesh_path, socket_name)` — read socket transform
+- `add_asset_socket(mesh_path, socket_name, transform)`
+- `remove_asset_socket(mesh_path, socket_name)`
+
+---
+
+### 4.6 — Editor automation (full)
+
+ue-mcp has 65 editor actions. Sage has 6.
+
+- `console_command(cmd, allow_unsafe?)` — explicit-confirm gated
+- `run_python(code)` — embedded Python execution (if PythonScriptPlugin loaded)
+- `editor.list_dialogs()` / `respond_to_dialog(id, choice)` /
+  `set_dialog_policy(policy)` — auto-respond modal dialogs (critical
+  for headless ops)
+- `take_screenshot(path?, viewport?)`
+- `set_viewport_camera(loc, rot)`
+- `set_viewport_mode(perspective|top|front|side|game)`
+- `set_log_filter({category, level})`
+- `read_log(category?, level?, since_ms?)` — recent log lines
+- `get_engine_version()` / `get_project_version()` / `get_plugin_versions()`
+- `play_in_editor_apply_damage(actor, amount, type)` — runtime PIE damage
+- `editor.inspect_pie()` — current PIE world state
+- `editor.get_pie_anim_state(actor)` — animation runtime state
+- `editor.get_pie_subsystem_state(subsystem_class)` — query a
+  GameInstanceSubsystem at runtime
+- `play_sequencer(path)` / `stop_sequencer(path)`
+- `read_sequencer_tracks(path)`
+- `add_sequencer_track(path, track_class, binding)`
+
+---
+
+### 4.7 — Project / engine introspection
+
+- `read_cpp_header(path)` — read project module header file
+- `read_module(name)` — Build.cs structure + dependencies
+- `list_modules()` — all modules in current project
+- `search_cpp(pattern, scope?)` — grep across project source
+- `read_engine_header(path)` — engine source under `Engine/Source/Runtime`
+- `find_engine_symbol(name)` — symbol grep in engine source
+- `read_config(ini_path)` / `search_config(pattern)` /
+  `list_config_tags()` — INI tree introspection
+- `get_project_settings()` — all DefaultGame.ini / DefaultEngine.ini
+  settings as structured JSON
+- `set_project_setting(key, value)` — write back through Project Settings
+- `build()` — invoke UBT against the project
+- `generate_project_files()` — UBT GenerateProjectFiles
+- `get_build_targets()` / `get_engine_modules()` / `list_plugins()`
+- `enable_plugin(name)` / `disable_plugin(name)`
+
+---
+
+### 4.8 — Animation (full)
+
+56 actions in ue-mcp.
+
+- AnimBlueprint: `read`, `create`, `read_anim_graph`, `add_state`,
+  `add_transition`, `set_state_machine`, `compile`
+- Montage: `create`, `read`, `set_sequence`, `add_section`,
+  `set_montage_properties`
+- Sequence: `create`, `read`, `set_bone_keyframes`, `get_bone_transforms`,
+  `add_curve`, `set_root_motion`
+- Blendspace: `create`, `read`, `add_sample`, `remove_sample`
+- Composite: `create`, `read`, `add_segment`
+- Skeleton: `get_info`, `list_sockets`, `add_virtual_bone`,
+  `remove_virtual_bone`
+- IK Rig: `create`, `read`, `add_solver`, `set_solver_setting`,
+  `add_retarget_chain`
+- ControlRig: `read`, `list_variables`, `set_variable`
+- Modifiers: `list`, `add_modifier`, `remove_modifier`, `apply_modifier`
+
+---
+
+### 4.9 — Niagara VFX (full)
+
+37 actions.
+
+- System: `create`, `read`, `compile`, `add_emitter`, `remove_emitter`
+- Emitter: `read`, `set_property`, `add_module`, `remove_module`
+- Module: `list_inputs`, `set_input`, `list_static_switches`,
+  `set_static_switch`, `create_from_hlsl`, `create_scratch`,
+  `get_compiled_hlsl`
+- Renderer: `list`, `add`, `remove`, `set_property`
+- System spec: `create_system_from_spec` — declarative VFX builder
+- Batch: `batch([{action, args}])` — fail-fast sequenced ops
+
+---
+
+### 4.10 — AI / Gameplay framework (full)
+
+59 actions in ue-mcp's gameplay category.
+
+- Physics: `set_collision_profile`, `set_simulate_physics`,
+  `set_collision_enabled`, `set_physics_properties`
+- Navigation: `rebuild_navigation`, `get_navmesh_info`, `project_to_nav`,
+  `spawn_nav_modifier`, `get_navmesh_details`
+- Enhanced Input: `create_input_action`, `create_input_mapping`,
+  `read_imc`, `add_imc_mapping`, `set_mapping_modifiers`,
+  `remove_imc_mapping`, `set_imc_mapping_key`, `set_imc_mapping_action`
+- Behavior Trees: `list_bts`, `get_bt_info`, `read_bt_graph`,
+  `create_bt`, `add_bt_node`, `connect_bt_nodes`
+- EQS: `create_eqs_query`, `read_eqs_query`, `add_eqs_test`
+- StateTree: `create_state_tree`, `read_state_tree`, `add_state`,
+  `add_transition`
+- SmartObject: `create_smart_object_def`, `read_smart_object_def`,
+  `add_slot`, `add_definition_data`
+- Perception: `add_perception`, `configure_sense`, `read_perception`
+- Game framework: `create_game_mode`, `create_game_state`,
+  `create_player_controller`, `create_player_state`, `create_hud`,
+  `set_world_game_mode`, `get_framework_info`
+- Runtime PIE inspection: `inspect_pie`, `get_pie_anim_state`,
+  `get_pie_anim_properties`, `get_pie_subsystem_state`,
+  `apply_damage_in_pie`
+
+---
+
+### 4.11 — UMG / Widget (full)
+
+21 actions.
+
+- Widget: `read`, `create`, `read_tree`, `add_widget`, `remove_widget`,
+  `set_widget_property`, `set_slot_property`
+- Animation: `create_animation`, `read_animations`, `add_track`
+- EUW: `create_utility_widget`, `run_utility_widget`
+- EUB: `create_utility_blueprint`, `run_utility_blueprint`
+- Layout: `set_anchors`, `set_alignment`, `set_padding`
+
+---
+
+### 4.12 — PCG (Procedural Content Generation)
+
+23 actions.
+
+- Graph: `create`, `read`, `add_node`, `connect_nodes`,
+  `set_node_settings`, `remove_node`
+- Mesh spawner: `set_static_mesh_spawner_meshes`, `read_spawner`
+- Component query: `query_components`, `set_component_property`
+- Volume: `place_volume`, `set_volume_bounds`
+
+---
+
+### 4.13 — Landscape (full)
+
+14 actions.
+
+- Sculpt: `sculpt(operation, brush, position, strength)`
+- Paint: `paint_layer(layer, brush, position, strength)`
+- Splines: `read_splines`, `add_spline`, `add_spline_segment`,
+  `set_spline_property`
+- Heightmap: `import_heightmap(file, settings)`,
+  `export_heightmap(path)`
+- Material: `set_landscape_material(path)`
+
+---
+
+### 4.14 — Foliage (full)
+
+13 actions.
+
+- Type: `create_type`, `read_type`, `set_type_settings`, `delete_type`
+- Painting: `paint(brush, position, strength)`,
+  `erase(brush, position, strength)`
+- Instances: `sample(area)`, `select(filter)`, `remove_selected`,
+  `transform_selected`
+
+---
+
+### 4.15 — GAS (Gameplay Ability System)
+
+18 actions.
+
+- Attributes: `create_attribute_set`, `read_attribute_set`,
+  `add_attribute`
+- Abilities: `create_ability`, `read_ability`, `set_ability_property`
+- Effects: `create_effect`, `read_effect`, `set_effect_modifier`,
+  `set_effect_executions`
+- Cues: `create_cue`, `read_cue`, `set_cue_response`
+
+---
+
+### 4.16 — Networking
+
+14 actions.
+
+- Replication: `set_replicated_property`, `list_replicated_properties`,
+  `set_replication_condition`
+- Network: `set_dormancy`, `set_relevancy`, `set_net_priority`,
+  `set_cull_distance`, `set_replicates`, `set_replicate_movement`
+
+---
+
+### 4.17 — Audio
+
+9 actions.
+
+- Sound: `create_sound_cue`, `create_metasound`, `read_sound_cue`
+- Playback: `play_at_location`, `play_attached`, `stop_all`
+- Ambient: `spawn_ambient_actor`, `set_ambient_property`
+
+---
+
+### 4.18 — Source control extras
+
+Beyond Sage's `get_source_control_state` + `checkout_files`:
+
+- `revert_files(paths)`
+- `submit(paths, message)`
+- `add_files(paths)`
+- `delete_files(paths)`
+- `get_file_state(path)` — synced/locked/modified
+- `get_history(path)` — change log
+
+---
+
+### 4.19 — Reporting / observability
+
+- `report_issue(title, body, labels?)` — write to
+  `.claude/notes/lessons.md` (or, if configured, GitHub via gh CLI)
+- `get_session_log(since_ms?, level?)` — recent log slice from
+  `/tmp/sage-server.log`
+- `get_metrics()` — pending RPC count, slot count, cache hit/miss,
+  ingest avg ms, query avg ms
+
+---
+
+### 4.20 — Headless test mode
+
+- Plugin's filesystem-only handlers (INI parsing, header reading,
+  asset listing via on-disk pak/uasset inspection) usable without
+  a running editor world
+- Mock plugin `sage-bridge-mock-plugin` extended with handler set
+  for read-only MCP tools, so CI can exercise Phase 4.0–4.7 without
+  booting UE
+- Catch2 unit suite expanded across new plugin handlers
+
+---
+
+## Won't ship
+
+The only items genuinely off-roadmap. None of these are scope cuts —
+they're either footguns or duplicates.
 
 | Item | Reason |
 |---|---|
-| ue-mcp `feedback` tool (auto GitHub issue) | Their workflow, not ours. We capture lessons in `.claude/notes/lessons.md`. |
-| `flow` (YAML multi-step executor) | LLM is already the orchestrator; YAML adds an intermediate language. |
-| `editor.run_python` | We're not embedding Python; agent already has Python via host environment. |
-| `console_command(cmd)` | Footgun — UE console can do anything including crash. Add behind explicit-confirm flag if needed. |
-| `demo.build_neon_shrine` | Project-specific marketing demo; not generic. |
+| ue-mcp `flow` (YAML executor) | The LLM is the orchestrator. Adding YAML inserts an intermediate language without payoff. |
+| ue-mcp `feedback` auto-GitHub-issue | We have `report_issue` writing to lessons.md; gh CLI integration optional via env var. |
+| ue-mcp `demo.build_neon_shrine` | Project-specific marketing demo. |
 
 ---
 
-## Concrete Task Breakdown — Phase 4 Plan
+## Implementation order
 
-**Phase 4.0 — UProperty collection support** (groundwork)
-- TArray ↔ JSON array round-trip in `set_property` family
-- TMap ↔ JSON object
-- TObjectPtr / TSoftObjectPtr asset reference resolution
-- TSubclassOf class path resolution
-- Unblocks B1-B10 + many later Tier D items
-- _Effort: ~2 days. Lands as a `SageToolHelpers` extension._
-
-**Phase 4.1 — Tier A reflection + asset extras** (15 tools)
-- A1-A4: reflect_class/struct/enum/list_classes — read-only Cypher + UE reflection
-- A5-A6: get_mesh_bounds / get_mesh_collision
-- A8-A9: bulk_rename_assets / move_folder
-- A10-A11: gameplay tag CRUD
-- A12-A14: dialog policy + auto-respond
-- _Effort: ~3 days. One commit per tool group._
-
-**Phase 4.2 — Blueprint read** (10 tools, B1-B10)
-- New plugin handler `SageBlueprintTools.cpp`
-- New server-side schemas + tool registrations (or main.cpp inline)
-- Smoke harness with a fixture .uasset (BP_ThirdPersonCharacter)
-- _Effort: ~5 days. Read-only — no graph mutation yet._
-
-**Phase 4.3 — Material graph authoring** (6 tools, C1-C6)
-- New plugin handler `SageMaterialGraphTools.cpp` (separate from existing `SageMaterialTools.cpp`)
-- _Effort: ~4 days. Skip declarative builder + preview render in this pass._
-
-**Phase 4.4 — Index perf via Kuzu COPY FROM JSON** (transverse)
-- ingestSnapshot writes temp JSON files, runs COPY FROM
-- 8K asset / 16K dep / 8K class current ~30s → target <5s
-- _Effort: ~2 days. Important before Phase 4.2 lands more class metadata._
-
-**Phase 4.5 — UE Editor headless / no-UI test** (transverse)
-- Currently any plugin test requires `open <uproject>` + 20s boot
-- ue-mcp has filesystem-only fallbacks for INI/header parsing
-- Replicate the pattern: a "lite" plugin handler set that operates on disk assets without an editor world
-- _Effort: ~3 days. Doubles smoke iteration speed._
-
----
-
-## Phase 4 commit-tree shape
+The graph of work matters; the calendar doesn't.
 
 ```
-Phase 4 — Execution + reflection parity (Tier A + B + C, ~3 weeks)
-├── 4.0 UProperty collections (1 commit)
-├── 4.1 Tier A reflection & asset extras (5 commits)
-│     ├── 4.1.1 reflect_class/struct/enum + list_classes
-│     ├── 4.1.2 get_mesh_bounds + get_mesh_collision
-│     ├── 4.1.3 bulk_rename_assets + move_folder
-│     ├── 4.1.4 gameplay tags CRUD
-│     └── 4.1.5 dialog policy
-├── 4.2 Blueprint read (3 commits)
-│     ├── 4.2.1 read + list_variables + list_functions
-│     ├── 4.2.2 read_graph + execution_flow
-│     └── 4.2.3 list_node_types + search_nodes + validate + compile
-├── 4.3 Material graph authoring (2 commits)
-│     ├── 4.3.1 read + list_parameters + list_expressions + shader_stats
-│     └── 4.3.2 create_instance + set_expression_value
-├── 4.4 Kuzu COPY FROM perf (1 commit)
-└── 4.5 Headless test mode (1 commit)
+4.0 UProperty collections + asset refs
+ │
+ ├──► 4.1 Reflection (depends on 4.0 for property dump)
+ ├──► 4.2 Blueprint (read + write, depends on 4.0 + 4.1)
+ ├──► 4.3 Material (depends on 4.0)
+ ├──► 4.5 Asset advanced (depends on 4.0)
+ ├──► 4.6 Editor automation (mostly independent)
+ ├──► 4.7 Project / engine introspection (mostly independent)
+ ├──► 4.8 Animation (depends on 4.0)
+ ├──► 4.9 Niagara (depends on 4.0)
+ ├──► 4.10 AI / Gameplay (depends on 4.0)
+ ├──► 4.11 UMG (depends on 4.0)
+ ├──► 4.12 PCG (depends on 4.0)
+ ├──► 4.13 Landscape (independent)
+ ├──► 4.14 Foliage (independent)
+ ├──► 4.15 GAS (depends on 4.0 + 4.10 for tag containers)
+ ├──► 4.16 Networking (depends on 4.1 reflection)
+ ├──► 4.17 Audio (depends on 4.0)
+ ├──► 4.18 Source control extras (independent)
+ ├──► 4.19 Reporting (independent)
+ └──► 4.20 Headless test mode (transversal — extends as new tools land)
+
+4.4 Index perf — transversal, lands when current ingest gets unwieldy.
 ```
 
-**Total: 13 commits, ~50 new tools (51 → ~101).** Brings Sage into rough functional parity with ue-mcp's most-used surface while keeping the knowledge-graph moat intact.
-
-Phase 5 (Tier D heavy lifts — Animation, Niagara, AI, PCG, Landscape, Foliage, GAS) only on demand.
-
----
-
-## Open questions for the user
-
-1. **Blueprint write tools (Tier D'ish)?** Read is in 4.2; full graph authoring (add_node, connect_pins, T3D round-trip) is a separate ~1 week. Defer or include?
-2. **Gameplay tag system priority?** A10-A11 are quick wins but only useful if your projects use GAS-style tagging.
-3. **GitHub issue feedback loop (ue-mcp's `feedback` tool)?** Sage's `.claude/notes/lessons.md` covers the same ground but isn't agent-visible. Worth wiring an MCP `report_issue` tool that writes there?
-4. **Cross-platform scope:** Tier D Niagara/Material editing depend on UE editor modules. Confirmed Mac+Linux+Win all targets, or Mac/Win only?
+Each milestone ships its full subsystem. Tools land as commits within
+their milestone. New `SageXxxTools.cpp` plugin handler groups per major
+subsystem (Blueprint, Material, Niagara, Animation, Landscape, etc.)
+mirror the structure already used for Actor/Asset/Editor/Material.
