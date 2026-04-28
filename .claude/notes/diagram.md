@@ -41,7 +41,7 @@ flowchart TB
   M17 ==Demo 1 ✓==> M21a
 
   %% Şu an
-  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>36 commit · 50 MCP tool<br/>Phase 1 + Phase 2 ÇALIŞIYOR<br/>SageTest UE 5.7 — 8K asset · 16K edge<br/>real-time delta · query_graph live<br/>Demo 1 + Demo 2 ispatlandı"]):::now
+  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>38 commit · 52 MCP tool<br/>Phase 1 + 2 + 3-partial ÇALIŞIYOR<br/>SageTest UE 5.7 — 8K asset · 16K dep · 8337 class · 8336 inherit<br/>real-time delta · query_graph · class_hierarchy · restart_editor live<br/>UE-MCP 562 action audit → Phase 4 plan hazır"]):::now
 
   %% Phase 1'den ertelenenler
   subgraph DEF["Storage / out-of-process gerektirenler"]
@@ -52,18 +52,41 @@ flowchart TB
   M15a -.persistent.-> M15b
   M16a -.LC alternatif.-> M16b
 
-  %% Phase 3 — sonraki kapsam
-  subgraph P3["Phase 3 — sonraki kapsam"]
+  %% Phase 3 — execution polish + reflection
+  subgraph P3["Phase 3 — Execution polish + T3 reflection (kısmen done)"]
     direction TB
-    P3W["Windows cross-platform test<br/>Live Coding compile + plugin BuildPlugin"]:::todo
-    P3CH["class_hierarchy tool<br/>UClass parent chain · Class node populated<br/>(Asset.AssetClassPath → Class table + INHERITS_FROM)"]:::todo
-    P3PERF["Index perf<br/>kuzu COPY FROM JSON (30s → &lt;5s)"]:::todo
+    P3R["1.6b restart_editor orchestrator ✓<br/>save→build→kill→swap→relaunch · 25s · cross-platform"]:::done
+    P3CH["class_hierarchy ✓<br/>schema v4 · 8337 UClass · 8336 INHERITS_FROM<br/>Pawn → Actor → Object verified"]:::done
+    P3W["Windows cross-platform test"]:::todo
+    P3PERF["Index perf — Kuzu COPY FROM JSON<br/>(30s → &lt;5s · Phase 4.4)"]:::todo
     P3SLOT["1.5b SQLite slot store<br/>merge/migrate/prune"]:::todo
-    P3RES["1.6b Full-restart orchestrator"]:::todo
   end
-  NOW --> P3W
+  NOW --> P3R
   NOW --> P3CH
-  NOW --> P3PERF
+
+  %% Phase 4 — UE-MCP capability parity
+  subgraph P4["Phase 4 — UE-MCP capability parity (~3 hafta plan)"]
+    direction TB
+    P40["4.0 UProperty collections<br/>TArray · TMap · TObjectPtr · TSubclassOf"]:::todo
+    P41["4.1 Tier A — 15 quick wins<br/>reflect_class · mesh_bounds · bulk_rename ·<br/>gameplay_tags · dialog_policy"]:::todo
+    P42["4.2 Tier B — Blueprint read (10 tool)<br/>read · variables · functions · graph · execution_flow"]:::todo
+    P43["4.3 Tier C — Material graph (6 tool)<br/>read · expressions · shader_stats · create_instance"]:::todo
+    P44["4.4 Index perf (Kuzu COPY FROM)"]:::todo
+    P45["4.5 Headless test mode<br/>(filesystem-only fallback for CI)"]:::todo
+  end
+  P3CH --> P40 --> P41 --> P42 --> P43 --> P44 --> P45
+
+  %% Phase 5 — Tier D heavy lifts (on demand)
+  subgraph P5["Phase 5 — Heavy lifts (on demand only)"]
+    direction TB
+    P5A["Animation (56 tool)<br/>AnimBP · IK Rig · ControlRig · montage"]:::todo
+    P5N["Niagara (37 tool)<br/>VFX · HLSL modules · GPU shader inspect"]:::todo
+    P5G["AI/Gameplay (35 tool)<br/>BT · EQS · StateTree · SmartObject · IMC"]:::todo
+    P5L["PCG · Landscape · Foliage · GAS · Networking · UMG"]:::todo
+  end
+  P45 -.demand-driven.-> P5A
+  P45 -.demand-driven.-> P5N
+  P45 -.demand-driven.-> P5G
 
   %% Demolar
   M17  -. "Demo 1 — execution"  .- DEMO1[/"spawn · CAS · transactions · bulk · PIE guard<br/>SageTest'te ispatlandı"/]:::done
@@ -80,10 +103,10 @@ flowchart TB
   NOW --- TURN
 ```
 
-## MCP tool yüzeyi (50 tool toplam)
+## MCP tool yüzeyi (52 tool toplam)
 
 ```mermaid
-pie title Tool Domain Dağılımı (P1: 44 + P2: 6)
+pie title Tool Domain Dağılımı (P1: 44 + P2: 6 + P3: 2)
   "Actor mutation" : 5
   "Component mutation" : 5
   "Asset mutation+lifecycle" : 8
@@ -98,6 +121,21 @@ pie title Tool Domain Dağılımı (P1: 44 + P2: 6)
   "Source control" : 2
   "Knowledge index (P2)" : 2
   "Knowledge query (P2)" : 4
+  "Restart orchestrator (P3)" : 1
+  "class_hierarchy (P3)" : 1
+```
+
+## Phase 4 hedef sürdürülen 51 tool dağılımı (UE-MCP audit'inden)
+
+```mermaid
+pie title Phase 4 Plan — yeni 51 tool
+  "Tier A reflection + asset" : 15
+  "Tier B Blueprint read" : 10
+  "Tier C Material graph" : 6
+  "Phase 4.0 UProperty collections" : 4
+  "Phase 4.4 Kuzu COPY perf" : 1
+  "Phase 4.5 Headless test mode" : 1
+  "Tier D (Phase 5+)" : 14
 ```
 
 ## Knowledge graph şeması (Phase 2 v3)
