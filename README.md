@@ -10,7 +10,14 @@ Part of the **Sage** family of engine MCP servers:
 
 ## Status
 
-Pre-implementation. Architecture design phase (started 2026-04-27).
+**Phase 1–4 Complete** (as of 2026-04-28 · 82 commits)
+
+- **443 MCP tool handlers** in the Unreal plugin (SageBridgeSubsystem)
+- **454 tool schemas** in the C++23 server (`tools/list` fully populated)
+- **UE-MCP parity:** 445 / 448 actions covered (99.3%) — 3 N/A (feedback + demo categories)
+- Knowledge graph live: 8 359 assets · 16 093 DEPENDS_ON edges · 8 337 UClass nodes
+- Tested on UE 5.7.4 (SageTest — Third Person + Blueprint project)
+- Both binaries build clean: `build-plugin.sh` (UAT) + `cmake --build --preset debug`
 
 ## What this is
 

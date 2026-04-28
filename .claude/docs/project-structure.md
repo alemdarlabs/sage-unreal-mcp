@@ -1,6 +1,6 @@
 # Project Structure
 
-Project layout. Code-side paths TBD until implementation phase.
+Gerçek proje yapısı (Phase 4 sonrası · 2026-04-28).
 
 ## Directory Layout
 
@@ -8,9 +8,9 @@ Project layout. Code-side paths TBD until implementation phase.
 sage-unreal-mcp/
 ├── CLAUDE.md                       # Codebase instructions for Claude
 ├── README.md                       # Public-facing description
-├── LICENSE                         # TBD
-├── .clang-format                   # Code style (TBD)
-├── .clang-tidy                     # Static analysis (TBD)
+├── LICENSE                         # Apache-2.0 (ADR-016 önerisi)
+├── .clang-format                   # Code style (repo kökünde)
+├── .clang-tidy                     # Static analysis (repo kökünde)
 ├── .gitignore
 │
 ├── .claude/                        # Claude Code workspace metadata
@@ -20,16 +20,37 @@ sage-unreal-mcp/
 │   ├── notes/                      # Scratch, todo, lessons
 │   └── skills/                     # Automation skills
 │
-├── plugin/                         # Unreal C++ plugin (TBD)
+├── plugin/                         # Unreal C++ plugin (Phase 1-4 complete)
 │   ├── SageBridge.uplugin
 │   ├── Source/
 │   │   └── SageBridge/
-│   │       ├── Public/
+│   │       ├── Public/             # Header'lar
 │   │       ├── Private/
+│   │       │   ├── SageBridgeSubsystem.cpp
+│   │       │   ├── SageToolDispatch.cpp
+│   │       │   └── Tools/          # 32 dosya · 443 handler
+│   │       │       ├── SageActorTools.cpp
+│   │       │       ├── SageAnimationTools.cpp  (46 tool)
+│   │       │       ├── SageAssetAdvancedTools.cpp
+│   │       │       ├── SageAssetTools.cpp
+│   │       │       ├── SageAudioTools.cpp      (5 tool)
+│   │       │       ├── SageBlueprintTools.cpp
+│   │       │       ├── SageEditorAutomationTools.cpp
+│   │       │       ├── SageFoliageTools.cpp    (7 tool)
+│   │       │       ├── SageGameplayTools.cpp   (45 tool)
+│   │       │       ├── SageGasTools.cpp        (9 tool)
+│   │       │       ├── SageLandscapeTools.cpp  (11 tool)
+│   │       │       ├── SageLevelTools.cpp      (22 tool)
+│   │       │       ├── SageMaterialGraphTools.cpp
+│   │       │       ├── SageNetworkingTools.cpp (11 tool)
+│   │       │       ├── SageNiagaraTools.cpp    (26 tool)
+│   │       │       ├── SagePcgTools.cpp        (16 tool)
+│   │       │       ├── SageWidgetTools.cpp
+│   │       │       └── ...
 │   │       └── SageBridge.Build.cs
 │   └── Resources/
 │
-├── server/                         # C++23 MCP server (TBD)
+├── server/                         # C++23 MCP server (Phase 1-4 complete, 454 şema)
 │   ├── CMakeLists.txt
 │   ├── vcpkg.json
 │   ├── src/
@@ -42,19 +63,11 @@ sage-unreal-mcp/
 │   │   └── tools/                  # Tool implementations
 │   └── include/
 │
-├── tests/                          # Catch2 tests (TBD)
+├── tests/                          # Catch2 unit tests (server tarafı; 35 test)
 │   ├── CMakeLists.txt
-│   ├── unit/
-│   ├── integration/                # Real plugin + real server
-│   └── fixtures/                   # Test UE projects
+│   └── unit/
 │
-├── migrations/                     # Schema migrations (TBD)
-│   ├── 0001_initial.cypher
-│   └── 0001_initial.sql
-│
-└── docs/                           # External / public-facing docs (TBD)
-    ├── getting-started.md
-    └── deployment.md
+└── docs/                           # External / public-facing docs (başlatılmadı)
 ```
 
 ## Naming Conventions

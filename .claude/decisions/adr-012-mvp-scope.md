@@ -1,7 +1,7 @@
 # ADR-012: MVP Scope — Execution-First, Knowledge-Second
 
 **Tarih:** 2026-04-27
-**Durum:** Kabul Edildi (önceki "Path A önce" önerisini supersede eder)
+**Durum:** Kabul Edildi ve DOĞRULANDI — Phase 1+2+3+4 tamamlandı (2026-04-28)
 
 ## Bağlam
 
@@ -69,5 +69,18 @@ Tool kategorileri:
 - Phase 1'de "tüm execution" tanımı geniş → scope creep riski yüksek; tight discipline + out-of-scope listesi şart
 
 ## Etkilenen Belgeler
-- `.claude/docs/mvp-roadmap.md` (yeni dosya) — Phase 1 + Phase 2 milestone breakdown, risk tracking
-- `.claude/docs/api-spec.md` — tool catalog hâlâ valid; öncelikler Phase'lere bağlı
+- `.claude/docs/mvp-roadmap.md` — Phase 1 + Phase 2 + Phase 4 milestone breakdown (tamamlandı)
+- `.claude/docs/api-spec.md` — tool catalog Phase 4 ile genişledi
+- `.claude/notes/ue-mcp-tasks.md` — 445/448 coverage audit
+
+## Sonuç (2026-04-28)
+
+Karar **doğru** çıktı. Execution-first sıralaması:
+- Phase 1 temel kontrolü verdi → agent eylebildi
+- Phase 2 knowledge layer'ı ekledi → agent anladı
+- Phase 3 editor restart orchestration'ı kapattı → otonom çalışma
+- Phase 4 UE-MCP'nin tüm 445 action'ını kapsadı → tam pariteye ulaşıldı
+
+Endişe konusu olan "Phase 1 commodity riski" gerçekleşmedi; Phase 2 ve Phase 4 tool derinliği ayırt edici oldu.
+
+Toplam: 82 commit · 443 plugin tool · 454 server şema.

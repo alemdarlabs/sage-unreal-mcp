@@ -1,6 +1,8 @@
-# Phase 1 Active Work
+# Milestone Kayıt Defteri (Phase 1-4 TAMAMLANDI)
 
-> Reference: `.claude/docs/mvp-roadmap.md`. Last updated: 2026-04-27.
+> Bu dosya Phase 1 Milestone 1.1'den Phase 4 sonuna kadar tüm tamamlanan işleri kayıt altına alır.
+> **Mevcut durum: 82 commit · 443 plugin tool · 454 server şema · Phase 4 complete (2026-04-28)**
+> Referans: `.claude/docs/mvp-roadmap.md` · `.claude/notes/ue-mcp-tasks.md`
 
 ---
 
@@ -233,9 +235,26 @@ ADR-013 (cpp-httplib seçimi) yazıldı.
 
 ---
 
-## Açık Sorular / Sonraki
+## Phase 4 Tamamlanma Özeti (2026-04-28)
 
-- **Real UE host project test** — Mac üzerinde sage-server'ı çalıştırıp gerçek bir UE 5.7 projesinde plugin'i yükleyip handshake doğrulaması (kullanıcı talep etti, Milestone 1.3a sonrası test penceresi)
-- **License** → ADR-016 (Apache-2.0 önerim)
-- **Symlink resolution** — `FSageSlotID::ResolveCanonicalPath()` Phase 2 polish
-- **Plugin tarafı incoming message parse** — şu an `OnMessageReceived` raw string, parse Milestone 1.3b'de eklenir
+Phase 1–3 sonrası 443 tool handler'a ulaşıldı. UE-MCP (448 action) ile %99.3 pariteye erişildi.
+
+**Yeni domain dosyaları (Phase 4):**
+- SageAnimationTools.cpp — 46 tool
+- SageLevelTools.cpp — 22 tool
+- SageGameplayTools.cpp — 45 tool
+- SageNiagaraTools.cpp — 26 tool
+- SagePcgTools.cpp — 16 tool
+- SageLandscapeTools.cpp — 11 tool
+- SageFoliageTools.cpp — 7 tool
+- SageAudioTools.cpp — 5 tool
+- SageNetworkingTools.cpp — 11 tool
+- SageGasTools.cpp — 9 tool
+
+**Server tarafı:** `phase4_schemas.cpp` — 254 remote tool şeması eklendi; `tools/list` eksiksiz.
+
+**Kalan açık maddeler (Phase 5 adayları):**
+- End-to-end entegrasyon test suite
+- Her domain için smoke test script'leri
+- `docs/` (public-facing) getting-started yazısı
+- License kararı (ADR-016 Apache-2.0 önerim)

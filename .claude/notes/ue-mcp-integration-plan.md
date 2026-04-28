@@ -1,8 +1,12 @@
 # UE-MCP → Sage Integration Roadmap
 
-> **Source:** `/Users/mahmutalemdar/Developer/alemdarlabs/ue-mcp` (TypeScript MCP server + C++ plugin, 562 actions across 19 categories, BUSL-1.1 → Apache after 4 yr).
-> **Target:** Sage Unreal MCP — currently 52 tools (Phase 1 + 2 + 3 partial).
-> **Strategy:** Full feature parity per subsystem. No scope cuts. No "MVP cuts." Read+write together; full UProperty type coverage; every subsystem ships whole.
+> **Source:** `/Users/mahmutalemdar/Developer/alemdarlabs/ue-mcp` (TypeScript MCP server + C++ plugin, 448 distinct actions, BUSL-1.1 → Apache after 4 yr).
+> **Target:** Sage Unreal MCP — **443 tool handler · Phase 4 COMPLETE (2026-04-28)**
+> **Parity:** 445 / 448 (%99.3) — 3 N/A (feedback.submit, demo.step, demo.cleanup)
+> **Strategy (doğrulandı):** Full feature parity per subsystem. Read+write birlikte shipped. Scope cut yapılmadı.
+
+> **NOT:** Bu belge entegrasyon planını kayıt altına alır. Plan tamamlanmıştır.
+> Güncel coverage detayı için bkz. [`ue-mcp-tasks.md`](ue-mcp-tasks.md).
 
 ---
 
