@@ -266,6 +266,36 @@ Confirmed live in SageTest UE 5.7.4: hook fires on `FMessageDialog::Open`
 calls; auto-respond + default-response paths both verified via
 LogSageBridge.
 
+## UE 5.7 — manually spawning UK2Node_FunctionEntry into a delegate signature graph CRASHES the editor
+
+**Symptom**: Adding a delegate signature graph via
+`FBlueprintEditorUtils::CreateNewGraph` then manually
+`NewObject<UK2Node_FunctionEntry>(SigGraph) + AllocateDefaultPins` to make
+the graph "look like" a function (so `bp.add_function_parameter` could
+attach payload pins) crashed the editor mid-MCP-tool call. Plugin tool
+dispatch timed out after 30s, WebSocket dropped with abnormal closure,
+editor process gone.
+
+**Root**: `UK2Node_FunctionEntry` derefs its `FunctionReference`
+(`UFunction*`) when `AllocateDefaultPins` walks the function's signature
+to lay out user-defined pins. A delegate signature graph has no
+compiled `UFunction` until the BP is compiled — the field is null and
+the codepath is not null-safe.
+
+**Rule**: Never spawn `UK2Node_FunctionEntry` into a `UEdGraph` that
+isn't backed by a real `UFunction`. The schema's
+`CreateDefaultNodesForGraph` is the only safe path; for delegate
+signature graphs in 5.7 it deliberately does NOT create an entry node.
+Configure dispatcher payload params via a dedicated tool that goes
+through the `FBlueprintEditorUtils` delegate API (or directly via the
+`FBPVariableDescription`'s `PinSubCategoryMemberReference`), not via
+`bp.add_function_parameter`.
+
+**Apply**: `FindFunctionGraph` deliberately excludes
+`DelegateSignatureGraphs` so accidental routing into them via
+`bp.add_function_parameter` is impossible. A future r2h
+`bp.set_dispatcher_payload_params` tool is the correct surface.
+
 ## C++ — helper hoisting when growing a single-TU plugin file
 
 **Symptom**: Adding a new handler section above an existing one that uses

@@ -73,7 +73,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Şu Anki Durum (Snapshot)
 
-> Tek satırda durum: **52 commit · 125 MCP tool · Phase 1+2+3 tamam · Phase 4 ~%58 (4.0/4.1/4.2-r1+r2a..r2f/4.3/4.5-r1/4.6-r1+r2)**.
+> Tek satırda durum: **53 commit · 128 MCP tool · Phase 1+2+3 tamam · Phase 4 ~%59 (4.0/4.1/4.2-r1+r2a..r2g(p1)/4.3/4.5-r1/4.6-r1+r2)**.
 
 - **Test ortamı**: `/Users/mahmutalemdar/Developer/alemdarlabs/SageTest/SageTest.uproject` (UE 5.7.4 Third Person + Blueprint).
 - **Knowledge graph (canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Real-time delta + query_graph + class_hierarchy çalışıyor.
@@ -104,6 +104,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 | 4.2-r2d | BP graph management (`bp.list_graphs` / rename_function) | 2 |
 | 4.2-r2e | BP function parameter I/O (`bp.list_function_parameters` / add_function_parameter / remove_function_parameter) | 3 |
 | 4.2-r2f | BP asset creation (`bp.create` / `bp.create_interface`) | 2 |
+| 4.2-r2g/p1 | BP event dispatcher CRUD (`bp.list_event_dispatchers` / add_event_dispatcher / remove_event_dispatcher) | 3 |
 
 ## Build & Run Commands
 

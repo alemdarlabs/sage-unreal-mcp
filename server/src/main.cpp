@@ -1244,6 +1244,60 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // -- read+write — event dispatchers (Phase 4.2 round 2g) --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.list_event_dispatchers",
+        .description = "Enumerate event dispatchers (multicast delegates) "
+                       "on the BP. Reads UBlueprint::DelegateSignatureGraphs. "
+                       "Each entry: {name, graph, node_count, parameters: "
+                       "[{name, type, direction:input}]}. Read-only.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.add_event_dispatcher",
+        .description = "Create a new event dispatcher. Wires up both halves: "
+                       "the '<Name>__DelegateSignature' graph in "
+                       "DelegateSignatureGraphs (UEdGraphSchema_K2 default "
+                       "nodes) AND a member variable of type PC_MCDelegate "
+                       "referencing the signature graph. Use "
+                       "bp.add_function_parameter on the signature graph to "
+                       "configure dispatcher payload types. -32602 on "
+                       "duplicate name. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path", {{"type", "string"}}},
+                {"name", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.remove_event_dispatcher",
+        .description = "Remove a dispatcher: deletes the signature graph "
+                       "AND the member variable. Returns {removed: 0|1} "
+                       "(idempotent — 0 when name absent on both sides). "
+                       "PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path", {{"type", "string"}}},
+                {"name", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // -- write — asset creation (Phase 4.2 round 2f) --
     registerRemote(sage::mcp::Tool{
         .name = "bp.create",

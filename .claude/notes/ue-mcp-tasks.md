@@ -1,8 +1,8 @@
 # UE-MCP → Sage: 448 Action Per-Tool Task List
 
 > **Source:** `/Users/mahmutalemdar/Developer/alemdarlabs/ue-mcp` — TypeScript MCP server + C++ plugin, BUSL-1.1.
-> **Audit date:** 2026-04-28 (last update: Phase 4.2-r2f BP asset creation shipped).
-> **Status:** Sage 125 tools · UE-MCP 448 actions · ~113 covered (mostly via Phase 4) · **335 actions remain**.
+> **Audit date:** 2026-04-28 (last update: Phase 4.2-r2g part 1 dispatcher CRUD shipped).
+> **Status:** Sage 128 tools · UE-MCP 448 actions · ~116 covered (mostly via Phase 4) · **332 actions remain**.
 >
 > Earlier note had cited 562; actual enumeration of every `RegisterHandler` / dispatcher branch in the ue-mcp source landed on 448. The 562 number likely came from including duplicates / aliases / TS-side validation rules that don't materialise as distinct C++ handlers.
 
@@ -14,7 +14,7 @@
 | editor | 15 | 29 | 44 | 34 |
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
-| blueprint | 25 | 21 | 46 | 54 |
+| blueprint | 28 | 18 | 46 | 61 |
 | asset | 7 | 32 | 39 | 18 |
 | level | 10 | 22 | 32 | 31 |
 | niagara | 0 | 26 | 26 | 0 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **113** | **335** | **448** | **25** |
+| **TOTAL** | **116** | **332** | **448** | **26** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -278,7 +278,9 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [x] `blueprint.list_interfaces` → `bp.list_interfaces` (Phase 4.2-r2c, NEW vs ue-mcp)
 - [x] `blueprint.remove_interface` → `bp.remove_interface` (Phase 4.2-r2c, NEW vs ue-mcp)
 - [x] `blueprint.list_graphs` → `bp.list_graphs` (Phase 4.2-r2d; ubergraph/function/delegate/macro)
-- [ ] `blueprint.add_event_dispatcher` — Add dispatcher · W
+- [x] `blueprint.add_event_dispatcher` → `bp.add_event_dispatcher` (Phase 4.2-r2g/p1; signature graph + member variable, payload-params deferred to r2h)
+- [x] `blueprint.list_event_dispatchers` → `bp.list_event_dispatchers` (Phase 4.2-r2g/p1, NEW vs ue-mcp)
+- [x] `blueprint.remove_event_dispatcher` → `bp.remove_event_dispatcher` (Phase 4.2-r2g/p1, NEW vs ue-mcp)
 - [ ] `blueprint.duplicate` — Duplicate BP · W
 - [x] `blueprint.add_local_variable` → `bp.add_local_variable` (Phase 4.2-r2b)
 - [x] `blueprint.list_local_variables` → `bp.list_local_variables` (Phase 4.2-r2b)

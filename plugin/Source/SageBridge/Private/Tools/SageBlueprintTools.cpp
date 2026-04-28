@@ -74,6 +74,15 @@ UEdGraph* FindFunctionGraph(UBlueprint* BP, const FString& FnName)
     {
         if (G && G->GetName() == FnName) return G;
     }
+    // r2g: also search macro graphs. Delegate signature graphs are
+    // intentionally excluded — bp.add_function_parameter assumes a UFunction
+    // owner, which delegate sig graphs don't have until compile, and routing
+    // bp.add_function_parameter into them crashes UE 5.7. Use a dedicated
+    // dispatcher-payload-param tool (r2h) instead.
+    for (UEdGraph* G : BP->MacroGraphs)
+    {
+        if (G && G->GetName() == FnName) return G;
+    }
     return nullptr;
 }
 
@@ -189,6 +198,30 @@ UK2Node_FunctionEntry* FindFunctionEntry(UEdGraph* Graph)
         }
     }
     return nullptr;
+}
+
+// Hoisted near common helpers so r2g (dispatchers) AND r2e (function I/O)
+// can both reach it without forward-declaration churn.
+TSharedRef<FJsonObject> FunctionParamToJson(const TSharedPtr<FUserPinInfo>& Info,
+                                             const TCHAR* Direction)
+{
+    auto O = MakeShared<FJsonObject>();
+    O->SetStringField(TEXT("name"),      Info->PinName.ToString());
+    O->SetStringField(TEXT("type"),      Info->PinType.PinCategory.ToString());
+    O->SetStringField(TEXT("direction"), Direction);
+    if (Info->PinType.PinSubCategoryObject.IsValid())
+    {
+        O->SetStringField(TEXT("type_object"),
+            Info->PinType.PinSubCategoryObject->GetName());
+    }
+    if (Info->PinType.IsArray()) O->SetBoolField(TEXT("is_array"), true);
+    if (Info->PinType.IsMap())   O->SetBoolField(TEXT("is_map"),   true);
+    if (Info->PinType.IsSet())   O->SetBoolField(TEXT("is_set"),   true);
+    if (!Info->PinDefaultValue.IsEmpty())
+    {
+        O->SetStringField(TEXT("default_value"), Info->PinDefaultValue);
+    }
+    return O;
 }
 
 // ---- bp.read --------------------------------------------------------------
@@ -830,6 +863,194 @@ FSageToolDispatch::FOutcome BpConnectPinsImpl(const TSharedPtr<FJsonObject>& Arg
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- bp.list_event_dispatchers + bp.add_event_dispatcher + ---------------
+// ---- bp.remove_event_dispatcher  (Phase 4.2 round 2g) --------------------
+
+// In UE, an event dispatcher is a multicast delegate stored as a member
+// variable (PC_MCDelegate) PLUS a UEdGraph in BP->DelegateSignatureGraphs
+// named "<Name>__DelegateSignature" that holds the entry node + signature.
+
+const TCHAR* kSigGraphSuffix = TEXT("__DelegateSignature");
+
+FSageToolDispatch::FOutcome BpListEventDispatchersImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    TArray<TSharedPtr<FJsonValue>> Out;
+    for (UEdGraph* G : BP->DelegateSignatureGraphs)
+    {
+        if (!G) continue;
+        const FString GName = G->GetName();
+        FString DispatcherName = GName;
+        if (DispatcherName.EndsWith(kSigGraphSuffix))
+        {
+            DispatcherName.LeftChopInline(FCString::Strlen(kSigGraphSuffix));
+        }
+
+        auto O = MakeShared<FJsonObject>();
+        O->SetStringField(TEXT("name"),       DispatcherName);
+        O->SetStringField(TEXT("graph"),      GName);
+        O->SetNumberField(TEXT("node_count"), G->Nodes.Num());
+
+        // Inputs (= dispatcher payload params), pulled from the entry node
+        // of the signature graph.
+        TArray<TSharedPtr<FJsonValue>> Params;
+        for (UEdGraphNode* N : G->Nodes)
+        {
+            if (UK2Node_FunctionEntry* Entry = Cast<UK2Node_FunctionEntry>(N))
+            {
+                for (const TSharedPtr<FUserPinInfo>& Info : Entry->UserDefinedPins)
+                {
+                    if (Info.IsValid())
+                        Params.Add(MakeShared<FJsonValueObject>(
+                            FunctionParamToJson(Info, TEXT("input"))));
+                }
+                break;
+            }
+        }
+        O->SetArrayField(TEXT("parameters"), Params);
+
+        Out.Add(MakeShared<FJsonValueObject>(O));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetArrayField (TEXT("dispatchers"), Out);
+    R->SetNumberField(TEXT("count"),     Out.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpAddEventDispatcherImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, DispName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("name"), DispName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path' or 'name'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    const FName DispFName(*DispName);
+
+    // Idempotency: existing var with the same name?
+    for (const FBPVariableDescription& V : BP->NewVariables)
+    {
+        if (V.VarName == DispFName)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("variable already exists: %s "
+                                     "(dispatcher or member variable)"), *DispName));
+        }
+    }
+
+    FScopedTransaction Tx(LOCTEXT("BpAddDispatcher", "Sage: Add Event Dispatcher"));
+    BP->Modify();
+
+    const FString SigGraphName = DispName + kSigGraphSuffix;
+    UEdGraph* SigGraph = FBlueprintEditorUtils::CreateNewGraph(
+        BP, FName(*SigGraphName),
+        UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+    if (!SigGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("CreateNewGraph returned nullptr for delegate signature graph"));
+    }
+    BP->DelegateSignatureGraphs.AddUnique(SigGraph);
+    SigGraph->SetFlags(RF_Transactional);
+    SigGraph->GetSchema()->CreateDefaultNodesForGraph(*SigGraph);
+    // Note: dispatcher payload parameters (configurable via bp.add_function_
+    // parameter on "<Name>__DelegateSignature") are NOT supported by this
+    // surface. Spawning UK2Node_FunctionEntry manually into a delegate
+    // signature graph crashed the editor in UE 5.7 — the function-reference
+    // codepath assumes a real UFunction owner. A dedicated dispatcher-
+    // payload-param tool is queued for r2h.
+
+    FEdGraphPinType PinType;
+    PinType.PinCategory = UEdGraphSchema_K2::PC_MCDelegate;
+    PinType.PinSubCategoryMemberReference.MemberName = SigGraph->GetFName();
+    PinType.PinSubCategoryMemberReference.MemberGuid = SigGraph->GraphGuid;
+
+    if (!FBlueprintEditorUtils::AddMemberVariable(BP, DispFName, PinType))
+    {
+        // Roll back the graph addition.
+        BP->DelegateSignatureGraphs.Remove(SigGraph);
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("AddMemberVariable failed for dispatcher"));
+    }
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"),  BP->GetName());
+    R->SetStringField(TEXT("dispatcher"), DispName);
+    R->SetStringField(TEXT("graph"),      SigGraph->GetName());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpRemoveEventDispatcherImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, DispName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("name"), DispName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path' or 'name'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    const FName DispFName(*DispName);
+    const FString SigGraphName = DispName + kSigGraphSuffix;
+
+    UEdGraph* SigGraph = nullptr;
+    for (UEdGraph* G : BP->DelegateSignatureGraphs)
+    {
+        if (G && G->GetName() == SigGraphName) { SigGraph = G; break; }
+    }
+
+    bool bAnyRemoved = false;
+    FScopedTransaction Tx(LOCTEXT("BpRemDispatcher", "Sage: Remove Event Dispatcher"));
+    BP->Modify();
+
+    // Remove the member variable side (only if it actually existed).
+    if (FBlueprintEditorUtils::FindNewVariableIndex(BP, DispFName) != INDEX_NONE)
+    {
+        FBlueprintEditorUtils::RemoveMemberVariable(BP, DispFName);
+        bAnyRemoved = true;
+    }
+    // Remove the signature graph side.
+    if (SigGraph)
+    {
+        BP->DelegateSignatureGraphs.Remove(SigGraph);
+        FBlueprintEditorUtils::RemoveGraph(BP, SigGraph, EGraphRemoveFlags::Default);
+        bAnyRemoved = true;
+    }
+
+    if (bAnyRemoved)
+    {
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"),  BP->GetName());
+    R->SetStringField(TEXT("dispatcher"), DispName);
+    R->SetNumberField(TEXT("removed"),    bAnyRemoved ? 1 : 0);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---- bp.create + bp.create_interface  (Phase 4.2 round 2f) ----------------
 
 // Split "/Game/Folder/Asset" or "/Game/Folder/Asset.Asset" into
@@ -1020,27 +1241,7 @@ UK2Node_FunctionResult* FindOrCreateFunctionResult(UEdGraph* Graph,
     return New;
 }
 
-TSharedRef<FJsonObject> FunctionParamToJson(const TSharedPtr<FUserPinInfo>& Info,
-                                             const TCHAR* Direction)
-{
-    auto O = MakeShared<FJsonObject>();
-    O->SetStringField(TEXT("name"),      Info->PinName.ToString());
-    O->SetStringField(TEXT("type"),      Info->PinType.PinCategory.ToString());
-    O->SetStringField(TEXT("direction"), Direction);
-    if (Info->PinType.PinSubCategoryObject.IsValid())
-    {
-        O->SetStringField(TEXT("type_object"),
-            Info->PinType.PinSubCategoryObject->GetName());
-    }
-    if (Info->PinType.IsArray()) O->SetBoolField(TEXT("is_array"), true);
-    if (Info->PinType.IsMap())   O->SetBoolField(TEXT("is_map"),   true);
-    if (Info->PinType.IsSet())   O->SetBoolField(TEXT("is_set"),   true);
-    if (!Info->PinDefaultValue.IsEmpty())
-    {
-        O->SetStringField(TEXT("default_value"), Info->PinDefaultValue);
-    }
-    return O;
-}
+// FunctionParamToJson hoisted to common helpers (top of file).
 
 FSageToolDispatch::FOutcome BpListFunctionParametersImpl(const TSharedPtr<FJsonObject>& Args)
 {
@@ -2033,6 +2234,11 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
     // Write — asset creation (Phase 4.2 round 2f)
     Dispatch.RegisterHandler(TEXT("bp.create"),                     GT(&BpCreateImpl));
     Dispatch.RegisterHandler(TEXT("bp.create_interface"),           GT(&BpCreateInterfaceImpl));
+
+    // Read+Write — event dispatchers (Phase 4.2 round 2g)
+    Dispatch.RegisterHandler(TEXT("bp.list_event_dispatchers"),     GT(&BpListEventDispatchersImpl));
+    Dispatch.RegisterHandler(TEXT("bp.add_event_dispatcher"),       GT(&BpAddEventDispatcherImpl));
+    Dispatch.RegisterHandler(TEXT("bp.remove_event_dispatcher"),    GT(&BpRemoveEventDispatcherImpl));
 
     // Write — functions
     Dispatch.RegisterHandler(TEXT("bp.add_function"),        GT(&BpAddFunctionImpl));
