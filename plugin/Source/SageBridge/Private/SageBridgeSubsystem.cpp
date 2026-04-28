@@ -22,6 +22,7 @@
 #include "Tools/SageQaTools.h"
 #include "Tools/SageScmTools.h"
 #include "Tools/SageTransactionTools.h"
+#include "Tools/SageSequencerTools.h"
 #include "Tools/SageWidgetTools.h"
 
 #include "AssetRegistry/AssetData.h"
@@ -175,6 +176,7 @@ void USageBridgeSubsystem::RegisterBuiltinHandlers()
     sage::tools::RegisterDialogTools(ToolDispatch);
     sage::tools::RegisterProjectTools(ToolDispatch);
     sage::tools::RegisterWidgetTools(ToolDispatch);
+    sage::tools::RegisterSequencerTools(ToolDispatch);
 }
 
 void USageBridgeSubsystem::BindAssetRegistryDeltaHooks()

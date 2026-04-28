@@ -2867,6 +2867,57 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // ---- Sequencer (Phase 4.6 round 3 batch 6) ---------------------------
+    registerRemote(sage::mcp::Tool{
+        .name = "seq.create",
+        .description = "Create a ULevelSequence at the given path. "
+                       "Calls Initialize() to spawn an empty UMovieScene. "
+                       "Wrapped in FScopedTransaction. -32602 if path "
+                       "lacks a directory or the package already "
+                       "exists. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "seq.list_tracks",
+        .description = "List the root UMovieSceneTracks on a "
+                       "ULevelSequence's MovieScene. Returns "
+                       "{tracks: [{name, class, display_name}], "
+                       "track_count, binding_count, possessable_count, "
+                       "spawnable_count}. -32602 if not a LevelSequence.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "seq.add_track",
+        .description = "Add a UMovieSceneTrack subclass to the root "
+                       "of a sequence's MovieScene. track_class is a "
+                       "concrete (non-abstract) subclass — e.g. "
+                       "'/Script/MovieSceneTracks.MovieSceneCameraCutTrack', "
+                       "'/Script/MovieSceneTracks.MovieScene3DTransformTrack'. "
+                       "Wrapped in FScopedTransaction. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",        {{"type", "string"}}},
+                {"track_class", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "track_class"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // ---- UMG widget authoring (Phase 4.11 round 1) -----------------------
     registerRemote(sage::mcp::Tool{
         .name = "widget.create",

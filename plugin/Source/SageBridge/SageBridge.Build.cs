@@ -55,6 +55,11 @@ public class SageBridge : ModuleRules
             // UWidgetTree, UWidget hierarchy. UMGEditor for the factory.
             "UMG",
             "UMGEditor",
+            // Sequencer (Phase 4.6-r3-b6) — ULevelSequence + UMovieScene
+            // + UMovieSceneTrack hierarchy.
+            "LevelSequence",
+            "MovieScene",
+            "MovieSceneTracks",
         });
 
         // Live Coding ships only on Windows in UE 5.7; Mac/Linux use the

@@ -73,7 +73,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Şu Anki Durum (Snapshot)
 
-> Tek satırda durum: **78 commit · 197 MCP tool · Phase 1+2+3 tamam · 4.2(r2) DONE · 4.4 ingest 7.5x · 4.5(r2-b1..b9 inc FBX import) · 4.6(r3 inc Python) · 4.7 DONE · 4.11-r1+r2 (UMG authoring) · Phase 4 ~%82**.
+> Tek satırda durum: **79 commit · 200 MCP tool · Phase 1+2+3 tamam · 4.2(r2) DONE · 4.4 ingest 7.5x · 4.5(r2-b1..b9) · 4.6(r3-b1..b6 inc sequencer) · 4.7 DONE · 4.11-r1+r2 (UMG authoring) · Phase 4 ~%83**.
 
 - **Test ortamı**: `/Users/mahmutalemdar/Developer/alemdarlabs/SageTest/SageTest.uproject` (UE 5.7.4 Third Person + Blueprint).
 - **Knowledge graph (canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Real-time delta + query_graph + class_hierarchy çalışıyor.
@@ -85,7 +85,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
   - [`.claude/notes/lessons.md`](.claude/notes/lessons.md) — kabul edilen kuralların kayıtlı olduğu dosya (en kritik: "MVP scope-cut yapma", BP/Material write GameThread'de marshal et)
 - **Yeni session devraldığında ilk bakılacak**: bu dosya → `.claude/notes/diagram.md` → `.claude/notes/ue-mcp-tasks.md` → son commit `git log --oneline | head -10`.
 
-## Tool Tablosu (özet — 197 toplam)
+## Tool Tablosu (özet — 200 toplam)
 
 | Phase | Domain | Tool sayısı |
 |---|---|---|
@@ -118,6 +118,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 | 4.6-r3-b3 | Log + crash forensics (`editor.search_log` / `list_crashes` / `check_for_crashes` / `get_crash_info`) | 4 |
 | 4.6-r3-b4 | Level building (`editor.build_all` / `build_geometry` / `build_lighting` / `build_hlod` / `get_build_status`) | 5 |
 | 4.6-r3-b5 | Python scripting (`editor.run_python`) | 1 |
+| 4.6-r3-b6 | Sequencer minimal (`seq.create` / `seq.list_tracks` / `seq.add_track`) | 3 |
 | 4.5-r2-b1 | Asset query (`asset.list` / `asset.search` / `asset.read_properties`) | 3 |
 | 4.5-r2-b2 | Mesh sockets (`asset.list_sockets` / `add_socket` / `remove_socket` — Static + Skeletal) | 3 |
 | 4.5-r2-b3 | Textures (`asset.list_textures` / `get_texture_info` / `set_texture_settings`) | 3 |

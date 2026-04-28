@@ -106,9 +106,9 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [x] `editor.get_viewport` — Viewport camera state · R · Sage `get_viewport_state`
 - [x] `editor.set_viewport` → `editor.set_viewport` (Phase 4.6-r3-b1; FLevelEditorViewportClient SetViewLocation/Rotation, both optional)
 - [x] `editor.focus_on_actor` → `editor.focus_on_actor` (Phase 4.6-r3-b1; GEditor->MoveViewportCamerasToActor)
-- [ ] `editor.create_sequence` — Create LevelSequence · W
-- [ ] `editor.get_sequence_info` — Read sequence · R
-- [ ] `editor.add_sequence_track` — Add track to LS · W
+- [x] `editor.create_sequence` → `seq.create` (Phase 4.6-r3-b6; ULevelSequence + Initialize + AssetRegistry::AssetCreated)
+- [x] `editor.get_sequence_info` → `seq.list_tracks` (Phase 4.6-r3-b6; tracks + binding/possessable/spawnable counts)
+- [x] `editor.add_sequence_track` → `seq.add_track` (Phase 4.6-r3-b6; UMovieScene::AddTrack with class assertion + abstract reject)
 - [ ] `editor.play_sequence` — Play/stop/pause LS · W
 - [x] `editor.build_all` → `editor.build_all` (Phase 4.6-r3-b4; MAP REBUILD + BUILD LIGHTING + RebuildNavigation)
 - [x] `editor.build_geometry` → `editor.build_geometry` (Phase 4.6-r3-b4; MAP REBUILD)
