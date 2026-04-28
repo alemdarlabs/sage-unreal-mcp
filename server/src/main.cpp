@@ -2524,6 +2524,31 @@ int main() {
         },
         .handler = nullptr, .remote = true,
     });
+    // Phase 4.5-r2 batch 8: export
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.export",
+        .description = "Export an asset to disk via "
+                       "UExporter::FindExporter + UExporter::"
+                       "RunAssetExportTask. The exporter is selected "
+                       "by file extension: Texture2D→.png/.tga/.exr; "
+                       "StaticMesh/SkeletalMesh→.fbx; SoundWave→.wav; "
+                       "etc. Runs in bAutomated mode (no dialogs). "
+                       "Returns {exported: bool, exporter (class), "
+                       "file_size, errors?: [...]}. Errors -32602 "
+                       "if no exporter exists for the asset class + "
+                       "extension combination. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path", {{"type", "string"}}},
+                {"file", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "file"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // Phase 4.5-r2 batch 7: import + reimport
     registerRemote(sage::mcp::Tool{
         .name = "asset.import_texture",

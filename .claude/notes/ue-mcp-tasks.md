@@ -339,7 +339,7 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [x] `asset.remove_socket` → `asset.remove_socket` (Phase 4.5-r2-b2; FindSocket + RemoveSocket / mesh-only list scan, FScopedTransaction wrapped, PIE rejected)
 - [x] `asset.list_sockets` → `asset.list_sockets` (Phase 4.5-r2-b2; reads UStaticMesh::Sockets / USkeletalMesh::GetMeshOnlySocketList — skeleton-derived sockets excluded)
 - [x] `asset.reload_package` → `asset.reload_package` (Phase 4.5-r2-b4; UPackageTools::ReloadPackages on FindPackage/LoadPackage result; accepts both /Game/Foo and /Game/Foo.Foo forms)
-- [ ] `asset.export` — Texture→PNG / Mesh→FBX · W
+- [x] `asset.export` → `asset.export` (Phase 4.5-r2-b8; UExporter::FindExporter + RunAssetExportTask; auto-detects exporter from file extension; bAutomated=true; SM→FBX, Tex→PNG/TGA/EXR, Sound→WAV all work; -32602 if class+ext combo unsupported)
 - [ ] `asset.search_fts` — SQLite FTS5 ranked search · R
 - [ ] `asset.reindex_fts` — Rebuild FTS index · W
 - [~] `asset.get_referencers` → `references_to` (Phase 2 graph; semantic match)

@@ -21,6 +21,8 @@
 #include "Materials/MaterialInterface.h"
 #include "Engine/DataTable.h"
 #include "AssetImportTask.h"
+#include "AssetExportTask.h"
+#include "Exporters/Exporter.h"
 #include "EditorReimportHandler.h"
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
@@ -504,6 +506,79 @@ FSageToolDispatch::FOutcome ReadAssetPropertiesImpl(const TSharedPtr<FJsonObject
     R->SetStringField(TEXT("class"),      Obj->GetClass()->GetName());
     R->SetObjectField(TEXT("properties"), Props);
     R->SetNumberField(TEXT("count"),      Count);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- asset.export -------------------------------------------------------
+// ---- (Phase 4.5 round 2 batch 8: texture→PNG, mesh→FBX) ------------------
+
+FSageToolDispatch::FOutcome ExportAssetImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, OutFile;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("file"), OutFile) || OutFile.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'file'"));
+    }
+    UObject* Asset = ResolveAsset(Path);
+    if (!Asset) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("asset not found: %s"), *Path));
+
+    FString Ext = FPaths::GetExtension(OutFile, /*bIncludeDot=*/false);
+    if (Ext.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("'file' must end in an extension: %s"), *OutFile));
+    }
+
+    UExporter* Exporter = UExporter::FindExporter(Asset, *Ext);
+    if (!Exporter)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("no exporter for %s → .%s"),
+                            *Asset->GetClass()->GetName(), *Ext));
+    }
+
+    UAssetExportTask* Task = NewObject<UAssetExportTask>();
+    Task->Object            = Asset;
+    Task->Exporter          = Exporter;
+    Task->Filename          = OutFile;
+    Task->bSelected         = false;
+    Task->bReplaceIdentical = true;
+    Task->bPrompt           = false;
+    Task->bAutomated        = true;
+    Task->bUseFileArchive   = Exporter->bText ? false : true;
+    Task->bWriteEmptyFiles  = false;
+
+    bool bOk = UExporter::RunAssetExportTask(Task);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),     Asset->GetPathName());
+    R->SetStringField(TEXT("class"),    Asset->GetClass()->GetName());
+    R->SetStringField(TEXT("file"),     OutFile);
+    R->SetStringField(TEXT("exporter"), Exporter->GetClass()->GetName());
+    R->SetStringField(TEXT("extension"), Ext);
+    R->SetBoolField  (TEXT("exported"), bOk);
+    if (Task->Errors.Num() > 0)
+    {
+        TArray<TSharedPtr<FJsonValue>> Errs;
+        for (const FString& E : Task->Errors)
+        {
+            Errs.Add(MakeShared<FJsonValueString>(E));
+        }
+        R->SetArrayField(TEXT("errors"), Errs);
+    }
+    if (bOk && IFileManager::Get().FileExists(*OutFile))
+    {
+        const int64 Size = IFileManager::Get().FileSize(*OutFile);
+        R->SetNumberField(TEXT("file_size"), static_cast<double>(Size));
+    }
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1821,6 +1896,9 @@ void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
     // Phase 4.5-r2 batch 7: import + reimport
     Dispatch.RegisterHandler(TEXT("asset.import_texture"),        GT(&ImportTextureImpl));
     Dispatch.RegisterHandler(TEXT("asset.reimport"),              GT(&ReimportImpl));
+
+    // Phase 4.5-r2 batch 8: export
+    Dispatch.RegisterHandler(TEXT("asset.export"),                GT(&ExportAssetImpl));
 
     // Write
     Dispatch.RegisterHandler(TEXT("asset.bulk_rename"),        GT(&BulkRenameImpl));
