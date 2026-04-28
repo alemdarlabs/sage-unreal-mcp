@@ -107,6 +107,24 @@ add_custom_command(TARGET sage-graph-manager-smoke POST_BUILD
         "${KUZU_DIR}/${KUZU_LIB_NAME}"
         "$<TARGET_FILE_DIR:sage-graph-manager-smoke>/${KUZU_LIB_NAME}")
 
+# ---- Cypher subset validator smoke ----
+# Pure validator (no kuzu dep at runtime), but link sage-graph because that's
+# where the impl lives. No sanitizers — sage-graph compiles without them.
+add_executable(sage-cypher-subset-smoke
+    integration/cypher_subset_smoke.cpp
+)
+target_link_libraries(sage-cypher-subset-smoke
+    PRIVATE sage-graph)
+target_compile_features(sage-cypher-subset-smoke PRIVATE cxx_std_23)
+set_target_properties(sage-cypher-subset-smoke PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    BUILD_RPATH   "${KUZU_DIR}"
+    INSTALL_RPATH "@executable_path")
+add_custom_command(TARGET sage-cypher-subset-smoke POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${KUZU_DIR}/${KUZU_LIB_NAME}"
+        "$<TARGET_FILE_DIR:sage-cypher-subset-smoke>/${KUZU_LIB_NAME}")
+
 # ---- AssetIndexer smoke ----
 # Drives ingestAssets / getIndexStatus on a slot — full-replace semantics,
 # Cypher escaping, validation. No plugin needed (mock asset list inline).

@@ -10,6 +10,7 @@
 
 #include "bridge/bridge_server.h"
 #include "graph/asset_indexer.h"
+#include "graph/cypher_subset.h"
 #include "graph/graph_store_manager.h"
 #include "mcp/server.h"
 #include "mcp/tool_registry.h"
@@ -1205,6 +1206,80 @@ int main() {
     };
     if (auto r = registry->registerTool(std::move(findUnusedTool)); !r.has_value()) {
         spdlog::warn("Failed to register 'find_unused'");
+    }
+
+    // ---- Cypher subset escape hatch (Milestone 2.5) --------------------
+    sage::mcp::Tool queryGraphTool{
+        .name        = "query_graph",
+        .description = "Read-only Cypher against the slot's knowledge graph. "
+                       "Use when impact_of / references_to / find_unused don't "
+                       "fit the question. Banned: CREATE, MERGE, SET, DELETE, "
+                       "DETACH, REMOVE, DROP, ALTER, COPY, LOAD, INSERT, CALL "
+                       "(read-only — for writes use ingest tools / direct MCP "
+                       "tools). Variable-length traversals must be bounded "
+                       "*N..M with M ≤ 10. LIMIT is auto-injected if missing "
+                       "(default 200, max 1000).",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"cypher",      {{"type", "string"},
+                                 {"description", "Cypher MATCH/RETURN query (max 8KB)"}}},
+                {"max_results", {{"type", "integer"},
+                                 {"minimum", 1}, {"maximum", 1000}}},
+                {"slot_id",     {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"cypher"})},
+            {"additionalProperties", false},
+        },
+        .handler = [graphMgr, resolveSlotId](const nlohmann::json& params)
+            -> sage::mcp::ToolResult {
+            if (!params.is_object() || !params.contains("cypher")
+                || !params["cypher"].is_string()) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InvalidParams, "missing 'cypher' string"));
+            }
+            const auto cypher = params["cypher"].get<std::string>();
+            const int maxResults = std::clamp(params.value("max_results",
+                sage::graph::kDefaultRowLimit), 1, sage::graph::kMaxRowLimit);
+
+            // Whitelist + bound check.
+            const auto v = sage::graph::validateReadOnlySubset(cypher);
+            if (!v.ok) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InvalidParams,
+                    "cypher rejected: " + v.error));
+            }
+
+            auto slot = resolveSlotId(params);
+            if (!slot.has_value()) return std::unexpected(slot.error());
+
+            const auto bounded = sage::graph::ensureLimit(cypher, maxResults);
+            try {
+                auto& store = graphMgr->acquireSlot(*slot);
+                auto r = store.execute(bounded);
+                if (sage::graph::is_error(r)) {
+                    return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                        sage::mcp::ErrorCode::InvalidParams,
+                        sage::graph::error_of(r).message));
+                }
+                const auto& env = sage::graph::value_of(r);
+                nlohmann::json out = nlohmann::json::object();
+                out["rows"]      = env["rows"];
+                out["schema"]    = env["schema"];
+                out["row_count"] = env["row_count"];
+                out["truncated"] = env["row_count"].get<int64_t>() == maxResults;
+                out["slot_id"]   = *slot;
+                return out;
+            } catch (const std::exception& ex) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InternalError,
+                    std::string{"query_graph failed: "} + ex.what()));
+            }
+        },
+        .remote = false,
+    };
+    if (auto r = registry->registerTool(std::move(queryGraphTool)); !r.has_value()) {
+        spdlog::warn("Failed to register 'query_graph'");
     }
 
     // ---- Real-time delta (Milestone 2.3b) -------------------------------

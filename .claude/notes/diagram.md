@@ -42,22 +42,23 @@ flowchart TB
   %% Phase 2 moat
   subgraph P2["Phase 2 — Knowledge Layer (intelligence moat)"]
     direction TB
-    M21a["2.1a KuzuDB baseline<br/>v0.11.3 prebuilt · CMake INTERFACE · smoke OK"]:::done
-    M21b["2.1b GraphStore abstraction<br/>variant&lt;Json,GraphError&gt; · {rows,schema,row_count}"]:::done
-    M21c["2.1c Slot-scoped DB + schema migration<br/>per-slot Kuzu path · _SchemaVersion node · v1 baseline"]:::done
+    M21a["2.1a KuzuDB baseline ✓<br/>v0.11.3 prebuilt · CMake INTERFACE · smoke OK"]:::done
+    M21b["2.1b GraphStore abstraction ✓<br/>variant&lt;Json,GraphError&gt; · {rows,schema,row_count}"]:::done
+    M21c["2.1c Slot-scoped DB + schema migration ✓<br/>per-slot Kuzu path · _SchemaVersion · v1/v2/v3"]:::done
     M22["2.2 T1 indexing (eager) ✓<br/>AssetRegistry full scan → Asset table<br/>SageTest: 8359 asset · 24ms scan"]:::done
-    M23["2.3 T2 topology + real-time delta<br/>depends_on / inherits_from / implements + AssetRegistry events"]:::now
-    M24["2.4 High-level query tools<br/>impact_of · references_to · class_hierarchy · find_unused"]:::moat
-    M25["2.5 Cypher subset (Layer 2)<br/>read-only AST whitelist · bounded *1..N · 8K cap"]:::todo
+    M23a["2.3a DEPENDS_ON edges ✓<br/>16093 dep · UNWIND batched · MANY_MANY"]:::done
+    M23b["2.3b Real-time delta ✓<br/>OnAssetAdded/Removed/Renamed → bridge event → graph patch"]:::done
+    M24["2.4 High-level query tools ✓<br/>impact_of · references_to · find_unused"]:::moat
+    M25["2.5 Cypher subset (Layer 2) ✓<br/>query_graph · whitelist · *1..10 · 8K cap · 30+ smoke"]:::done
   end
 
-  M21a --> M21b --> M21c --> M22 --> M23 --> M24 --> M25
+  M21a --> M21b --> M21c --> M22 --> M23a --> M23b --> M24 --> M25
 
-  NOW ==Phase 2 başladı==> M21a
+  NOW ==Phase 2 BİTTİ==> M21a
+  M25 -. Demo 2 .- DEMO2X[/"Demo 2 LIVE — moat<br/>references_to(DefaultMaterial) → 5 assets<br/>impact_of depth=2 transitif<br/>top-5 most-referenced (VerseClass 300 refs)"/]:::done
 
   %% Demo hedefleri
   M17 -. Demo 1 .- DEMO1[/"Demo 1 ispatlandı<br/>spawn · CAS · transactions · bulk · PIE guard"/]:::done
-  M24 -. Demo 2 .- DEMO2[/"Demo 2 — moat<br/>impact_of(BP_Enemy) → safe delete"/]:::moat
 
   %% Bu turda eklenenler
   subgraph TOOLS["Bu turda eklenenler"]

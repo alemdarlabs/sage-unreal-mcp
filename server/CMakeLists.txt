@@ -50,6 +50,7 @@ add_library(sage-graph STATIC
     src/graph/graph_schema.cpp
     src/graph/graph_store_manager.cpp
     src/graph/asset_indexer.cpp
+    src/graph/cypher_subset.cpp
 )
 target_include_directories(sage-graph
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
