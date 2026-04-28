@@ -13,6 +13,8 @@
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/IAssetRegistry.h"
 #include "AssetToolsModule.h"
 #include "EdGraphUtilities.h"
 #include "EdGraphSchema_K2.h"
@@ -197,6 +199,94 @@ UK2Node_FunctionEntry* FindFunctionEntry(UEdGraph* Graph)
         {
             return Entry;
         }
+    }
+    return nullptr;
+}
+
+// Centralised pin-type construction. UE 5.0+ requires PC_Real to carry a
+// PC_Float / PC_Double sub-category — without it KismetCompilerMisc.cpp
+// asserts at compile time and the editor crashes. Earlier Sage handlers
+// did `PinCategory = FName(*TypeStr)` directly, which produced PC_Real
+// with PinSubCategory=None whenever the agent passed type='real' (or
+// 'float' / 'double'). Verified the crash: "Erroneous pin subcategory
+// for PC_Real: None" in KismetCompilerMisc.cpp:1453.
+FEdGraphPinType MakePinType(const FString& TypeStr,
+                            const FString& TypeObjStr,
+                            bool bIsArray)
+{
+    FEdGraphPinType PinType;
+    const FString L = TypeStr.ToLower();
+
+    if (L == TEXT("bool") || L == TEXT("boolean"))
+        PinType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
+    else if (L == TEXT("int") || L == TEXT("integer") || L == TEXT("int32"))
+        PinType.PinCategory = UEdGraphSchema_K2::PC_Int;
+    else if (L == TEXT("int64"))
+        PinType.PinCategory = UEdGraphSchema_K2::PC_Int64;
+    else if (L == TEXT("real") || L == TEXT("float") || L == TEXT("double"))
+    {
+        PinType.PinCategory    = UEdGraphSchema_K2::PC_Real;
+        PinType.PinSubCategory = UEdGraphSchema_K2::PC_Double;
+    }
+    else if (L == TEXT("string") || L == TEXT("str"))
+        PinType.PinCategory = UEdGraphSchema_K2::PC_String;
+    else if (L == TEXT("name"))
+        PinType.PinCategory = UEdGraphSchema_K2::PC_Name;
+    else if (L == TEXT("text"))
+        PinType.PinCategory = UEdGraphSchema_K2::PC_Text;
+    else if (L == TEXT("byte"))
+        PinType.PinCategory = UEdGraphSchema_K2::PC_Byte;
+    else if (L == TEXT("object"))
+        PinType.PinCategory = UEdGraphSchema_K2::PC_Object;
+    else if (L == TEXT("class"))
+        PinType.PinCategory = UEdGraphSchema_K2::PC_Class;
+    else if (L == TEXT("struct"))
+        PinType.PinCategory = UEdGraphSchema_K2::PC_Struct;
+    else if (L == TEXT("interface"))
+        PinType.PinCategory = UEdGraphSchema_K2::PC_Interface;
+    else if (L == TEXT("softobject"))
+        PinType.PinCategory = UEdGraphSchema_K2::PC_SoftObject;
+    else if (L == TEXT("softclass"))
+        PinType.PinCategory = UEdGraphSchema_K2::PC_SoftClass;
+    else
+    {
+        // Pass-through for anything else (e.g. agent passed a verbatim
+        // PC_* enum). The compiler will reject obviously bad ones.
+        PinType.PinCategory = FName(*TypeStr);
+    }
+
+    if (!TypeObjStr.IsEmpty())
+    {
+        if (UObject* SubObj = FindObject<UObject>(nullptr, *TypeObjStr))
+        {
+            PinType.PinSubCategoryObject = SubObj;
+        }
+    }
+    if (bIsArray)
+    {
+        PinType.ContainerType = EPinContainerType::Array;
+    }
+    return PinType;
+}
+
+// Hoisted near common helpers so r2g/p5 (CDO read) AND r2f (asset create)
+// can both reach it without forward-declaration churn.
+UClass* ResolveParentClassByName(const FString& Name)
+{
+    if (Name.IsEmpty()) return nullptr;
+    if (UClass* C = LoadObject<UClass>(nullptr, *Name)) return C;
+    FString Stripped = Name;
+    if (Stripped.Len() > 1 && (Stripped[0] == TEXT('A') || Stripped[0] == TEXT('U')))
+    {
+        const FString Try = Stripped.Mid(1);
+        for (TObjectIterator<UClass> It; It; ++It)
+        {
+            if (It->GetName() == Try || It->GetName() == Stripped) return *It;
+        }
+    }
+    for (TObjectIterator<UClass> It; It; ++It)
+    {
+        if (It->GetName() == Name) return *It;
     }
     return nullptr;
 }
@@ -550,20 +640,11 @@ FSageToolDispatch::FOutcome BpAddVariableImpl(const TSharedPtr<FJsonObject>& Arg
     UBlueprint* BP = ResolveBlueprint(Path);
     if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
 
-    FEdGraphPinType PinType;
-    PinType.PinCategory = FName(*TypeStr);
-    if (Args->HasField(TEXT("type_object")))
-    {
-        FString TypeObj;
-        Args->TryGetStringField(TEXT("type_object"), TypeObj);
-        PinType.PinSubCategoryObject = FindObject<UObject>(nullptr, *TypeObj);
-    }
-    if (Args->HasField(TEXT("is_array")))
-    {
-        bool bArr = false;
-        Args->TryGetBoolField(TEXT("is_array"), bArr);
-        if (bArr) PinType.ContainerType = EPinContainerType::Array;
-    }
+    FString TypeObj;
+    Args->TryGetStringField(TEXT("type_object"), TypeObj);
+    bool bArr = false;
+    Args->TryGetBoolField(TEXT("is_array"), bArr);
+    FEdGraphPinType PinType = MakePinType(TypeStr, TypeObj, bArr);
 
     FScopedTransaction Tx(LOCTEXT("BpAddVar", "Sage: Add BP Variable"));
     BP->Modify();
@@ -861,6 +942,219 @@ FSageToolDispatch::FOutcome BpConnectPinsImpl(const TSharedPtr<FJsonObject>& Arg
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("blueprint"), BP->GetName());
     R->SetStringField(TEXT("function"),  FnName);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- bp.set_variable_properties + bp.get_cdo_properties + ----------------
+// ---- bp.get_dependencies  (Phase 4.2 round 2g/p5) ------------------------
+
+FSageToolDispatch::FOutcome BpSetVariablePropertiesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, VarName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("name"), VarName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path' or 'name'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    FBPVariableDescription* Var = nullptr;
+    for (FBPVariableDescription& V : BP->NewVariables)
+    {
+        if (V.VarName.ToString() == VarName) { Var = &V; break; }
+    }
+    if (!Var) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("variable not found: %s"), *VarName));
+
+    FScopedTransaction Tx(LOCTEXT("BpSetVarProps", "Sage: Set BP Variable Properties"));
+    BP->Modify();
+
+    // instance_editable: when enabled, also strip the 'private' metadata
+    // hint so the editor surface treats it as exposed (UE-MCP pattern).
+    bool bInstanceEditable = false;
+    if (Args->TryGetBoolField(TEXT("instance_editable"), bInstanceEditable))
+    {
+        if (bInstanceEditable)
+        {
+            Var->PropertyFlags |= CPF_Edit;
+            Var->RemoveMetaData(FBlueprintMetadata::MD_Private);
+        }
+        else
+        {
+            Var->PropertyFlags &= ~CPF_Edit;
+        }
+    }
+
+    auto ApplyFlag = [&](const TCHAR* FieldName, EPropertyFlags Flag)
+    {
+        bool b = false;
+        if (Args->TryGetBoolField(FieldName, b))
+        {
+            if (b) Var->PropertyFlags |=  Flag;
+            else   Var->PropertyFlags &= ~Flag;
+        }
+    };
+    ApplyFlag(TEXT("blueprint_readonly"),   CPF_BlueprintReadOnly);
+    ApplyFlag(TEXT("transient"),            CPF_Transient);
+    ApplyFlag(TEXT("save_game"),            CPF_SaveGame);
+
+    bool bReplicated = false;
+    if (Args->TryGetBoolField(TEXT("replicated"), bReplicated))
+    {
+        if (bReplicated) Var->PropertyFlags |=  (CPF_Net);
+        else             Var->PropertyFlags &= ~(CPF_Net | CPF_RepNotify);
+    }
+
+    bool bExposeOnSpawn = false;
+    if (Args->TryGetBoolField(TEXT("expose_on_spawn"), bExposeOnSpawn))
+    {
+        if (bExposeOnSpawn)
+        {
+            Var->SetMetaData(FBlueprintMetadata::MD_ExposeOnSpawn, TEXT("true"));
+            Var->PropertyFlags |= CPF_ExposeOnSpawn;
+        }
+        else
+        {
+            Var->RemoveMetaData(FBlueprintMetadata::MD_ExposeOnSpawn);
+            Var->PropertyFlags &= ~CPF_ExposeOnSpawn;
+        }
+    }
+
+    FString Category;
+    if (Args->TryGetStringField(TEXT("category"), Category))
+    {
+        Var->SetMetaData(FBlueprintMetadata::MD_FunctionCategory, *Category);
+    }
+    FString Tooltip;
+    if (Args->TryGetStringField(TEXT("tooltip"), Tooltip))
+    {
+        Var->SetMetaData(FBlueprintMetadata::MD_Tooltip, *Tooltip);
+    }
+
+    // ROOT CAUSE FIX: do NOT manually MarkBlueprintAsModified /
+    // MarkBlueprintAsStructurallyModified. Recompiling the BP
+    // automatically reconciles class layout + dirties the package; the
+    // manual Mark before compile leaves the BP in a half-mutated state
+    // that crashes the editor on next mutation. UE-MCP just calls
+    // CompileBlueprint, full stop.
+    FKismetEditorUtilities::CompileBlueprint(BP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetStringField(TEXT("variable"),  VarName);
+    R->SetStringField(TEXT("flags"),     FlagsForVariable(*Var));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpGetCdoPropertiesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString ClassName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("class"), ClassName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'class'"));
+    }
+    UClass* Cls = ResolveParentClassByName(ClassName);
+    if (!Cls) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("class not found: %s"), *ClassName));
+
+    UObject* CDO = Cls->GetDefaultObject();
+    if (!CDO) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no CDO"));
+
+    // Optional name filter
+    TSet<FString> Filter;
+    const TArray<TSharedPtr<FJsonValue>>* NamesArr = nullptr;
+    if (Args->TryGetArrayField(TEXT("properties"), NamesArr) && NamesArr)
+    {
+        for (const auto& V : *NamesArr)
+        {
+            FString S; if (V->TryGetString(S)) Filter.Add(S);
+        }
+    }
+
+    auto Props = MakeShared<FJsonObject>();
+    int32 Count = 0;
+    for (TFieldIterator<FProperty> It(Cls); It; ++It)
+    {
+        FProperty* P = *It;
+        if (!P) continue;
+        if (P->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient)) continue;
+        const FString N = P->GetName();
+        if (Filter.Num() > 0 && !Filter.Contains(N)) continue;
+        TSharedPtr<FJsonValue> V = detail::GetUPropertyAsJson(CDO, P);
+        if (V.IsValid()) { Props->SetField(N, V); ++Count; }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("class"),      Cls->GetPathName());
+    R->SetStringField(TEXT("class_name"), Cls->GetName());
+    R->SetObjectField(TEXT("properties"), Props);
+    R->SetNumberField(TEXT("count"),      Count);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpGetDependenciesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    bool bReverse = false;
+    Args->TryGetBoolField(TEXT("reverse"), bReverse);
+
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    FAssetRegistryModule& Module = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+    IAssetRegistry& Registry = Module.Get();
+    const FName PackageName = BP->GetOutermost()->GetFName();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetBoolField  (TEXT("reverse"),   bReverse);
+
+    if (bReverse)
+    {
+        TArray<FName> Referencers;
+        Registry.GetReferencers(PackageName, Referencers,
+            UE::AssetRegistry::EDependencyCategory::Package);
+        TArray<TSharedPtr<FJsonValue>> Arr;
+        Arr.Reserve(Referencers.Num());
+        for (const FName& N : Referencers) Arr.Add(MakeShared<FJsonValueString>(N.ToString()));
+        R->SetArrayField (TEXT("referencers"),       Arr);
+        R->SetNumberField(TEXT("referencer_count"),  Arr.Num());
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    TArray<FName> Deps;
+    Registry.GetDependencies(PackageName, Deps,
+        UE::AssetRegistry::EDependencyCategory::Package);
+    TArray<TSharedPtr<FJsonValue>> DepArr;
+    DepArr.Reserve(Deps.Num());
+    for (const FName& N : Deps) DepArr.Add(MakeShared<FJsonValueString>(N.ToString()));
+    R->SetArrayField(TEXT("dependencies"), DepArr);
+    R->SetNumberField(TEXT("dependency_count"), DepArr.Num());
+
+    // Class refs: parent + variable type objects
+    TSet<FString> Classes;
+    if (UClass* ParentCls = BP->ParentClass)
+    {
+        Classes.Add(ParentCls->GetPathName());
+    }
+    for (const FBPVariableDescription& V : BP->NewVariables)
+    {
+        if (UObject* Sub = V.VarType.PinSubCategoryObject.Get())
+            Classes.Add(Sub->GetPathName());
+    }
+    TArray<TSharedPtr<FJsonValue>> ClassArr;
+    for (const FString& C : Classes) ClassArr.Add(MakeShared<FJsonValueString>(C));
+    R->SetArrayField(TEXT("referenced_classes"), ClassArr);
+
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1510,30 +1804,7 @@ bool SplitAssetPath(const FString& AssetPath, FString& OutPackagePath, FString& 
     return !OutPackagePath.IsEmpty() && !OutAssetName.IsEmpty();
 }
 
-UClass* ResolveParentClassByName(const FString& Name)
-{
-    if (Name.IsEmpty()) return nullptr;
-
-    // 1. Full /Script/... or /Game/...:
-    if (UClass* C = LoadObject<UClass>(nullptr, *Name)) return C;
-
-    // 2. Short-name lookup. Drop any leading 'A'/'U' Unreal prefix and
-    //    iterate native UClasses for a name match.
-    FString Stripped = Name;
-    if (Stripped.Len() > 1 && (Stripped[0] == TEXT('A') || Stripped[0] == TEXT('U')))
-    {
-        const FString Try = Stripped.Mid(1);
-        for (TObjectIterator<UClass> It; It; ++It)
-        {
-            if (It->GetName() == Try || It->GetName() == Stripped) return *It;
-        }
-    }
-    for (TObjectIterator<UClass> It; It; ++It)
-    {
-        if (It->GetName() == Name) return *It;
-    }
-    return nullptr;
-}
+// ResolveParentClassByName hoisted to common-helpers (top of file).
 
 FSageToolDispatch::FOutcome BpCreateImpl(const TSharedPtr<FJsonObject>& Args)
 {
@@ -1761,20 +2032,11 @@ FSageToolDispatch::FOutcome BpAddFunctionParameterImpl(const TSharedPtr<FJsonObj
     if (!Entry) return FSageToolDispatch::FOutcome::MakeError(-32603,
         TEXT("function entry node not found"));
 
-    FEdGraphPinType PinType;
-    PinType.PinCategory = FName(*TypeStr);
-    if (Args->HasField(TEXT("type_object")))
-    {
-        FString TypeObj;
-        Args->TryGetStringField(TEXT("type_object"), TypeObj);
-        PinType.PinSubCategoryObject = FindObject<UObject>(nullptr, *TypeObj);
-    }
-    if (Args->HasField(TEXT("is_array")))
-    {
-        bool bArr = false;
-        Args->TryGetBoolField(TEXT("is_array"), bArr);
-        if (bArr) PinType.ContainerType = EPinContainerType::Array;
-    }
+    FString TypeObj;
+    Args->TryGetStringField(TEXT("type_object"), TypeObj);
+    bool bArr = false;
+    Args->TryGetBoolField(TEXT("is_array"), bArr);
+    FEdGraphPinType PinType = MakePinType(TypeStr, TypeObj, bArr);
 
     UK2Node_EditablePinBase* TargetNode = nullptr;
     // Direction relative to the underlying node:
@@ -2193,20 +2455,12 @@ FSageToolDispatch::FOutcome BpAddLocalVariableImpl(const TSharedPtr<FJsonObject>
     UEdGraph* Graph = FindFunctionGraph(BP, FnName);
     if (!Graph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("graph not found"));
 
-    FEdGraphPinType PinType;
-    PinType.PinCategory = FName(*TypeStr);
-    if (Args->HasField(TEXT("type_object")))
-    {
-        FString TypeObj;
-        Args->TryGetStringField(TEXT("type_object"), TypeObj);
-        PinType.PinSubCategoryObject = FindObject<UObject>(nullptr, *TypeObj);
-    }
-    if (Args->HasField(TEXT("is_array")))
-    {
-        bool bArr = false;
-        Args->TryGetBoolField(TEXT("is_array"), bArr);
-        if (bArr) PinType.ContainerType = EPinContainerType::Array;
-    }
+    FString TypeObj;
+    Args->TryGetStringField(TEXT("type_object"), TypeObj);
+    bool bArr = false;
+    Args->TryGetBoolField(TEXT("is_array"), bArr);
+    FEdGraphPinType PinType = MakePinType(TypeStr, TypeObj, bArr);
+
     FString DefaultValue;
     Args->TryGetStringField(TEXT("default_value"), DefaultValue);
 
@@ -2694,6 +2948,11 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
     // Read+Write — diagnostics + dry-run (Phase 4.2 round 2g/p4)
     Dispatch.RegisterHandler(TEXT("bp.validate"),                   GT(&BpValidateImpl));
     Dispatch.RegisterHandler(TEXT("bp.run_construction_script"),    GT(&BpRunConstructionScriptImpl));
+
+    // Read+Write — variable props + CDO + deps (Phase 4.2 round 2g/p5)
+    Dispatch.RegisterHandler(TEXT("bp.set_variable_properties"),    GT(&BpSetVariablePropertiesImpl));
+    Dispatch.RegisterHandler(TEXT("bp.get_cdo_properties"),         GT(&BpGetCdoPropertiesImpl));
+    Dispatch.RegisterHandler(TEXT("bp.get_dependencies"),           GT(&BpGetDependenciesImpl));
 
     // Write — functions
     Dispatch.RegisterHandler(TEXT("bp.add_function"),        GT(&BpAddFunctionImpl));

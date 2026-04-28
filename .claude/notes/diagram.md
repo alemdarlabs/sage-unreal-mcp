@@ -41,7 +41,7 @@ flowchart TB
   M17 ==Demo 1 ✓==> M21a
 
   %% Şu an
-  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>56 commit · 135 MCP tool<br/>Phase 1 + 2 + 3 + 4.0/4.1/4.2-r1+r2a..r2g(p1..p4)/4.3/4.5-r1/4.6-r1+r2 CANLI<br/>SageTest UE 5.7 — 8K asset · 16K dep · 8337 class · 8336 inherit<br/>BP authoring + diagnostics + RCS dry-run · Material · Asset · Editor · Dialog<br/>UE-MCP 448 action audit → Phase 4 yol haritası %61 done"]):::now
+  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>57 commit · 138 MCP tool<br/>Phase 1 + 2 + 3 + 4.0/4.1/4.2-r1+r2a..r2g(p1..p5)/4.3/4.5-r1/4.6-r1+r2 CANLI<br/>SageTest UE 5.7 — 8K asset · 16K dep · 8337 class · 8336 inherit<br/>BP r2g/p5 var-flags+CDO+deps · UE 5.0 PC_Real fix · Material · Asset · Dialog<br/>UE-MCP 448 action audit → Phase 4 yol haritası %62 done · Round 2g DONE"]):::now
 
   %% Phase 1'den ertelenenler
   subgraph DEF["Storage / out-of-process gerektirenler"]

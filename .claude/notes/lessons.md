@@ -266,6 +266,66 @@ Confirmed live in SageTest UE 5.7.4: hook fires on `FMessageDialog::Open`
 calls; auto-respond + default-response paths both verified via
 LogSageBridge.
 
+## UE 5.0+ — PC_Real REQUIRES a PC_Float / PC_Double sub-category, or KismetCompiler asserts
+
+**Symptom**: Adding a BP variable / local variable / function parameter
+with `type='real'` (or `'float'` / `'double'`) silently saves a
+malformed `FEdGraphPinType { PinCategory: PC_Real, PinSubCategory: None }`.
+The next BP compile, asset scan, or duplicate hits
+```
+Assertion failed: false [File:./Editor/KismetCompiler/Private/KismetCompilerMisc.cpp] [Line: 1453]
+Erroneous pin subcategory for PC_Real: None
+```
+and the editor crashes. If the BP got saved before the crash, the
+project enters a CRASH LOOP — every relaunch tries to compile the
+corrupt asset and dies again. Recover by deleting the .uasset from
+disk before opening the editor.
+
+**Root**: UE 5.0 split the legacy `PC_Float` pin category into
+`PC_Real` (the actual type) plus a precision sub-category
+(`PC_Float` for 32-bit, `PC_Double` for 64-bit). The compiler reads
+the sub-category to lay out memory and rejects `None` outright. The
+editor UI sets this automatically when an artist adds a Real variable;
+code paths that build `FEdGraphPinType` from a string need to do it
+themselves.
+
+**Rule**: NEVER do `PinType.PinCategory = FName(*UserTypeStr)`
+directly. Route every type-string through a centralised
+`MakePinType(TypeStr, TypeObjStr, bIsArray)` helper that maps:
+- `bool / boolean` → `PC_Boolean`
+- `int / integer / int32` → `PC_Int`
+- `int64` → `PC_Int64`
+- `byte` → `PC_Byte`
+- `real / float / double` → `PC_Real` + `PinSubCategory = PC_Double`
+- `string / str` → `PC_String`
+- `name` / `text` → `PC_Name` / `PC_Text`
+- `object / class / struct / interface / softobject / softclass`
+  → matching `PC_*` (sub-category-object expected separately)
+- anything else: pass through as `FName` (compiler will reject bad
+  ones with a clearer error than this lurking crash)
+
+See `MakePinType` in SageBlueprintTools.cpp for the canonical impl.
+
+This bug was latent in `bp.add_variable` since Phase 4.2-r1 — only
+surfaced in r2g/p5 smoke when Health:real was the trigger type.
+Earlier rounds tested with `int / bool / object` types that don't
+need a sub-category, so the path stayed cold.
+
+## UE 5.7 — set_variable_properties needs CompileBlueprint at the end, not MarkBlueprintAsStructurallyModified
+
+**Symptom**: Toggling `FBPVariableDescription::PropertyFlags` (CPF_Edit,
+CPF_Net, CPF_BlueprintReadOnly, …) and metadata (MD_Tooltip,
+MD_FunctionCategory) then calling `MarkBlueprintAsStructurallyModified`
+without a follow-up compile leaves the BP's compiled class layout out
+of sync with the variable description. Next mutation crashes.
+
+**Rule**: Don't manually `MarkBlueprintAs*Modified` and then leave the
+BP uncompiled. Either (a) call `FKismetEditorUtilities::CompileBlueprint(BP)`
+after the mutation (UE-MCP pattern, what `set_variable_properties` now
+does), or (b) skip the manual Mark entirely and let a subsequent
+`bp.compile` do the structural reconcile. Mixing manual Mark with no
+compile = corrupt half-state.
+
 ## UE 5.7 — manually spawning UK2Node_FunctionEntry into a delegate signature graph CRASHES the editor
 
 **Symptom**: Adding a delegate signature graph via

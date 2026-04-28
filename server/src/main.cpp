@@ -1244,6 +1244,76 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // -- read+write — variable props + CDO + deps (Phase 4.2 round 2g/p5) --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.set_variable_properties",
+        .description = "Toggle BP member variable property flags + metadata. "
+                       "All optional bools layer onto FBPVariableDescription"
+                       "::PropertyFlags: instance_editable (CPF_Edit), "
+                       "blueprint_readonly (CPF_BlueprintReadOnly), "
+                       "replicated (CPF_Net; clears RepNotify on false), "
+                       "transient (CPF_Transient), save_game (CPF_SaveGame), "
+                       "expose_on_spawn (CPF_ExposeOnSpawn + MD_ExposeOnSpawn "
+                       "metadata). Strings: category (MD_FunctionCategory), "
+                       "tooltip (MD_Tooltip). PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",                {{"type", "string"}}},
+                {"name",                {{"type", "string"}}},
+                {"instance_editable",   {{"type", "boolean"}}},
+                {"blueprint_readonly",  {{"type", "boolean"}}},
+                {"replicated",          {{"type", "boolean"}}},
+                {"transient",           {{"type", "boolean"}}},
+                {"save_game",           {{"type", "boolean"}}},
+                {"expose_on_spawn",     {{"type", "boolean"}}},
+                {"category",            {{"type", "string"}}},
+                {"tooltip",             {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.get_cdo_properties",
+        .description = "Read the Class Default Object of any UClass — "
+                       "engine native (e.g. /Script/Engine.Actor) or BP-"
+                       "generated. Optional 'properties' array filters to "
+                       "specific names. Skips transient. Returns "
+                       "{class, class_name, properties: {...}, count}. "
+                       "Read-only.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"class",      {{"type", "string"}}},
+                {"properties", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+            }},
+            {"required", nlohmann::json::array({"class"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.get_dependencies",
+        .description = "Forward (default) or reverse (reverse=true) asset "
+                       "dependencies via AssetRegistry. Forward also "
+                       "enumerates class refs (parent + variable subtypes). "
+                       "Returns {dependencies[], dependency_count, "
+                       "referenced_classes[]} or {referencers[], "
+                       "referencer_count} depending on direction.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",    {{"type", "string"}}},
+                {"reverse", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // -- read+write — diagnostics + dry-run (Phase 4.2 round 2g/p4) --
     registerRemote(sage::mcp::Tool{
         .name = "bp.validate",

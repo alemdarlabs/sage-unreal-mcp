@@ -14,7 +14,7 @@
 | editor | 15 | 29 | 44 | 34 |
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
-| blueprint | 35 | 11 | 46 | 76 |
+| blueprint | 38 | 8 | 46 | 83 |
 | asset | 7 | 32 | 39 | 18 |
 | level | 10 | 22 | 32 | 31 |
 | niagara | 0 | 26 | 26 | 0 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **123** | **325** | **448** | **27** |
+| **TOTAL** | **126** | **322** | **448** | **28** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -249,10 +249,10 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [x] `blueprint.read_graph` → `bp.read_function_graph`
 - [ ] `blueprint.read_graph_summary` — Lightweight ~10KB summary · R
 - [x] `blueprint.get_execution_flow` → `bp.get_execution_flow`
-- [ ] `blueprint.get_dependencies` — Forward+reverse deps · R
+- [x] `blueprint.get_dependencies` → `bp.get_dependencies` (Phase 4.2-r2g/p5; AssetRegistry forward/reverse + class refs)
 - [x] `blueprint.create` → `bp.create` (Phase 4.2-r2f; UBlueprintFactory + IAssetTools::CreateAsset, idempotent, parent class short-name + full path)
 - [x] `blueprint.add_variable` → `bp.add_variable`
-- [ ] `blueprint.set_variable_properties` — Edit instance/BP props · W
+- [x] `blueprint.set_variable_properties` → `bp.set_variable_properties` (Phase 4.2-r2g/p5; instance_editable, blueprint_readonly, replicated, transient, save_game, expose_on_spawn, category, tooltip; calls CompileBlueprint at end)
 - [ ] `blueprint.create_function` — Create user fn · W
 - [x] `blueprint.delete_function` → `bp.delete_function`
 - [x] `blueprint.rename_function` → `bp.rename_function` (Phase 4.2-r2d)
@@ -293,7 +293,7 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [x] `blueprint.export_nodes_t3d` → `bp.export_nodes_t3d` (Phase 4.2-r2g/p2; FEdGraphUtilities::ExportNodesToText, optional node_ids filter)
 - [x] `blueprint.import_nodes_t3d` → `bp.import_nodes_t3d` (Phase 4.2-r2g/p2; CanImportNodesFromText pre-flight, fresh GUIDs, optional pos_x/pos_y re-center)
 - [x] `blueprint.set_cdo_property` → `bp.set_cdo_property`
-- [ ] `blueprint.get_cdo_properties` — Read C++ class CDO · R
+- [x] `blueprint.get_cdo_properties` → `bp.get_cdo_properties` (Phase 4.2-r2g/p5; class lookup short-name + full path, optional property filter)
 - [x] `blueprint.run_construction_script` → `bp.run_construction_script` (Phase 4.2-r2g/p4; transient SpawnActor + RerunConstructionScripts + DestroyActor; Actor-derived guard)
 
 **Phase 4.2 round 2 progress:**
