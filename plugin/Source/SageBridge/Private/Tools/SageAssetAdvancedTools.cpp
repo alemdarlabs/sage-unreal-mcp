@@ -20,6 +20,8 @@
 #include "Engine/DataAsset.h"
 #include "Materials/MaterialInterface.h"
 #include "Engine/DataTable.h"
+#include "AssetImportTask.h"
+#include "EditorReimportHandler.h"
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "FileHelpers.h"
@@ -502,6 +504,146 @@ FSageToolDispatch::FOutcome ReadAssetPropertiesImpl(const TSharedPtr<FJsonObject
     R->SetStringField(TEXT("class"),      Obj->GetClass()->GetName());
     R->SetObjectField(TEXT("properties"), Props);
     R->SetNumberField(TEXT("count"),      Count);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- asset.import_texture / asset.reimport ------------------------------
+// ---- (Phase 4.5 round 2 batch 7) -----------------------------------------
+
+FSageToolDispatch::FOutcome ImportTextureImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString FilePath, DestPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("file"), FilePath) || FilePath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'file'"));
+    }
+    if (!Args->TryGetStringField(TEXT("destination"), DestPath) || DestPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'destination'"));
+    }
+    if (!IFileManager::Get().FileExists(*FilePath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("source file not found: %s"), *FilePath));
+    }
+
+    bool bReplace = false;
+    Args->TryGetBoolField(TEXT("replace_existing"), bReplace);
+
+    // destination /Game/Foo/Bar.Bar form; split into dir + name
+    FString DestDir = DestPath, DestName;
+    int32 DotIdx = INDEX_NONE;
+    if (DestPath.FindChar(TEXT('.'), DotIdx))
+    {
+        DestDir = DestPath.Left(DotIdx);
+    }
+    int32 SlashIdx = INDEX_NONE;
+    if (DestDir.FindLastChar(TEXT('/'), SlashIdx))
+    {
+        DestName = DestDir.RightChop(SlashIdx + 1);
+        DestDir  = DestDir.Left(SlashIdx);
+    }
+    if (DestDir.IsEmpty() || DestName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("destination must be /Folder/AssetName form"));
+    }
+
+    UAssetImportTask* Task = NewObject<UAssetImportTask>();
+    Task->Filename         = FilePath;
+    Task->DestinationPath  = DestDir;
+    Task->DestinationName  = DestName;
+    Task->bAutomated       = true;
+    Task->bSave            = false;
+    Task->bReplaceExisting = bReplace;
+    Task->bReplaceExistingSettings = bReplace;
+
+    FAssetToolsModule& AssetToolsMod = FModuleManager::LoadModuleChecked<FAssetToolsModule>(
+        TEXT("AssetTools"));
+    IAssetTools& AssetTools = AssetToolsMod.Get();
+    TArray<UAssetImportTask*> Tasks; Tasks.Add(Task);
+    AssetTools.ImportAssetTasks(Tasks);
+
+    if (Task->ImportedObjectPaths.Num() == 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32000,
+            FString::Printf(TEXT("import failed for %s (no objects produced)"), *FilePath));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("source"),    FilePath);
+    R->SetStringField(TEXT("dest_dir"),  DestDir);
+    R->SetStringField(TEXT("dest_name"), DestName);
+    TArray<TSharedPtr<FJsonValue>> Imported;
+    for (const FString& P : Task->ImportedObjectPaths)
+    {
+        Imported.Add(MakeShared<FJsonValueString>(P));
+    }
+    R->SetArrayField(TEXT("imported"), Imported);
+    R->SetNumberField(TEXT("count"),   Imported.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ReimportImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UObject* Asset = ResolveAsset(Path);
+    if (!Asset) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("asset not found: %s"), *Path));
+
+    FString PreferredFile;
+    Args->TryGetStringField(TEXT("source_file"), PreferredFile);
+
+    FReimportManager* Mgr = FReimportManager::Instance();
+    if (!Mgr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("FReimportManager unavailable"));
+    }
+
+    TArray<FString> KnownSources;
+    if (!Mgr->CanReimport(Asset, &KnownSources))
+    {
+        if (PreferredFile.IsEmpty())
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("asset cannot be reimported (no source on file): %s"),
+                                *Asset->GetPathName()));
+        }
+    }
+
+    bool bOk = Mgr->Reimport(Asset,
+        /*bAskForNewFileIfMissing*/ false,
+        /*bShowNotification*/       false,
+        PreferredFile,
+        /*SpecifiedReimportHandler*/nullptr,
+        /*SourceFileIndex*/         INDEX_NONE,
+        /*bForceNewFile*/           !PreferredFile.IsEmpty(),
+        /*bAutomated*/              true);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),       Asset->GetPathName());
+    R->SetBoolField  (TEXT("reimported"), bOk);
+    if (!PreferredFile.IsEmpty())
+    {
+        R->SetStringField(TEXT("source_file"), PreferredFile);
+    }
+    TArray<TSharedPtr<FJsonValue>> Sources;
+    for (const FString& S : KnownSources)
+    {
+        Sources.Add(MakeShared<FJsonValueString>(S));
+    }
+    R->SetArrayField (TEXT("known_sources"), Sources);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1675,6 +1817,10 @@ void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("asset.read_datatable"),        GT(&ReadDataTableImpl));
     Dispatch.RegisterHandler(TEXT("asset.create_datatable"),      GT(&CreateDataTableImpl));
     Dispatch.RegisterHandler(TEXT("asset.reimport_datatable"),    GT(&ReimportDataTableImpl));
+
+    // Phase 4.5-r2 batch 7: import + reimport
+    Dispatch.RegisterHandler(TEXT("asset.import_texture"),        GT(&ImportTextureImpl));
+    Dispatch.RegisterHandler(TEXT("asset.reimport"),              GT(&ReimportImpl));
 
     // Write
     Dispatch.RegisterHandler(TEXT("asset.bulk_rename"),        GT(&BulkRenameImpl));

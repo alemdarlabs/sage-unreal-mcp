@@ -327,8 +327,8 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `asset.import_static_mesh` — From FBX/OBJ · W
 - [ ] `asset.import_skeletal_mesh` — From FBX · W
 - [ ] `asset.import_animation` — From FBX · W
-- [ ] `asset.import_texture` — From image · W
-- [ ] `asset.reimport` — Reimport from source · W
+- [x] `asset.import_texture` → `asset.import_texture` (Phase 4.5-r2-b7; UAssetImportTask + IAssetTools::ImportAssetTasks; bAutomated=true; PNG/TGA/JPG/EXR/HDR; replace_existing toggle)
+- [x] `asset.reimport` → `asset.reimport` (Phase 4.5-r2-b7; FReimportManager::Reimport(automated=true); optional source_file overrides saved path; reports known_sources)
 - [x] `asset.read_datatable` → `asset.read_datatable` (Phase 4.5-r2-b6; iterates RowStruct properties via Sage GetPropertyValueAtPtr; TArray/TMap/TSet/structs/enums round-tripped; max_rows clamped 1..100000)
 - [x] `asset.create_datatable` → `asset.create_datatable` (Phase 4.5-r2-b6; manual CreatePackage + NewObject<UDataTable> + RowStruct binding; rejects non-FTableRowBase; PIE rejected)
 - [x] `asset.reimport_datatable` → `asset.reimport_datatable` (Phase 4.5-r2-b6; UDataTable::CreateTableFromJSONString; inline 'json' or filesystem 'json_file'; clear_first toggle; reports problems[])

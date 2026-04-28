@@ -2524,6 +2524,50 @@ int main() {
         },
         .handler = nullptr, .remote = true,
     });
+    // Phase 4.5-r2 batch 7: import + reimport
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.import_texture",
+        .description = "Import an image file (PNG/TGA/JPG/EXR/HDR) "
+                       "into a UTexture2D via UAssetImportTask + "
+                       "IAssetTools::ImportAssetTasks. file = absolute "
+                       "path on disk; destination = '/Game/Folder/Name' "
+                       "or '/Game/Folder/Name.Name'. replace_existing "
+                       "(default false) overwrites a name collision. "
+                       "Returns {imported: [paths], dest_dir, dest_name}. "
+                       "PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"file",             {{"type", "string"}}},
+                {"destination",      {{"type", "string"}}},
+                {"replace_existing", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"file", "destination"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.reimport",
+        .description = "Reimport an asset from its source file via "
+                       "FReimportManager::Reimport. If source_file is "
+                       "given, that path overrides the saved source. "
+                       "Runs in bAutomated mode (no dialogs). Returns "
+                       "{reimported: bool, known_sources: [paths]}. "
+                       "Errors -32602 if the asset has no source on "
+                       "file AND no source_file is supplied. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",        {{"type", "string"}}},
+                {"source_file", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // Phase 4.5-r2 batch 6: datatable read/create/reimport
     registerRemote(sage::mcp::Tool{
         .name = "asset.read_datatable",
