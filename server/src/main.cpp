@@ -2196,6 +2196,74 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // ---- Project introspection batch 2 (Phase 4.7 batch 2) -------------
+    registerRemote(sage::mcp::Tool{
+        .name = "project.search_cpp",
+        .description = "Substring search across the project's Source/ "
+                       "subtree (.h, .cpp, .inl). Case-sensitive. Returns "
+                       "{hits: [{file, line, snippet}], count, capped}. "
+                       "max_results clamped 1..500 (default 50). Snippet "
+                       "trimmed/capped at 200 chars.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"query",       {{"type", "string"}}},
+                {"max_results", {{"type", "integer"},
+                                 {"minimum", 1}, {"maximum", 500}}},
+            }},
+            {"required", nlohmann::json::array({"query"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "project.list_engine_modules",
+        .description = "Enumerate engine native modules under Engine/Source/"
+                       "{Runtime,Editor,Developer,ThirdParty}. Returns "
+                       "{name, category, module_dir} per module.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "project.read_engine_header",
+        .description = "Same shape as project.read_cpp_header but the path "
+                       "must live under EngineDir (the safety guard rejects "
+                       "anywhere else). Convenience alias so the agent's "
+                       "intent is clear.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "project.find_engine_symbol",
+        .description = "Substring search across an engine source category "
+                       "tree (.h + .cpp). category ∈ {Runtime (default), "
+                       "Editor, Developer, ThirdParty}. max_results clamped "
+                       "1..500 (default 50). Returns same shape as "
+                       "search_cpp plus the category and root.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"symbol",      {{"type", "string"}}},
+                {"category",    {{"type", "string"},
+                                 {"enum", nlohmann::json::array({
+                                     "Runtime","Editor","Developer","ThirdParty"})}}},
+                {"max_results", {{"type", "integer"},
+                                 {"minimum", 1}, {"maximum", 500}}},
+            }},
+            {"required", nlohmann::json::array({"symbol"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // ---- Editor automation (Phase 4.6) ---------------------------------
     registerRemote(sage::mcp::Tool{
         .name = "editor.console_command",

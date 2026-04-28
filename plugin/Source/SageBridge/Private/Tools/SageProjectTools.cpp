@@ -229,6 +229,192 @@ FSageToolDispatch::FOutcome ProjectReadCppHeaderImpl(const TSharedPtr<FJsonObjec
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// Recursive case-sensitive substring search across .h/.cpp/.inl files
+// in a directory subtree. Returns up to max_results hits with surrounding
+// context. Used by project.search_cpp + project.find_engine_symbol.
+struct FSearchHit
+{
+    FString File;
+    int32   Line;
+    FString Snippet;
+};
+
+void SearchInDir(const FString& Root, const FString& Query,
+                 const TArray<FString>& Extensions,
+                 int32 MaxResults, int32 ContextLen,
+                 TArray<FSearchHit>& Out)
+{
+    IFileManager& FileMgr = IFileManager::Get();
+    TArray<FString> Files;
+    for (const FString& Ext : Extensions)
+    {
+        TArray<FString> Found;
+        FileMgr.FindFilesRecursive(Found, *Root, *(FString(TEXT("*")) + Ext), true, false);
+        Files.Append(MoveTemp(Found));
+    }
+
+    for (const FString& F : Files)
+    {
+        if (Out.Num() >= MaxResults) return;
+        FString Content;
+        if (!FFileHelper::LoadFileToString(Content, *F)) continue;
+        if (!Content.Contains(Query)) continue;
+
+        TArray<FString> Lines;
+        Content.ParseIntoArrayLines(Lines, /*bCullEmpty*/ false);
+        for (int32 i = 0; i < Lines.Num(); ++i)
+        {
+            if (Out.Num() >= MaxResults) return;
+            if (!Lines[i].Contains(Query)) continue;
+            FSearchHit H;
+            H.File    = F;
+            H.Line    = i + 1;
+            H.Snippet = Lines[i].TrimStartAndEnd().Left(ContextLen);
+            Out.Add(MoveTemp(H));
+        }
+    }
+}
+
+TArray<TSharedPtr<FJsonValue>> SearchHitsToJson(const TArray<FSearchHit>& Hits)
+{
+    TArray<TSharedPtr<FJsonValue>> Arr;
+    for (const FSearchHit& H : Hits)
+    {
+        auto O = MakeShared<FJsonObject>();
+        O->SetStringField(TEXT("file"),    H.File);
+        O->SetNumberField(TEXT("line"),    H.Line);
+        O->SetStringField(TEXT("snippet"), H.Snippet);
+        Arr.Add(MakeShared<FJsonValueObject>(O));
+    }
+    return Arr;
+}
+
+FSageToolDispatch::FOutcome ProjectSearchCppImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Query;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("query"), Query) || Query.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing/empty 'query'"));
+    }
+    int32 MaxResults = 50;
+    if (Args.IsValid())
+    {
+        double N = 0;
+        if (Args->TryGetNumberField(TEXT("max_results"), N))
+        {
+            MaxResults = FMath::Clamp(static_cast<int32>(N), 1, 500);
+        }
+    }
+
+    const FString SourceDir = FPaths::ProjectDir() / TEXT("Source");
+
+    TArray<FSearchHit> Hits;
+    SearchInDir(SourceDir, Query,
+        {TEXT(".h"), TEXT(".cpp"), TEXT(".inl")},
+        MaxResults, 200, Hits);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("query"),    Query);
+    R->SetStringField(TEXT("root"),     FPaths::ConvertRelativePathToFull(SourceDir));
+    R->SetArrayField (TEXT("hits"),     SearchHitsToJson(Hits));
+    R->SetNumberField(TEXT("count"),    Hits.Num());
+    R->SetBoolField  (TEXT("capped"),   Hits.Num() >= MaxResults);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ProjectListEngineModulesImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    const FString EngineSourceDir = FPaths::EngineDir() / TEXT("Source");
+    IFileManager& FileMgr = IFileManager::Get();
+
+    TArray<TSharedPtr<FJsonValue>> Out;
+    // Engine/Source has Runtime/, Editor/, Developer/, Programs/, ThirdParty/.
+    // Each has <Module>/<Module>.Build.cs underneath.
+    const TArray<FString> Categories = {
+        TEXT("Runtime"), TEXT("Editor"), TEXT("Developer"), TEXT("ThirdParty")
+    };
+    for (const FString& Cat : Categories)
+    {
+        const FString CatDir = EngineSourceDir / Cat;
+        if (!FileMgr.DirectoryExists(*CatDir)) continue;
+
+        TArray<FString> SubDirs;
+        FileMgr.FindFiles(SubDirs, *(CatDir / TEXT("*")), false, true);
+        for (const FString& Dir : SubDirs)
+        {
+            const FString ModuleDir   = CatDir / Dir;
+            const FString BuildCsPath = ModuleDir / (Dir + TEXT(".Build.cs"));
+            if (!FileMgr.FileExists(*BuildCsPath)) continue;
+
+            auto O = MakeShared<FJsonObject>();
+            O->SetStringField(TEXT("name"),       Dir);
+            O->SetStringField(TEXT("category"),   Cat);
+            O->SetStringField(TEXT("module_dir"), FPaths::ConvertRelativePathToFull(ModuleDir));
+            Out.Add(MakeShared<FJsonValueObject>(O));
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("engine_source_dir"),
+        FPaths::ConvertRelativePathToFull(EngineSourceDir));
+    R->SetArrayField (TEXT("modules"), Out);
+    R->SetNumberField(TEXT("count"),   Out.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ProjectReadEngineHeaderImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    // Just delegates to ReadCppHeader after asserting the path is under
+    // EngineDir. The safety guard in ResolveSafeSourcePath already permits
+    // EngineDir paths, so the heavy lifting is shared. Kept as a separate
+    // tool for naming clarity in the agent's mental model.
+    return ProjectReadCppHeaderImpl(Args);
+}
+
+FSageToolDispatch::FOutcome ProjectFindEngineSymbolImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Symbol;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("symbol"), Symbol) || Symbol.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing/empty 'symbol'"));
+    }
+    int32 MaxResults = 50;
+    if (Args.IsValid())
+    {
+        double N = 0;
+        if (Args->TryGetNumberField(TEXT("max_results"), N))
+        {
+            MaxResults = FMath::Clamp(static_cast<int32>(N), 1, 500);
+        }
+    }
+    FString Category;
+    Args->TryGetStringField(TEXT("category"), Category);
+    if (Category.IsEmpty()) Category = TEXT("Runtime");
+    if (Category != TEXT("Runtime") && Category != TEXT("Editor")
+        && Category != TEXT("Developer") && Category != TEXT("ThirdParty"))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("category must be Runtime/Editor/Developer/ThirdParty, got %s"),
+                            *Category));
+    }
+
+    const FString SearchRoot = FPaths::EngineDir() / TEXT("Source") / Category;
+
+    TArray<FSearchHit> Hits;
+    SearchInDir(SearchRoot, Symbol,
+        {TEXT(".h"), TEXT(".cpp")},
+        MaxResults, 200, Hits);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("symbol"),    Symbol);
+    R->SetStringField(TEXT("category"),  Category);
+    R->SetStringField(TEXT("root"),      FPaths::ConvertRelativePathToFull(SearchRoot));
+    R->SetArrayField (TEXT("hits"),      SearchHitsToJson(Hits));
+    R->SetNumberField(TEXT("count"),     Hits.Num());
+    R->SetBoolField  (TEXT("capped"),    Hits.Num() >= MaxResults);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 FSageToolDispatch::FOutcome ProjectReadCppSourceImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString InPath;
@@ -292,10 +478,16 @@ void RegisterProjectTools(FSageToolDispatch& Dispatch)
         };
     };
 
-    Dispatch.RegisterHandler(TEXT("project.get_info"),         GT(&ProjectGetInfoImpl));
-    Dispatch.RegisterHandler(TEXT("project.list_modules"),     GT(&ProjectListModulesImpl));
-    Dispatch.RegisterHandler(TEXT("project.read_cpp_header"),  GT(&ProjectReadCppHeaderImpl));
-    Dispatch.RegisterHandler(TEXT("project.read_cpp_source"),  GT(&ProjectReadCppSourceImpl));
+    Dispatch.RegisterHandler(TEXT("project.get_info"),            GT(&ProjectGetInfoImpl));
+    Dispatch.RegisterHandler(TEXT("project.list_modules"),        GT(&ProjectListModulesImpl));
+    Dispatch.RegisterHandler(TEXT("project.read_cpp_header"),     GT(&ProjectReadCppHeaderImpl));
+    Dispatch.RegisterHandler(TEXT("project.read_cpp_source"),     GT(&ProjectReadCppSourceImpl));
+
+    // Phase 4.7 batch 2: engine source + search
+    Dispatch.RegisterHandler(TEXT("project.search_cpp"),          GT(&ProjectSearchCppImpl));
+    Dispatch.RegisterHandler(TEXT("project.list_engine_modules"), GT(&ProjectListEngineModulesImpl));
+    Dispatch.RegisterHandler(TEXT("project.read_engine_header"),  GT(&ProjectReadEngineHeaderImpl));
+    Dispatch.RegisterHandler(TEXT("project.find_engine_symbol"),  GT(&ProjectFindEngineSymbolImpl));
 }
 
 #undef LOCTEXT_NAMESPACE

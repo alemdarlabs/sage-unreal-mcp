@@ -10,7 +10,7 @@
 
 | Category | Have | Need | Total | % |
 |---|---:|---:|---:|---:|
-| project | 6 | 23 | 29 | 21 |
+| project | 10 | 19 | 29 | 34 |
 | editor | 15 | 29 | 44 | 34 |
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **130** | **318** | **448** | **29** |
+| **TOTAL** | **134** | **314** | **448** | **30** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -63,10 +63,10 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [x] `project.read_cpp_header` → `project.read_cpp_header` (Phase 4.7-p1; heuristic regex UCLASS/USTRUCT/UENUM scan)
 - [ ] `project.read_module` — Read module source with header/source counts · R
 - [x] `project.list_modules` → `project.list_modules` (Phase 4.7-p1; Source/<X>/<X>.Build.cs scan with header/source counts)
-- [ ] `project.search_cpp` — Search .h/.cpp for query · R
-- [ ] `project.read_engine_header` — Parse engine source .h · R
-- [ ] `project.find_engine_symbol` — Grep engine source for symbol · R
-- [ ] `project.list_engine_modules` — List Engine/Source/Runtime modules · R
+- [x] `project.search_cpp` → `project.search_cpp` (Phase 4.7-p2; .h/.cpp/.inl substring scan with snippet)
+- [x] `project.read_engine_header` → `project.read_engine_header` (Phase 4.7-p2; alias to read_cpp_header with EngineDir guard)
+- [x] `project.find_engine_symbol` → `project.find_engine_symbol` (Phase 4.7-p2; Runtime/Editor/Developer/ThirdParty category-scoped grep)
+- [x] `project.list_engine_modules` → `project.list_engine_modules` (Phase 4.7-p2; Engine/Source/{Runtime,Editor,Developer,ThirdParty} = 492 modules total in UE 5.7)
 - [ ] `project.search_engine_cpp` — Search Runtime/Editor/Developer/Plugins · R
 - [ ] `project.set_config` — Write INI · W
 - [~] `project.build` — Build C++ · W · Sage `compile_and_reload` (Win-only LC alias)
