@@ -1244,6 +1244,76 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // -- read+write — function parameter I/O (Phase 4.2 round 2e) --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.list_function_parameters",
+        .description = "Enumerate user-defined input/output parameters on "
+                       "a BP function. Inputs come from "
+                       "UK2Node_FunctionEntry::UserDefinedPins, outputs "
+                       "from UK2Node_FunctionResult::UserDefinedPins (may "
+                       "be empty if no FunctionResult node yet). Returns "
+                       "{inputs: [{name, type, direction, type_object?, "
+                       "is_array?, default_value?}], outputs: [...], "
+                       "input_count, output_count}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"function", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "function"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.add_function_parameter",
+        .description = "Add a parameter (input or output) to a BP function "
+                       "via UK2Node_EditablePinBase::CreateUserDefinedPin. "
+                       "direction='input' (default) targets FunctionEntry, "
+                       "'output' targets FunctionResult (auto-spawned if "
+                       "the function has no result node yet). Same type "
+                       "shape as bp.add_variable. -32602 on duplicate name. "
+                       "PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",        {{"type", "string"}}},
+                {"function",    {{"type", "string"}}},
+                {"name",        {{"type", "string"}}},
+                {"type",        {{"type", "string"}}},
+                {"direction",   {{"type", "string"},
+                                 {"enum", nlohmann::json::array({"input","output"})}}},
+                {"type_object", {{"type", "string"}}},
+                {"is_array",    {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"path","function","name","type"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.remove_function_parameter",
+        .description = "Remove a parameter from a BP function via "
+                       "RemoveUserDefinedPinByName on the appropriate "
+                       "Entry / Result node. direction='input' (default) "
+                       "or 'output'. Returns {removed: 0|1} (idempotent — "
+                       "0 when name absent or no result node). PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",      {{"type", "string"}}},
+                {"function",  {{"type", "string"}}},
+                {"name",      {{"type", "string"}}},
+                {"direction", {{"type", "string"},
+                               {"enum", nlohmann::json::array({"input","output"})}}},
+            }},
+            {"required", nlohmann::json::array({"path","function","name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // -- read+write — graph management (Phase 4.2 round 2d) --
     registerRemote(sage::mcp::Tool{
         .name = "bp.list_graphs",

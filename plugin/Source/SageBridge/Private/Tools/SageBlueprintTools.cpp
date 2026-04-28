@@ -17,8 +17,10 @@
 #include "K2Node.h"
 #include "K2Node_CallFunction.h"
 #include "K2Node_CustomEvent.h"
+#include "K2Node_EditablePinBase.h"
 #include "K2Node_Event.h"
 #include "K2Node_FunctionEntry.h"
+#include "K2Node_FunctionResult.h"
 #include "K2Node_IfThenElse.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
@@ -168,6 +170,19 @@ UEdGraphPin* FindPin(UEdGraphNode* Node, const FString& PinName)
     for (UEdGraphPin* Pin : Node->Pins)
     {
         if (Pin && Pin->GetName() == PinName) return Pin;
+    }
+    return nullptr;
+}
+
+UK2Node_FunctionEntry* FindFunctionEntry(UEdGraph* Graph)
+{
+    if (!Graph) return nullptr;
+    for (UEdGraphNode* N : Graph->Nodes)
+    {
+        if (UK2Node_FunctionEntry* Entry = Cast<UK2Node_FunctionEntry>(N))
+        {
+            return Entry;
+        }
     }
     return nullptr;
 }
@@ -811,6 +826,281 @@ FSageToolDispatch::FOutcome BpConnectPinsImpl(const TSharedPtr<FJsonObject>& Arg
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- bp.list_function_parameters + bp.add_function_parameter + ------------
+// ---- bp.remove_function_parameter  (Phase 4.2 round 2e) ------------------
+
+UK2Node_FunctionResult* FindOrCreateFunctionResult(UEdGraph* Graph,
+                                                    UK2Node_FunctionEntry* Entry,
+                                                    bool bAllowCreate)
+{
+    if (!Graph) return nullptr;
+    for (UEdGraphNode* N : Graph->Nodes)
+    {
+        if (UK2Node_FunctionResult* R = Cast<UK2Node_FunctionResult>(N))
+        {
+            return R;
+        }
+    }
+    if (!bAllowCreate) return nullptr;
+
+    // Auto-spawn FunctionResult to the right of Entry. UE displays it in
+    // the function graph automatically once added; agent can wire return
+    // pins via bp.connect_pins.
+    UK2Node_FunctionResult* New = NewObject<UK2Node_FunctionResult>(Graph);
+    Graph->AddNode(New, /*bSelectNewNode*/ false, /*bUpdateGraphCount*/ true);
+    New->CreateNewGuid();
+    if (Entry)
+    {
+        New->NodePosX = Entry->NodePosX + 400;
+        New->NodePosY = Entry->NodePosY;
+        // Match function reference so the result node is correctly bound
+        // to the same function.
+        New->FunctionReference = Entry->FunctionReference;
+    }
+    New->AllocateDefaultPins();
+    New->PostPlacedNewNode();
+    return New;
+}
+
+TSharedRef<FJsonObject> FunctionParamToJson(const TSharedPtr<FUserPinInfo>& Info,
+                                             const TCHAR* Direction)
+{
+    auto O = MakeShared<FJsonObject>();
+    O->SetStringField(TEXT("name"),      Info->PinName.ToString());
+    O->SetStringField(TEXT("type"),      Info->PinType.PinCategory.ToString());
+    O->SetStringField(TEXT("direction"), Direction);
+    if (Info->PinType.PinSubCategoryObject.IsValid())
+    {
+        O->SetStringField(TEXT("type_object"),
+            Info->PinType.PinSubCategoryObject->GetName());
+    }
+    if (Info->PinType.IsArray()) O->SetBoolField(TEXT("is_array"), true);
+    if (Info->PinType.IsMap())   O->SetBoolField(TEXT("is_map"),   true);
+    if (Info->PinType.IsSet())   O->SetBoolField(TEXT("is_set"),   true);
+    if (!Info->PinDefaultValue.IsEmpty())
+    {
+        O->SetStringField(TEXT("default_value"), Info->PinDefaultValue);
+    }
+    return O;
+}
+
+FSageToolDispatch::FOutcome BpListFunctionParametersImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, FnName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("function"), FnName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path' or 'function'"));
+    }
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    UEdGraph* Graph = FindFunctionGraph(BP, FnName);
+    if (!Graph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("graph not found"));
+
+    TArray<TSharedPtr<FJsonValue>> Inputs, Outputs;
+
+    if (UK2Node_FunctionEntry* Entry = FindFunctionEntry(Graph))
+    {
+        for (const TSharedPtr<FUserPinInfo>& Info : Entry->UserDefinedPins)
+        {
+            if (Info.IsValid())
+                Inputs.Add(MakeShared<FJsonValueObject>(
+                    FunctionParamToJson(Info, TEXT("input"))));
+        }
+    }
+    if (UK2Node_FunctionResult* Result = FindOrCreateFunctionResult(Graph, nullptr, /*allow_create*/ false))
+    {
+        for (const TSharedPtr<FUserPinInfo>& Info : Result->UserDefinedPins)
+        {
+            if (Info.IsValid())
+                Outputs.Add(MakeShared<FJsonValueObject>(
+                    FunctionParamToJson(Info, TEXT("output"))));
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"),  BP->GetName());
+    R->SetStringField(TEXT("function"),   FnName);
+    R->SetArrayField (TEXT("inputs"),     Inputs);
+    R->SetArrayField (TEXT("outputs"),    Outputs);
+    R->SetNumberField(TEXT("input_count"),  Inputs.Num());
+    R->SetNumberField(TEXT("output_count"), Outputs.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpAddFunctionParameterImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, FnName, ParamName, TypeStr, DirStr;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("function"), FnName)
+        || !Args->TryGetStringField(TEXT("name"), ParamName)
+        || !Args->TryGetStringField(TEXT("type"), TypeStr))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'function', 'name', or 'type'"));
+    }
+    Args->TryGetStringField(TEXT("direction"), DirStr);
+    if (DirStr.IsEmpty()) DirStr = TEXT("input");
+    const bool bIsOutput = DirStr.Equals(TEXT("output"), ESearchCase::IgnoreCase);
+    if (!bIsOutput && !DirStr.Equals(TEXT("input"), ESearchCase::IgnoreCase))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("direction must be 'input' or 'output'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    UEdGraph* Graph = FindFunctionGraph(BP, FnName);
+    if (!Graph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("graph not found"));
+    UK2Node_FunctionEntry* Entry = FindFunctionEntry(Graph);
+    if (!Entry) return FSageToolDispatch::FOutcome::MakeError(-32603,
+        TEXT("function entry node not found"));
+
+    FEdGraphPinType PinType;
+    PinType.PinCategory = FName(*TypeStr);
+    if (Args->HasField(TEXT("type_object")))
+    {
+        FString TypeObj;
+        Args->TryGetStringField(TEXT("type_object"), TypeObj);
+        PinType.PinSubCategoryObject = FindObject<UObject>(nullptr, *TypeObj);
+    }
+    if (Args->HasField(TEXT("is_array")))
+    {
+        bool bArr = false;
+        Args->TryGetBoolField(TEXT("is_array"), bArr);
+        if (bArr) PinType.ContainerType = EPinContainerType::Array;
+    }
+
+    UK2Node_EditablePinBase* TargetNode = nullptr;
+    // Direction relative to the underlying node:
+    //   input parameter  → entry node's OUTPUT pin
+    //   output parameter → result node's INPUT pin
+    EEdGraphPinDirection PinDir;
+    if (bIsOutput)
+    {
+        TargetNode = FindOrCreateFunctionResult(Graph, Entry, /*allow_create*/ true);
+        if (!TargetNode) return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("could not create FunctionResult node"));
+        PinDir = EGPD_Input;
+    }
+    else
+    {
+        TargetNode = Entry;
+        PinDir = EGPD_Output;
+    }
+
+    // Idempotency
+    const FName PName(*ParamName);
+    for (const TSharedPtr<FUserPinInfo>& Info : TargetNode->UserDefinedPins)
+    {
+        if (Info.IsValid() && Info->PinName == PName)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("parameter already exists: %s (%s)"),
+                                *ParamName, *DirStr));
+        }
+    }
+
+    FScopedTransaction Tx(LOCTEXT("BpAddFnParam", "Sage: Add BP Function Parameter"));
+    TargetNode->Modify();
+    UEdGraphPin* NewPin = TargetNode->CreateUserDefinedPin(PName, PinType, PinDir);
+    if (!NewPin)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("CreateUserDefinedPin returned nullptr"));
+    }
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetStringField(TEXT("function"),  FnName);
+    R->SetStringField(TEXT("name"),      ParamName);
+    R->SetStringField(TEXT("type"),      TypeStr);
+    R->SetStringField(TEXT("direction"), bIsOutput ? TEXT("output") : TEXT("input"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpRemoveFunctionParameterImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, FnName, ParamName, DirStr;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("function"), FnName)
+        || !Args->TryGetStringField(TEXT("name"), ParamName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'function', or 'name'"));
+    }
+    Args->TryGetStringField(TEXT("direction"), DirStr);
+    if (DirStr.IsEmpty()) DirStr = TEXT("input");
+    const bool bIsOutput = DirStr.Equals(TEXT("output"), ESearchCase::IgnoreCase);
+    if (!bIsOutput && !DirStr.Equals(TEXT("input"), ESearchCase::IgnoreCase))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("direction must be 'input' or 'output'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    UEdGraph* Graph = FindFunctionGraph(BP, FnName);
+    if (!Graph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("graph not found"));
+
+    UK2Node_EditablePinBase* TargetNode = nullptr;
+    if (bIsOutput)
+    {
+        TargetNode = FindOrCreateFunctionResult(Graph, nullptr, /*allow_create*/ false);
+    }
+    else
+    {
+        TargetNode = FindFunctionEntry(Graph);
+    }
+    if (!TargetNode)
+    {
+        // No entry/result node = no params to remove (idempotent).
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("blueprint"), BP->GetName());
+        R->SetStringField(TEXT("function"),  FnName);
+        R->SetStringField(TEXT("name"),      ParamName);
+        R->SetNumberField(TEXT("removed"),   0);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    const FName PName(*ParamName);
+    int32 Existed = 0;
+    for (const TSharedPtr<FUserPinInfo>& Info : TargetNode->UserDefinedPins)
+    {
+        if (Info.IsValid() && Info->PinName == PName) { Existed = 1; break; }
+    }
+
+    if (Existed == 0)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("blueprint"), BP->GetName());
+        R->SetStringField(TEXT("function"),  FnName);
+        R->SetStringField(TEXT("name"),      ParamName);
+        R->SetNumberField(TEXT("removed"),   0);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("BpRemFnParam", "Sage: Remove BP Function Parameter"));
+    TargetNode->Modify();
+    TargetNode->RemoveUserDefinedPinByName(PName);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetStringField(TEXT("function"),  FnName);
+    R->SetStringField(TEXT("name"),      ParamName);
+    R->SetStringField(TEXT("direction"), bIsOutput ? TEXT("output") : TEXT("input"));
+    R->SetNumberField(TEXT("removed"),   1);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---- bp.list_graphs + bp.rename_function (Phase 4.2 round 2d) -------------
 
 FSageToolDispatch::FOutcome BpListGraphsImpl(const TSharedPtr<FJsonObject>& Args)
@@ -1049,19 +1339,7 @@ FSageToolDispatch::FOutcome BpRemoveInterfaceImpl(const TSharedPtr<FJsonObject>&
 
 // ---- bp.list_local_variables + bp.add_local_variable + --------------------
 // ---- bp.delete_local_variable  (Phase 4.2 round 2b) -----------------------
-
-UK2Node_FunctionEntry* FindFunctionEntry(UEdGraph* Graph)
-{
-    if (!Graph) return nullptr;
-    for (UEdGraphNode* N : Graph->Nodes)
-    {
-        if (UK2Node_FunctionEntry* Entry = Cast<UK2Node_FunctionEntry>(N))
-        {
-            return Entry;
-        }
-    }
-    return nullptr;
-}
+// (FindFunctionEntry helper hoisted above r2e function-parameter handlers)
 
 FSageToolDispatch::FOutcome BpListLocalVariablesImpl(const TSharedPtr<FJsonObject>& Args)
 {
@@ -1588,6 +1866,11 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
     // Read+Write — graph management (Phase 4.2 round 2d)
     Dispatch.RegisterHandler(TEXT("bp.list_graphs"),          GT(&BpListGraphsImpl));
     Dispatch.RegisterHandler(TEXT("bp.rename_function"),      GT(&BpRenameFunctionImpl));
+
+    // Read+Write — function parameter I/O (Phase 4.2 round 2e)
+    Dispatch.RegisterHandler(TEXT("bp.list_function_parameters"),   GT(&BpListFunctionParametersImpl));
+    Dispatch.RegisterHandler(TEXT("bp.add_function_parameter"),     GT(&BpAddFunctionParameterImpl));
+    Dispatch.RegisterHandler(TEXT("bp.remove_function_parameter"),  GT(&BpRemoveFunctionParameterImpl));
 
     // Write — functions
     Dispatch.RegisterHandler(TEXT("bp.add_function"),        GT(&BpAddFunctionImpl));

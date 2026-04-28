@@ -266,6 +266,24 @@ Confirmed live in SageTest UE 5.7.4: hook fires on `FMessageDialog::Open`
 calls; auto-respond + default-response paths both verified via
 LogSageBridge.
 
+## C++ — helper hoisting when growing a single-TU plugin file
+
+**Symptom**: Adding a new handler section above an existing one that uses
+a helper defined further down in the same TU fails with
+"use of undeclared identifier" (e.g. `FindFunctionEntry` defined in r2b
+section, used in newly added r2e section above it). UE-MCP-style monolithic
+TUs are common in the Sage plugin (SageBlueprintTools.cpp >1000 LoC).
+
+**Rule**: When a helper crosses two or more handler sections, hoist its
+*definition* into the file's "common helpers" block at the top (where
+`ResolveBlueprint` / `FindFunctionGraph` / `FindNodeByGuid` / `FindPin`
+live in SageBlueprintTools.cpp). Cheaper than forward declarations, and
+keeps the helper logically grouped with its peers.
+
+**How to spot it**: a `grep -n "^Type\* FuncName\|FuncName(" file.cpp`
+shows multiple call sites but only one definition far below. If the
+definition line number is greater than ANY call site, hoist it.
+
 ## UE 5.7 — Slate modal click sim needs InputCore + ApplicationCore in Build.cs
 
 **Symptom**: `FPointerEvent` constructor + `FKeyEvent(EKeys::Escape, ...)`
