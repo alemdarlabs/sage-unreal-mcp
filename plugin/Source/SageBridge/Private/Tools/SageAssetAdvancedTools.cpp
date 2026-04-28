@@ -17,9 +17,11 @@
 #include "Engine/SkeletalMeshSocket.h"
 #include "Engine/Texture.h"
 #include "Engine/Texture2D.h"
+#include "Engine/DataAsset.h"
 #include "FileHelpers.h"
 #include "IAssetTools.h"
 #include "Modules/ModuleManager.h"
+#include "PackageTools.h"
 #include "PhysicsEngine/BodySetup.h"
 #include "ScopedTransaction.h"
 #include "Subsystems/EditorAssetSubsystem.h"
@@ -496,6 +498,195 @@ FSageToolDispatch::FOutcome ReadAssetPropertiesImpl(const TSharedPtr<FJsonObject
     R->SetStringField(TEXT("class"),      Obj->GetClass()->GetName());
     R->SetObjectField(TEXT("properties"), Props);
     R->SetNumberField(TEXT("count"),      Count);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- asset.create_data_asset / asset.delete_batch / asset.reload_package
+// ---- (Phase 4.5 round 2 batch 4: write essentials) -----------------------
+
+FSageToolDispatch::FOutcome CreateDataAssetImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, ClassPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("class"), ClassPath) || ClassPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'class'"));
+    }
+
+    UClass* Cls = FindObject<UClass>(nullptr, *ClassPath);
+    if (!Cls)
+    {
+        Cls = LoadObject<UClass>(nullptr, *ClassPath);
+    }
+    if (!Cls)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("class not found: %s"), *ClassPath));
+    }
+    if (!Cls->IsChildOf(UDataAsset::StaticClass()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("class %s is not a UDataAsset"), *Cls->GetName()));
+    }
+    if (Cls->HasAnyClassFlags(CLASS_Deprecated | CLASS_NewerVersionExists))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("class %s is deprecated"), *Cls->GetName()));
+    }
+
+    // Split /Game/Foo/Bar/MyAsset into PackagePath=/Game/Foo/Bar AssetName=MyAsset
+    FString PackagePath, AssetName;
+    if (!Path.Split(TEXT("/"), &PackagePath, &AssetName, ESearchCase::IgnoreCase, ESearchDir::FromEnd))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("path must include directory: %s"), *Path));
+    }
+    if (PackagePath.IsEmpty() || AssetName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("path must be /Folder/AssetName form"));
+    }
+
+    if (FindPackage(nullptr, *(PackagePath / AssetName)))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("package already exists: %s/%s"), *PackagePath, *AssetName));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("CreateDataAsset", "Create Data Asset"));
+    UPackage* Pkg = CreatePackage(*(PackagePath / AssetName));
+    if (!Pkg)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32000,
+            FString::Printf(TEXT("CreatePackage failed for %s/%s"), *PackagePath, *AssetName));
+    }
+    Pkg->FullyLoad();
+    Pkg->Modify();
+
+    UObject* Created = NewObject<UObject>(Pkg, Cls, *AssetName,
+        RF_Public | RF_Standalone | RF_Transactional);
+    if (!Created)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32000,
+            FString::Printf(TEXT("NewObject failed for %s"), *Cls->GetName()));
+    }
+    FAssetRegistryModule::AssetCreated(Created);
+    Created->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),  Created->GetPathName());
+    R->SetStringField(TEXT("class"), Created->GetClass()->GetName());
+    R->SetStringField(TEXT("name"),  Created->GetName());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome DeleteBatchImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    if (!Args.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing args"));
+    }
+    const TArray<TSharedPtr<FJsonValue>>* PathsArr = nullptr;
+    if (!Args->TryGetArrayField(TEXT("paths"), PathsArr) || !PathsArr || PathsArr->Num() == 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing/empty 'paths'"));
+    }
+
+    if (GEditor == nullptr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
+    }
+    UEditorAssetSubsystem* Sub = GEditor->GetEditorSubsystem<UEditorAssetSubsystem>();
+    if (!Sub)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("UEditorAssetSubsystem unavailable"));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("DeleteBatch", "Delete Asset Batch"));
+    TArray<TSharedPtr<FJsonValue>> Results;
+    int32 Deleted = 0, Missing = 0, Failed = 0;
+    for (const TSharedPtr<FJsonValue>& V : *PathsArr)
+    {
+        FString P;
+        if (!V.IsValid() || !V->TryGetString(P) || P.IsEmpty()) continue;
+        auto E = MakeShared<FJsonObject>();
+        E->SetStringField(TEXT("path"), P);
+        if (!Sub->DoesAssetExist(P))
+        {
+            E->SetStringField(TEXT("status"), TEXT("missing"));
+            ++Missing;
+        }
+        else if (Sub->DeleteAsset(P))
+        {
+            E->SetStringField(TEXT("status"), TEXT("deleted"));
+            ++Deleted;
+        }
+        else
+        {
+            E->SetStringField(TEXT("status"), TEXT("failed"));
+            ++Failed;
+        }
+        Results.Add(MakeShared<FJsonValueObject>(E));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetArrayField (TEXT("results"), Results);
+    R->SetNumberField(TEXT("deleted"), Deleted);
+    R->SetNumberField(TEXT("missing"), Missing);
+    R->SetNumberField(TEXT("failed"),  Failed);
+    R->SetNumberField(TEXT("total"),   PathsArr->Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ReloadPackageImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+
+    // Path can be /Game/Foo/Bar.Bar or /Game/Foo/Bar — strip object name if present
+    FString PackageName = Path;
+    int32 DotIdx = INDEX_NONE;
+    if (PackageName.FindChar(TEXT('.'), DotIdx))
+    {
+        PackageName = PackageName.Left(DotIdx);
+    }
+
+    UPackage* Pkg = FindPackage(nullptr, *PackageName);
+    if (!Pkg)
+    {
+        Pkg = LoadPackage(nullptr, *PackageName, LOAD_None);
+    }
+    if (!Pkg)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("package not found: %s"), *PackageName));
+    }
+
+    TArray<UPackage*> ToReload;
+    ToReload.Add(Pkg);
+    UPackageTools::ReloadPackages(ToReload);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("package"),  PackageName);
+    R->SetStringField(TEXT("status"),   TEXT("reloaded"));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1051,6 +1242,11 @@ void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("asset.list_textures"),         GT(&ListTexturesImpl));
     Dispatch.RegisterHandler(TEXT("asset.get_texture_info"),      GT(&GetTextureInfoImpl));
     Dispatch.RegisterHandler(TEXT("asset.set_texture_settings"),  GT(&SetTextureSettingsImpl));
+
+    // Phase 4.5-r2 batch 4: write essentials
+    Dispatch.RegisterHandler(TEXT("asset.create_data_asset"),     GT(&CreateDataAssetImpl));
+    Dispatch.RegisterHandler(TEXT("asset.delete_batch"),          GT(&DeleteBatchImpl));
+    Dispatch.RegisterHandler(TEXT("asset.reload_package"),        GT(&ReloadPackageImpl));
 
     // Write
     Dispatch.RegisterHandler(TEXT("asset.bulk_rename"),        GT(&BulkRenameImpl));

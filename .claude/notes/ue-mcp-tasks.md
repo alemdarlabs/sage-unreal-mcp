@@ -319,8 +319,8 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [x] `asset.bulk_rename` → `asset.bulk_rename`
 - [x] `asset.move` → `move_asset`
 - [x] `asset.delete` → `delete_asset`
-- [ ] `asset.delete_batch` — Batch with status · W
-- [ ] `asset.create_data_asset` — DataAsset instance · W
+- [x] `asset.delete_batch` → `asset.delete_batch` (Phase 4.5-r2-b4; UEditorAssetSubsystem::DeleteAsset per path inside one FScopedTransaction; missing paths soft-tolerated; returns deleted/missing/failed/total)
+- [x] `asset.create_data_asset` → `asset.create_data_asset` (Phase 4.5-r2-b4; manual CreatePackage + NewObject<UObject>(Pkg, Cls) — no AssetTools factory dep; rejects non-UDataAsset, deprecated, duplicate package)
 - [x] `asset.save` → `save_assets`
 - [ ] `asset.set_mesh_material` — Material on slot · W
 - [ ] `asset.recenter_pivot` — Mesh pivot to center · W
@@ -338,7 +338,7 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [x] `asset.add_socket` → `asset.add_socket` (Phase 4.5-r2-b2; UStaticMeshSocket + USkeletalMeshSocket via NewObject + AddSocket/MeshOnly list, FScopedTransaction wrapped, PIE rejected)
 - [x] `asset.remove_socket` → `asset.remove_socket` (Phase 4.5-r2-b2; FindSocket + RemoveSocket / mesh-only list scan, FScopedTransaction wrapped, PIE rejected)
 - [x] `asset.list_sockets` → `asset.list_sockets` (Phase 4.5-r2-b2; reads UStaticMesh::Sockets / USkeletalMesh::GetMeshOnlySocketList — skeleton-derived sockets excluded)
-- [ ] `asset.reload_package` — Force reload · W
+- [x] `asset.reload_package` → `asset.reload_package` (Phase 4.5-r2-b4; UPackageTools::ReloadPackages on FindPackage/LoadPackage result; accepts both /Game/Foo and /Game/Foo.Foo forms)
 - [ ] `asset.export` — Texture→PNG / Mesh→FBX · W
 - [ ] `asset.search_fts` — SQLite FTS5 ranked search · R
 - [ ] `asset.reindex_fts` — Rebuild FTS index · W

@@ -2524,6 +2524,68 @@ int main() {
         },
         .handler = nullptr, .remote = true,
     });
+    // Phase 4.5-r2 batch 4: write essentials
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.create_data_asset",
+        .description = "Create a new UDataAsset (concrete subclass of "
+                       "UDataAsset). path is the destination object path "
+                       "/Game/.../AssetName form. class is a class path "
+                       "(e.g. '/Script/Engine.DataAsset' or "
+                       "'/Game/MyTypes/MyDataAsset.MyDataAsset_C'). "
+                       "Errors -32602 if the class isn't a UDataAsset, is "
+                       "abstract, or the path lacks a directory. Wrapped "
+                       "in FScopedTransaction. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",  {{"type", "string"}}},
+                {"class", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "class"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.delete_batch",
+        .description = "Bulk delete a list of assets. Returns per-path "
+                       "{status: 'deleted'|'missing'|'failed'} plus "
+                       "rollup counters {deleted, missing, failed, "
+                       "total}. Soft-tolerates missing paths (no error). "
+                       "Wrapped in single FScopedTransaction so the "
+                       "whole batch is one undo step. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"paths", {
+                    {"type", "array"},
+                    {"items", {{"type", "string"}}},
+                    {"minItems", 1},
+                }},
+            }},
+            {"required", nlohmann::json::array({"paths"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.reload_package",
+        .description = "Force reload a UPackage from disk via "
+                       "UPackageTools::ReloadPackages. Useful after "
+                       "external edits (Python/USD/uassetool). path may "
+                       "be either a package path '/Game/Foo/Bar' or a "
+                       "full object path '/Game/Foo/Bar.Bar' (the dot "
+                       "suffix is stripped automatically). Errors -32602 "
+                       "if the package can't be found or loaded. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     registerRemote(sage::mcp::Tool{
         .name = "asset.set_texture_settings",
         .description = "Mutate UTexture settings. Each field optional; "
