@@ -1514,6 +1514,87 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // ---- Editor automation (Phase 4.6) ---------------------------------
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.console_command",
+        .description = "Execute a UE console command. Default: gated to a "
+                       "read-only / view-state whitelist (STAT, SHOW, "
+                       "VIEWMODE, CAMERA, R.SCREENPERCENTAGE, MEMREPORT, "
+                       "OBJ, LOG, HELP). allow_unsafe=true bypasses — UE "
+                       "console can crash the editor with the wrong command, "
+                       "use with care.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"cmd",          {{"type", "string"}}},
+                {"allow_unsafe", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"cmd"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.take_screenshot",
+        .description = "Capture the active viewport as a PNG. Default path: "
+                       "ProjectSavedDir/Screenshots/Sage_<timestamp>.png. "
+                       "Returns the saved path. Async — UE writes the file "
+                       "shortly after the call returns.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.get_engine_version",
+        .description = "Engine + project + build configuration metadata: "
+                       "engine_version, compatible_version, "
+                       "build_configuration, project_dir, engine_dir.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.get_project_version",
+        .description = "Project name + dir + log/saved/content paths.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.get_log_file_path",
+        .description = "Absolute path of the current editor log file. The "
+                       "agent can tail it directly via filesystem when more "
+                       "than read_log's slice is needed.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.read_log",
+        .description = "Tail recent editor log lines. filter (substring) and "
+                       "max_lines (1..5000, default 200). Returns {log_path, "
+                       "lines[], count, total_lines}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"filter",    {{"type", "string"}}},
+                {"max_lines", {{"type", "integer"},
+                               {"minimum", 1}, {"maximum", 5000}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // Material parameter (Milestone 1.3c).
     registerRemote(sage::mcp::Tool{
         .name        = "modify_material_parameter",
