@@ -196,6 +196,93 @@ FSageToolDispatch::FOutcome ReadLogImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- editor.build_all / build_geometry / build_lighting / build_hlod /
+// ---- get_build_status  (Phase 4.6-r3 batch 4) ----------------------------
+
+// Build commands fire-and-forget — the real status query is best-effort
+// (only IsLightingBuildCurrentlyRunning / Exporting are exposed in 5.7).
+
+FSageToolDispatch::FOutcome BuildAllImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    if (!GEditor) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
+    UWorld* World = GEditor->GetEditorWorldContext().World();
+    if (!World) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("editor world unavailable"));
+    GEngine->Exec(World, TEXT("MAP REBUILD"));
+    GEngine->Exec(World, TEXT("BUILD LIGHTING"));
+    GEngine->Exec(World, TEXT("RebuildNavigation"));
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("message"),
+        TEXT("Build All triggered: MAP REBUILD + BUILD LIGHTING + RebuildNavigation"));
+    R->SetStringField(TEXT("note"),
+        TEXT("Async; poll editor.get_build_status for lighting progress"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BuildGeometryImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    if (!GEditor) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
+    UWorld* World = GEditor->GetEditorWorldContext().World();
+    if (!World) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("editor world unavailable"));
+    GEngine->Exec(World, TEXT("MAP REBUILD"));
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("message"), TEXT("Geometry (BSP) rebuild triggered: MAP REBUILD"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BuildLightingImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    if (!GEditor) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
+    UWorld* World = GEditor->GetEditorWorldContext().World();
+    if (!World) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("editor world unavailable"));
+
+    // Optional quality: Preview / Medium / High / Production. Default Preview.
+    FString Quality = TEXT("Preview");
+    if (Args.IsValid()) Args->TryGetStringField(TEXT("quality"), Quality);
+
+    const FString Cmd = FString::Printf(TEXT("BUILD LIGHTING %s"), *Quality);
+    GEngine->Exec(World, *Cmd);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("message"), Cmd);
+    R->SetStringField(TEXT("quality"), Quality);
+    R->SetStringField(TEXT("note"),
+        TEXT("Async; poll editor.get_build_status for progress"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BuildHlodImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    if (!GEditor) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
+    UWorld* World = GEditor->GetEditorWorldContext().World();
+    if (!World) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("editor world unavailable"));
+    GEngine->Exec(World, TEXT("BuildHLODs"));
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("message"), TEXT("HLOD build triggered: BuildHLODs"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome GetBuildStatusImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    auto R = MakeShared<FJsonObject>();
+    if (!GEditor)
+    {
+        R->SetStringField(TEXT("status"), TEXT("editor_unavailable"));
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+    const bool bLightingRunning   = GEditor->IsLightingBuildCurrentlyRunning();
+    const bool bLightingExporting = GEditor->IsLightingBuildCurrentlyExporting();
+
+    FString Status;
+    if (bLightingRunning)        Status = TEXT("lighting_running");
+    else if (bLightingExporting) Status = TEXT("lighting_exporting");
+    else                         Status = TEXT("idle");
+
+    R->SetStringField(TEXT("status"),             Status);
+    R->SetBoolField  (TEXT("lighting_running"),   bLightingRunning);
+    R->SetBoolField  (TEXT("lighting_exporting"), bLightingExporting);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---- editor.search_log / list_crashes / check_for_crashes /
 // ---- get_crash_info  (Phase 4.6-r3 batch 3) ------------------------------
 
@@ -669,6 +756,13 @@ void RegisterEditorAutomationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("editor.list_crashes"),       GT(&ListCrashesImpl));
     Dispatch.RegisterHandler(TEXT("editor.check_for_crashes"),  GT(&CheckForCrashesImpl));
     Dispatch.RegisterHandler(TEXT("editor.get_crash_info"),     GT(&GetCrashInfoImpl));
+
+    // Phase 4.6-r3 batch 4: level building
+    Dispatch.RegisterHandler(TEXT("editor.build_all"),          GT(&BuildAllImpl));
+    Dispatch.RegisterHandler(TEXT("editor.build_geometry"),     GT(&BuildGeometryImpl));
+    Dispatch.RegisterHandler(TEXT("editor.build_lighting"),     GT(&BuildLightingImpl));
+    Dispatch.RegisterHandler(TEXT("editor.build_hlod"),         GT(&BuildHlodImpl));
+    Dispatch.RegisterHandler(TEXT("editor.get_build_status"),   GT(&GetBuildStatusImpl));
 }
 
 #undef LOCTEXT_NAMESPACE

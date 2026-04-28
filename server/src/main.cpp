@@ -2622,6 +2622,72 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // ---- Level building (Phase 4.6 round 3 batch 4) --------------------
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.build_all",
+        .description = "Trigger a full level build: MAP REBUILD (BSP) + "
+                       "BUILD LIGHTING + RebuildNavigation. Fire-and-"
+                       "forget — async; poll editor.get_build_status.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.build_geometry",
+        .description = "Rebuild BSP geometry only via 'MAP REBUILD' "
+                       "console command. Useful before lighting build "
+                       "after volume/CSG edits.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.build_lighting",
+        .description = "Build lighting via 'BUILD LIGHTING <quality>' "
+                       "console command. quality ∈ {Preview (default), "
+                       "Medium, High, Production}. Async — agent should "
+                       "poll editor.get_build_status until lighting_"
+                       "running becomes false.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"quality", {{"type", "string"},
+                             {"enum", nlohmann::json::array({
+                                 "Preview","Medium","High","Production"})}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.build_hlod",
+        .description = "Trigger HLOD build via 'BuildHLODs' console "
+                       "command. Async.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.get_build_status",
+        .description = "Report editor's current build state. Returns "
+                       "{status: 'idle' | 'lighting_running' | "
+                       "'lighting_exporting', lighting_running, "
+                       "lighting_exporting}. UE 5.7 only exposes the "
+                       "lighting build flags — geometry/HLOD/navigation "
+                       "build progress isn't queryable per-call.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // ---- Dialog policy (Phase 4.6 round 2) -----------------------------
     // Hooks FCoreDelegates::ModalMessageDialog so unattended agent flows
     // don't stall on Save?/Reload?/Confirm Delete? modals. Lazy install

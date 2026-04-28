@@ -11,7 +11,7 @@
 | Category | Have | Need | Total | % |
 |---|---:|---:|---:|---:|
 | project | 15 | 14 | 29 | 52 |
-| editor | 25 | 19 | 44 | 57 |
+| editor | 29 | 15 | 44 | 66 |
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
 | blueprint | 38 | 8 | 46 | 83 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **149** | **299** | **448** | **33** |
+| **TOTAL** | **154** | **294** | **448** | **34** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -110,11 +110,12 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `editor.get_sequence_info` — Read sequence · R
 - [ ] `editor.add_sequence_track` — Add track to LS · W
 - [ ] `editor.play_sequence` — Play/stop/pause LS · W
-- [ ] `editor.build_all` — Build geometry+lighting+paths+HLOD · W
-- [ ] `editor.build_geometry` — Rebuild BSP · W
-- [ ] `editor.build_hlod` — Build HLODs · W
+- [x] `editor.build_all` → `editor.build_all` (Phase 4.6-r3-b4; MAP REBUILD + BUILD LIGHTING + RebuildNavigation)
+- [x] `editor.build_geometry` → `editor.build_geometry` (Phase 4.6-r3-b4; MAP REBUILD)
+- [~] Build lighting NEW: `editor.build_lighting` (Phase 4.6-r3-b4; quality Preview/Medium/High/Production) — UE-MCP didn't expose this separately
+- [x] `editor.build_hlod` → `editor.build_hlod` (Phase 4.6-r3-b4; BuildHLODs)
 - [ ] `editor.validate_assets` — Run validation on directory · W
-- [ ] `editor.get_build_status` — Build/map compile status · R
+- [x] `editor.get_build_status` → `editor.get_build_status` (Phase 4.6-r3-b4; IsLightingBuildCurrentlyRunning/Exporting flags)
 - [ ] `editor.cook_content` — Cook for platform · W
 - [x] `editor.get_log` — Read log with filter · R · Sage `editor.read_log`
 - [x] `editor.search_log` → `editor.search_log` (Phase 4.6-r3-b3; substring scan with line + 500-char snippet)
