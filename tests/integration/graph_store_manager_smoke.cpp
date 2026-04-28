@@ -9,6 +9,10 @@
 #include "graph/graph_schema.h"
 #include "graph/graph_store_manager.h"
 
+// Pin to whatever migration head the binary is built for, so adding new
+// migrations doesn't keep silently breaking this smoke. We assert the
+// store is up-to-date, not pinned to a specific version.
+
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -48,8 +52,8 @@ int main() {
         if (!storeA1.isOpen()) throw std::runtime_error("alpha not open");
         if (!fs::exists(root / "alpha" / "graph.kuzu"))
             throw std::runtime_error("expected slot dir not created on disk");
-        if (schemaVersionOf(storeA1) != 1)
-            throw std::runtime_error("schema version != 1 after acquire");
+        if (schemaVersionOf(storeA1) != sg::kCurrentSchemaVersion)
+            throw std::runtime_error("schema version != current after acquire");
 
         // --- (2) re-acquire returns same instance ------------------------
         auto& storeA2 = mgr.acquireSlot("alpha");
@@ -93,7 +97,7 @@ int main() {
                                "reopen show_tables");
         if (bAgain["row_count"].get<int64_t>() < 5)
             throw std::runtime_error("expected schema tables to persist");
-        if (schemaVersionOf(storeB2) != 1)
+        if (schemaVersionOf(storeB2) != sg::kCurrentSchemaVersion)
             throw std::runtime_error("schema version drift after reopen");
 
         // --- (6) invalid slot IDs rejected --------------------------------
