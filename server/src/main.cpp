@@ -2867,6 +2867,62 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // ---- UMG widget authoring (Phase 4.11 round 1) -----------------------
+    registerRemote(sage::mcp::Tool{
+        .name = "widget.create",
+        .description = "Create a new UWidgetBlueprint via "
+                       "UWidgetBlueprintFactory. parent_class must be a "
+                       "UUserWidget subclass (defaults to UUserWidget). "
+                       "path is /Game/Folder/WBP_Name. The factory "
+                       "produces a default Canvas root widget unless a "
+                       "custom RootWidgetClass is plumbed (future). "
+                       "Returns {path, name, parent_class, "
+                       "root_widget_class}. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",         {{"type", "string"}}},
+                {"parent_class", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "widget.list",
+        .description = "Enumerate UWidgetBlueprint assets under a "
+                       "content directory via AssetRegistry filter on "
+                       "/Script/UMGEditor.WidgetBlueprint. Returns "
+                       "{widgets: [{path, name}], returned, total, capped}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"directory",   {{"type", "string"}}},
+                {"max_results", {{"type", "integer"}, {"minimum", 1}, {"maximum", 50000}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "widget.read",
+        .description = "Read a UWidgetBlueprint's tree. Returns "
+                       "{parent_class, root: {name, class, children: "
+                       "[...]}, widgets: [{name, class}], "
+                       "widget_count}. root is a recursive tree (panel "
+                       "widgets nest); widgets is the flat list from "
+                       "WidgetTree::GetAllWidgets. -32602 if not a "
+                       "WidgetBlueprint.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // ---- Editor automation (Phase 4.6) ---------------------------------
     registerRemote(sage::mcp::Tool{
         .name = "editor.console_command",

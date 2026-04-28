@@ -484,12 +484,12 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 
 ## widget (17) — Sage covers 0
 
-- [ ] `widget.read_tree` · R
+- [x] `widget.read_tree` → `widget.read` (Phase 4.11-r1; UWidgetTree::GetAllWidgets + recursive root tree, panel children nested)
 - [ ] `widget.get_details` · R
 - [ ] `widget.set_property` · W
-- [ ] `widget.list` · R
+- [x] `widget.list` → `widget.list` (Phase 4.11-r1; AssetRegistry FARFilter on /Script/UMGEditor.WidgetBlueprint)
 - [ ] `widget.read_animations` · R
-- [ ] `widget.create` · W
+- [x] `widget.create` → `widget.create` (Phase 4.11-r1; UWidgetBlueprintFactory; parent_class must be UUserWidget subclass; -32602 if not)
 - [ ] `widget.create_utility_widget` · W
 - [ ] `widget.run_utility_widget` · W
 - [ ] `widget.create_utility_blueprint` · W

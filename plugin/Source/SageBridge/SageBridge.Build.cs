@@ -51,6 +51,10 @@ public class SageBridge : ModuleRules
             // the Python plugin, IPythonScriptPlugin::Get()->IsPythonAvailable()
             // returns false and our handler reports a graceful error.
             "PythonScriptPlugin",
+            // UMG widget authoring (Phase 4.11) — UWidgetBlueprint,
+            // UWidgetTree, UWidget hierarchy. UMGEditor for the factory.
+            "UMG",
+            "UMGEditor",
         });
 
         // Live Coding ships only on Windows in UE 5.7; Mac/Linux use the
