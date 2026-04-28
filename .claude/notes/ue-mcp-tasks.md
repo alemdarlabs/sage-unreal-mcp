@@ -1,8 +1,8 @@
 # UE-MCP → Sage: 448 Action Per-Tool Task List
 
 > **Source:** `/Users/mahmutalemdar/Developer/alemdarlabs/ue-mcp` — TypeScript MCP server + C++ plugin, BUSL-1.1.
-> **Audit date:** 2026-04-28 (last update: Phase 4.2-r2e BP function parameter I/O shipped).
-> **Status:** Sage 123 tools · UE-MCP 448 actions · ~111 covered (mostly via Phase 4) · **337 actions remain**.
+> **Audit date:** 2026-04-28 (last update: Phase 4.2-r2f BP asset creation shipped).
+> **Status:** Sage 125 tools · UE-MCP 448 actions · ~113 covered (mostly via Phase 4) · **335 actions remain**.
 >
 > Earlier note had cited 562; actual enumeration of every `RegisterHandler` / dispatcher branch in the ue-mcp source landed on 448. The 562 number likely came from including duplicates / aliases / TS-side validation rules that don't materialise as distinct C++ handlers.
 
@@ -14,7 +14,7 @@
 | editor | 15 | 29 | 44 | 34 |
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
-| blueprint | 23 | 23 | 46 | 50 |
+| blueprint | 25 | 21 | 46 | 54 |
 | asset | 7 | 32 | 39 | 18 |
 | level | 10 | 22 | 32 | 31 |
 | niagara | 0 | 26 | 26 | 0 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **111** | **337** | **448** | **25** |
+| **TOTAL** | **113** | **335** | **448** | **25** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -250,7 +250,7 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `blueprint.read_graph_summary` — Lightweight ~10KB summary · R
 - [x] `blueprint.get_execution_flow` → `bp.get_execution_flow`
 - [ ] `blueprint.get_dependencies` — Forward+reverse deps · R
-- [ ] `blueprint.create` — New BP asset · W
+- [x] `blueprint.create` → `bp.create` (Phase 4.2-r2f; UBlueprintFactory + IAssetTools::CreateAsset, idempotent, parent class short-name + full path)
 - [x] `blueprint.add_variable` → `bp.add_variable`
 - [ ] `blueprint.set_variable_properties` — Edit instance/BP props · W
 - [ ] `blueprint.create_function` — Create user fn · W
@@ -273,7 +273,7 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [x] `blueprint.compile` → `bp.compile`
 - [x] `blueprint.list_node_types` → `bp.list_node_types` (Phase 4.2-r2a; supports filter substring)
 - [~] `blueprint.search_node_types` → `bp.list_node_types` with filter parameter (semantic match)
-- [ ] `blueprint.create_interface` — Create BP interface · W
+- [x] `blueprint.create_interface` → `bp.create_interface` (Phase 4.2-r2f; UBlueprintInterfaceFactory)
 - [x] `blueprint.add_interface` → `bp.add_interface` (Phase 4.2-r2c)
 - [x] `blueprint.list_interfaces` → `bp.list_interfaces` (Phase 4.2-r2c, NEW vs ue-mcp)
 - [x] `blueprint.remove_interface` → `bp.remove_interface` (Phase 4.2-r2c, NEW vs ue-mcp)
@@ -300,7 +300,8 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - **r2c DONE (3 tools):** list_interfaces + add_interface + remove_interface. FBlueprintEditorUtils::ImplementNewInterface(BP, FTopLevelAssetPath) + RemoveInterface. UInterface guard via IsChildOf(UInterface::StaticClass()). 7-step round-trip green: add NavMovementInterface (already=false) → re-add (already=true, idempotent) → list 2 → remove (removed=1) → list 1 → re-remove (removed=0, idempotent) → cleanup. Plus error guards: missing path -32602, non-existent class -32602, non-UInterface class -32602.
 - **r2d DONE (2 tools):** list_graphs (ubergraph/function/delegate/macro enumeration with node count) + rename_function (FBlueprintEditorUtils::RenameGraph w/ collision + same-name + missing guards). 9/9 smoke green: baseline list shows template's 4 graphs (EventGraph + UCS + Move + Aim) → add OldFn → rename OldFn→NewFn → verify list reflects → guards: nonexistent/collision/same-name all -32602.
 - **r2e DONE (3 tools):** list/add/remove_function_parameter. UK2Node_EditablePinBase::CreateUserDefinedPin + RemoveUserDefinedPinByName. direction='input' (default) targets FunctionEntry, 'output' targets FunctionResult (auto-spawned with matching FunctionReference). Pin direction: input → entry's EGPD_Output pin; output → result's EGPD_Input pin (UE convention). 12/12 smoke green: empty → add 2 in + 1 out (FunctionResult auto-spawn) → list (2/1) → duplicate -32602 → remove 1 in + 1 out → remove missing removed=0 → list (1/0) → cleanup.
-- **r2f remaining (~10 tools):** T3D import/export pair, BP component CRUD via SCS path, validate, run_construction_script, dispatcher (add_event_dispatcher + list/remove), blueprint.create, blueprint.create_interface, set_variable_properties, read_component_properties, get_cdo_properties, get_dependencies, reparent_component.
+- **r2f DONE (2 tools):** bp.create + bp.create_interface. UBlueprintFactory (parent class short-name + full /Script path resolution) + UBlueprintInterfaceFactory. Idempotent (already=true on existing path). 10/10 smoke green + integration: created Test_NewBP, created Test_NewIface, duplicated Test_NewBP→Test_NewBP_Iface, added Test_NewIface_C as interface on Test_NewBP_Iface, list_interfaces confirmed. Full BP authoring loop closed: agent can now create asset → add var/fn → add params → add nodes → connect pins → implement interfaces → compile, all from Sage MCP without UE editor manual interaction.
+- **r2g remaining (~8 tools):** T3D import/export pair, BP component CRUD via SCS path, validate, run_construction_script, dispatcher (add_event_dispatcher + list/remove), set_variable_properties, read_component_properties, get_cdo_properties, get_dependencies, reparent_component.
 
 ---
 

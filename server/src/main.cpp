@@ -1244,6 +1244,42 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // -- write — asset creation (Phase 4.2 round 2f) --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.create",
+        .description = "Create a new Blueprint asset via UBlueprintFactory + "
+                       "IAssetTools::CreateAsset. parent_class accepts a "
+                       "full path ('/Script/Engine.Actor') or a short name "
+                       "('Actor', 'Pawn', 'Character'); defaults to Actor. "
+                       "path: '/Game/Folder/BP_Foo' or '/Game/Folder/BP_Foo."
+                       "BP_Foo'. Idempotent — returns {already: true} if "
+                       "the asset already exists. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",         {{"type", "string"}}},
+                {"parent_class", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.create_interface",
+        .description = "Create a new Blueprint Interface asset via "
+                       "UBlueprintInterfaceFactory. ParentClass is "
+                       "UInterface (set by the factory). path same form "
+                       "as bp.create. Idempotent. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // -- read+write — function parameter I/O (Phase 4.2 round 2e) --
     registerRemote(sage::mcp::Tool{
         .name = "bp.list_function_parameters",

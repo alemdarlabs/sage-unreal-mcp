@@ -13,7 +13,11 @@
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
+#include "AssetToolsModule.h"
 #include "EdGraphSchema_K2.h"
+#include "Factories/BlueprintFactory.h"
+#include "Factories/BlueprintInterfaceFactory.h"
+#include "IAssetTools.h"
 #include "K2Node.h"
 #include "K2Node_CallFunction.h"
 #include "K2Node_CustomEvent.h"
@@ -823,6 +827,160 @@ FSageToolDispatch::FOutcome BpConnectPinsImpl(const TSharedPtr<FJsonObject>& Arg
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("blueprint"), BP->GetName());
     R->SetStringField(TEXT("function"),  FnName);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- bp.create + bp.create_interface  (Phase 4.2 round 2f) ----------------
+
+// Split "/Game/Folder/Asset" or "/Game/Folder/Asset.Asset" into
+// (PackagePath="/Game/Folder", AssetName="Asset"). Returns false on a
+// malformed input.
+bool SplitAssetPath(const FString& AssetPath, FString& OutPackagePath, FString& OutAssetName)
+{
+    FString Sanitised = AssetPath;
+    int32 DotIdx;
+    if (Sanitised.FindChar('.', DotIdx)) Sanitised.LeftInline(DotIdx);
+    int32 SlashIdx;
+    if (!Sanitised.FindLastChar('/', SlashIdx)) return false;
+    OutPackagePath = Sanitised.Left(SlashIdx);
+    OutAssetName   = Sanitised.Mid(SlashIdx + 1);
+    return !OutPackagePath.IsEmpty() && !OutAssetName.IsEmpty();
+}
+
+UClass* ResolveParentClassByName(const FString& Name)
+{
+    if (Name.IsEmpty()) return nullptr;
+
+    // 1. Full /Script/... or /Game/...:
+    if (UClass* C = LoadObject<UClass>(nullptr, *Name)) return C;
+
+    // 2. Short-name lookup. Drop any leading 'A'/'U' Unreal prefix and
+    //    iterate native UClasses for a name match.
+    FString Stripped = Name;
+    if (Stripped.Len() > 1 && (Stripped[0] == TEXT('A') || Stripped[0] == TEXT('U')))
+    {
+        const FString Try = Stripped.Mid(1);
+        for (TObjectIterator<UClass> It; It; ++It)
+        {
+            if (It->GetName() == Try || It->GetName() == Stripped) return *It;
+        }
+    }
+    for (TObjectIterator<UClass> It; It; ++It)
+    {
+        if (It->GetName() == Name) return *It;
+    }
+    return nullptr;
+}
+
+FSageToolDispatch::FOutcome BpCreateImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, ParentName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    Args->TryGetStringField(TEXT("parent_class"), ParentName);
+    if (ParentName.IsEmpty()) ParentName = TEXT("Actor");
+
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+
+    UClass* ParentCls = ResolveParentClassByName(ParentName);
+    if (!ParentCls)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("parent class not found: %s (try '/Script/Engine.Actor' "
+                                 "or short name 'Actor')"), *ParentName));
+    }
+
+    FString PackagePath, AssetName;
+    if (!SplitAssetPath(Path, PackagePath, AssetName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("malformed path: %s"), *Path));
+    }
+
+    // Idempotency: if asset exists, return existing.
+    if (UBlueprint* Existing = ResolveBlueprint(Path))
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"),         Path);
+        R->SetStringField(TEXT("blueprint"),    Existing->GetName());
+        R->SetStringField(TEXT("parent_class"),
+            Existing->ParentClass ? Existing->ParentClass->GetPathName() : FString());
+        R->SetBoolField  (TEXT("already"),      true);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FAssetToolsModule& Module = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
+    IAssetTools& Tools = Module.Get();
+
+    UBlueprintFactory* Factory = NewObject<UBlueprintFactory>();
+    Factory->ParentClass = ParentCls;
+
+    FScopedTransaction Tx(LOCTEXT("BpCreate", "Sage: Create Blueprint"));
+    UBlueprint* NewBP = Cast<UBlueprint>(
+        Tools.CreateAsset(AssetName, PackagePath, UBlueprint::StaticClass(), Factory));
+    if (!NewBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("AssetTools::CreateAsset returned nullptr"));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),         NewBP->GetPathName());
+    R->SetStringField(TEXT("blueprint"),    NewBP->GetName());
+    R->SetStringField(TEXT("parent_class"), ParentCls->GetPathName());
+    R->SetBoolField  (TEXT("already"),      false);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpCreateInterfaceImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+
+    FString PackagePath, AssetName;
+    if (!SplitAssetPath(Path, PackagePath, AssetName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("malformed path: %s"), *Path));
+    }
+
+    if (UBlueprint* Existing = ResolveBlueprint(Path))
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"),      Path);
+        R->SetStringField(TEXT("blueprint"), Existing->GetName());
+        R->SetBoolField  (TEXT("already"),   true);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FAssetToolsModule& Module = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
+    IAssetTools& Tools = Module.Get();
+
+    UBlueprintInterfaceFactory* Factory = NewObject<UBlueprintInterfaceFactory>();
+
+    FScopedTransaction Tx(LOCTEXT("BpCreateIface", "Sage: Create BP Interface"));
+    UBlueprint* NewBP = Cast<UBlueprint>(
+        Tools.CreateAsset(AssetName, PackagePath, UBlueprint::StaticClass(), Factory));
+    if (!NewBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("AssetTools::CreateAsset returned nullptr"));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),         NewBP->GetPathName());
+    R->SetStringField(TEXT("blueprint"),    NewBP->GetName());
+    R->SetStringField(TEXT("parent_class"),
+        NewBP->ParentClass ? NewBP->ParentClass->GetPathName() : TEXT("/Script/CoreUObject.Interface"));
+    R->SetBoolField  (TEXT("already"),      false);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1871,6 +2029,10 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("bp.list_function_parameters"),   GT(&BpListFunctionParametersImpl));
     Dispatch.RegisterHandler(TEXT("bp.add_function_parameter"),     GT(&BpAddFunctionParameterImpl));
     Dispatch.RegisterHandler(TEXT("bp.remove_function_parameter"),  GT(&BpRemoveFunctionParameterImpl));
+
+    // Write — asset creation (Phase 4.2 round 2f)
+    Dispatch.RegisterHandler(TEXT("bp.create"),                     GT(&BpCreateImpl));
+    Dispatch.RegisterHandler(TEXT("bp.create_interface"),           GT(&BpCreateInterfaceImpl));
 
     // Write — functions
     Dispatch.RegisterHandler(TEXT("bp.add_function"),        GT(&BpAddFunctionImpl));
