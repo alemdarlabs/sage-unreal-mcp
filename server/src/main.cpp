@@ -9,6 +9,8 @@
 // Listens until SIGINT / SIGTERM, then graceful shutdown.
 
 #include "bridge/bridge_server.h"
+#include "graph/asset_indexer.h"
+#include "graph/graph_store_manager.h"
 #include "mcp/server.h"
 #include "mcp/tool_registry.h"
 #include "tools/builtin.h"
@@ -20,6 +22,7 @@
 #include <atomic>
 #include <csignal>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <string>
 
@@ -95,6 +98,36 @@ int main() {
         [&bridge](std::string_view tool, const nlohmann::json& args) {
             return bridge.dispatchTool(tool, args);
         });
+
+    // ---- Knowledge layer (Phase 2) --------------------------------------
+    const auto sageDataDir = []() -> std::filesystem::path {
+        if (const char* d = std::getenv("SAGE_DATA_DIR")) return std::filesystem::path{d};
+        if (const char* h = std::getenv("HOME"))          return std::filesystem::path{h} / ".sage-mcp";
+        return std::filesystem::temp_directory_path() / "sage-mcp";
+    }();
+    const auto graphRoot = sageDataDir / "graph";
+    auto graphMgr = std::make_shared<sage::graph::GraphStoreManager>(graphRoot);
+    spdlog::info("Knowledge graph root: {}", graphRoot.string());
+
+    // Resolves an explicit slot_id from params, else falls back to the
+    // active session, else (when exactly one editor connected) that one.
+    auto resolveSlotId = [&bridge](const nlohmann::json& params)
+        -> std::expected<std::string, sage::mcp::ErrorObject> {
+        if (params.is_object() && params.contains("slot_id")
+            && params["slot_id"].is_string()) {
+            return params["slot_id"].get<std::string>();
+        }
+        const auto activeId = bridge.activeSession();
+        if (!activeId.empty()) {
+            if (auto s = bridge.snapshotSession(activeId)) return s->slot_id;
+        }
+        const auto sessions = bridge.snapshotSessions();
+        if (sessions.size() == 1) return sessions.front().slot_id;
+        return std::unexpected(sage::mcp::ErrorObject::fromCode(
+            sage::mcp::ErrorCode::EditorNotConnected,
+            "no slot_id provided and no unique active editor; "
+            "either pass slot_id or call set_active_editor first"));
+    };
 
     // Smoke-test remote tool: round-trips through the connected editor.
     {
@@ -851,6 +884,105 @@ int main() {
         .handler = nullptr,
         .remote  = true,
     });
+
+    // ---- Knowledge layer MCP tools (Milestone 2.2 — T1 indexing) -------
+    sage::mcp::Tool indexSlotTool{
+        .name        = "index_slot",
+        .description = "Reindex the slot's knowledge graph from the editor's "
+                       "AssetRegistry. Server asks the connected plugin for a "
+                       "full asset scan, then full-replaces the Asset table. "
+                       "If 'slot_id' omitted, uses the active editor (or the "
+                       "single connected editor when exactly one is present). "
+                       "Returns {slot_id, asset_count, last_indexed_at_ms, "
+                       "scan_ms?}. -32001 EditorNotConnected if no editor "
+                       "available, -32603 InternalError on plugin or DB failure.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"slot_id", {{"type", "string"}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = [&bridge, graphMgr, resolveSlotId](const nlohmann::json& params)
+            -> sage::mcp::ToolResult {
+            auto slot = resolveSlotId(params);
+            if (!slot.has_value()) return std::unexpected(slot.error());
+
+            // Plugin scans AssetRegistry; we receive {assets, scan_ms}.
+            auto scan = bridge.dispatchTool(
+                "_scan_asset_registry", nlohmann::json::object());
+            if (!scan.has_value()) return std::unexpected(scan.error());
+
+            const auto& payload = scan.value();
+            if (!payload.contains("assets") || !payload["assets"].is_array()) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InternalError,
+                    "plugin response missing 'assets' array"));
+            }
+
+            try {
+                auto& store = graphMgr->acquireSlot(*slot);
+                auto ingest = sage::graph::ingestAssets(store, payload["assets"]);
+                if (sage::graph::is_error(ingest)) {
+                    return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                        sage::mcp::ErrorCode::InternalError,
+                        "ingest failed: " + sage::graph::error_of(ingest).message));
+                }
+                nlohmann::json out = sage::graph::value_of(ingest);
+                out["slot_id"] = *slot;
+                if (payload.contains("scan_ms")) out["scan_ms"] = payload["scan_ms"];
+                return out;
+            } catch (const std::exception& ex) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InternalError,
+                    std::string{"graph slot acquire failed: "} + ex.what()));
+            }
+        },
+        .remote = false,
+    };
+    if (auto r = registry->registerTool(std::move(indexSlotTool)); !r.has_value()) {
+        spdlog::warn("Failed to register 'index_slot'");
+    }
+
+    sage::mcp::Tool indexStatusTool{
+        .name        = "index_status",
+        .description = "Read the slot's last index pass: {slot_id, asset_count, "
+                       "last_indexed_at_ms}. last_indexed_at_ms is null if the "
+                       "slot has never been indexed. Read-only — does not open "
+                       "an editor connection.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"slot_id", {{"type", "string"}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = [graphMgr, resolveSlotId](const nlohmann::json& params)
+            -> sage::mcp::ToolResult {
+            auto slot = resolveSlotId(params);
+            if (!slot.has_value()) return std::unexpected(slot.error());
+            try {
+                auto& store = graphMgr->acquireSlot(*slot);
+                auto st = sage::graph::getIndexStatus(store);
+                if (sage::graph::is_error(st)) {
+                    return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                        sage::mcp::ErrorCode::InternalError,
+                        sage::graph::error_of(st).message));
+                }
+                nlohmann::json out = sage::graph::value_of(st);
+                out["slot_id"] = *slot;
+                return out;
+            } catch (const std::exception& ex) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InternalError,
+                    std::string{"graph slot acquire failed: "} + ex.what()));
+            }
+        },
+        .remote = false,
+    };
+    if (auto r = registry->registerTool(std::move(indexStatusTool)); !r.has_value()) {
+        spdlog::warn("Failed to register 'index_status'");
+    }
 
     // ---- HTTP+SSE transport (Claude ↔ server) ---------------------------
     sage::transport::HttpSseConfig httpCfg{

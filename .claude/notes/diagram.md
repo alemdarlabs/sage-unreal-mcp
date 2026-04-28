@@ -44,9 +44,9 @@ flowchart TB
     direction TB
     M21a["2.1a KuzuDB baseline<br/>v0.11.3 prebuilt · CMake INTERFACE · smoke OK"]:::done
     M21b["2.1b GraphStore abstraction<br/>variant&lt;Json,GraphError&gt; · {rows,schema,row_count}"]:::done
-    M21c["2.1c Slot-scoped DB + schema migration<br/>per-slot Kuzu path · _SchemaVersion node · v1 init"]:::now
-    M22["2.2 T1 indexing (eager)<br/>AssetRegistry full scan → Asset/Class/Module/Plugin"]:::todo
-    M23["2.3 T2 topology + real-time delta<br/>depends_on / inherits_from / implements + AssetRegistry events"]:::todo
+    M21c["2.1c Slot-scoped DB + schema migration<br/>per-slot Kuzu path · _SchemaVersion node · v1 baseline"]:::done
+    M22["2.2 T1 indexing (eager) ✓<br/>AssetRegistry full scan → Asset table<br/>SageTest: 8359 asset · 24ms scan"]:::done
+    M23["2.3 T2 topology + real-time delta<br/>depends_on / inherits_from / implements + AssetRegistry events"]:::now
     M24["2.4 High-level query tools<br/>impact_of · references_to · class_hierarchy · find_unused"]:::moat
     M25["2.5 Cypher subset (Layer 2)<br/>read-only AST whitelist · bounded *1..N · 8K cap"]:::todo
   end

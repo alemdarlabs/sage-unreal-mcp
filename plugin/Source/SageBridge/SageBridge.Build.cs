@@ -26,6 +26,7 @@ public class SageBridge : ModuleRules
             "EditorSubsystem",
             "MaterialEditor",
             "SourceControl",
+            "AssetRegistry",
             "Json",
             "JsonUtilities",
             "Projects",

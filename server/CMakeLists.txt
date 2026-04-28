@@ -49,6 +49,7 @@ add_library(sage-graph STATIC
     src/graph/kuzu_graph_store.cpp
     src/graph/graph_schema.cpp
     src/graph/graph_store_manager.cpp
+    src/graph/asset_indexer.cpp
 )
 target_include_directories(sage-graph
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
@@ -82,7 +83,15 @@ target_link_libraries(sage-bridge
 # ---- executable ----
 add_executable(sage-server src/main.cpp)
 target_link_libraries(sage-server
-    PRIVATE sage-transport sage-tools sage-bridge
+    PRIVATE sage-transport sage-tools sage-bridge sage-graph
             sage-warnings sage-sanitizers)
 set_target_properties(sage-server PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    BUILD_RPATH   "${KUZU_DIR}"
+    INSTALL_RPATH "@executable_path")
+# sage-server transitively pulls libkuzu via sage-graph; copy the dylib next
+# to the executable so loader finds it without DYLD_LIBRARY_PATH.
+add_custom_command(TARGET sage-server POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${KUZU_DIR}/${KUZU_LIB_NAME}"
+        "$<TARGET_FILE_DIR:sage-server>/${KUZU_LIB_NAME}")

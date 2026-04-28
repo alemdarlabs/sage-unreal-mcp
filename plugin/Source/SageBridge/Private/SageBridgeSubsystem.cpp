@@ -10,6 +10,7 @@
 #include "Tools/SageCompileTools.h"
 #include "Tools/SageComponentTools.h"
 #include "Tools/SageEditorTools.h"
+#include "Tools/SageIndexTools.h"
 #include "Tools/SageMaterialTools.h"
 #include "Tools/SageQaTools.h"
 #include "Tools/SageScmTools.h"
@@ -146,6 +147,7 @@ void USageBridgeSubsystem::RegisterBuiltinHandlers()
     sage::tools::RegisterCompileTools(ToolDispatch);
     sage::tools::RegisterQaTools(ToolDispatch);
     sage::tools::RegisterScmTools(ToolDispatch);
+    sage::tools::RegisterIndexTools(ToolDispatch);
 }
 
 void USageBridgeSubsystem::BuildClientFromSettings()

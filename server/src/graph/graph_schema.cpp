@@ -25,6 +25,14 @@ CREATE NODE TABLE IF NOT EXISTS Module(name STRING PRIMARY KEY, plugin STRING);
 CREATE NODE TABLE IF NOT EXISTS Plugin(name STRING PRIMARY KEY);
 )";
 
+// v2: indexer state table. last_indexed_at_ms is a Unix-epoch ms timestamp
+// captured server-side at the end of an ingest pass. asset_count is the
+// number of Asset rows that were just written (cheaper than COUNT(*) on
+// every status query). Single-row table, id always = 1.
+constexpr const char* kV2Cypher = R"(
+CREATE NODE TABLE IF NOT EXISTS _IndexState(id INT64 PRIMARY KEY, last_indexed_at_ms INT64, asset_count INT64);
+)";
+
 // Split a multi-statement Cypher blob on `;` boundaries, ignoring blanks
 // and Cypher line comments. Kuzu's Connection::query takes a single stmt.
 std::vector<std::string> splitStatements(std::string_view blob) {
@@ -115,6 +123,7 @@ GraphResult writeVersion(GraphStore& store, int version) {
 const std::vector<Migration>& schemaMigrations() {
     static const std::vector<Migration> kMigrations = {
         {1, kV1Cypher},
+        {2, kV2Cypher},
     };
     return kMigrations;
 }

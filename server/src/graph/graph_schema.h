@@ -18,7 +18,7 @@ struct Migration {
 
 // Highest version known to this binary. Bumped whenever a new migration is
 // appended. Stores at this version are up-to-date.
-inline constexpr int kCurrentSchemaVersion = 1;
+inline constexpr int kCurrentSchemaVersion = 2;
 
 // Registry of every migration the binary knows. Sorted by version ascending.
 [[nodiscard]] const std::vector<Migration>& schemaMigrations();

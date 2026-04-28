@@ -106,3 +106,21 @@ add_custom_command(TARGET sage-graph-manager-smoke POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${KUZU_DIR}/${KUZU_LIB_NAME}"
         "$<TARGET_FILE_DIR:sage-graph-manager-smoke>/${KUZU_LIB_NAME}")
+
+# ---- AssetIndexer smoke ----
+# Drives ingestAssets / getIndexStatus on a slot — full-replace semantics,
+# Cypher escaping, validation. No plugin needed (mock asset list inline).
+add_executable(sage-asset-indexer-smoke
+    integration/asset_indexer_smoke.cpp
+)
+target_link_libraries(sage-asset-indexer-smoke
+    PRIVATE sage-graph)
+target_compile_features(sage-asset-indexer-smoke PRIVATE cxx_std_23)
+set_target_properties(sage-asset-indexer-smoke PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    BUILD_RPATH   "${KUZU_DIR}"
+    INSTALL_RPATH "@executable_path")
+add_custom_command(TARGET sage-asset-indexer-smoke POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${KUZU_DIR}/${KUZU_LIB_NAME}"
+        "$<TARGET_FILE_DIR:sage-asset-indexer-smoke>/${KUZU_LIB_NAME}")
