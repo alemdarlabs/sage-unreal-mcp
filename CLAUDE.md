@@ -71,14 +71,58 @@ sage-unreal-mcp/
 
 Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
+## Şu Anki Durum (Snapshot)
+
+> Tek satırda durum: **44 commit · 103 MCP tool · Phase 1+2+3 tamam · Phase 4 ~%50 (4.0/4.1/4.2-r1/4.3/4.5-r1/4.6-r1)**.
+
+- **Test ortamı**: `/Users/mahmutalemdar/Developer/alemdarlabs/SageTest/SageTest.uproject` (UE 5.7.4 Third Person + Blueprint).
+- **Knowledge graph (canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Real-time delta + query_graph + class_hierarchy çalışıyor.
+- **Skills**: `/unreal-close` ve `/unreal-open` ile editor restart loop otonom — agent BuildPlugin → dylib swap → relaunch yapabiliyor (ayrıca tek MCP tool olarak `restart_editor`).
+- **Dokümantasyon**:
+  - [`.claude/notes/diagram.md`](.claude/notes/diagram.md) — Phase 1-4 milestone akışı + tool dağılımı pie chart + knowledge graph şeması (v4)
+  - [`.claude/notes/ue-mcp-integration-plan.md`](.claude/notes/ue-mcp-integration-plan.md) — UE-MCP'nin 562 action'ına karşı Sage'ın yol haritası (Phase 4.0–4.20)
+  - [`.claude/notes/ue-mcp-tasks.md`](.claude/notes/ue-mcp-tasks.md) — eksik action'lar için per-tool task listesi (yeni)
+  - [`.claude/notes/lessons.md`](.claude/notes/lessons.md) — kabul edilen kuralların kayıtlı olduğu dosya (en kritik: "MVP scope-cut yapma", BP/Material write GameThread'de marshal et)
+- **Yeni session devraldığında ilk bakılacak**: bu dosya → `.claude/notes/diagram.md` → `.claude/notes/ue-mcp-tasks.md` → son commit `git log --oneline | head -10`.
+
+## Tool Tablosu (özet — 103 toplam)
+
+| Phase | Domain | Tool sayısı |
+|---|---|---|
+| 1 | Actor/Component/Asset/Editor/Level/PIE/Material/Tx/CAS/Multi-editor/Compile/QA/SCM | 44 |
+| 2 | Knowledge graph (index_*, impact_of, references_to, find_unused, query_graph) | 6 |
+| 3 | restart_editor + class_hierarchy | 2 |
+| 4.1 | Reflection (reflect_class/struct/enum, list_*, find_implementers, CDO) | 8 |
+| 4.2-r1 | Blueprint authoring round 1 (`bp.*`) | 17 |
+| 4.3 | Material graph authoring (`mat.*`) | 13 |
+| 4.5-r1 | Asset advanced round 1 (`asset.*`) | 7 |
+| 4.6-r1 | Editor automation round 1 (`editor.*`) | 6 |
+
 ## Build & Run Commands
 
 ```bash
-# Henüz implement edilmedi. Tasarım fazında.
+# Server build:
+VCPKG_ROOT=$HOME/vcpkg cmake --build --preset debug --target sage-server
 
-# Server build (planlanan):
+# Server start (with knowledge graph + restart orchestrator wiring):
+SAGE_REPO_ROOT=/Users/mahmutalemdar/Developer/alemdarlabs/sage-unreal-mcp \
+SAGE_LOG_LEVEL=info \
+./build/debug/bin/sage-server >/tmp/sage-server.log 2>&1 &
+
+# Plugin build (UAT BuildPlugin, ~50s):
+./scripts/build-plugin.sh
+
+# Plugin swap into SageTest:
+cp build/plugin/Binaries/Mac/UnrealEditor-SageBridge.{dylib,modules} \
+   /Users/mahmutalemdar/Developer/alemdarlabs/SageTest/Plugins/SageBridge/Binaries/Mac/
+
+# Editor restart loop (autonomous via MCP tool):
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"restart_editor","arguments":{"confirmed":true}}}' \
+  http://127.0.0.1:7777/mcp
+
+# Server start (eski/legacy command):
 # cmake -B build -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
-# cmake --build build --config Release
 
 # Plugin: Unreal Editor üzerinden veya UnrealBuildTool plugin compile
 
