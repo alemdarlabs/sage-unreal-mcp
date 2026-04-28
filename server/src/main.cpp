@@ -1193,6 +1193,87 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // -- write — graph node CRUD (Phase 4.2 round 2a) --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.add_node",
+        .description = "Spawn a UEdGraphNode subclass into the target graph. "
+                       "node_class accepts a full class name (K2Node_*) or one of "
+                       "the aliases: CallFunction, Event, CustomEvent, GetVar, "
+                       "SetVar, Branch (=K2Node_IfThenElse), If. node_params for "
+                       "CallFunction: {function_name, target_class}. node_params "
+                       "for GetVar/SetVar: {variable_name}. Returns "
+                       "{node_id (guid), node_class, pos, pins[]}. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",        {{"type", "string"}}},
+                {"function",    {{"type", "string"}}},
+                {"node_class",  {{"type", "string"}}},
+                {"node_x",      {{"type", "number"}}},
+                {"node_y",      {{"type", "number"}}},
+                {"node_params", {{"type", "object"}}},
+            }},
+            {"required", nlohmann::json::array({"path","function","node_class"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.set_node_property",
+        .description = "Set a pin's default value. Goes through the schema's "
+                       "TrySetDefaultValue (type-coerces and validates). "
+                       "Execution pins are rejected — use bp.connect_pins. "
+                       "PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"function", {{"type", "string"}}},
+                {"node_id",  {{"type", "string"}}},
+                {"pin",      {{"type", "string"}}},
+                {"value",    {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path","function","node_id","pin","value"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.read_node_property",
+        .description = "Read a pin's default value + type metadata. Returns "
+                       "{type, direction, default_value, default_object?, "
+                       "default_text?, is_execution, link_count}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"function", {{"type", "string"}}},
+                {"node_id",  {{"type", "string"}}},
+                {"pin",      {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path","function","node_id","pin"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.list_node_types",
+        .description = "Enumerate concrete UK2Node subclasses available to the "
+                       "BP palette. filter (substring match on class name), max "
+                       "(default 200, clamped 1..2000). Returns {types: "
+                       "[{name, module}], returned, total}. Excludes Abstract / "
+                       "Deprecated / NewerVersionExists classes.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"filter", {{"type", "string"}}},
+                {"max",    {{"type", "integer"}, {"minimum", 1}, {"maximum", 2000}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // -- write — class shape --
     registerRemote(sage::mcp::Tool{
         .name = "bp.set_cdo_property",

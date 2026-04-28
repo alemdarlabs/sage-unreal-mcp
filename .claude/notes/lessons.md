@@ -236,3 +236,50 @@ Also: kuzu `Database(path)` v0.11 expects a *file* path, not a directory
 binary cache; `nlohmann-json + spdlog + cpp-httplib + catch2` initial install
 30 seconds. Don't pre-pessimize cmake configure timing on a developer box with
 warm vcpkg cache.
+
+## UE 5.7 — FCoreDelegates::ModalMessageDialog has V2 signature
+
+**Symptom**: `BindStatic(&MyHandler)` against
+`FCoreDelegates::ModalMessageDialog` fails to compile with "no matching
+function" if the handler takes the old `(EAppMsgType, FText, FText)`
+signature.
+
+**Root**: UE 5.4+ added an `EAppMsgCategory` first parameter to the
+delegate. In 5.7 the bound function MUST be
+`(EAppMsgCategory, EAppMsgType, const FText&, const FText&)`.
+
+**Rule**: For the dialog auto-respond hook in `SageDialogTools.cpp`, the
+bound function is named `HandleModalDialogV2` and takes the V2 sig. Even
+if you don't care about Category, accept it as `/*Category*/` and pass
+through to the V1-shaped helper. Header: `GenericPlatform/GenericPlatformMisc.h`
+for `EAppMsgCategory`.
+
+```cpp
+EAppReturnType::Type HandleModalDialogV2(
+    EAppMsgCategory /*Category*/,
+    EAppMsgType::Type MsgType,
+    const FText& Text, const FText& Title);
+FCoreDelegates::ModalMessageDialog.BindStatic(&HandleModalDialogV2);
+```
+
+Confirmed live in SageTest UE 5.7.4: hook fires on `FMessageDialog::Open`
+calls; auto-respond + default-response paths both verified via
+LogSageBridge.
+
+## UE 5.7 — Slate modal click sim needs InputCore + ApplicationCore in Build.cs
+
+**Symptom**: `FPointerEvent` constructor + `FKeyEvent(EKeys::Escape, ...)`
++ `OnMouseButtonDown/Up` in a plugin Build.cs that lists only
+`UnrealEd, EditorSubsystem, ...` fails to link with missing-symbol errors
+on `EKeys::*` and `FSlateApplication::ProcessKeyDownEvent`.
+
+**Root**: `EKeys` lives in `InputCore`, `FSlateApplication` lives in
+`Slate` + `SlateCore`, modifier-key state in `ApplicationCore`. UnrealEd
+brings these transitively for HOSTED tools but not for handler-only
+plugin TUs.
+
+**Rule**: Any plugin TU that simulates input or walks the active modal's
+widget tree (SButton / STextBlock / SWindow) must add `Slate, SlateCore,
+ApplicationCore, InputCore` to `PrivateDependencyModuleNames` in the
+`.Build.cs`. See SageBridge.Build.cs (Phase 4.6 r2) for the canonical
+form.

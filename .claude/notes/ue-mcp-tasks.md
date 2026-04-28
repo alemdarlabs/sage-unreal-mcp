@@ -1,8 +1,8 @@
 # UE-MCP → Sage: 448 Action Per-Tool Task List
 
 > **Source:** `/Users/mahmutalemdar/Developer/alemdarlabs/ue-mcp` — TypeScript MCP server + C++ plugin, BUSL-1.1.
-> **Audit date:** 2026-04-28 (last update: Phase 4.6-r2 dialog policy quartet shipped).
-> **Status:** Sage 108 tools · UE-MCP 448 actions · ~101 covered (mostly via Phase 4) · **347 actions remain**.
+> **Audit date:** 2026-04-28 (last update: Phase 4.2-r2a BP graph node CRUD shipped).
+> **Status:** Sage 112 tools · UE-MCP 448 actions · ~105 covered (mostly via Phase 4) · **343 actions remain**.
 >
 > Earlier note had cited 562; actual enumeration of every `RegisterHandler` / dispatcher branch in the ue-mcp source landed on 448. The 562 number likely came from including duplicates / aliases / TS-side validation rules that don't materialise as distinct C++ handlers.
 
@@ -14,7 +14,7 @@
 | editor | 15 | 29 | 44 | 34 |
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
-| blueprint | 13 | 33 | 46 | 28 |
+| blueprint | 17 | 29 | 46 | 37 |
 | asset | 7 | 32 | 39 | 18 |
 | level | 10 | 22 | 32 | 31 |
 | niagara | 0 | 26 | 26 | 0 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **101** | **347** | **448** | **23** |
+| **TOTAL** | **105** | **343** | **448** | **23** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -256,9 +256,9 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `blueprint.create_function` — Create user fn · W
 - [x] `blueprint.delete_function` → `bp.delete_function`
 - [ ] `blueprint.rename_function` — Rename fn · W
-- [ ] `blueprint.add_node` — Add graph node · W (**high priority — pairs with `connect_pins`**)
+- [x] `blueprint.add_node` → `bp.add_node` (Phase 4.2-r2a)
 - [x] `blueprint.delete_node` → `bp.delete_node`
-- [ ] `blueprint.set_node_property` — Edit pin default / struct · W
+- [x] `blueprint.set_node_property` → `bp.set_node_property` (Phase 4.2-r2a)
 - [x] `blueprint.connect_pins` → `bp.connect_pins`
 - [x] `blueprint.add_component` → `add_component` (Phase 1, runtime path; SCS path = `add_bp_component` not yet)
 - [x] `blueprint.remove_component` → `remove_component` (same caveat)
@@ -269,8 +269,8 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `blueprint.add_function_parameter` — Input/output param · W
 - [x] `blueprint.set_variable_default` → `bp.set_variable_default`
 - [x] `blueprint.compile` → `bp.compile`
-- [ ] `blueprint.list_node_types` — Available palette · R
-- [ ] `blueprint.search_node_types` — Search palette · R
+- [x] `blueprint.list_node_types` → `bp.list_node_types` (Phase 4.2-r2a; supports filter substring)
+- [~] `blueprint.search_node_types` → `bp.list_node_types` with filter parameter (semantic match)
 - [ ] `blueprint.create_interface` — Create BP interface · W
 - [ ] `blueprint.add_interface` — Implement interface · W
 - [ ] `blueprint.list_graphs` — All graphs · R
@@ -280,7 +280,7 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `blueprint.list_local_variables` — List local vars · R
 - [ ] `blueprint.validate` — Compile-without-output · R
 - [ ] `blueprint.read_component_properties` — Dump ALL props on component · R
-- [ ] `blueprint.read_node_property` — Read pin default · R
+- [x] `blueprint.read_node_property` → `bp.read_node_property` (Phase 4.2-r2a)
 - [ ] `blueprint.reparent_component` — SCS hierarchy reparent · W
 - [x] `blueprint.reparent` → `bp.reparent`
 - [ ] `blueprint.set_actor_tick_settings` — CDO tick settings · W
@@ -290,7 +290,9 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `blueprint.get_cdo_properties` — Read C++ class CDO · R
 - [ ] `blueprint.run_construction_script` — Spawn temp + run CS · R
 
-**Phase 4.2 round 2** scope: add_node, set_node_property, T3D pair, function I/O, rename, reparent_component, BP component CRUD via SCS path, interface CRUD, validate, run_construction_script, list/search node types, dispatcher, local variables, dependencies. ~25 tools.
+**Phase 4.2 round 2 progress:**
+- **r2a DONE (4 tools):** add_node + set_node_property + read_node_property + list_node_types. 12+3 smoke tests green on UE 5.7 SageTest. Branch (K2Node_IfThenElse) + CallFunction (with function_name/target_class) + GetVar/SetVar (with variable_name) spawn paths verified. Pin default round-trip (true→false→read) confirmed via Schema::TrySetDefaultValue.
+- **r2b/c remaining (~21 tools):** T3D pair, function I/O (create_function fix + add_function_parameter), rename_function, reparent_component, BP component CRUD via SCS path, interface CRUD, validate, run_construction_script, dispatcher, local variables, dependencies, blueprint.create.
 
 ---
 

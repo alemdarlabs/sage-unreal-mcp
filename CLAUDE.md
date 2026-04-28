@@ -73,7 +73,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Şu Anki Durum (Snapshot)
 
-> Tek satırda durum: **46 commit · 108 MCP tool · Phase 1+2+3 tamam · Phase 4 ~%52 (4.0/4.1/4.2-r1/4.3/4.5-r1/4.6-r1+r2)**.
+> Tek satırda durum: **47 commit · 112 MCP tool · Phase 1+2+3 tamam · Phase 4 ~%53 (4.0/4.1/4.2-r1+r2a/4.3/4.5-r1/4.6-r1+r2)**.
 
 - **Test ortamı**: `/Users/mahmutalemdar/Developer/alemdarlabs/SageTest/SageTest.uproject` (UE 5.7.4 Third Person + Blueprint).
 - **Knowledge graph (canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Real-time delta + query_graph + class_hierarchy çalışıyor.
@@ -98,6 +98,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 | 4.5-r1 | Asset advanced round 1 (`asset.*`) | 7 |
 | 4.6-r1 | Editor automation round 1 (`editor.*`) | 6 |
 | 4.6-r2 | Dialog policy (`editor.set_dialog_policy` / clear / get / list_dialogs / respond_to_dialog) | 5 |
+| 4.2-r2a | BP graph node CRUD (`bp.add_node` / set_node_property / read_node_property / list_node_types) | 4 |
 
 ## Build & Run Commands
 

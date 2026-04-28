@@ -13,10 +13,13 @@
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
+#include "EdGraphSchema_K2.h"
 #include "K2Node.h"
 #include "K2Node_CallFunction.h"
+#include "K2Node_CustomEvent.h"
 #include "K2Node_Event.h"
 #include "K2Node_FunctionEntry.h"
+#include "K2Node_IfThenElse.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
 #include "Kismet2/BlueprintEditorUtils.h"
@@ -808,6 +811,316 @@ FSageToolDispatch::FOutcome BpConnectPinsImpl(const TSharedPtr<FJsonObject>& Arg
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- bp.add_node + bp.set_node_property + bp.read_node_property + ----------
+// ---- bp.list_node_types  (Phase 4.2 round 2a) ------------------------------
+
+struct FNodeAlias { const TCHAR* Alias; const TCHAR* ClassName; };
+
+UClass* ResolveEdGraphNodeClass(const FString& NameOrAlias)
+{
+    static const FNodeAlias kAliases[] = {
+        {TEXT("CallFunction"), TEXT("K2Node_CallFunction")},
+        {TEXT("Event"),        TEXT("K2Node_Event")},
+        {TEXT("CustomEvent"),  TEXT("K2Node_CustomEvent")},
+        {TEXT("GetVar"),       TEXT("K2Node_VariableGet")},
+        {TEXT("SetVar"),       TEXT("K2Node_VariableSet")},
+        {TEXT("Branch"),       TEXT("K2Node_IfThenElse")},
+        {TEXT("If"),           TEXT("K2Node_IfThenElse")},
+    };
+    FString Resolved = NameOrAlias;
+    for (const FNodeAlias& A : kAliases)
+    {
+        if (Resolved.Equals(A.Alias, ESearchCase::IgnoreCase))
+        {
+            Resolved = A.ClassName;
+            break;
+        }
+    }
+    for (TObjectIterator<UClass> It; It; ++It)
+    {
+        if (It->GetName() == Resolved && It->IsChildOf(UEdGraphNode::StaticClass()))
+        {
+            return *It;
+        }
+    }
+    return nullptr;
+}
+
+FSageToolDispatch::FOutcome BpAddNodeImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, FnName, NodeClass;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("function"), FnName)
+        || !Args->TryGetStringField(TEXT("node_class"), NodeClass))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'function', or 'node_class'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    UEdGraph* Graph = FindFunctionGraph(BP, FnName);
+    if (!Graph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("graph not found"));
+
+    UClass* NodeUClass = ResolveEdGraphNodeClass(NodeClass);
+    if (!NodeUClass)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("node class not found: %s (must be UEdGraphNode subclass)"),
+                            *NodeClass));
+    }
+
+    double NodeX = 0.0, NodeY = 0.0;
+    Args->TryGetNumberField(TEXT("node_x"), NodeX);
+    Args->TryGetNumberField(TEXT("node_y"), NodeY);
+
+    const TSharedPtr<FJsonObject>* NodeParams = nullptr;
+    Args->TryGetObjectField(TEXT("node_params"), NodeParams);
+
+    FScopedTransaction Tx(LOCTEXT("BpAddNode", "Sage: Add BP Node"));
+    Graph->Modify();
+
+    UEdGraphNode* NewNode = NewObject<UEdGraphNode>(Graph, NodeUClass);
+    if (!NewNode)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("failed to NewObject node"));
+    }
+    NewNode->CreateNewGuid();
+    NewNode->NodePosX = static_cast<int32>(NodeX);
+    NewNode->NodePosY = static_cast<int32>(NodeY);
+
+    // Special-case init BEFORE AllocateDefaultPins — pin layout depends on
+    // the function reference / variable reference being set first.
+    if (UK2Node_CallFunction* Call = Cast<UK2Node_CallFunction>(NewNode))
+    {
+        if (NodeParams)
+        {
+            FString FnRef, TargetClassName;
+            (*NodeParams)->TryGetStringField(TEXT("function_name"), FnRef);
+            (*NodeParams)->TryGetStringField(TEXT("target_class"),  TargetClassName);
+
+            // Allow "/Script/Engine.GameplayStatics:GetGameMode" shorthand.
+            if (FnRef.Contains(TEXT(":")))
+            {
+                FString CP, Fn;
+                FnRef.Split(TEXT(":"), &CP, &Fn);
+                if (TargetClassName.IsEmpty()) TargetClassName = CP;
+                FnRef = Fn;
+            }
+
+            UFunction* FoundFn = nullptr;
+            if (!TargetClassName.IsEmpty())
+            {
+                FSoftObjectPath ClsPath(TargetClassName);
+                UClass* C = Cast<UClass>(ClsPath.ResolveObject());
+                if (!C) C = Cast<UClass>(ClsPath.TryLoad());
+                if (C) FoundFn = C->FindFunctionByName(FName(*FnRef));
+            }
+            if (!FoundFn && BP->ParentClass)
+            {
+                FoundFn = BP->ParentClass->FindFunctionByName(FName(*FnRef));
+            }
+            if (FoundFn)
+            {
+                Call->SetFromFunction(FoundFn);
+            }
+        }
+    }
+    else if (UK2Node_VariableGet* VG = Cast<UK2Node_VariableGet>(NewNode))
+    {
+        if (NodeParams)
+        {
+            FString VarName;
+            if ((*NodeParams)->TryGetStringField(TEXT("variable_name"), VarName))
+            {
+                VG->VariableReference.SetSelfMember(FName(*VarName));
+            }
+        }
+    }
+    else if (UK2Node_VariableSet* VS = Cast<UK2Node_VariableSet>(NewNode))
+    {
+        if (NodeParams)
+        {
+            FString VarName;
+            if ((*NodeParams)->TryGetStringField(TEXT("variable_name"), VarName))
+            {
+                VS->VariableReference.SetSelfMember(FName(*VarName));
+            }
+        }
+    }
+
+    Graph->AddNode(NewNode, /*bSelectNewNode*/ false, /*bUpdateGraphCount*/ true);
+    NewNode->AllocateDefaultPins();
+    NewNode->PostPlacedNewNode();
+
+    FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"),  BP->GetName());
+    R->SetStringField(TEXT("function"),   FnName);
+    R->SetStringField(TEXT("node_id"),    NewNode->NodeGuid.ToString());
+    R->SetStringField(TEXT("node_class"), NodeUClass->GetName());
+    TArray<TSharedPtr<FJsonValue>> Pos;
+    Pos.Add(MakeShared<FJsonValueNumber>(NewNode->NodePosX));
+    Pos.Add(MakeShared<FJsonValueNumber>(NewNode->NodePosY));
+    R->SetArrayField(TEXT("pos"), Pos);
+
+    TArray<TSharedPtr<FJsonValue>> Pins;
+    for (UEdGraphPin* P : NewNode->Pins)
+    {
+        if (!P) continue;
+        auto PJ = MakeShared<FJsonObject>();
+        PJ->SetStringField(TEXT("name"), P->PinName.ToString());
+        PJ->SetStringField(TEXT("direction"),
+            P->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
+        PJ->SetStringField(TEXT("type"), P->PinType.PinCategory.ToString());
+        Pins.Add(MakeShared<FJsonValueObject>(PJ));
+    }
+    R->SetArrayField(TEXT("pins"), Pins);
+
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpSetNodePropertyImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, FnName, NodeId, PinName, ValueStr;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("function"), FnName)
+        || !Args->TryGetStringField(TEXT("node_id"), NodeId)
+        || !Args->TryGetStringField(TEXT("pin"), PinName)
+        || !Args->TryGetStringField(TEXT("value"), ValueStr))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'function', 'node_id', 'pin', or 'value'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    UEdGraph* Graph = FindFunctionGraph(BP, FnName);
+    if (!Graph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("graph not found"));
+    UEdGraphNode* Node = FindNodeByGuid(Graph, NodeId);
+    if (!Node) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("node not found"));
+    UEdGraphPin* Pin = FindPin(Node, PinName);
+    if (!Pin) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("pin not found"));
+
+    if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("cannot set default value on execution pin (use bp.connect_pins)"));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("BpSetNodeProp", "Sage: Set BP Pin Default"));
+    Node->Modify();
+    if (const UEdGraphSchema* Schema = Graph->GetSchema())
+    {
+        Schema->TrySetDefaultValue(*Pin, ValueStr);
+    }
+    else
+    {
+        Pin->DefaultValue = ValueStr;
+    }
+    FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetStringField(TEXT("node_id"),   NodeId);
+    R->SetStringField(TEXT("pin"),       PinName);
+    R->SetStringField(TEXT("value"),     Pin->DefaultValue);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpReadNodePropertyImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, FnName, NodeId, PinName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("function"), FnName)
+        || !Args->TryGetStringField(TEXT("node_id"), NodeId)
+        || !Args->TryGetStringField(TEXT("pin"), PinName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'function', 'node_id', or 'pin'"));
+    }
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    UEdGraph* Graph = FindFunctionGraph(BP, FnName);
+    if (!Graph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("graph not found"));
+    UEdGraphNode* Node = FindNodeByGuid(Graph, NodeId);
+    if (!Node) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("node not found"));
+    UEdGraphPin* Pin = FindPin(Node, PinName);
+    if (!Pin) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("pin not found"));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"),     BP->GetName());
+    R->SetStringField(TEXT("node_id"),       NodeId);
+    R->SetStringField(TEXT("pin"),           PinName);
+    R->SetStringField(TEXT("type"),          Pin->PinType.PinCategory.ToString());
+    R->SetStringField(TEXT("direction"),
+        Pin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
+    R->SetStringField(TEXT("default_value"), Pin->DefaultValue);
+    if (Pin->DefaultObject)
+    {
+        R->SetStringField(TEXT("default_object"),
+            FSoftObjectPath(Pin->DefaultObject).ToString());
+    }
+    if (!Pin->DefaultTextValue.IsEmpty())
+    {
+        R->SetStringField(TEXT("default_text"), Pin->DefaultTextValue.ToString());
+    }
+    R->SetBoolField(TEXT("is_execution"),
+        Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec);
+    R->SetNumberField(TEXT("link_count"), Pin->LinkedTo.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpListNodeTypesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Filter;
+    int32   Max = 200;
+    if (Args.IsValid())
+    {
+        Args->TryGetStringField(TEXT("filter"), Filter);
+        double NumMax = 0;
+        if (Args->TryGetNumberField(TEXT("max"), NumMax))
+        {
+            Max = FMath::Clamp(static_cast<int32>(NumMax), 1, 2000);
+        }
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Out;
+    int32 Total = 0;
+    for (TObjectIterator<UClass> It; It; ++It)
+    {
+        UClass* C = *It;
+        if (!C->IsChildOf(UK2Node::StaticClass())) continue;
+        if (C->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
+            continue;
+        const FString N = C->GetName();
+        if (!Filter.IsEmpty() && !N.Contains(Filter)) continue;
+        ++Total;
+        if (Out.Num() >= Max) continue;
+        auto O = MakeShared<FJsonObject>();
+        O->SetStringField(TEXT("name"), N);
+        if (UPackage* Pkg = C->GetOuterUPackage())
+        {
+            O->SetStringField(TEXT("module"), Pkg->GetName());
+        }
+        Out.Add(MakeShared<FJsonValueObject>(O));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetArrayField (TEXT("types"),    Out);
+    R->SetNumberField(TEXT("returned"), Out.Num());
+    R->SetNumberField(TEXT("total"),    Total);
+    if (!Filter.IsEmpty()) R->SetStringField(TEXT("filter"), Filter);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---- bp.reparent ----------------------------------------------------------
 
 FSageToolDispatch::FOutcome BpReparentImpl(const TSharedPtr<FJsonObject>& Args)
@@ -883,6 +1196,10 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
     // Write — graph
     Dispatch.RegisterHandler(TEXT("bp.delete_node"),         GT(&BpDeleteNodeImpl));
     Dispatch.RegisterHandler(TEXT("bp.connect_pins"),        GT(&BpConnectPinsImpl));
+    Dispatch.RegisterHandler(TEXT("bp.add_node"),            GT(&BpAddNodeImpl));
+    Dispatch.RegisterHandler(TEXT("bp.set_node_property"),   GT(&BpSetNodePropertyImpl));
+    Dispatch.RegisterHandler(TEXT("bp.read_node_property"),  GT(&BpReadNodePropertyImpl));
+    Dispatch.RegisterHandler(TEXT("bp.list_node_types"),     GT(&BpListNodeTypesImpl));
 
     // Write — class shape
     Dispatch.RegisterHandler(TEXT("bp.set_cdo_property"),    GT(&BpSetCdoPropertyImpl));
