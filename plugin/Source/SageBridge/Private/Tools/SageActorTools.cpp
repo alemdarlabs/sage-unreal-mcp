@@ -1,6 +1,7 @@
 #include "Tools/SageActorTools.h"
 #include "SageBridge.h"
 #include "ToolDispatch/SageToolDispatch.h"
+#include "Tools/SageToolHelpers.h"
 
 #include "Async/Async.h"
 #include "Dom/JsonObject.h"
@@ -93,65 +94,10 @@ bool RejectIfPie(FSageToolDispatch::FOutcome& OutErr)
     return false;
 }
 
-// Reflection-based UProperty setter. Phase 1 supports primitive types; struct
-// (Vector, Rotator), object reference, and array property paths land in
-// Milestone 1.3+. Returns false if `Property`'s type is unsupported.
-bool SetUPropertyFromJson(UObject* Container,
-                          FProperty* Property,
-                          const TSharedPtr<FJsonValue>& Value)
-{
-    if (Property == nullptr || Container == nullptr || !Value.IsValid())
-    {
-        return false;
-    }
-
-    if (FBoolProperty* P = CastField<FBoolProperty>(Property))
-    {
-        P->SetPropertyValue_InContainer(Container, Value->AsBool());
-        return true;
-    }
-    if (FIntProperty* P = CastField<FIntProperty>(Property))
-    {
-        P->SetPropertyValue_InContainer(Container, static_cast<int32>(Value->AsNumber()));
-        return true;
-    }
-    if (FInt64Property* P = CastField<FInt64Property>(Property))
-    {
-        P->SetPropertyValue_InContainer(Container, static_cast<int64>(Value->AsNumber()));
-        return true;
-    }
-    if (FFloatProperty* P = CastField<FFloatProperty>(Property))
-    {
-        P->SetPropertyValue_InContainer(Container, static_cast<float>(Value->AsNumber()));
-        return true;
-    }
-    if (FDoubleProperty* P = CastField<FDoubleProperty>(Property))
-    {
-        P->SetPropertyValue_InContainer(Container, Value->AsNumber());
-        return true;
-    }
-    if (FStrProperty* P = CastField<FStrProperty>(Property))
-    {
-        P->SetPropertyValue_InContainer(Container, Value->AsString());
-        return true;
-    }
-    if (FNameProperty* P = CastField<FNameProperty>(Property))
-    {
-        P->SetPropertyValue_InContainer(Container, FName(*Value->AsString()));
-        return true;
-    }
-    if (FTextProperty* P = CastField<FTextProperty>(Property))
-    {
-        P->SetPropertyValue_InContainer(Container, FText::FromString(Value->AsString()));
-        return true;
-    }
-    if (FByteProperty* P = CastField<FByteProperty>(Property))
-    {
-        P->SetPropertyValue_InContainer(Container, static_cast<uint8>(Value->AsNumber()));
-        return true;
-    }
-    return false;
-}
+// (Phase 1 had a file-local SetUPropertyFromJson copy here. Phase 4.0
+// removed it — all callers now use detail::SetUPropertyFromJson which
+// covers TArray/TMap/TSet/TObjectPtr/FSoftObjectPtr/TSubclassOf/UEnum/
+// USTRUCT.)
 
 // ---- spawn_actor -----------------------------------------------------------
 
@@ -449,7 +395,7 @@ FSageToolDispatch::FOutcome ModifyActorPropertyOnGameThread(const TSharedPtr<FJs
     Actor->Modify();
     Actor->PreEditChange(Property);
 
-    if (!SetUPropertyFromJson(Actor, Property, ValueField))
+    if (!detail::SetUPropertyFromJson(Actor, Property, ValueField))
     {
         Transaction.Cancel();
         return FSageToolDispatch::FOutcome::MakeError(-32602,

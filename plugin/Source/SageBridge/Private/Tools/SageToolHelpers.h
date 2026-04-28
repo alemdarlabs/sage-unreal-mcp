@@ -38,19 +38,45 @@ TSharedRef<FJsonValue> Vec3ToJson(const FVector& V);
 TSharedRef<FJsonValue> Rot3ToJson(const FRotator& R);
 
 // ---- reflection ------------------------------------------------------------
+//
+// Phase 4.0 — full UProperty surface:
+//   - Primitives: bool, int8/16/32/64, uint8/16/32/64, float, double,
+//     FString, FName, FText, byte (uint8 with optional UEnum metadata)
+//   - Containers: TArray<T>, TMap<K,V>, TSet<T> (recursive on inner type)
+//   - References:
+//     - TObjectPtr<T> / UObject*: accept asset path string or null
+//     - FSoftObjectPtr / TSoftObjectPtr<T>: accept path string
+//     - TSubclassOf<T> / UClass*: accept class path or null
+//     - TSoftClassPtr<T>: accept class path
+//   - Enums (FEnumProperty + FByteProperty with UEnum):
+//     accept name string or numeric value
+//   - Structs: vector/rotator/transform/color/linearColor/intpoint/intvector
+//     have shorthand JSON forms; arbitrary USTRUCTs go through ImportText/
+//     ExportText round-trip.
+//
+// Per-element edit ops (set_property_array_op family) call the lower-level
+// raw-pointer API directly with the inner FProperty + element pointer.
 
-// Sets a UProperty on Container from a JSON value. Phase 1 supports primitive
-// types: bool, int, int64, float, double, string, name, text, byte. Returns
-// false when the property type is unsupported.
+// Public: write a UProperty on a UObject container from a JSON value.
+// Returns false when the property type isn't supported or the value shape
+// doesn't match (e.g. JSON object on a primitive).
 bool SetUPropertyFromJson(UObject* Container,
                           FProperty* Property,
                           const TSharedPtr<FJsonValue>& Value);
 
-// Reads a UProperty from Container into a JSON value. Symmetric inverse of
-// SetUPropertyFromJson — same primitive set. Returns nullptr on unsupported
-// type.
+// Public: read a UProperty into a JSON value. Symmetric inverse.
 [[nodiscard]] TSharedPtr<FJsonValue> GetUPropertyAsJson(const UObject* Container,
                                                         const FProperty* Property);
+
+// Lower-level: write into a raw memory location given a property descriptor.
+// Used by both the public form (after ContainerPtrToValuePtr) and the
+// per-element ops (when iterating TArray elements via FScriptArrayHelper).
+bool SetPropertyValueAtPtr(FProperty* Property, void* ValuePtr,
+                           const TSharedPtr<FJsonValue>& Value);
+
+// Symmetric read from raw pointer.
+[[nodiscard]] TSharedPtr<FJsonValue> GetPropertyValueAtPtr(const FProperty* Property,
+                                                            const void* ValuePtr);
 
 // Type-aware JSON value equality for the primitive set we round-trip.
 // Numbers compared with FMath::IsNearlyEqual; arrays/objects fall back to false.

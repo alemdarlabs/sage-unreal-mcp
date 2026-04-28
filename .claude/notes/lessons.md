@@ -29,6 +29,43 @@ user might exercise. Group them by shared infrastructure, not by guessed
 calendar weeks. Phases land when the work lands; the graph of work is
 the plan, the timeline is a side effect.
 
+## File-local helper shadows the public version
+
+**Symptom**: `nm` showed two `SetUPropertyFromJson` symbols in the plugin
+dylib — `sage::tools::detail::SetUPropertyFromJson` (the public form
+declared in SageToolHelpers.h) and `sage::tools::(anonymous)::SetUPropertyFromJson`
+(a Phase-1 file-local copy in SageActorTools.cpp). All callers in the
+file resolved to the anonymous-namespace shadow, never the public one.
+Phase 4.0's collection support landed in `detail::` and was simply
+unreachable from `modify_actor_property`.
+
+**Root**: When a public helper grows, a stale file-local copy in another
+TU silently keeps shipping the old behaviour. Compiler warns nothing
+because both symbols are well-formed.
+
+**Rule**:
+- Before adding a `SetXFromJson` / `JsonToX` style helper to a file,
+  grep the whole project for an existing one with the same role; if it
+  exists in a header, use that.
+- When refactoring a public helper, search for shadowed copies in
+  anonymous namespaces by name (`grep -n 'bool YourFunc(' --include='*.cpp'`)
+  before declaring the refactor done.
+- `nm <dylib> | c++filt` is the fastest way to detect this — duplicate
+  symbol names from "(anonymous namespace)" vs the named namespace are
+  the smoking gun.
+
+## UE_LOG `LogTemp` is filtered by default
+
+**Symptom**: `UE_LOG(LogTemp, Log, TEXT("..."))` produced no output in
+SageTest.log even at default Display level.
+
+**Rule**: Use a project-specific log category (`LogSageBridge` here);
+LogTemp is meant for ad-hoc throwaway prints and is filtered in many
+configs. Verbose-level diagnostics for our reflection helpers go through
+`LogSageBridge, Verbose` so they're enabled by adding
+`-LogCmds="LogSageBridge Verbose"` (or in an .ini) without spamming
+the default log.
+
 ## UE 5.7 — `AssetDependencyInfo.h` does not exist
 
 **Symptom**: `fatal error: 'AssetRegistry/AssetDependencyInfo.h' file not found`
