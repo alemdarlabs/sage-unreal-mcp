@@ -41,7 +41,7 @@ flowchart TB
   M17 ==Demo 1 ✓==> M21a
 
   %% Şu an
-  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>62 commit · 151 MCP tool · index_slot 30s→4s (7.5x)<br/>Phase 1+2+3+4.0/4.1/4.2(r1+r2)/4.3/4.4/4.5-r1/4.6-r1+r2/4.7-p1..p4 CANLI<br/>SageTest UE 5.7 — 8K asset · 16K dep · 8337 class · 8336 inherit · 492 engine module<br/>Phase 4.7 DONE: 13 tool · type-matrix smoke 38/38 · INI write + plugin enable<br/>UE-MCP 448 action audit → Phase 4 yol haritası %67 done"]):::now
+  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>63 commit · 155 MCP tool · index_slot 30s→4s (7.5x)<br/>Phase 1+2+3+4.0/4.1/4.2(r1+r2)/4.3/4.4/4.5-r1/4.6-r1+r2+r3-b1/4.7 CANLI<br/>SageTest UE 5.7 — 8K asset · 16K dep · 8337 class · 8336 inherit · 492 engine module<br/>Phase 4.6-r3-b1: undo · redo · focus_on_actor · set_viewport<br/>UE-MCP 448 action audit → Phase 4 yol haritası %68 done"]):::now
 
   %% Phase 1'den ertelenenler
   subgraph DEF["Storage / out-of-process gerektirenler"]
@@ -72,7 +72,7 @@ flowchart TB
     P42["4.2 Blueprint authoring (round 1+2a..2g/p1) ✓ (37 tool)<br/>r1: read/list_vars/fns/function graph/components/search<br/>add/delete var·fn · delete_node · connect_pins<br/>set_cdo_property · reparent · compile<br/>r2a: add_node · set/read_node_property · list_node_types<br/>r2b: list/add/delete_local_variable<br/>r2c: list/add/remove_interface<br/>r2d: list_graphs · rename_function<br/>r2e: list/add/remove_function_parameter (in+out, FnResult auto)<br/>r2f: create · create_interface (authoring loop closed)<br/>r2g/p1: list/add/remove_event_dispatcher (payload→r2h)<br/><i>round 2g remaining: ~11 tool (T3D, validate, SCS, set_var_props, ...)</i>"]:::done
     P43["4.3 Material round 1 ✓ (13 tool)<br/>read · params · expressions · create_instance<br/>add/delete/connect_expressions · set_base_color<br/>set_shading_model · validate · connect_texture<br/><i>round 2: build_graph · render_preview · shader_stats</i>"]:::done
     P45["4.5 Asset advanced round 1 ✓ (7 tool)<br/>mesh_bounds · mesh_collision · diagnose_registry<br/>list_redirectors · bulk_rename · move_folder · fixup_redirectors<br/><i>round 2: import_fbx/texture · datatable · FTS · sockets</i>"]:::done
-    P46["4.6 Editor automation round 1+2 ✓ (11 tool)<br/>r1: console_command · take_screenshot · get_engine_version<br/>get_project_version · get_log_file_path · read_log<br/>r2 (dialog policy): set/clear/get_dialog_policy<br/>list_dialogs · respond_to_dialog<br/><i>round 3: sequencer · viewport · run_python · build_*</i>"]:::done
+    P46["4.6 Editor automation r1+r2+r3/b1 ✓ (15 tool)<br/>r1: console_command · screenshot · engine/project version · log<br/>r2 (dialog): set/clear/get_dialog_policy · list_dialogs · respond<br/>r3-b1: undo · redo · focus_on_actor · set_viewport<br/><i>r3 remaining: sequencer · run_python · build_* · set_property</i>"]:::done
     P47["4.7 Project introspection (round 1+2+3+4) ✓ (13 tool)<br/>p1: get_info · list_modules · read_cpp_header · read_cpp_source<br/>p2: search_cpp · list_engine_modules · read_engine_header · find_engine_symbol<br/>p3: read_config · search_config · list_config_tags<br/>p4: set_config (W) · set_plugin_enabled (W)<br/>+ scripts/smoke/type_matrix.py (38 BP variable type variants verified)"]:::done
     P48["4.8 Animation<br/>AnimBP · montage · sequence · blendspace<br/>IK Rig · ControlRig · skeleton · modifiers (~56 tool)"]:::todo
     P49["4.9 Niagara VFX<br/>system · emitter · modules · HLSL · renderer (~37 tool)"]:::todo

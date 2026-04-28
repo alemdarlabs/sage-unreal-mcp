@@ -2453,6 +2453,67 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // ---- Editor state control (Phase 4.6 round 3 batch 1) --------------
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.undo",
+        .description = "Run GEditor->UndoTransaction. Reverts the most "
+                       "recent transactional change. Returns {undid: bool} "
+                       "— false when the undo stack is empty.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.redo",
+        .description = "Run GEditor->RedoTransaction. Re-applies the most "
+                       "recently undone change. Returns {redid: bool}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.focus_on_actor",
+        .description = "Move the active level viewport's camera to focus on "
+                       "the actor identified by actor_id (full path, like "
+                       "what spawn_actor returns). active_viewport_only=true "
+                       "limits the move to the current viewport (default "
+                       "false: all level viewports). -32602 if the actor "
+                       "doesn't exist.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"actor_id",             {{"type", "string"}}},
+                {"active_viewport_only", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"actor_id"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.set_viewport",
+        .description = "Set the active level viewport's camera position "
+                       "and/or rotation. Provide location [x,y,z] and/or "
+                       "rotation [pitch,yaw,roll]. -32602 if neither is "
+                       "supplied. Forces a viewport invalidate so the "
+                       "change renders immediately.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"location", {{"type", "array"}, {"items", {{"type", "number"}}},
+                              {"minItems", 3}, {"maxItems", 3}}},
+                {"rotation", {{"type", "array"}, {"items", {{"type", "number"}}},
+                              {"minItems", 3}, {"maxItems", 3}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // ---- Dialog policy (Phase 4.6 round 2) -----------------------------
     // Hooks FCoreDelegates::ModalMessageDialog so unattended agent flows
     // don't stall on Save?/Reload?/Confirm Delete? modals. Lazy install

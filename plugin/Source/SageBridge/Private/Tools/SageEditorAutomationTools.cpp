@@ -6,9 +6,12 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Editor.h"
+#include "EditorViewportClient.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
+#include "GameFramework/Actor.h"
 #include "GenericPlatform/GenericPlatformMisc.h"
+#include "LevelEditorViewport.h"
 #include "GenericPlatform/GenericPlatformOutputDevices.h"
 #include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformOutputDevices.h"
@@ -191,6 +194,97 @@ FSageToolDispatch::FOutcome ReadLogImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- editor.undo / editor.redo  (Phase 4.6-r3) ---------------------------
+
+FSageToolDispatch::FOutcome UndoImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    if (!GEditor) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
+    const bool bDid = GEditor->UndoTransaction(/*bCanRedo*/ true);
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("undid"), bDid);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome RedoImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    if (!GEditor) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
+    const bool bDid = GEditor->RedoTransaction();
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("redid"), bDid);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- editor.focus_on_actor / editor.set_viewport  (Phase 4.6-r3) --------
+
+FLevelEditorViewportClient* GetActiveLevelViewportClient()
+{
+    if (!GEditor) return nullptr;
+    if (FLevelEditorViewportClient* C = GCurrentLevelEditingViewportClient) return C;
+    const TArray<FLevelEditorViewportClient*>& Clients = GEditor->GetLevelViewportClients();
+    return Clients.Num() > 0 ? Clients[0] : nullptr;
+}
+
+FSageToolDispatch::FOutcome FocusOnActorImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString ActorPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("actor_id"), ActorPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor_id'"));
+    }
+    if (!GEditor) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
+
+    AActor* A = sage::tools::detail::ResolveActor(ActorPath);
+    if (!A) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("actor not found: %s"), *ActorPath));
+
+    bool bActiveOnly = false;
+    Args->TryGetBoolField(TEXT("active_viewport_only"), bActiveOnly);
+
+    GEditor->MoveViewportCamerasToActor(*A, bActiveOnly);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("actor"), ActorPath);
+    R->SetBoolField  (TEXT("active_viewport_only"), bActiveOnly);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetViewportImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FLevelEditorViewportClient* VPC = GetActiveLevelViewportClient();
+    if (!VPC) return FSageToolDispatch::FOutcome::MakeError(-32603,
+        TEXT("no level viewport available"));
+
+    bool bSetLoc = false, bSetRot = false;
+    FVector  Loc{};
+    FRotator Rot{};
+    if (Args.IsValid())
+    {
+        if (sage::tools::detail::ParseVector3(Args, TEXT("location"), Loc))
+        {
+            VPC->SetViewLocation(Loc);
+            bSetLoc = true;
+        }
+        if (sage::tools::detail::ParseRotator3(Args, TEXT("rotation"), Rot))
+        {
+            VPC->SetViewRotation(Rot);
+            bSetRot = true;
+        }
+    }
+    if (!bSetLoc && !bSetRot)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("provide 'location' [x,y,z] and/or 'rotation' [pitch,yaw,roll]"));
+    }
+    VPC->Invalidate();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("location_set"), bSetLoc);
+    R->SetBoolField(TEXT("rotation_set"), bSetRot);
+    if (bSetLoc) R->SetField(TEXT("location"), sage::tools::detail::Vec3ToJson(Loc));
+    if (bSetRot) R->SetField(TEXT("rotation"), sage::tools::detail::Rot3ToJson(Rot));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 }  // namespace (anonymous)
 
 void RegisterEditorAutomationTools(FSageToolDispatch& Dispatch)
@@ -212,6 +306,12 @@ void RegisterEditorAutomationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("editor.get_project_version"),GT(&GetProjectVersionImpl));
     Dispatch.RegisterHandler(TEXT("editor.get_log_file_path"),  GT(&GetLogFilePathImpl));
     Dispatch.RegisterHandler(TEXT("editor.read_log"),           GT(&ReadLogImpl));
+
+    // Phase 4.6-r3 batch 1: editor state control
+    Dispatch.RegisterHandler(TEXT("editor.undo"),               GT(&UndoImpl));
+    Dispatch.RegisterHandler(TEXT("editor.redo"),               GT(&RedoImpl));
+    Dispatch.RegisterHandler(TEXT("editor.focus_on_actor"),     GT(&FocusOnActorImpl));
+    Dispatch.RegisterHandler(TEXT("editor.set_viewport"),       GT(&SetViewportImpl));
 }
 
 #undef LOCTEXT_NAMESPACE

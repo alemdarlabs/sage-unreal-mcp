@@ -23,6 +23,7 @@ public class SageBridge : ModuleRules
 
         PrivateDependencyModuleNames.AddRange(new string[] {
             "UnrealEd",
+            "LevelEditor",       // FLevelEditorViewportClient (Phase 4.6-r3)
             "EditorSubsystem",
             "MaterialEditor",
             "SourceControl",

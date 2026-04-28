@@ -11,7 +11,7 @@
 | Category | Have | Need | Total | % |
 |---|---:|---:|---:|---:|
 | project | 15 | 14 | 29 | 52 |
-| editor | 15 | 29 | 44 | 34 |
+| editor | 19 | 25 | 44 | 43 |
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
 | blueprint | 38 | 8 | 46 | 83 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **139** | **309** | **448** | **31** |
+| **TOTAL** | **143** | **305** | **448** | **32** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -96,16 +96,16 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [~] `editor.get_runtime_value` — Read PIE actor property · R · Sage `get_pie_state` (partial)
 - [ ] `editor.set_pie_time_scale` — PIE time dilation · W
 - [ ] `editor.hot_reload` — Hot reload C++ · W
-- [ ] `editor.undo` — Undo last transaction · W
-- [ ] `editor.redo` — Redo last transaction · W
+- [x] `editor.undo` → `editor.undo` (Phase 4.6-r3-b1; GEditor->UndoTransaction(true))
+- [x] `editor.redo` → `editor.redo` (Phase 4.6-r3-b1; GEditor->RedoTransaction)
 - [ ] `editor.get_perf_stats` — Editor performance stats · R
 - [ ] `editor.run_stat` — STAT command for profiling · W (covered indirectly by `console_command`)
 - [ ] `editor.set_scalability` — Quality/scalability level · W
 - [x] `editor.capture_screenshot` — Take screenshot · W · Sage `editor.take_screenshot`
 - [ ] `editor.capture_scene_png` — Headless PNG via SceneCapture2D · W
 - [x] `editor.get_viewport` — Viewport camera state · R · Sage `get_viewport_state`
-- [ ] `editor.set_viewport` — Set camera position · W
-- [ ] `editor.focus_on_actor` — Focus viewport on actor · W
+- [x] `editor.set_viewport` → `editor.set_viewport` (Phase 4.6-r3-b1; FLevelEditorViewportClient SetViewLocation/Rotation, both optional)
+- [x] `editor.focus_on_actor` → `editor.focus_on_actor` (Phase 4.6-r3-b1; GEditor->MoveViewportCamerasToActor)
 - [ ] `editor.create_sequence` — Create LevelSequence · W
 - [ ] `editor.get_sequence_info` — Read sequence · R
 - [ ] `editor.add_sequence_track` — Add track to LS · W
