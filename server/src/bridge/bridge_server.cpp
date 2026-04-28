@@ -194,13 +194,12 @@ void BridgeServer::onClientMessage(const std::shared_ptr<ix::ConnectionState>& s
             return;
         }
         const auto type = parsed["type"].get<std::string>();
+        spdlog::debug("Bridge: incoming type='{}' from id={}", type, session_id);
         switch (parseType(type)) {
         case MessageType::Hello:      handleHello(ws, session_id, parsed); break;
         case MessageType::Heartbeat:  handleHeartbeat(ws, session_id, parsed); break;
         case MessageType::ToolResult: handleToolResult(session_id, parsed); break;
-        case MessageType::Event:
-            spdlog::debug("Bridge: event received from id={} (deferred to Phase 2)", session_id);
-            break;
+        case MessageType::Event:    handleEvent(session_id, parsed); break;
         default:
             spdlog::warn("Bridge: unknown message type '{}' from id={}", type, session_id);
             ws.send(errorMessage(-32601, "unknown type").dump());
@@ -309,6 +308,49 @@ void BridgeServer::handleToolResult(const std::string& session_id, const Json& p
         spdlog::debug("Bridge: late tool_result for tx={}; promise already satisfied", r.tx_id);
     }
     pending_.erase(it);
+}
+
+void BridgeServer::handleEvent(const std::string& session_id, const Json& payload) {
+    spdlog::info("Bridge: event recv from id={} kind='{}'",
+                 session_id, payload.value("kind", "<missing>"));
+    auto evRes = parseEvent(payload);
+    if (!evRes.has_value()) {
+        spdlog::warn("Bridge: event parse failed (id={}): {}", session_id, evRes.error());
+        return;
+    }
+
+    // Resolve slot_id from the originating session — plugins don't echo it
+    // on every event, the bridge already knows.
+    std::string slotId;
+    {
+        std::lock_guard lk(sessionsMu_);
+        auto it = sessions_.find(session_id);
+        if (it == sessions_.end()) {
+            spdlog::debug("Bridge: event from unregistered session id={}, dropping", session_id);
+            return;
+        }
+        slotId = it->second.slot_id;
+    }
+
+    EventHandler h;
+    {
+        std::lock_guard lk(eventHandlerMu_);
+        h = eventHandler_;
+    }
+    if (!h) {
+        spdlog::debug("Bridge: event handler not set; dropping kind='{}'", evRes->kind);
+        return;
+    }
+    try {
+        h(slotId, *evRes);
+    } catch (const std::exception& ex) {
+        spdlog::error("Bridge: event handler threw on kind='{}': {}", evRes->kind, ex.what());
+    }
+}
+
+void BridgeServer::setEventHandler(EventHandler handler) {
+    std::lock_guard lk(eventHandlerMu_);
+    eventHandler_ = std::move(handler);
 }
 
 std::string BridgeServer::nextTxId() {

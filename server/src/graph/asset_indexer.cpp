@@ -202,25 +202,31 @@ GraphResult ingestSnapshot(GraphStore& store, const Json& snapshot) {
 }
 
 GraphResult getIndexStatus(GraphStore& store) {
-    auto r = store.execute(
+    // last_indexed_at_ms tracks the last *full* ingest pass; deltas update
+    // the graph but not this timestamp (so the agent can tell "since this
+    // moment, the snapshot has been patched live"). The counts however
+    // must reflect the current graph — `_IndexState.asset_count` would go
+    // stale every delta otherwise. So we live-count.
+    auto stateR = store.execute(
         "MATCH (s:_IndexState {id: 1}) "
-        "RETURN s.last_indexed_at_ms AS last_indexed_at_ms, "
-        "       s.asset_count        AS asset_count, "
-        "       s.dep_count          AS dep_count;");
-    if (is_error(r)) return error_of(r);
+        "RETURN s.last_indexed_at_ms AS last_indexed_at_ms;");
+    if (is_error(stateR)) return error_of(stateR);
 
-    const auto& env = value_of(r);
     Json out = Json::object();
-    if (env["row_count"].get<int64_t>() == 0) {
-        out["asset_count"]        = 0;
-        out["dep_count"]          = 0;
+    if (value_of(stateR)["row_count"].get<int64_t>() == 0) {
         out["last_indexed_at_ms"] = nullptr;
     } else {
-        const auto& row = env["rows"][0];
-        out["asset_count"]        = row["asset_count"];
-        out["dep_count"]          = row["dep_count"];
-        out["last_indexed_at_ms"] = row["last_indexed_at_ms"];
+        out["last_indexed_at_ms"] = value_of(stateR)["rows"][0]["last_indexed_at_ms"];
     }
+
+    auto assetR = store.execute("MATCH (a:Asset) RETURN count(a) AS c;");
+    if (is_error(assetR)) return error_of(assetR);
+    out["asset_count"] = value_of(assetR)["rows"][0]["c"];
+
+    auto depR = store.execute("MATCH ()-[r:DEPENDS_ON]->() RETURN count(r) AS c;");
+    if (is_error(depR)) return error_of(depR);
+    out["dep_count"] = value_of(depR)["rows"][0]["c"];
+
     return out;
 }
 

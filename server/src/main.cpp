@@ -1207,6 +1207,66 @@ int main() {
         spdlog::warn("Failed to register 'find_unused'");
     }
 
+    // ---- Real-time delta (Milestone 2.3b) -------------------------------
+    // Plugin emits AssetRegistry deltas as `event` envelopes; we patch the
+    // per-slot graph in place so the snapshot stays current without a full
+    // re-index. Failures are logged but never rethrown — async stream.
+    bridge.setEventHandler(
+        [graphMgr, escCypher](std::string_view slot_id,
+                              const sage::bridge::EventMessage& ev) {
+            try {
+                auto& store = graphMgr->acquireSlot(slot_id);
+                const auto& p = ev.payload;
+
+                if (ev.kind == "asset_added") {
+                    if (!p.contains("path") || !p.contains("kind")) return;
+                    std::ostringstream q;
+                    q << "MERGE (a:Asset {path: "
+                      << escCypher(p["path"].get<std::string>())
+                      << "}) SET a.kind = "
+                      << escCypher(p["kind"].get<std::string>()) << ";";
+                    auto r = store.execute(q.str());
+                    if (sage::graph::is_error(r)) {
+                        spdlog::warn("delta asset_added failed: {}",
+                                     sage::graph::error_of(r).message);
+                    }
+                }
+                else if (ev.kind == "asset_removed") {
+                    if (!p.contains("path")) return;
+                    std::ostringstream q;
+                    q << "MATCH (a:Asset {path: "
+                      << escCypher(p["path"].get<std::string>())
+                      << "}) DETACH DELETE a;";
+                    auto r = store.execute(q.str());
+                    if (sage::graph::is_error(r)) {
+                        spdlog::warn("delta asset_removed failed: {}",
+                                     sage::graph::error_of(r).message);
+                    }
+                }
+                else if (ev.kind == "asset_renamed") {
+                    if (!p.contains("old_path") || !p.contains("new_path")) return;
+                    // Kuzu allows updating the PK column via SET; edges
+                    // attached to the node move with it (verified via smoke).
+                    std::ostringstream q;
+                    q << "MATCH (a:Asset {path: "
+                      << escCypher(p["old_path"].get<std::string>())
+                      << "}) SET a.path = "
+                      << escCypher(p["new_path"].get<std::string>()) << ";";
+                    auto r = store.execute(q.str());
+                    if (sage::graph::is_error(r)) {
+                        spdlog::warn("delta asset_renamed failed: {}",
+                                     sage::graph::error_of(r).message);
+                    }
+                }
+                else {
+                    spdlog::debug("delta: unhandled event kind='{}'", ev.kind);
+                }
+            } catch (const std::exception& ex) {
+                spdlog::warn("delta handler threw on kind='{}' slot='{}': {}",
+                             ev.kind, slot_id, ex.what());
+            }
+        });
+
     // ---- HTTP+SSE transport (Claude ↔ server) ---------------------------
     sage::transport::HttpSseConfig httpCfg{
         .host            = envOr("SAGE_HTTP_HOST", "127.0.0.1"),

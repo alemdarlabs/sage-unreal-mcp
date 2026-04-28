@@ -92,6 +92,14 @@ public:
 
     [[nodiscard]] std::size_t pendingCount() const;
 
+    // Async event handler: invoked off the bridge worker thread for every
+    // `event` envelope received from any plugin. Caller (main.cpp) sets this
+    // once at startup with the slot-aware graph patcher. `slot_id` is
+    // resolved from the originating session's Hello.
+    using EventHandler = std::function<void(std::string_view slot_id,
+                                             const EventMessage& ev)>;
+    void setEventHandler(EventHandler handler);
+
 private:
     void onClientMessage(const std::shared_ptr<ix::ConnectionState>& state,
                          ix::WebSocket& ws,
@@ -100,6 +108,7 @@ private:
     void handleHello(ix::WebSocket& ws, const std::string& session_id, const Json& payload);
     void handleHeartbeat(ix::WebSocket& ws, const std::string& session_id, const Json& payload);
     void handleToolResult(const std::string& session_id, const Json& payload);
+    void handleEvent(const std::string& session_id, const Json& payload);
 
     [[nodiscard]] std::string nextTxId();
 
@@ -120,6 +129,9 @@ private:
 
     mutable std::mutex                                activeMu_;
     std::string                                       activeSessionId_;
+
+    mutable std::mutex                                eventHandlerMu_;
+    EventHandler                                      eventHandler_;
 };
 
 }  // namespace sage::bridge

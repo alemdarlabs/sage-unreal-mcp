@@ -55,9 +55,18 @@ struct ToolResultMessage {
     std::optional<std::string> after_hash;
 };
 
+// Asynchronous notification from plugin. Phase 2.3b uses these for
+// AssetRegistry deltas; future phases may add transaction events,
+// PIE state, etc. `kind` discriminates payload shape.
+struct EventMessage {
+    std::string kind;     // e.g. "asset_added", "asset_removed", "asset_renamed"
+    Json        payload;  // kind-specific shape; see asset_indexer event handler
+};
+
 [[nodiscard]] std::expected<HelloMessage, std::string>      parseHello(const Json& j);
 [[nodiscard]] std::expected<HeartbeatMessage, std::string>  parseHeartbeat(const Json& j);
 [[nodiscard]] std::expected<ToolResultMessage, std::string> parseToolResult(const Json& j);
+[[nodiscard]] std::expected<EventMessage, std::string>      parseEvent(const Json& j);
 
 // ---- Server → Plugin payloads (factories) -----------------------------------
 

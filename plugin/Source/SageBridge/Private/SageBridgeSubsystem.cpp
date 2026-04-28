@@ -16,7 +16,11 @@
 #include "Tools/SageScmTools.h"
 #include "Tools/SageTransactionTools.h"
 
+#include "AssetRegistry/AssetData.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/IAssetRegistry.h"
 #include "Dom/JsonObject.h"
+#include "Modules/ModuleManager.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 
@@ -29,6 +33,9 @@ void USageBridgeSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
     RegisterBuiltinHandlers();
     BuildClientFromSettings();
+    // AssetRegistry delta hooks bind in HandleConnected — bound at Initialize
+    // they fire for every row of the editor's startup scan (8K+ events) all
+    // before the WebSocket handshake completes, so the events evaporate.
 
     UE_LOG(LogSageBridge, Log,
            TEXT("SageBridgeSubsystem initialized (label='%s', auto_connect=%s, handlers=%d)"),
@@ -44,6 +51,7 @@ void USageBridgeSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void USageBridgeSubsystem::Deinitialize()
 {
+    UnbindAssetRegistryDeltaHooks();
     if (Client.IsValid())
     {
         Client->Disconnect();
@@ -74,6 +82,9 @@ void USageBridgeSubsystem::Reconnect()
 void USageBridgeSubsystem::HandleConnected()
 {
     SendHandshake();
+    // Idempotent re-bind: reconnects must not double-register the delegate.
+    UnbindAssetRegistryDeltaHooks();
+    BindAssetRegistryDeltaHooks();
 }
 
 void USageBridgeSubsystem::SendHandshake()
@@ -148,6 +159,75 @@ void USageBridgeSubsystem::RegisterBuiltinHandlers()
     sage::tools::RegisterQaTools(ToolDispatch);
     sage::tools::RegisterScmTools(ToolDispatch);
     sage::tools::RegisterIndexTools(ToolDispatch);
+}
+
+void USageBridgeSubsystem::BindAssetRegistryDeltaHooks()
+{
+    FAssetRegistryModule& M = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(
+        TEXT("AssetRegistry"));
+    IAssetRegistry& AR = M.Get();
+    AR.OnAssetAdded()  .AddUObject(this, &USageBridgeSubsystem::OnAssetAddedHook);
+    AR.OnAssetRemoved().AddUObject(this, &USageBridgeSubsystem::OnAssetRemovedHook);
+    AR.OnAssetRenamed().AddUObject(this, &USageBridgeSubsystem::OnAssetRenamedHook);
+    UE_LOG(LogSageBridge, Log, TEXT("AssetRegistry delta hooks bound"));
+}
+
+void USageBridgeSubsystem::UnbindAssetRegistryDeltaHooks()
+{
+    if (FAssetRegistryModule* M =
+            FModuleManager::GetModulePtr<FAssetRegistryModule>(TEXT("AssetRegistry")))
+    {
+        IAssetRegistry& AR = M->Get();
+        AR.OnAssetAdded()  .RemoveAll(this);
+        AR.OnAssetRemoved().RemoveAll(this);
+        AR.OnAssetRenamed().RemoveAll(this);
+    }
+}
+
+void USageBridgeSubsystem::SendDeltaEvent(const FString& Kind,
+                                          TSharedRef<FJsonObject> Payload)
+{
+    if (!Client.IsValid() || !Client->IsConnected()) return;
+
+    auto Env = MakeShared<FJsonObject>();
+    Env->SetStringField(TEXT("type"),    TEXT("event"));
+    Env->SetStringField(TEXT("kind"),    Kind);
+    Env->SetObjectField(TEXT("payload"), Payload);
+    Client->SendJson(Env);
+}
+
+void USageBridgeSubsystem::OnAssetAddedHook(const FAssetData& Data)
+{
+    if (Data.PackagePath.IsNone()) return;
+    const FString Path = Data.GetSoftObjectPath().ToString();
+    UE_LOG(LogSageBridge, Log, TEXT("AR delta: asset_added %s"), *Path);
+    auto P = MakeShared<FJsonObject>();
+    P->SetStringField(TEXT("path"), Path);
+    P->SetStringField(TEXT("kind"), Data.AssetClassPath.GetAssetName().ToString());
+    SendDeltaEvent(TEXT("asset_added"), P);
+}
+
+void USageBridgeSubsystem::OnAssetRemovedHook(const FAssetData& Data)
+{
+    if (Data.PackagePath.IsNone()) return;
+    const FString Path = Data.GetSoftObjectPath().ToString();
+    UE_LOG(LogSageBridge, Log, TEXT("AR delta: asset_removed %s"), *Path);
+    auto P = MakeShared<FJsonObject>();
+    P->SetStringField(TEXT("path"), Path);
+    SendDeltaEvent(TEXT("asset_removed"), P);
+}
+
+void USageBridgeSubsystem::OnAssetRenamedHook(const FAssetData& Data,
+                                               const FString& OldObjectPath)
+{
+    if (Data.PackagePath.IsNone()) return;
+    const FString NewPath = Data.GetSoftObjectPath().ToString();
+    UE_LOG(LogSageBridge, Log, TEXT("AR delta: asset_renamed %s -> %s"),
+           *OldObjectPath, *NewPath);
+    auto P = MakeShared<FJsonObject>();
+    P->SetStringField(TEXT("old_path"), OldObjectPath);
+    P->SetStringField(TEXT("new_path"), NewPath);
+    SendDeltaEvent(TEXT("asset_renamed"), P);
 }
 
 void USageBridgeSubsystem::BuildClientFromSettings()

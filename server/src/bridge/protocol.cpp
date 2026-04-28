@@ -64,6 +64,19 @@ std::expected<HeartbeatMessage, std::string> parseHeartbeat(const Json& j) {
     return h;
 }
 
+std::expected<EventMessage, std::string> parseEvent(const Json& j) {
+    if (!j.is_object())
+        return std::unexpected("event: not an object");
+    if (!j.contains("kind") || !j["kind"].is_string())
+        return std::unexpected("event: missing or non-string 'kind'");
+
+    EventMessage e;
+    e.kind = j["kind"].get<std::string>();
+    if (j.contains("payload")) e.payload = j["payload"];
+    else                       e.payload = Json::object();
+    return e;
+}
+
 std::expected<ToolResultMessage, std::string> parseToolResult(const Json& j) {
     if (!j.contains("tx_id") || !j["tx_id"].is_string())
         return std::unexpected("tool_result: missing or non-string 'tx_id'");
