@@ -12,7 +12,9 @@
 #include "Dom/JsonValue.h"
 #include "Editor.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/StaticMeshSocket.h"
 #include "Engine/SkeletalMesh.h"
+#include "Engine/SkeletalMeshSocket.h"
 #include "Engine/Texture.h"
 #include "FileHelpers.h"
 #include "IAssetTools.h"
@@ -496,6 +498,236 @@ FSageToolDispatch::FOutcome ReadAssetPropertiesImpl(const TSharedPtr<FJsonObject
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- asset.list_sockets / asset.add_socket / asset.remove_socket --------
+// ---- (Phase 4.5 round 2 batch 2: static + skeletal mesh sockets) --------
+
+namespace socket_helpers
+{
+    TSharedPtr<FJsonObject> StaticSocketToJson(const UStaticMeshSocket* S)
+    {
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("name"),     S->SocketName.ToString());
+        J->SetField(TEXT("location"),       detail::Vec3ToJson(S->RelativeLocation));
+        J->SetField(TEXT("rotation"),       detail::Rot3ToJson(S->RelativeRotation));
+        J->SetField(TEXT("scale"),          detail::Vec3ToJson(S->RelativeScale));
+        if (!S->Tag.IsEmpty()) J->SetStringField(TEXT("tag"), S->Tag);
+        return J;
+    }
+
+    TSharedPtr<FJsonObject> SkelSocketToJson(const USkeletalMeshSocket* S)
+    {
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("name"),         S->SocketName.ToString());
+        J->SetStringField(TEXT("bone"),         S->BoneName.ToString());
+        J->SetField(TEXT("location"),           detail::Vec3ToJson(S->RelativeLocation));
+        J->SetField(TEXT("rotation"),           detail::Rot3ToJson(S->RelativeRotation));
+        J->SetField(TEXT("scale"),              detail::Vec3ToJson(S->RelativeScale));
+        J->SetBoolField(TEXT("force_always_animated"), S->bForceAlwaysAnimated);
+        return J;
+    }
+}
+
+FSageToolDispatch::FOutcome ListSocketsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UObject* Asset = ResolveAsset(Path);
+    if (!Asset) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("asset not found"));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),  Asset->GetPathName());
+    R->SetStringField(TEXT("class"), Asset->GetClass()->GetName());
+
+    TArray<TSharedPtr<FJsonValue>> SocketArr;
+    if (UStaticMesh* SM = Cast<UStaticMesh>(Asset))
+    {
+        for (UStaticMeshSocket* S : SM->Sockets)
+        {
+            if (!S) continue;
+            SocketArr.Add(MakeShared<FJsonValueObject>(socket_helpers::StaticSocketToJson(S)));
+        }
+        R->SetStringField(TEXT("kind"), TEXT("static_mesh"));
+    }
+    else if (USkeletalMesh* SK = Cast<USkeletalMesh>(Asset))
+    {
+        for (const TObjectPtr<USkeletalMeshSocket>& S : SK->GetMeshOnlySocketList())
+        {
+            if (!S) continue;
+            SocketArr.Add(MakeShared<FJsonValueObject>(socket_helpers::SkelSocketToJson(S.Get())));
+        }
+        R->SetStringField(TEXT("kind"), TEXT("skeletal_mesh"));
+    }
+    else
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("asset is %s, expected StaticMesh or SkeletalMesh"),
+                            *Asset->GetClass()->GetName()));
+    }
+    R->SetArrayField(TEXT("sockets"), SocketArr);
+    R->SetNumberField(TEXT("count"), SocketArr.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AddSocketImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, Name;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+    }
+    UObject* Asset = ResolveAsset(Path);
+    if (!Asset) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("asset not found"));
+
+    FVector Location(0,0,0);
+    FRotator Rotation(0,0,0);
+    FVector Scale(1,1,1);
+    detail::ParseVector3 (Args, TEXT("location"), Location);
+    detail::ParseRotator3(Args, TEXT("rotation"), Rotation);
+    detail::ParseVector3 (Args, TEXT("scale"),    Scale);
+    FString BoneName;
+    Args->TryGetStringField(TEXT("bone"), BoneName);
+
+    FName SocketFName(*Name);
+
+    if (UStaticMesh* SM = Cast<UStaticMesh>(Asset))
+    {
+        if (SM->FindSocket(SocketFName))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("socket '%s' already exists"), *Name));
+        }
+        FScopedTransaction Tx(LOCTEXT("AddSocket", "Add Socket"));
+        SM->Modify();
+        UStaticMeshSocket* S = NewObject<UStaticMeshSocket>(SM);
+        S->SocketName       = SocketFName;
+        S->RelativeLocation = Location;
+        S->RelativeRotation = Rotation;
+        S->RelativeScale    = Scale;
+        SM->AddSocket(S);
+        SM->MarkPackageDirty();
+        SM->PostEditChange();
+
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Asset->GetPathName());
+        R->SetStringField(TEXT("kind"), TEXT("static_mesh"));
+        R->SetField(TEXT("socket"), MakeShared<FJsonValueObject>(socket_helpers::StaticSocketToJson(S)));
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    if (USkeletalMesh* SK = Cast<USkeletalMesh>(Asset))
+    {
+        if (SK->FindSocket(SocketFName))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("socket '%s' already exists"), *Name));
+        }
+        FScopedTransaction Tx(LOCTEXT("AddSocket", "Add Socket"));
+        SK->Modify();
+        USkeletalMeshSocket* S = NewObject<USkeletalMeshSocket>(SK);
+        S->SocketName       = SocketFName;
+        S->BoneName         = BoneName.IsEmpty() ? NAME_None : FName(*BoneName);
+        S->RelativeLocation = Location;
+        S->RelativeRotation = Rotation;
+        S->RelativeScale    = Scale;
+        SK->GetMeshOnlySocketList().Add(TObjectPtr<USkeletalMeshSocket>(S));
+        SK->MarkPackageDirty();
+        SK->PostEditChange();
+
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Asset->GetPathName());
+        R->SetStringField(TEXT("kind"), TEXT("skeletal_mesh"));
+        R->SetField(TEXT("socket"), MakeShared<FJsonValueObject>(socket_helpers::SkelSocketToJson(S)));
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("asset is %s, expected StaticMesh or SkeletalMesh"),
+                        *Asset->GetClass()->GetName()));
+}
+
+FSageToolDispatch::FOutcome RemoveSocketImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, Name;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+    }
+    UObject* Asset = ResolveAsset(Path);
+    if (!Asset) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("asset not found"));
+
+    FName SocketFName(*Name);
+
+    if (UStaticMesh* SM = Cast<UStaticMesh>(Asset))
+    {
+        UStaticMeshSocket* Found = SM->FindSocket(SocketFName);
+        if (!Found)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("socket '%s' not found"), *Name));
+        }
+        FScopedTransaction Tx(LOCTEXT("RemoveSocket", "Remove Socket"));
+        SM->Modify();
+        SM->RemoveSocket(Found);
+        SM->MarkPackageDirty();
+        SM->PostEditChange();
+
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"),    Asset->GetPathName());
+        R->SetStringField(TEXT("kind"),    TEXT("static_mesh"));
+        R->SetStringField(TEXT("removed"), Name);
+        R->SetNumberField(TEXT("remaining"), SM->Sockets.Num());
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    if (USkeletalMesh* SK = Cast<USkeletalMesh>(Asset))
+    {
+        TArray<TObjectPtr<USkeletalMeshSocket>>& MeshOnly = SK->GetMeshOnlySocketList();
+        USkeletalMeshSocket* Found = nullptr;
+        for (const TObjectPtr<USkeletalMeshSocket>& S : MeshOnly)
+        {
+            if (S && S->SocketName == SocketFName) { Found = S.Get(); break; }
+        }
+        if (!Found)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("mesh-only socket '%s' not found"), *Name));
+        }
+        FScopedTransaction Tx(LOCTEXT("RemoveSocket", "Remove Socket"));
+        SK->Modify();
+        MeshOnly.RemoveSingle(TObjectPtr<USkeletalMeshSocket>(Found));
+        SK->MarkPackageDirty();
+        SK->PostEditChange();
+
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"),    Asset->GetPathName());
+        R->SetStringField(TEXT("kind"),    TEXT("skeletal_mesh"));
+        R->SetStringField(TEXT("removed"), Name);
+        R->SetNumberField(TEXT("remaining"), SK->GetMeshOnlySocketList().Num());
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("asset is %s, expected StaticMesh or SkeletalMesh"),
+                        *Asset->GetClass()->GetName()));
+}
+
 }  // namespace (anonymous)
 
 void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
@@ -521,6 +753,11 @@ void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("asset.list"),               GT(&ListAssetsImpl));
     Dispatch.RegisterHandler(TEXT("asset.search"),             GT(&SearchAssetsImpl));
     Dispatch.RegisterHandler(TEXT("asset.read_properties"),    GT(&ReadAssetPropertiesImpl));
+
+    // Phase 4.5-r2 batch 2: socket management
+    Dispatch.RegisterHandler(TEXT("asset.list_sockets"),       GT(&ListSocketsImpl));
+    Dispatch.RegisterHandler(TEXT("asset.add_socket"),         GT(&AddSocketImpl));
+    Dispatch.RegisterHandler(TEXT("asset.remove_socket"),      GT(&RemoveSocketImpl));
 
     // Write
     Dispatch.RegisterHandler(TEXT("asset.bulk_rename"),        GT(&BulkRenameImpl));

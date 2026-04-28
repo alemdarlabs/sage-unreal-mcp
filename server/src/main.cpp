@@ -2431,6 +2431,65 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // Phase 4.5-r2 batch 2: socket management (StaticMesh + SkeletalMesh)
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.list_sockets",
+        .description = "List sockets on a UStaticMesh or USkeletalMesh. "
+                       "Returns {kind: 'static_mesh'|'skeletal_mesh', "
+                       "sockets: [{name, location, rotation, scale, "
+                       "tag?, bone?, force_always_animated?}], count}. "
+                       "Skeletal mesh returns mesh-only sockets (not "
+                       "skeleton-derived).",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.add_socket",
+        .description = "Add a socket to a UStaticMesh or USkeletalMesh. "
+                       "Wrapped in FScopedTransaction (undo-friendly). "
+                       "location/rotation/scale default to identity. "
+                       "Skeletal mesh accepts optional bone (defaults "
+                       "NAME_None). Errors -32602 if a socket with "
+                       "that name already exists. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"name",     {{"type", "string"}}},
+                {"bone",     {{"type", "string"}}},
+                {"location", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3}}},
+                {"rotation", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3}}},
+                {"scale",    {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3}}},
+            }},
+            {"required", nlohmann::json::array({"path", "name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.remove_socket",
+        .description = "Remove a named socket from a UStaticMesh or "
+                       "USkeletalMesh. Wrapped in FScopedTransaction. "
+                       "Skeletal mesh removes from the mesh-only socket "
+                       "list (skeleton-derived sockets cannot be touched "
+                       "from here). Errors -32602 if not found. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path", {{"type", "string"}}},
+                {"name", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // ---- Editor automation (Phase 4.6) ---------------------------------
     registerRemote(sage::mcp::Tool{
         .name = "editor.console_command",

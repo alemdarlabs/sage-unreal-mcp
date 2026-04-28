@@ -335,9 +335,9 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `asset.list_textures` — List textures · R
 - [ ] `asset.get_texture_info` — Settings · R
 - [ ] `asset.set_texture_settings` — Compression/LOD/sRGB · W
-- [ ] `asset.add_socket` — Add mesh socket · W
-- [ ] `asset.remove_socket` — Remove · W
-- [ ] `asset.list_sockets` — List · R
+- [x] `asset.add_socket` → `asset.add_socket` (Phase 4.5-r2-b2; UStaticMeshSocket + USkeletalMeshSocket via NewObject + AddSocket/MeshOnly list, FScopedTransaction wrapped, PIE rejected)
+- [x] `asset.remove_socket` → `asset.remove_socket` (Phase 4.5-r2-b2; FindSocket + RemoveSocket / mesh-only list scan, FScopedTransaction wrapped, PIE rejected)
+- [x] `asset.list_sockets` → `asset.list_sockets` (Phase 4.5-r2-b2; reads UStaticMesh::Sockets / USkeletalMesh::GetMeshOnlySocketList — skeleton-derived sockets excluded)
 - [ ] `asset.reload_package` — Force reload · W
 - [ ] `asset.export` — Texture→PNG / Mesh→FBX · W
 - [ ] `asset.search_fts` — SQLite FTS5 ranked search · R
