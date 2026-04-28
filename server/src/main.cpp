@@ -1244,7 +1244,53 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
-    // -- read+write — event dispatchers (Phase 4.2 round 2g) --
+    // -- read+write — T3D node clipboard (Phase 4.2 round 2g/p2) --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.export_nodes_t3d",
+        .description = "Export BP graph nodes to UE's T3D ASCII format via "
+                       "FEdGraphUtilities::ExportNodesToText. Mirrors the "
+                       "editor's Copy operation. node_ids[] selects specific "
+                       "nodes by FGuid; omit/empty exports the whole graph. "
+                       "Entry/return nodes are skipped (CanDuplicateNode "
+                       "filter). Returns {t3d, count, skipped}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"function", {{"type", "string"}}},
+                {"node_ids", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+            }},
+            {"required", nlohmann::json::array({"path", "function"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.import_nodes_t3d",
+        .description = "Import T3D-formatted nodes into a BP graph via "
+                       "FEdGraphUtilities::ImportNodesFromText. Pre-checks "
+                       "with CanImportNodesFromText (-32602 on schema "
+                       "mismatch / malformed text). Pasted nodes get fresh "
+                       "FGuids so re-pasting into the same graph doesn't "
+                       "collide. Optional pos_x + pos_y anchors the pasted "
+                       "set's centroid at the given position. Returns "
+                       "{count, node_ids[], recentered}. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"function", {{"type", "string"}}},
+                {"t3d",      {{"type", "string"}}},
+                {"pos_x",    {{"type", "number"}}},
+                {"pos_y",    {{"type", "number"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "function", "t3d"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    // -- read+write — event dispatchers (Phase 4.2 round 2g/p1) --
     registerRemote(sage::mcp::Tool{
         .name = "bp.list_event_dispatchers",
         .description = "Enumerate event dispatchers (multicast delegates) "

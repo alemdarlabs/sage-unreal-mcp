@@ -1,8 +1,8 @@
 # UE-MCP → Sage: 448 Action Per-Tool Task List
 
 > **Source:** `/Users/mahmutalemdar/Developer/alemdarlabs/ue-mcp` — TypeScript MCP server + C++ plugin, BUSL-1.1.
-> **Audit date:** 2026-04-28 (last update: Phase 4.2-r2g part 1 dispatcher CRUD shipped).
-> **Status:** Sage 128 tools · UE-MCP 448 actions · ~116 covered (mostly via Phase 4) · **332 actions remain**.
+> **Audit date:** 2026-04-28 (last update: Phase 4.2-r2g part 2 T3D clipboard shipped).
+> **Status:** Sage 130 tools · UE-MCP 448 actions · ~118 covered (mostly via Phase 4) · **330 actions remain**.
 >
 > Earlier note had cited 562; actual enumeration of every `RegisterHandler` / dispatcher branch in the ue-mcp source landed on 448. The 562 number likely came from including duplicates / aliases / TS-side validation rules that don't materialise as distinct C++ handlers.
 
@@ -14,7 +14,7 @@
 | editor | 15 | 29 | 44 | 34 |
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
-| blueprint | 28 | 18 | 46 | 61 |
+| blueprint | 30 | 16 | 46 | 65 |
 | asset | 7 | 32 | 39 | 18 |
 | level | 10 | 22 | 32 | 31 |
 | niagara | 0 | 26 | 26 | 0 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **116** | **332** | **448** | **26** |
+| **TOTAL** | **118** | **330** | **448** | **26** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -290,8 +290,8 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `blueprint.reparent_component` — SCS hierarchy reparent · W
 - [x] `blueprint.reparent` → `bp.reparent`
 - [ ] `blueprint.set_actor_tick_settings` — CDO tick settings · W
-- [ ] `blueprint.export_nodes_t3d` — Export T3D · R
-- [ ] `blueprint.import_nodes_t3d` — Import T3D · W
+- [x] `blueprint.export_nodes_t3d` → `bp.export_nodes_t3d` (Phase 4.2-r2g/p2; FEdGraphUtilities::ExportNodesToText, optional node_ids filter)
+- [x] `blueprint.import_nodes_t3d` → `bp.import_nodes_t3d` (Phase 4.2-r2g/p2; CanImportNodesFromText pre-flight, fresh GUIDs, optional pos_x/pos_y re-center)
 - [x] `blueprint.set_cdo_property` → `bp.set_cdo_property`
 - [ ] `blueprint.get_cdo_properties` — Read C++ class CDO · R
 - [ ] `blueprint.run_construction_script` — Spawn temp + run CS · R

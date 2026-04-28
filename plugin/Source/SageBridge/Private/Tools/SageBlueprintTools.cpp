@@ -14,6 +14,7 @@
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
 #include "AssetToolsModule.h"
+#include "EdGraphUtilities.h"
 #include "EdGraphSchema_K2.h"
 #include "Factories/BlueprintFactory.h"
 #include "Factories/BlueprintInterfaceFactory.h"
@@ -860,6 +861,161 @@ FSageToolDispatch::FOutcome BpConnectPinsImpl(const TSharedPtr<FJsonObject>& Arg
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("blueprint"), BP->GetName());
     R->SetStringField(TEXT("function"),  FnName);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- bp.export_nodes_t3d + bp.import_nodes_t3d  (Phase 4.2 round 2g/p2) ---
+
+FSageToolDispatch::FOutcome BpExportNodesT3DImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, FnName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("function"), FnName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path' or 'function'"));
+    }
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    UEdGraph* Graph = FindFunctionGraph(BP, FnName);
+    if (!Graph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("graph not found"));
+
+    // Optional node_ids filter; default = whole graph.
+    TArray<UEdGraphNode*> Selected;
+    const TArray<TSharedPtr<FJsonValue>>* IdsPtr = nullptr;
+    if (Args->TryGetArrayField(TEXT("node_ids"), IdsPtr) && IdsPtr && IdsPtr->Num() > 0)
+    {
+        for (const TSharedPtr<FJsonValue>& V : *IdsPtr)
+        {
+            if (!V.IsValid()) continue;
+            const FString Id = V->AsString();
+            UEdGraphNode* N = FindNodeByGuid(Graph, Id);
+            if (!N) return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("node not found: %s"), *Id));
+            Selected.AddUnique(N);
+        }
+    }
+    else
+    {
+        for (UEdGraphNode* N : Graph->Nodes) if (N) Selected.Add(N);
+    }
+
+    if (Selected.Num() == 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("no nodes to export"));
+    }
+
+    // ExportNodesToText only writes nodes flagged CanDuplicateNode (UE editor's
+    // Copy filter — entry/return nodes are excluded). Pre-filter so the count
+    // matches reality.
+    TSet<UObject*> NodeSet;
+    int32 Skipped = 0;
+    for (UEdGraphNode* N : Selected)
+    {
+        if (N && N->CanDuplicateNode())
+        {
+            N->PrepareForCopying();
+            NodeSet.Add(N);
+        }
+        else
+        {
+            ++Skipped;
+        }
+    }
+    if (NodeSet.Num() == 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("no duplicatable nodes (entry/return nodes can't be exported)"));
+    }
+
+    FString Exported;
+    FEdGraphUtilities::ExportNodesToText(NodeSet, Exported);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetStringField(TEXT("function"),  FnName);
+    R->SetStringField(TEXT("t3d"),       Exported);
+    R->SetNumberField(TEXT("count"),     NodeSet.Num());
+    R->SetNumberField(TEXT("skipped"),   Skipped);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpImportNodesT3DImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, FnName, T3D;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("function"), FnName)
+        || !Args->TryGetStringField(TEXT("t3d"), T3D))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'function', or 't3d'"));
+    }
+    if (T3D.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("'t3d' is empty"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    UEdGraph* Graph = FindFunctionGraph(BP, FnName);
+    if (!Graph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("graph not found"));
+
+    if (!FEdGraphUtilities::CanImportNodesFromText(Graph, T3D))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("t3d not importable into this graph (schema mismatch or malformed)"));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("BpImportT3D", "Sage: Import T3D Nodes"));
+    Graph->Modify();
+
+    TSet<UEdGraphNode*> Pasted;
+    FEdGraphUtilities::ImportNodesFromText(Graph, T3D, /*out*/ Pasted);
+    if (Pasted.Num() == 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("ImportNodesFromText produced no nodes"));
+    }
+
+    // Optional re-center: anchor pasted nodes' centroid at (pos_x, pos_y).
+    double AnchorX = 0.0, AnchorY = 0.0;
+    const bool bRecenter = Args->HasField(TEXT("pos_x")) && Args->HasField(TEXT("pos_y"));
+    if (bRecenter)
+    {
+        Args->TryGetNumberField(TEXT("pos_x"), AnchorX);
+        Args->TryGetNumberField(TEXT("pos_y"), AnchorY);
+        double AvgX = 0.0, AvgY = 0.0;
+        for (UEdGraphNode* N : Pasted) { AvgX += N->NodePosX; AvgY += N->NodePosY; }
+        AvgX /= Pasted.Num();
+        AvgY /= Pasted.Num();
+        for (UEdGraphNode* N : Pasted)
+        {
+            N->NodePosX = static_cast<int32>((N->NodePosX - AvgX) + AnchorX);
+            N->NodePosY = static_cast<int32>((N->NodePosY - AvgY) + AnchorY);
+        }
+    }
+
+    // Fresh GUIDs so re-pasting into the same graph doesn't collide with the
+    // original nodes.
+    TArray<TSharedPtr<FJsonValue>> Ids;
+    for (UEdGraphNode* N : Pasted)
+    {
+        N->CreateNewGuid();
+        N->PostPasteNode();
+        if (UK2Node* K2 = Cast<UK2Node>(N)) K2->ReconstructNode();
+        Ids.Add(MakeShared<FJsonValueString>(N->NodeGuid.ToString()));
+    }
+    FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetStringField(TEXT("function"),  FnName);
+    R->SetNumberField(TEXT("count"),     Pasted.Num());
+    R->SetArrayField (TEXT("node_ids"),  Ids);
+    R->SetBoolField  (TEXT("recentered"), bRecenter);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -2235,10 +2391,14 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("bp.create"),                     GT(&BpCreateImpl));
     Dispatch.RegisterHandler(TEXT("bp.create_interface"),           GT(&BpCreateInterfaceImpl));
 
-    // Read+Write — event dispatchers (Phase 4.2 round 2g)
+    // Read+Write — event dispatchers (Phase 4.2 round 2g/p1)
     Dispatch.RegisterHandler(TEXT("bp.list_event_dispatchers"),     GT(&BpListEventDispatchersImpl));
     Dispatch.RegisterHandler(TEXT("bp.add_event_dispatcher"),       GT(&BpAddEventDispatcherImpl));
     Dispatch.RegisterHandler(TEXT("bp.remove_event_dispatcher"),    GT(&BpRemoveEventDispatcherImpl));
+
+    // Read+Write — T3D node clipboard (Phase 4.2 round 2g/p2)
+    Dispatch.RegisterHandler(TEXT("bp.export_nodes_t3d"),           GT(&BpExportNodesT3DImpl));
+    Dispatch.RegisterHandler(TEXT("bp.import_nodes_t3d"),           GT(&BpImportNodesT3DImpl));
 
     // Write — functions
     Dispatch.RegisterHandler(TEXT("bp.add_function"),        GT(&BpAddFunctionImpl));
