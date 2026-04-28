@@ -8,7 +8,10 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Modules/ModuleManager.h"
+#include "UObject/Class.h"
+#include "UObject/Package.h"
 #include "UObject/TopLevelAssetPath.h"
+#include "UObject/UObjectIterator.h"
 
 namespace sage::tools
 {
@@ -88,17 +91,66 @@ FSageToolDispatch::FOutcome ScanAssetRegistry(const TSharedPtr<FJsonObject>& /*A
         }
     }
 
+    // Third pass: walk the live UClass registry for the inheritance tree.
+    // GetSuperClass() encodes single inheritance; we record name + parent
+    // + module (the engine module / plugin owning the class) + is_native
+    // (true for C++/UCLASS, false for Blueprint generated classes).
+    //
+    // Skip duplicates from the SKEL_/REINST_/HOTRELOADED_ prefix space —
+    // those are editor-only churn artefacts.
+    TArray<TSharedPtr<FJsonValue>> JsonClasses;
+    JsonClasses.Reserve(2048);
+    for (TObjectIterator<UClass> It; It; ++It)
+    {
+        UClass* Cls = *It;
+        if (Cls == nullptr) continue;
+
+        const FString Name = Cls->GetName();
+        if (Name.StartsWith(TEXT("SKEL_"))
+         || Name.StartsWith(TEXT("REINST_"))
+         || Name.StartsWith(TEXT("HOTRELOADED_"))
+         || Name.StartsWith(TEXT("TRASHCLASS_"))
+         || Name.StartsWith(TEXT("PLACEHOLDER-"))) {
+            continue;
+        }
+
+        FString ParentName;
+        if (UClass* Super = Cls->GetSuperClass()) {
+            ParentName = Super->GetName();
+        }
+
+        FString Module;
+        if (UPackage* Pkg = Cls->GetOutermost()) {
+            const FString PkgName = Pkg->GetName();      // e.g. "/Script/Engine"
+            int32 SlashIdx = INDEX_NONE;
+            if (PkgName.FindLastChar('/', SlashIdx)) {
+                Module = PkgName.Mid(SlashIdx + 1);
+            } else {
+                Module = PkgName;
+            }
+        }
+        const bool bIsNative = Cls->HasAnyClassFlags(CLASS_Native);
+
+        auto Row = MakeShared<FJsonObject>();
+        Row->SetStringField(TEXT("name"),     Name);
+        Row->SetStringField(TEXT("parent"),   ParentName);
+        Row->SetStringField(TEXT("module"),   Module);
+        Row->SetBoolField  (TEXT("is_native"), bIsNative);
+        JsonClasses.Add(MakeShared<FJsonValueObject>(Row));
+    }
+
     const double ElapsedMs = (FPlatformTime::Seconds() - StartSec) * 1000.0;
 
     auto Result = MakeShared<FJsonObject>();
     Result->SetArrayField(TEXT("assets"),       JsonAssets);
     Result->SetArrayField(TEXT("dependencies"), JsonDeps);
+    Result->SetArrayField(TEXT("classes"),      JsonClasses);
     Result->SetNumberField(TEXT("total"),       JsonAssets.Num());
     Result->SetNumberField(TEXT("scan_ms"),     ElapsedMs);
 
     UE_LOG(LogSageBridge, Log,
-           TEXT("AssetRegistry scan: %d assets, %d edges in %.1f ms"),
-           JsonAssets.Num(), EdgeCount, ElapsedMs);
+           TEXT("AssetRegistry scan: %d assets, %d edges, %d classes in %.1f ms"),
+           JsonAssets.Num(), EdgeCount, JsonClasses.Num(), ElapsedMs);
 
     return FSageToolDispatch::FOutcome::MakeSuccess(Result);
 }

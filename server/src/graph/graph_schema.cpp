@@ -43,6 +43,17 @@ CREATE REL TABLE IF NOT EXISTS DEPENDS_ON(FROM Asset TO Asset, MANY_MANY);
 ALTER TABLE _IndexState ADD dep_count INT64 DEFAULT 0;
 )";
 
+// v4: class hierarchy. UClass parent chain backs `class_hierarchy` (Phase
+// 3). Class.parent is denormalised so a 1-hop ancestor lookup doesn't
+// require the relationship traversal. INHERITS_FROM is the canonical
+// edge for *N..M depth queries. is_native discriminates engine/C++
+// classes from Blueprint-generated ones.
+constexpr const char* kV4Cypher = R"(
+ALTER TABLE Class ADD parent STRING DEFAULT '';
+ALTER TABLE Class ADD is_native BOOLEAN DEFAULT FALSE;
+CREATE REL TABLE IF NOT EXISTS INHERITS_FROM(FROM Class TO Class);
+)";
+
 // Split a multi-statement Cypher blob on `;` boundaries, ignoring blanks
 // and Cypher line comments. Kuzu's Connection::query takes a single stmt.
 std::vector<std::string> splitStatements(std::string_view blob) {
@@ -135,6 +146,7 @@ const std::vector<Migration>& schemaMigrations() {
         {1, kV1Cypher},
         {2, kV2Cypher},
         {3, kV3Cypher},
+        {4, kV4Cypher},
     };
     return kMigrations;
 }

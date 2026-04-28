@@ -59,6 +59,69 @@ GraphResult upsertIndexState(GraphStore& store,
     return Json(true);
 }
 
+GraphResult insertClassesBatched(GraphStore& store, const Json& classes) {
+    constexpr size_t kBatchSize = 200;
+    for (size_t i = 0; i < classes.size(); i += kBatchSize) {
+        std::ostringstream q;
+        q << "CREATE ";
+        const size_t end = std::min(i + kBatchSize, classes.size());
+        for (size_t j = i; j < end; ++j) {
+            const auto& c = classes[j];
+            if (j > i) q << ", ";
+            q << "(:Class {name: " << escapeCypherStr(c["name"].get<std::string>())
+              << ", parent: "       << escapeCypherStr(c.value("parent", std::string{}))
+              << ", module: "       << escapeCypherStr(c.value("module", std::string{}))
+              << ", is_native: "    << (c.value("is_native", false) ? "true" : "false")
+              << "})";
+        }
+        q << ";";
+        auto r = store.execute(q.str());
+        if (is_error(r)) {
+            spdlog::error("ingestSnapshot: class batch [{}, {}) failed: {}",
+                          i, end, error_of(r).message);
+            return error_of(r);
+        }
+    }
+    return Json(true);
+}
+
+// INHERITS_FROM edges from Class.parent. Returns the count actually
+// inserted (parents missing from the Class table are silently skipped —
+// e.g. the topmost UObject often has no recorded parent).
+GraphResult insertInheritsFromEdges(GraphStore& store,
+                                     const Json& classes,
+                                     const std::unordered_set<std::string>& known) {
+    std::vector<std::pair<std::string, std::string>> edges;
+    edges.reserve(classes.size());
+    for (const auto& c : classes) {
+        const auto name   = c["name"].get<std::string>();
+        const auto parent = c.value("parent", std::string{});
+        if (parent.empty() || parent == name) continue;
+        if (!known.contains(parent)) continue;
+        edges.emplace_back(name, parent);
+    }
+
+    constexpr size_t kBatchSize = 200;
+    int64_t inserted = 0;
+    for (size_t i = 0; i < edges.size(); i += kBatchSize) {
+        std::ostringstream q;
+        q << "UNWIND [";
+        const size_t end = std::min(i + kBatchSize, edges.size());
+        for (size_t j = i; j < end; ++j) {
+            if (j > i) q << ", ";
+            q << "{c: " << escapeCypherStr(edges[j].first)
+              << ", p: " << escapeCypherStr(edges[j].second) << "}";
+        }
+        q << "] AS row "
+          << "MATCH (child:Class {name: row.c}), (parent:Class {name: row.p}) "
+          << "CREATE (child)-[:INHERITS_FROM]->(parent);";
+        auto r = store.execute(q.str());
+        if (is_error(r)) return error_of(r);
+        inserted += static_cast<int64_t>(end - i);
+    }
+    return Json(inserted);
+}
+
 GraphResult insertAssetsBatched(GraphStore& store, const Json& assets) {
     constexpr size_t kBatchSize = 200;
     for (size_t i = 0; i < assets.size(); i += kBatchSize) {
@@ -166,13 +229,31 @@ GraphResult ingestSnapshot(GraphStore& store, const Json& snapshot) {
         }
     }
 
+    const bool hasClasses = snapshot.contains("classes")
+                         && snapshot["classes"].is_array();
+    const auto& classes = hasClasses ? snapshot["classes"] : Json::array();
+    for (size_t i = 0; i < classes.size(); ++i) {
+        const auto& c = classes[i];
+        if (!c.is_object()
+            || !c.contains("name") || !c["name"].is_string()) {
+            return GraphError{"ingestSnapshot: class row " + std::to_string(i)
+                              + " missing string 'name'", 0};
+        }
+    }
+
     // Wipe edges first (explicit), then nodes — DETACH on the node would
     // also drop edges but the explicit pass is cheaper to debug.
-    auto wipeEdges = store.execute("MATCH ()-[r:DEPENDS_ON]->() DELETE r;");
-    if (is_error(wipeEdges)) return error_of(wipeEdges);
+    auto wipeDeps = store.execute("MATCH ()-[r:DEPENDS_ON]->() DELETE r;");
+    if (is_error(wipeDeps)) return error_of(wipeDeps);
 
-    auto wipeNodes = store.execute("MATCH (a:Asset) DETACH DELETE a;");
-    if (is_error(wipeNodes)) return error_of(wipeNodes);
+    auto wipeInherits = store.execute("MATCH ()-[r:INHERITS_FROM]->() DELETE r;");
+    if (is_error(wipeInherits)) return error_of(wipeInherits);
+
+    auto wipeClasses = store.execute("MATCH (c:Class) DETACH DELETE c;");
+    if (is_error(wipeClasses)) return error_of(wipeClasses);
+
+    auto wipeAssets = store.execute("MATCH (a:Asset) DETACH DELETE a;");
+    if (is_error(wipeAssets)) return error_of(wipeAssets);
 
     auto insAssets = insertAssetsBatched(store, assets);
     if (is_error(insAssets)) return error_of(insAssets);
@@ -189,6 +270,22 @@ GraphResult ingestSnapshot(GraphStore& store, const Json& snapshot) {
         depCount = value_of(insDeps).get<int64_t>();
     }
 
+    int64_t classCount    = 0;
+    int64_t classEdgeCount = 0;
+    if (!classes.empty()) {
+        auto insClasses = insertClassesBatched(store, classes);
+        if (is_error(insClasses)) return error_of(insClasses);
+        classCount = static_cast<int64_t>(classes.size());
+
+        std::unordered_set<std::string> knownClasses;
+        knownClasses.reserve(classes.size());
+        for (const auto& c : classes) knownClasses.insert(c["name"].get<std::string>());
+
+        auto insInherits = insertInheritsFromEdges(store, classes, knownClasses);
+        if (is_error(insInherits)) return error_of(insInherits);
+        classEdgeCount = value_of(insInherits).get<int64_t>();
+    }
+
     const int64_t at = nowEpochMs();
     auto upsert = upsertIndexState(
         store, static_cast<int64_t>(assets.size()), depCount, at);
@@ -197,6 +294,8 @@ GraphResult ingestSnapshot(GraphStore& store, const Json& snapshot) {
     Json out = Json::object();
     out["asset_count"]        = static_cast<int64_t>(assets.size());
     out["dep_count"]          = depCount;
+    out["class_count"]        = classCount;
+    out["class_edge_count"]   = classEdgeCount;
     out["last_indexed_at_ms"] = at;
     return out;
 }

@@ -1209,6 +1209,93 @@ int main() {
         spdlog::warn("Failed to register 'find_unused'");
     }
 
+    sage::mcp::Tool classHierarchyTool{
+        .name        = "class_hierarchy",
+        .description = "Walk INHERITS_FROM edges from a UClass. "
+                       "direction='ancestors' returns parent chain (Pawn → "
+                       "Actor → Object); 'descendants' returns subclasses "
+                       "(Pawn → all pawn types). max_depth 1..10 (default 10 "
+                       "covers UE's typical inheritance depth). Returns "
+                       "[{name, module, is_native, depth}] ordered by depth. "
+                       "Class table is populated by index_slot from UE's "
+                       "reflected UClass registry.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"class_name",  {{"type", "string"}}},
+                {"direction",   {{"type", "string"},
+                                 {"enum", nlohmann::json::array({"ancestors","descendants"})}}},
+                {"max_depth",   {{"type", "integer"},
+                                 {"minimum", 1}, {"maximum", 10}}},
+                {"max_results", {{"type", "integer"},
+                                 {"minimum", 1}, {"maximum", 500}}},
+                {"slot_id",     {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"class_name"})},
+            {"additionalProperties", false},
+        },
+        .handler = [graphMgr, resolveSlotId, escCypher](const nlohmann::json& params)
+            -> sage::mcp::ToolResult {
+            if (!params.is_object() || !params.contains("class_name")
+                || !params["class_name"].is_string()) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InvalidParams, "missing 'class_name'"));
+            }
+            const auto cls = params["class_name"].get<std::string>();
+            const auto dir = params.value("direction", std::string{"ancestors"});
+            if (dir != "ancestors" && dir != "descendants") {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InvalidParams,
+                    "direction must be 'ancestors' or 'descendants'"));
+            }
+            const int  maxDepth   = std::clamp(params.value("max_depth",   10), 1, 10);
+            const int  maxResults = std::clamp(params.value("max_results", 200), 1, 500);
+
+            auto slot = resolveSlotId(params);
+            if (!slot.has_value()) return std::unexpected(slot.error());
+
+            try {
+                auto& store = graphMgr->acquireSlot(*slot);
+                std::ostringstream q;
+                if (dir == "ancestors") {
+                    q << "MATCH (c:Class {name: " << escCypher(cls) << "})"
+                      << "-[r:INHERITS_FROM*1.." << maxDepth << "]->(a:Class) ";
+                } else {
+                    q << "MATCH (c:Class {name: " << escCypher(cls) << "})"
+                      << "<-[r:INHERITS_FROM*1.." << maxDepth << "]-(a:Class) ";
+                }
+                q << "RETURN DISTINCT a.name AS name, a.module AS module, "
+                  << "       a.is_native AS is_native "
+                  << "ORDER BY name LIMIT " << maxResults << ";";
+
+                auto r = store.execute(q.str());
+                if (sage::graph::is_error(r)) {
+                    return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                        sage::mcp::ErrorCode::InternalError,
+                        sage::graph::error_of(r).message));
+                }
+                const auto& env = sage::graph::value_of(r);
+                nlohmann::json out = nlohmann::json::object();
+                out["class_name"] = cls;
+                out["direction"]  = dir;
+                out["max_depth"]  = maxDepth;
+                out["classes"]    = env["rows"];
+                out["count"]      = env["row_count"];
+                out["truncated"]  = env["row_count"].get<int64_t>() == maxResults;
+                out["slot_id"]    = *slot;
+                return out;
+            } catch (const std::exception& ex) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InternalError,
+                    std::string{"class_hierarchy failed: "} + ex.what()));
+            }
+        },
+        .remote = false,
+    };
+    if (auto r = registry->registerTool(std::move(classHierarchyTool)); !r.has_value()) {
+        spdlog::warn("Failed to register 'class_hierarchy'");
+    }
+
     // ---- Cypher subset escape hatch (Milestone 2.5) --------------------
     sage::mcp::Tool queryGraphTool{
         .name        = "query_graph",

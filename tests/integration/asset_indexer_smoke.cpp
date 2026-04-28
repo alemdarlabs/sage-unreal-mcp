@@ -156,6 +156,45 @@ int main() {
         if (countAssets(store) != 2)
             throw std::runtime_error("bad input clobbered DB; pre-validation broken");
 
+        // --- (8) classes + INHERITS_FROM edges ---------------------------
+        sg::Json snap5 = {
+            {"assets", sg::Json::array({
+                {{"path", "/Game/X"}, {"kind", "Y"}},
+            })},
+            {"classes", sg::Json::array({
+                {{"name", "Object"},   {"parent", ""},        {"is_native", true}},
+                {{"name", "Actor"},    {"parent", "Object"},  {"module", "Engine"}, {"is_native", true}},
+                {{"name", "Pawn"},     {"parent", "Actor"},   {"module", "Engine"}, {"is_native", true}},
+                {{"name", "MyBP_Pawn"},{"parent", "Pawn"},    {"module", "Game"},   {"is_native", false}},
+                {{"name", "Orphan"},   {"parent", "Missing"}, {"module", ""}},      // skip — parent unknown
+            })},
+        };
+        auto in5 = mustOk(sg::ingestSnapshot(store, snap5), "ingest5 (classes)");
+        if (in5["class_count"].get<int64_t>() != 5)
+            throw std::runtime_error("ingest5 class_count != 5: " + in5.dump());
+        if (in5["class_edge_count"].get<int64_t>() != 3)
+            throw std::runtime_error("ingest5 class_edge_count != 3 (Orphan should skip): "
+                                     + in5.dump());
+
+        // Pawn's ancestors via *1..N traversal
+        auto anc = mustOk(store.execute(
+            "MATCH (p:Class {name: 'Pawn'})-[:INHERITS_FROM*1..5]->(a:Class) "
+            "RETURN a.name AS name ORDER BY name;"),
+            "Pawn ancestors");
+        if (anc["row_count"].get<int64_t>() != 2
+            || anc["rows"][0]["name"] != "Actor"
+            || anc["rows"][1]["name"] != "Object") {
+            throw std::runtime_error("ancestor traversal wrong: " + anc.dump());
+        }
+
+        // Re-ingest without classes wipes the class table
+        sg::Json snap6 = {{"assets", sg::Json::array({
+            {{"path", "/Game/X"}, {"kind", "Y"}},
+        })}};
+        auto in6 = mustOk(sg::ingestSnapshot(store, snap6), "ingest6 (drop classes)");
+        if (in6["class_count"].get<int64_t>() != 0)
+            throw std::runtime_error("class table not wiped on no-classes ingest");
+
         // --- (7) deps to unknown assets silently skipped -----------------
         sg::Json snap4 = {
             {"assets", sg::Json::array({
