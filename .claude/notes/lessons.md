@@ -266,6 +266,76 @@ Confirmed live in SageTest UE 5.7.4: hook fires on `FMessageDialog::Open`
 calls; auto-respond + default-response paths both verified via
 LogSageBridge.
 
+## Kuzu 0.11 — UNWIND+MATCH×2+CREATE is ~30x slower than COPY FROM CSV for bulk edge insert
+
+**Symptom**: `index_slot` on 8K-asset SageTest took ~30 seconds end-to-
+end. Per-stage profiling fingered the edge inserts:
+```
+DEPENDS_ON insert (16K edges):  12,514 ms
+INHERITS_FROM insert (8K edges): 5,999 ms
+Class insert (8K nodes):         3,012 ms
+Asset insert (8K nodes):         1,913 ms
+```
+The pattern was UNWIND+MATCH-by-PK×2+CREATE in 200-element batches.
+Bumping the batch to 2000 changed nothing — query parse wasn't the
+bottleneck. Per-row hash lookups on the PK index + Kuzu's per-CREATE
+WAL fsync were.
+
+**Rule**: For node + relationship bulk ingest into Kuzu, write a CSV
+to a temp file and run `COPY <Table> FROM '<path>' (HEADER=true)`.
+Rel COPY automatically resolves PK columns into internal IDs — no
+MATCH needed in the agent's code path.
+
+**Numbers (8K-asset SageTest, Kuzu 0.11):**
+```
+                         UNWIND/CREATE   COPY FROM CSV   speedup
+Asset insert (8K nodes)     1,913 ms        266 ms       7.2x
+DEPENDS_ON   (16K edges)   12,514 ms        339 ms      37x
+Class        (8K nodes)     3,012 ms        215 ms      14x
+INHERITS_FROM (8K edges)    5,999 ms        118 ms      51x
+TOTAL                      30,000 ms      4,000 ms      7.5x
+```
+
+**Apply**: see `insertAssetsViaCopy / insertDepsViaCopy /
+insertClassesViaCopy / insertInheritsFromViaCopy` in
+`server/src/graph/asset_indexer.cpp`. Pattern: filesystem temp path
+(`std::filesystem::temp_directory_path()` + random suffix), CSV
+escape (double-quote field, escape internal quotes by doubling),
+header row matching the table's PK / property column names. Best-
+effort cleanup with `std::error_code` so a failed COPY doesn't crash
+the server on tmp removal.
+
+**Caveat**: COPY assumes the rel CSV's first two columns are the
+FROM-table PK and TO-table PK respectively, in declaration order.
+For DEPENDS_ON (Asset → Asset) and INHERITS_FROM (Class → Class)
+this means `from,to` headers. If you reuse the table for two-hop
+joins later, the COPY semantics still resolve the right way.
+
+## Profiling before optimising — UNWIND batch size was a red herring
+
+**Story**: Initial intuition for Phase 4.4 was "30s ingest must mean
+per-query overhead — bump batch size from 200 to 2000". Built it,
+re-measured: 30s → 28s. **5% improvement.** Real bottleneck was
+elsewhere.
+
+**Rule**: Don't speculate-optimise a 30-second pipeline. Add
+per-stage `spdlog::info` timing FIRST, look at the histogram, then
+attack the worst stage. The two-edit cost of adding/removing the
+timing logs is trivial relative to chasing the wrong optimisation.
+
+**Numbers for the same case:**
+```
+batch=200 (baseline):   wipe 1.1s + Assets 1.9s + Deps 12.5s
+                                + Classes 3.0s + Inherits 6.0s
+batch=2000 (intuition): wipe 1.2s + Assets 1.9s + Deps ~12s
+                                + Classes ~3s + Inherits ~6s
+COPY FROM CSV:          wipe 1.2s + Assets 0.27s + Deps 0.34s
+                                + Classes 0.22s + Inherits 0.12s
+```
+The bottleneck was the *per-row hash-lookup + per-row CREATE WAL
+fsync* inside the UNWIND, not the per-statement parse cost that
+batch sizing addresses.
+
 ## UE 5.0+ — PC_Real REQUIRES a PC_Float / PC_Double sub-category, or KismetCompiler asserts
 
 **Symptom**: Adding a BP variable / local variable / function parameter

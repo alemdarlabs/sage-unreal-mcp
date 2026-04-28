@@ -73,7 +73,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Şu Anki Durum (Snapshot)
 
-> Tek satırda durum: **57 commit · 138 MCP tool · Phase 1+2+3 tamam · Phase 4.2 round 2g DONE · Phase 4 ~%62**.
+> Tek satırda durum: **58 commit · 138 MCP tool · Phase 1+2+3 tamam · Phase 4.2 round 2g DONE · Phase 4.4 Kuzu COPY ingest 30s→4s (7.5x) · Phase 4 ~%63**.
 
 - **Test ortamı**: `/Users/mahmutalemdar/Developer/alemdarlabs/SageTest/SageTest.uproject` (UE 5.7.4 Third Person + Blueprint).
 - **Knowledge graph (canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Real-time delta + query_graph + class_hierarchy çalışıyor.

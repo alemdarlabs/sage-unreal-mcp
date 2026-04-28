@@ -41,7 +41,7 @@ flowchart TB
   M17 ==Demo 1 ✓==> M21a
 
   %% Şu an
-  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>57 commit · 138 MCP tool<br/>Phase 1 + 2 + 3 + 4.0/4.1/4.2-r1+r2a..r2g(p1..p5)/4.3/4.5-r1/4.6-r1+r2 CANLI<br/>SageTest UE 5.7 — 8K asset · 16K dep · 8337 class · 8336 inherit<br/>BP r2g/p5 var-flags+CDO+deps · UE 5.0 PC_Real fix · Material · Asset · Dialog<br/>UE-MCP 448 action audit → Phase 4 yol haritası %62 done · Round 2g DONE"]):::now
+  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>58 commit · 138 MCP tool · index_slot 30s→4s (7.5x)<br/>Phase 1+2+3+4.0/4.1/4.2(r1+r2)/4.3/4.4/4.5-r1/4.6-r1+r2 CANLI<br/>SageTest UE 5.7 — 8K asset · 16K dep · 8337 class · 8336 inherit<br/>Phase 4.4 Kuzu COPY FROM CSV ingest · BP authoring complete<br/>UE-MCP 448 action audit → Phase 4 yol haritası %63 done"]):::now
 
   %% Phase 1'den ertelenenler
   subgraph DEF["Storage / out-of-process gerektirenler"]
@@ -80,7 +80,7 @@ flowchart TB
     P411["4.11 UMG / Widget · 4.12 PCG · 4.13 Landscape<br/>4.14 Foliage · 4.15 GAS · 4.16 Networking<br/>4.17 Audio · 4.18 Source control extras"]:::todo
     P419["4.19 Reporting / observability<br/>report_issue · session log · metrics"]:::todo
     P420["4.20 Headless test mode<br/>filesystem-only handlers + mock plugin coverage"]:::todo
-    P44["4.4 Index perf — Kuzu COPY FROM JSON<br/>(transversal · 30s → &lt;5s)"]:::todo
+    P44["4.4 Index perf — Kuzu COPY FROM CSV ✓<br/>30s → 4s (7.5x); DEPENDS_ON 12.5s→0.34s (37x);<br/>INHERITS_FROM 6s→0.12s (51x)"]:::done
   end
   P3CH --> P40
   P40 --> P41 & P42 & P43 & P45 & P46 & P47
