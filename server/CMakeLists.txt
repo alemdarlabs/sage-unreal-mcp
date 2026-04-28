@@ -82,7 +82,10 @@ target_link_libraries(sage-bridge
     PRIVATE sage-warnings sage-sanitizers)
 
 # ---- executable ----
-add_executable(sage-server src/main.cpp)
+add_executable(sage-server
+    src/main.cpp
+    src/tools/restart_orchestrator.cpp
+)
 target_link_libraries(sage-server
     PRIVATE sage-transport sage-tools sage-bridge sage-graph
             sage-warnings sage-sanitizers)

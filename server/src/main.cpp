@@ -15,6 +15,7 @@
 #include "mcp/server.h"
 #include "mcp/tool_registry.h"
 #include "tools/builtin.h"
+#include "tools/restart_orchestrator.h"
 #include "transport/http_sse_server.h"
 
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -1280,6 +1281,20 @@ int main() {
     };
     if (auto r = registry->registerTool(std::move(queryGraphTool)); !r.has_value()) {
         spdlog::warn("Failed to register 'query_graph'");
+    }
+
+    // ---- Editor restart orchestrator (Milestone 1.6b) ------------------
+    sage::tools::RestartConfig restartCfg{
+        .repoRoot = envOr("SAGE_REPO_ROOT", std::filesystem::current_path().string()),
+        .ueRoot   = envOr("SAGE_UE_ROOT",   ""),
+    };
+    spdlog::info("Restart orchestrator: repo_root={} ue_root={}",
+                 restartCfg.repoRoot.string(),
+                 restartCfg.ueRoot.empty() ? "<from-script-default>" : restartCfg.ueRoot.string());
+    if (auto r = registry->registerTool(
+            sage::tools::buildRestartEditorTool(bridge, std::move(restartCfg)));
+        !r.has_value()) {
+        spdlog::warn("Failed to register 'restart_editor'");
     }
 
     // ---- Real-time delta (Milestone 2.3b) -------------------------------
