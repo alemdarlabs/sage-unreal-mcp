@@ -11,7 +11,7 @@
 | Category | Have | Need | Total | % |
 |---|---:|---:|---:|---:|
 | project | 15 | 14 | 29 | 52 |
-| editor | 21 | 23 | 44 | 48 |
+| editor | 25 | 19 | 44 | 57 |
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
 | blueprint | 38 | 8 | 46 | 83 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **145** | **303** | **448** | **32** |
+| **TOTAL** | **149** | **299** | **448** | **33** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -117,11 +117,11 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `editor.get_build_status` — Build/map compile status · R
 - [ ] `editor.cook_content` — Cook for platform · W
 - [x] `editor.get_log` — Read log with filter · R · Sage `editor.read_log`
-- [ ] `editor.search_log` — Substring search log · R
+- [x] `editor.search_log` → `editor.search_log` (Phase 4.6-r3-b3; substring scan with line + 500-char snippet)
 - [ ] `editor.get_message_log` — Read message log · R
-- [ ] `editor.list_crashes` — List crash reports · R
-- [ ] `editor.get_crash_info` — Crash details by folder · R
-- [ ] `editor.check_for_crashes` — Recent crashes? · R
+- [x] `editor.list_crashes` → `editor.list_crashes` (Phase 4.6-r3-b3; ~/Library/.../UnrealEngine/Saved/Crashes scan, mtime-sorted)
+- [x] `editor.get_crash_info` → `editor.get_crash_info` (Phase 4.6-r3-b3; CrashContext.runtime-xml ErrorMessage+CallStack extract + 50-line log tail)
+- [x] `editor.check_for_crashes` → `editor.check_for_crashes` (Phase 4.6-r3-b3; within_hours threshold)
 - [x] `editor.set_dialog_policy` → `editor.set_dialog_policy` (Phase 4.6-r2)
 - [x] `editor.clear_dialog_policy` → `editor.clear_dialog_policy` (Phase 4.6-r2)
 - [x] `editor.get_dialog_policy` → `editor.get_dialog_policy` (Phase 4.6-r2)

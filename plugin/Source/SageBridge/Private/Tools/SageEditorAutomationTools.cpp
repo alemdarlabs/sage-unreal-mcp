@@ -196,6 +196,248 @@ FSageToolDispatch::FOutcome ReadLogImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- editor.search_log / list_crashes / check_for_crashes /
+// ---- get_crash_info  (Phase 4.6-r3 batch 3) ------------------------------
+
+FSageToolDispatch::FOutcome SearchLogImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Query;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("query"), Query) || Query.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing/empty 'query'"));
+    }
+    int32 MaxLines = 100;
+    double Num = 0;
+    if (Args->TryGetNumberField(TEXT("max_lines"), Num))
+    {
+        MaxLines = FMath::Clamp(static_cast<int32>(Num), 1, 5000);
+    }
+
+    const FString LogPath = FPlatformOutputDevices::GetAbsoluteLogFilename();
+    FString Contents;
+    if (!FFileHelper::LoadFileToString(Contents, *LogPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("could not read log: %s"), *LogPath));
+    }
+    TArray<FString> Lines;
+    Contents.ParseIntoArrayLines(Lines, /*bCullEmpty*/ false);
+
+    TArray<TSharedPtr<FJsonValue>> Hits;
+    for (int32 i = 0; i < Lines.Num(); ++i)
+    {
+        if (Hits.Num() >= MaxLines) break;
+        if (!Lines[i].Contains(Query)) continue;
+        auto O = MakeShared<FJsonObject>();
+        O->SetNumberField(TEXT("line"), i + 1);
+        O->SetStringField(TEXT("text"), Lines[i].Left(500));
+        Hits.Add(MakeShared<FJsonValueObject>(O));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("query"),       Query);
+    R->SetStringField(TEXT("log_path"),    LogPath);
+    R->SetArrayField (TEXT("hits"),        Hits);
+    R->SetNumberField(TEXT("count"),       Hits.Num());
+    R->SetNumberField(TEXT("total_lines"), Lines.Num());
+    R->SetBoolField  (TEXT("capped"),      Hits.Num() >= MaxLines);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// macOS: ~/Library/Application Support/Epic/UnrealEngine/<Version>/Saved/Crashes/
+// Win:   %LOCALAPPDATA%/UnrealEngine/<Version>/Saved/Crashes/
+// Linux: ~/Unreal Projects/.../Saved/Crashes/  (best-effort)
+//
+// We scan the per-user UE crash root because that's where the editor
+// drops crash dumps (verified on Mac; structure mirrors UE-MCP's expectations).
+FString GetUserCrashesRoot()
+{
+    // FPlatformProcess::UserSettingsDir() on Mac:
+    //   ~/Library/Application Support/Epic/   (already includes /Epic)
+    // On Win:
+    //   %LOCALAPPDATA%/   (no /Epic suffix)
+    // The crash root is always <UserRoot>/UnrealEngine/<MAJ.MIN>/Saved/Crashes
+    // — the editor doesn't add a project-name dir under there.
+    const FString UserRoot = FPlatformProcess::UserSettingsDir();
+    const FString EngineVer = FString::Printf(TEXT("%d.%d"),
+        FEngineVersion::Current().GetMajor(), FEngineVersion::Current().GetMinor());
+    return UserRoot / TEXT("UnrealEngine") / EngineVer
+                    / TEXT("Saved") / TEXT("Crashes");
+}
+
+TArray<FString> ListCrashDirs(IFileManager& FM, const FString& Root)
+{
+    TArray<FString> Dirs;
+    if (!FM.DirectoryExists(*Root)) return Dirs;
+    TArray<FString> SubDirs;
+    FM.FindFiles(SubDirs, *(Root / TEXT("CrashReport*")), false, true);
+    Dirs.Reserve(SubDirs.Num());
+    for (const FString& D : SubDirs)
+    {
+        Dirs.Add(Root / D);
+    }
+    return Dirs;
+}
+
+FSageToolDispatch::FOutcome ListCrashesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    int32 MaxResults = 25;
+    if (Args.IsValid())
+    {
+        double N = 0;
+        if (Args->TryGetNumberField(TEXT("max_results"), N))
+        {
+            MaxResults = FMath::Clamp(static_cast<int32>(N), 1, 200);
+        }
+    }
+    const FString Root = GetUserCrashesRoot();
+    IFileManager& FM = IFileManager::Get();
+    TArray<FString> Dirs = ListCrashDirs(FM, Root);
+
+    // Sort by mtime descending (newest first)
+    Dirs.Sort([&FM](const FString& A, const FString& B) {
+        return FM.GetTimeStamp(*A) > FM.GetTimeStamp(*B);
+    });
+
+    TArray<TSharedPtr<FJsonValue>> Out;
+    for (int32 i = 0; i < FMath::Min(Dirs.Num(), MaxResults); ++i)
+    {
+        const FString& D = Dirs[i];
+        auto O = MakeShared<FJsonObject>();
+        O->SetStringField(TEXT("crash_dir"), FPaths::ConvertRelativePathToFull(D));
+        O->SetStringField(TEXT("name"),      FPaths::GetCleanFilename(D));
+        const FDateTime TS = FM.GetTimeStamp(*D);
+        O->SetStringField(TEXT("timestamp"), TS.ToIso8601());
+        // Quick file presence flags (each crash dir always has these in modern UE).
+        O->SetBoolField(TEXT("has_log"),     FM.FileExists(*(D / TEXT("SageTest.log"))) ||
+                                              FM.FileExists(*(D / TEXT("UnrealEditor.log"))));
+        O->SetBoolField(TEXT("has_dump"),    FM.FileExists(*(D / TEXT("minidump.dmp"))));
+        O->SetBoolField(TEXT("has_context"), FM.FileExists(*(D / TEXT("CrashContext.runtime-xml"))));
+        Out.Add(MakeShared<FJsonValueObject>(O));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("crashes_root"),  FPaths::ConvertRelativePathToFull(Root));
+    R->SetArrayField (TEXT("crashes"),       Out);
+    R->SetNumberField(TEXT("count"),         Out.Num());
+    R->SetNumberField(TEXT("total_on_disk"), Dirs.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome CheckForCrashesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    int32 WithinHours = 24;
+    if (Args.IsValid())
+    {
+        double N = 0;
+        if (Args->TryGetNumberField(TEXT("within_hours"), N))
+        {
+            WithinHours = FMath::Clamp(static_cast<int32>(N), 1, 24 * 365);
+        }
+    }
+    const FString Root = GetUserCrashesRoot();
+    IFileManager& FM = IFileManager::Get();
+    TArray<FString> Dirs = ListCrashDirs(FM, Root);
+
+    const FDateTime Now = FDateTime::UtcNow();
+    int32 Recent = 0;
+    FDateTime Latest{};
+    for (const FString& D : Dirs)
+    {
+        const FDateTime TS = FM.GetTimeStamp(*D);
+        if (TS == FDateTime::MinValue()) continue;
+        const FTimespan Age = Now - TS;
+        if (FMath::Abs(Age.GetTotalHours()) <= WithinHours)
+        {
+            ++Recent;
+            if (TS > Latest) Latest = TS;
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetNumberField(TEXT("within_hours"), WithinHours);
+    R->SetNumberField(TEXT("recent_count"), Recent);
+    R->SetBoolField  (TEXT("has_recent"),   Recent > 0);
+    if (Latest != FDateTime::MinValue())
+    {
+        R->SetStringField(TEXT("latest_timestamp"), Latest.ToIso8601());
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome GetCrashInfoImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString CrashDir;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("crash_dir"), CrashDir))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'crash_dir'"));
+    }
+    // Safety: the crash_dir must live under the per-user crashes root.
+    const FString Root = FPaths::ConvertRelativePathToFull(GetUserCrashesRoot());
+    const FString Abs  = FPaths::ConvertRelativePathToFull(CrashDir);
+    if (!Abs.StartsWith(Root))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("crash_dir outside crashes root: %s"), *Abs));
+    }
+    IFileManager& FM = IFileManager::Get();
+    if (!FM.DirectoryExists(*Abs))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("crash_dir not found: %s"), *Abs));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("crash_dir"), Abs);
+    R->SetStringField(TEXT("name"),      FPaths::GetCleanFilename(Abs));
+    R->SetStringField(TEXT("timestamp"), FM.GetTimeStamp(*Abs).ToIso8601());
+
+    // Try to read CrashContext.runtime-xml's <ErrorMessage> + <CallStack>.
+    const FString XmlPath = Abs / TEXT("CrashContext.runtime-xml");
+    FString Xml;
+    if (FFileHelper::LoadFileToString(Xml, *XmlPath))
+    {
+        auto Extract = [&Xml](const FString& Tag) -> FString
+        {
+            const FString Open  = FString::Printf(TEXT("<%s>"),  *Tag);
+            const FString Close = FString::Printf(TEXT("</%s>"), *Tag);
+            const int32 S = Xml.Find(Open);
+            if (S == INDEX_NONE) return FString();
+            const int32 SE = S + Open.Len();
+            const int32 E = Xml.Find(Close, ESearchCase::IgnoreCase, ESearchDir::FromStart, SE);
+            if (E == INDEX_NONE) return FString();
+            return Xml.Mid(SE, E - SE).TrimStartAndEnd();
+        };
+        const FString ErrMsg   = Extract(TEXT("ErrorMessage"));
+        const FString Stack    = Extract(TEXT("CallStack"));
+        if (!ErrMsg.IsEmpty()) R->SetStringField(TEXT("error_message"), ErrMsg.Left(2000));
+        if (!Stack.IsEmpty())  R->SetStringField(TEXT("call_stack"),    Stack.Left(8192));
+    }
+
+    // Tail of the crash log (last 50 lines).
+    TArray<FString> Candidates = { TEXT("UnrealEditor.log"), TEXT("SageTest.log") };
+    for (const FString& Cand : Candidates)
+    {
+        const FString LP = Abs / Cand;
+        FString LogTxt;
+        if (!FFileHelper::LoadFileToString(LogTxt, *LP)) continue;
+        TArray<FString> Lines;
+        LogTxt.ParseIntoArrayLines(Lines, false);
+        const int32 Tail = FMath::Max(0, Lines.Num() - 50);
+        TArray<TSharedPtr<FJsonValue>> Out;
+        for (int32 i = Tail; i < Lines.Num(); ++i)
+        {
+            Out.Add(MakeShared<FJsonValueString>(Lines[i].Left(500)));
+        }
+        R->SetStringField(TEXT("log_path"),  LP);
+        R->SetArrayField (TEXT("log_tail"),  Out);
+        R->SetNumberField(TEXT("log_total_lines"), Lines.Num());
+        break;
+    }
+
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---- editor.set_property / editor.set_pie_time_scale  (Phase 4.6-r3 b2) --
 
 FSageToolDispatch::FOutcome SetPropertyImpl(const TSharedPtr<FJsonObject>& Args)
@@ -421,6 +663,12 @@ void RegisterEditorAutomationTools(FSageToolDispatch& Dispatch)
     // Phase 4.6-r3 batch 2: runtime state mutation
     Dispatch.RegisterHandler(TEXT("editor.set_property"),       GT(&SetPropertyImpl));
     Dispatch.RegisterHandler(TEXT("editor.set_pie_time_scale"), GT(&SetPieTimeScaleImpl));
+
+    // Phase 4.6-r3 batch 3: log + crash forensics
+    Dispatch.RegisterHandler(TEXT("editor.search_log"),         GT(&SearchLogImpl));
+    Dispatch.RegisterHandler(TEXT("editor.list_crashes"),       GT(&ListCrashesImpl));
+    Dispatch.RegisterHandler(TEXT("editor.check_for_crashes"),  GT(&CheckForCrashesImpl));
+    Dispatch.RegisterHandler(TEXT("editor.get_crash_info"),     GT(&GetCrashInfoImpl));
 }
 
 #undef LOCTEXT_NAMESPACE

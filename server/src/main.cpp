@@ -2553,6 +2553,75 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // ---- Log + crash forensics (Phase 4.6 round 3 batch 3) -------------
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.search_log",
+        .description = "Substring search across the active editor log. "
+                       "Returns {hits: [{line, text}], count, total_lines, "
+                       "capped} where text is line-truncated to 500 chars. "
+                       "max_lines clamped 1..5000 (default 100). Pair with "
+                       "editor.read_log for tail / editor.get_log_file_path "
+                       "for direct fs access.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"query",     {{"type", "string"}}},
+                {"max_lines", {{"type", "integer"}, {"minimum", 1}, {"maximum", 5000}}},
+            }},
+            {"required", nlohmann::json::array({"query"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.list_crashes",
+        .description = "Enumerate UE crash report directories under "
+                       "~/Library/.../Epic/UnrealEngine/<Version>/Saved/"
+                       "Crashes/ (Mac) / %LOCALAPPDATA%/.../ (Win), sorted "
+                       "newest-first. max_results clamped 1..200 "
+                       "(default 25). Each entry: {crash_dir, name, "
+                       "timestamp, has_log, has_dump, has_context}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"max_results", {{"type", "integer"}, {"minimum", 1}, {"maximum", 200}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.check_for_crashes",
+        .description = "Quick boolean: did any crash report drop within "
+                       "the last `within_hours` hours? Returns "
+                       "{recent_count, has_recent, latest_timestamp?}. "
+                       "within_hours clamped 1..8760 (default 24).",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"within_hours", {{"type", "integer"}, {"minimum", 1}, {"maximum", 8760}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.get_crash_info",
+        .description = "Read a specific crash dir's CrashContext.runtime-"
+                       "xml (extracts <ErrorMessage> + <CallStack>) plus "
+                       "the last 50 lines of UnrealEditor.log / "
+                       "<Project>.log inside the dir. crash_dir must live "
+                       "under the per-user crashes root (path-safety "
+                       "guard, -32602 otherwise).",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"crash_dir", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"crash_dir"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // ---- Dialog policy (Phase 4.6 round 2) -----------------------------
     // Hooks FCoreDelegates::ModalMessageDialog so unattended agent flows
     // don't stall on Save?/Reload?/Confirm Delete? modals. Lazy install
