@@ -2524,6 +2524,59 @@ int main() {
         },
         .handler = nullptr, .remote = true,
     });
+    // Phase 4.5-r2 batch 9: FBX import wrappers
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.import_static_mesh",
+        .description = "Import a UStaticMesh from .fbx/.obj/.gltf via "
+                       "UAssetImportTask + IAssetTools::ImportAssetTasks. "
+                       "Same args as asset.import_texture; verifies the "
+                       "produced asset is a UStaticMesh, otherwise -32000. "
+                       "PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"file",             {{"type", "string"}}},
+                {"destination",      {{"type", "string"}}},
+                {"replace_existing", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"file", "destination"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.import_skeletal_mesh",
+        .description = "Import a USkeletalMesh from FBX. Verifies the "
+                       "produced asset is a USkeletalMesh.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"file",             {{"type", "string"}}},
+                {"destination",      {{"type", "string"}}},
+                {"replace_existing", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"file", "destination"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.import_animation",
+        .description = "Import a UAnimSequence from FBX. Verifies the "
+                       "produced asset is a UAnimSequence.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"file",             {{"type", "string"}}},
+                {"destination",      {{"type", "string"}}},
+                {"replace_existing", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"file", "destination"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // Phase 4.5-r2 batch 8: export
     registerRemote(sage::mcp::Tool{
         .name = "asset.export",

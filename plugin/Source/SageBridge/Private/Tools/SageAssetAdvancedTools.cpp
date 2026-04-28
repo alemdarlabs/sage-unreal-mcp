@@ -582,84 +582,133 @@ FSageToolDispatch::FOutcome ExportAssetImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
-// ---- asset.import_texture / asset.reimport ------------------------------
-// ---- (Phase 4.5 round 2 batch 7) -----------------------------------------
+// ---- asset.import_texture / asset.import_*mesh / asset.import_animation
+// ---- asset.reimport (shared)
+// ---- (Phase 4.5 round 2 batch 7+9) ---------------------------------------
+
+namespace import_helpers
+{
+    FSageToolDispatch::FOutcome RunImport(const TSharedPtr<FJsonObject>& Args,
+                                          UClass* ExpectedBase)
+    {
+        FSageToolDispatch::FOutcome Reject;
+        if (detail::RejectIfPie(Reject)) return Reject;
+
+        FString FilePath, DestPath;
+        if (!Args.IsValid() || !Args->TryGetStringField(TEXT("file"), FilePath) || FilePath.IsEmpty())
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'file'"));
+        }
+        if (!Args->TryGetStringField(TEXT("destination"), DestPath) || DestPath.IsEmpty())
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'destination'"));
+        }
+        if (!IFileManager::Get().FileExists(*FilePath))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("source file not found: %s"), *FilePath));
+        }
+
+        bool bReplace = false;
+        Args->TryGetBoolField(TEXT("replace_existing"), bReplace);
+
+        // destination /Game/Foo/Bar.Bar form; split into dir + name
+        FString DestDir = DestPath, DestName;
+        int32 DotIdx = INDEX_NONE;
+        if (DestPath.FindChar(TEXT('.'), DotIdx))
+        {
+            DestDir = DestPath.Left(DotIdx);
+        }
+        int32 SlashIdx = INDEX_NONE;
+        if (DestDir.FindLastChar(TEXT('/'), SlashIdx))
+        {
+            DestName = DestDir.RightChop(SlashIdx + 1);
+            DestDir  = DestDir.Left(SlashIdx);
+        }
+        if (DestDir.IsEmpty() || DestName.IsEmpty())
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("destination must be /Folder/AssetName form"));
+        }
+
+        UAssetImportTask* Task = NewObject<UAssetImportTask>();
+        Task->Filename         = FilePath;
+        Task->DestinationPath  = DestDir;
+        Task->DestinationName  = DestName;
+        Task->bAutomated       = true;
+        Task->bSave            = false;
+        Task->bReplaceExisting = bReplace;
+        Task->bReplaceExistingSettings = bReplace;
+
+        FAssetToolsModule& AssetToolsMod = FModuleManager::LoadModuleChecked<FAssetToolsModule>(
+            TEXT("AssetTools"));
+        IAssetTools& AssetTools = AssetToolsMod.Get();
+        TArray<UAssetImportTask*> Tasks; Tasks.Add(Task);
+        AssetTools.ImportAssetTasks(Tasks);
+
+        if (Task->ImportedObjectPaths.Num() == 0)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32000,
+                FString::Printf(TEXT("import failed for %s (no objects produced)"), *FilePath));
+        }
+
+        if (ExpectedBase)
+        {
+            bool bAnyMatched = false;
+            for (const FString& P : Task->ImportedObjectPaths)
+            {
+                FSoftObjectPath Soft(P);
+                UObject* Obj = Soft.ResolveObject();
+                if (!Obj) Obj = Soft.TryLoad();
+                if (Obj && Obj->IsA(ExpectedBase)) { bAnyMatched = true; break; }
+            }
+            if (!bAnyMatched)
+            {
+                return FSageToolDispatch::FOutcome::MakeError(-32000,
+                    FString::Printf(TEXT("import produced no %s (got %d objects)"),
+                                    *ExpectedBase->GetName(),
+                                    Task->ImportedObjectPaths.Num()));
+            }
+        }
+
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("source"),    FilePath);
+        R->SetStringField(TEXT("dest_dir"),  DestDir);
+        R->SetStringField(TEXT("dest_name"), DestName);
+        if (ExpectedBase)
+        {
+            R->SetStringField(TEXT("expected_class"), ExpectedBase->GetName());
+        }
+        TArray<TSharedPtr<FJsonValue>> Imported;
+        for (const FString& P : Task->ImportedObjectPaths)
+        {
+            Imported.Add(MakeShared<FJsonValueString>(P));
+        }
+        R->SetArrayField(TEXT("imported"), Imported);
+        R->SetNumberField(TEXT("count"),   Imported.Num());
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+}
 
 FSageToolDispatch::FOutcome ImportTextureImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    FSageToolDispatch::FOutcome Reject;
-    if (detail::RejectIfPie(Reject)) return Reject;
+    return import_helpers::RunImport(Args, UTexture::StaticClass());
+}
 
-    FString FilePath, DestPath;
-    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("file"), FilePath) || FilePath.IsEmpty())
-    {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'file'"));
-    }
-    if (!Args->TryGetStringField(TEXT("destination"), DestPath) || DestPath.IsEmpty())
-    {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'destination'"));
-    }
-    if (!IFileManager::Get().FileExists(*FilePath))
-    {
-        return FSageToolDispatch::FOutcome::MakeError(-32602,
-            FString::Printf(TEXT("source file not found: %s"), *FilePath));
-    }
+FSageToolDispatch::FOutcome ImportStaticMeshImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return import_helpers::RunImport(Args, UStaticMesh::StaticClass());
+}
 
-    bool bReplace = false;
-    Args->TryGetBoolField(TEXT("replace_existing"), bReplace);
+FSageToolDispatch::FOutcome ImportSkeletalMeshImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return import_helpers::RunImport(Args, USkeletalMesh::StaticClass());
+}
 
-    // destination /Game/Foo/Bar.Bar form; split into dir + name
-    FString DestDir = DestPath, DestName;
-    int32 DotIdx = INDEX_NONE;
-    if (DestPath.FindChar(TEXT('.'), DotIdx))
-    {
-        DestDir = DestPath.Left(DotIdx);
-    }
-    int32 SlashIdx = INDEX_NONE;
-    if (DestDir.FindLastChar(TEXT('/'), SlashIdx))
-    {
-        DestName = DestDir.RightChop(SlashIdx + 1);
-        DestDir  = DestDir.Left(SlashIdx);
-    }
-    if (DestDir.IsEmpty() || DestName.IsEmpty())
-    {
-        return FSageToolDispatch::FOutcome::MakeError(-32602,
-            TEXT("destination must be /Folder/AssetName form"));
-    }
-
-    UAssetImportTask* Task = NewObject<UAssetImportTask>();
-    Task->Filename         = FilePath;
-    Task->DestinationPath  = DestDir;
-    Task->DestinationName  = DestName;
-    Task->bAutomated       = true;
-    Task->bSave            = false;
-    Task->bReplaceExisting = bReplace;
-    Task->bReplaceExistingSettings = bReplace;
-
-    FAssetToolsModule& AssetToolsMod = FModuleManager::LoadModuleChecked<FAssetToolsModule>(
-        TEXT("AssetTools"));
-    IAssetTools& AssetTools = AssetToolsMod.Get();
-    TArray<UAssetImportTask*> Tasks; Tasks.Add(Task);
-    AssetTools.ImportAssetTasks(Tasks);
-
-    if (Task->ImportedObjectPaths.Num() == 0)
-    {
-        return FSageToolDispatch::FOutcome::MakeError(-32000,
-            FString::Printf(TEXT("import failed for %s (no objects produced)"), *FilePath));
-    }
-
-    auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("source"),    FilePath);
-    R->SetStringField(TEXT("dest_dir"),  DestDir);
-    R->SetStringField(TEXT("dest_name"), DestName);
-    TArray<TSharedPtr<FJsonValue>> Imported;
-    for (const FString& P : Task->ImportedObjectPaths)
-    {
-        Imported.Add(MakeShared<FJsonValueString>(P));
-    }
-    R->SetArrayField(TEXT("imported"), Imported);
-    R->SetNumberField(TEXT("count"),   Imported.Num());
-    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+FSageToolDispatch::FOutcome ImportAnimationImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    UClass* AnimSeq = FindObject<UClass>(nullptr, TEXT("/Script/Engine.AnimSequence"));
+    return import_helpers::RunImport(Args, AnimSeq);
 }
 
 FSageToolDispatch::FOutcome ReimportImpl(const TSharedPtr<FJsonObject>& Args)
@@ -1899,6 +1948,11 @@ void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
 
     // Phase 4.5-r2 batch 8: export
     Dispatch.RegisterHandler(TEXT("asset.export"),                GT(&ExportAssetImpl));
+
+    // Phase 4.5-r2 batch 9: FBX import wrappers
+    Dispatch.RegisterHandler(TEXT("asset.import_static_mesh"),    GT(&ImportStaticMeshImpl));
+    Dispatch.RegisterHandler(TEXT("asset.import_skeletal_mesh"),  GT(&ImportSkeletalMeshImpl));
+    Dispatch.RegisterHandler(TEXT("asset.import_animation"),      GT(&ImportAnimationImpl));
 
     // Write
     Dispatch.RegisterHandler(TEXT("asset.bulk_rename"),        GT(&BulkRenameImpl));

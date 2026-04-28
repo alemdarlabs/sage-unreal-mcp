@@ -324,9 +324,9 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [x] `asset.save` → `save_assets`
 - [x] `asset.set_mesh_material` → `asset.set_mesh_material` (Phase 4.5-r2-b5; UStaticMesh::SetMaterial; nullptr clears slot; out-of-range/missing-material -> -32602)
 - [ ] `asset.recenter_pivot` — Mesh pivot to center · W
-- [ ] `asset.import_static_mesh` — From FBX/OBJ · W
-- [ ] `asset.import_skeletal_mesh` — From FBX · W
-- [ ] `asset.import_animation` — From FBX · W
+- [x] `asset.import_static_mesh` → `asset.import_static_mesh` (Phase 4.5-r2-b9; UAssetImportTask + class assert on UStaticMesh; PNG → -32000 rejection works)
+- [x] `asset.import_skeletal_mesh` → `asset.import_skeletal_mesh` (Phase 4.5-r2-b9; same wrapper, USkeletalMesh assertion)
+- [x] `asset.import_animation` → `asset.import_animation` (Phase 4.5-r2-b9; UAnimSequence assertion via FindObject<UClass>)
 - [x] `asset.import_texture` → `asset.import_texture` (Phase 4.5-r2-b7; UAssetImportTask + IAssetTools::ImportAssetTasks; bAutomated=true; PNG/TGA/JPG/EXR/HDR; replace_existing toggle)
 - [x] `asset.reimport` → `asset.reimport` (Phase 4.5-r2-b7; FReimportManager::Reimport(automated=true); optional source_file overrides saved path; reports known_sources)
 - [x] `asset.read_datatable` → `asset.read_datatable` (Phase 4.5-r2-b6; iterates RowStruct properties via Sage GetPropertyValueAtPtr; TArray/TMap/TSet/structs/enums round-tripped; max_rows clamped 1..100000)
