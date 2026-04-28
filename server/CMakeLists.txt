@@ -47,6 +47,8 @@ target_link_libraries(sage-tools
 # C++23; only this TU needs the downgrade. See .claude/notes/lessons.md.
 add_library(sage-graph STATIC
     src/graph/kuzu_graph_store.cpp
+    src/graph/graph_schema.cpp
+    src/graph/graph_store_manager.cpp
 )
 target_include_directories(sage-graph
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)

@@ -42,16 +42,18 @@ flowchart TB
   %% Phase 2 moat
   subgraph P2["Phase 2 — Knowledge Layer (intelligence moat)"]
     direction TB
-    M21["2.1 KuzuDB integration<br/>embedded · schema migration · slot-scoped"]:::todo
+    M21a["2.1a KuzuDB baseline<br/>v0.11.3 prebuilt · CMake INTERFACE · smoke OK"]:::done
+    M21b["2.1b GraphStore abstraction<br/>variant&lt;Json,GraphError&gt; · {rows,schema,row_count}"]:::done
+    M21c["2.1c Slot-scoped DB + schema migration<br/>per-slot Kuzu path · _SchemaVersion node · v1 init"]:::now
     M22["2.2 T1 indexing (eager)<br/>AssetRegistry full scan → Asset/Class/Module/Plugin"]:::todo
     M23["2.3 T2 topology + real-time delta<br/>depends_on / inherits_from / implements + AssetRegistry events"]:::todo
     M24["2.4 High-level query tools<br/>impact_of · references_to · class_hierarchy · find_unused"]:::moat
     M25["2.5 Cypher subset (Layer 2)<br/>read-only AST whitelist · bounded *1..N · 8K cap"]:::todo
   end
 
-  M21 --> M22 --> M23 --> M24 --> M25
+  M21a --> M21b --> M21c --> M22 --> M23 --> M24 --> M25
 
-  NOW ==yarın Windows test ve<br/>Phase 2 başlat==> M21
+  NOW ==Phase 2 başladı==> M21a
 
   %% Demo hedefleri
   M17 -. Demo 1 .- DEMO1[/"Demo 1 ispatlandı<br/>spawn · CAS · transactions · bulk · PIE guard"/]:::done

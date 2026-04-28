@@ -89,3 +89,20 @@ add_custom_command(TARGET sage-graph-smoke POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${KUZU_DIR}/${KUZU_LIB_NAME}"
         "$<TARGET_FILE_DIR:sage-graph-smoke>/${KUZU_LIB_NAME}")
+
+# ---- GraphStoreManager smoke ----
+# Verifies slot-scoped DB acquisition, schema migration, and isolation.
+add_executable(sage-graph-manager-smoke
+    integration/graph_store_manager_smoke.cpp
+)
+target_link_libraries(sage-graph-manager-smoke
+    PRIVATE sage-graph)
+target_compile_features(sage-graph-manager-smoke PRIVATE cxx_std_23)
+set_target_properties(sage-graph-manager-smoke PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    BUILD_RPATH   "${KUZU_DIR}"
+    INSTALL_RPATH "@executable_path")
+add_custom_command(TARGET sage-graph-manager-smoke POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${KUZU_DIR}/${KUZU_LIB_NAME}"
+        "$<TARGET_FILE_DIR:sage-graph-manager-smoke>/${KUZU_LIB_NAME}")
