@@ -73,7 +73,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Şu Anki Durum (Snapshot)
 
-> Tek satırda durum: **67 commit · 167 MCP tool · Phase 1+2+3 tamam · 4.2(r2) DONE · 4.4 ingest 7.5x · 4.6(r3-b1..b5 inc Python) · 4.7 DONE · Phase 4 ~%72**.
+> Tek satırda durum: **68 commit · 170 MCP tool · Phase 1+2+3 tamam · 4.2(r2) DONE · 4.4 ingest 7.5x · 4.5(r2-b1 query) · 4.6(r3 inc Python) · 4.7 DONE · Phase 4 ~%73**.
 
 - **Test ortamı**: `/Users/mahmutalemdar/Developer/alemdarlabs/SageTest/SageTest.uproject` (UE 5.7.4 Third Person + Blueprint).
 - **Knowledge graph (canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Real-time delta + query_graph + class_hierarchy çalışıyor.
@@ -118,6 +118,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 | 4.6-r3-b3 | Log + crash forensics (`editor.search_log` / `list_crashes` / `check_for_crashes` / `get_crash_info`) | 4 |
 | 4.6-r3-b4 | Level building (`editor.build_all` / `build_geometry` / `build_lighting` / `build_hlod` / `get_build_status`) | 5 |
 | 4.6-r3-b5 | Python scripting (`editor.run_python`) | 1 |
+| 4.5-r2-b1 | Asset query (`asset.list` / `asset.search` / `asset.read_properties`) | 3 |
 
 ## Build & Run Commands
 

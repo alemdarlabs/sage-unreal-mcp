@@ -341,6 +341,161 @@ FSageToolDispatch::FOutcome DiagnoseRegistryImpl(const TSharedPtr<FJsonObject>& 
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- asset.list / asset.search / asset.read_properties ------------------
+// ---- (Phase 4.5 round 2 batch 1: asset query) ----------------------------
+
+FSageToolDispatch::FOutcome ListAssetsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Dir = TEXT("/Game");
+    if (Args.IsValid()) Args->TryGetStringField(TEXT("directory"), Dir);
+    bool bRecursive = true;
+    if (Args.IsValid()) Args->TryGetBoolField(TEXT("recursive"), bRecursive);
+    int32 MaxResults = 1000;
+    if (Args.IsValid())
+    {
+        double N = 0;
+        if (Args->TryGetNumberField(TEXT("max_results"), N))
+        {
+            MaxResults = FMath::Clamp(static_cast<int32>(N), 1, 50000);
+        }
+    }
+
+    FAssetRegistryModule& Module = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(
+        TEXT("AssetRegistry"));
+    IAssetRegistry& Registry = Module.Get();
+
+    TArray<FAssetData> Found;
+    Registry.GetAssetsByPath(FName(*Dir), Found, bRecursive, /*bIncludeOnlyOnDiskAssets*/ false);
+
+    TArray<TSharedPtr<FJsonValue>> Out;
+    int32 Total = Found.Num();
+    int32 Returned = 0;
+    for (const FAssetData& A : Found)
+    {
+        if (Returned >= MaxResults) break;
+        auto O = MakeShared<FJsonObject>();
+        O->SetStringField(TEXT("path"),  A.GetSoftObjectPath().ToString());
+        O->SetStringField(TEXT("kind"),  A.AssetClassPath.GetAssetName().ToString());
+        O->SetStringField(TEXT("name"),  A.AssetName.ToString());
+        Out.Add(MakeShared<FJsonValueObject>(O));
+        ++Returned;
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("directory"), Dir);
+    R->SetBoolField  (TEXT("recursive"), bRecursive);
+    R->SetArrayField (TEXT("assets"),    Out);
+    R->SetNumberField(TEXT("returned"),  Returned);
+    R->SetNumberField(TEXT("total"),     Total);
+    R->SetBoolField  (TEXT("capped"),    Returned < Total);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SearchAssetsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Query;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("query"), Query) || Query.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing/empty 'query'"));
+    }
+    FString ClassFilter;
+    Args->TryGetStringField(TEXT("class"), ClassFilter);
+    FString Dir = TEXT("/Game");
+    Args->TryGetStringField(TEXT("directory"), Dir);
+    int32 MaxResults = 200;
+    double N = 0;
+    if (Args->TryGetNumberField(TEXT("max_results"), N))
+    {
+        MaxResults = FMath::Clamp(static_cast<int32>(N), 1, 5000);
+    }
+
+    FAssetRegistryModule& Module = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(
+        TEXT("AssetRegistry"));
+    IAssetRegistry& Registry = Module.Get();
+
+    FARFilter Filter;
+    Filter.PackagePaths.Add(FName(*Dir));
+    Filter.bRecursivePaths = true;
+    if (!ClassFilter.IsEmpty())
+    {
+        Filter.ClassPaths.Add(FTopLevelAssetPath(ClassFilter));
+    }
+
+    TArray<FAssetData> Found;
+    Registry.GetAssets(Filter, Found);
+
+    TArray<TSharedPtr<FJsonValue>> Out;
+    const FString QLower = Query.ToLower();
+    int32 Total = 0;
+    for (const FAssetData& A : Found)
+    {
+        const FString Name = A.AssetName.ToString();
+        const FString Path = A.GetSoftObjectPath().ToString();
+        if (!Name.ToLower().Contains(QLower) && !Path.ToLower().Contains(QLower)) continue;
+        ++Total;
+        if (Out.Num() >= MaxResults) continue;
+
+        auto O = MakeShared<FJsonObject>();
+        O->SetStringField(TEXT("path"), Path);
+        O->SetStringField(TEXT("kind"), A.AssetClassPath.GetAssetName().ToString());
+        O->SetStringField(TEXT("name"), Name);
+        Out.Add(MakeShared<FJsonValueObject>(O));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("query"),     Query);
+    if (!ClassFilter.IsEmpty()) R->SetStringField(TEXT("class"), ClassFilter);
+    R->SetStringField(TEXT("directory"), Dir);
+    R->SetArrayField (TEXT("matches"),   Out);
+    R->SetNumberField(TEXT("returned"),  Out.Num());
+    R->SetNumberField(TEXT("total"),     Total);
+    R->SetBoolField  (TEXT("capped"),    Out.Num() < Total);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ReadAssetPropertiesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UObject* Obj = nullptr;
+    {
+        FSoftObjectPath Soft(Path);
+        Obj = Soft.ResolveObject();
+        if (!Obj) Obj = Soft.TryLoad();
+    }
+    if (!Obj)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("asset not found: %s"), *Path));
+    }
+
+    auto Props = MakeShared<FJsonObject>();
+    int32 Count = 0;
+    for (TFieldIterator<FProperty> It(Obj->GetClass()); It; ++It)
+    {
+        FProperty* P = *It;
+        if (!P) continue;
+        if (P->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient)) continue;
+        const FString PropName = P->GetName();
+        TSharedPtr<FJsonValue> V = detail::GetUPropertyAsJson(Obj, P);
+        if (V.IsValid())
+        {
+            Props->SetField(PropName, V);
+            ++Count;
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),       Obj->GetPathName());
+    R->SetStringField(TEXT("class"),      Obj->GetClass()->GetName());
+    R->SetObjectField(TEXT("properties"), Props);
+    R->SetNumberField(TEXT("count"),      Count);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 }  // namespace (anonymous)
 
 void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
@@ -361,6 +516,11 @@ void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("asset.get_mesh_collision"), GT(&GetMeshCollisionImpl));
     Dispatch.RegisterHandler(TEXT("asset.list_redirectors"),   GT(&ListRedirectorsImpl));
     Dispatch.RegisterHandler(TEXT("asset.diagnose_registry"),  GT(&DiagnoseRegistryImpl));
+
+    // Phase 4.5-r2 batch 1: asset query
+    Dispatch.RegisterHandler(TEXT("asset.list"),               GT(&ListAssetsImpl));
+    Dispatch.RegisterHandler(TEXT("asset.search"),             GT(&SearchAssetsImpl));
+    Dispatch.RegisterHandler(TEXT("asset.read_properties"),    GT(&ReadAssetPropertiesImpl));
 
     // Write
     Dispatch.RegisterHandler(TEXT("asset.bulk_rename"),        GT(&BulkRenameImpl));

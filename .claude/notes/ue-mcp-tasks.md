@@ -15,7 +15,7 @@
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
 | blueprint | 38 | 8 | 46 | 83 |
-| asset | 7 | 32 | 39 | 18 |
+| asset | 10 | 29 | 39 | 26 |
 | level | 10 | 22 | 32 | 31 |
 | niagara | 0 | 26 | 26 | 0 |
 | material | 11 | 16 | 27 | 41 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **155** | **293** | **448** | **35** |
+| **TOTAL** | **158** | **290** | **448** | **35** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -310,10 +310,10 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 
 ## asset (39) — Sage covers 7
 
-- [ ] `asset.list` — List in directory · R
-- [ ] `asset.search` — Search by name/class/path · R
-- [ ] `asset.read` — Read via reflection · R
-- [ ] `asset.read_properties` — Property dump · R
+- [x] `asset.list` → `asset.list` (Phase 4.5-r2-b1; AssetRegistry::GetAssetsByPath, recursive flag, max_results clamp)
+- [x] `asset.search` → `asset.search` (Phase 4.5-r2-b1; substring on name+path, optional class filter via TopLevelAssetPath)
+- [~] `asset.read` — covered by `asset.read_properties` (full reflection dump; `asset.read` would be a lighter-weight name+kind which is what `asset.list` already returns per row)
+- [x] `asset.read_properties` → `asset.read_properties` (Phase 4.5-r2-b1; Sage GetUPropertyAsJson over every reflected FProperty)
 - [x] `asset.duplicate` → `duplicate_asset`
 - [x] `asset.rename` → `rename_asset`
 - [x] `asset.bulk_rename` → `asset.bulk_rename`

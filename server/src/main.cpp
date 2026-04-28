@@ -2372,6 +2372,65 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // ---- Asset query (Phase 4.5 round 2 batch 1) -----------------------
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.list",
+        .description = "Enumerate assets under a content directory via "
+                       "AssetRegistry::GetAssetsByPath. directory defaults "
+                       "to '/Game' (project content root); '/Engine', "
+                       "'/Plugin/<Name>' also accepted. recursive=true "
+                       "(default) descends. max_results clamped 1..50000 "
+                       "(default 1000). Returns {assets: [{path, kind, "
+                       "name}], returned, total, capped}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"directory",   {{"type", "string"}}},
+                {"recursive",   {{"type", "boolean"}}},
+                {"max_results", {{"type", "integer"}, {"minimum", 1}, {"maximum", 50000}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.search",
+        .description = "Substring search assets by name OR path under the "
+                       "given directory (case-insensitive). Optional "
+                       "class filter is a TopLevelAssetPath (e.g. "
+                       "'/Script/Engine.Blueprint'). Returns same shape "
+                       "as asset.list plus {query, class?} echo.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"query",       {{"type", "string"}}},
+                {"class",       {{"type", "string"}}},
+                {"directory",   {{"type", "string"}}},
+                {"max_results", {{"type", "integer"}, {"minimum", 1}, {"maximum", 5000}}},
+            }},
+            {"required", nlohmann::json::array({"query"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.read_properties",
+        .description = "Dump every reflected UProperty on an asset's "
+                       "UObject. Skips CPF_Transient + DuplicateTransient. "
+                       "Goes through Sage's GetUPropertyAsJson — structs "
+                       "(Vector/Rotator/Transform/Color), TArray/TMap/"
+                       "TSet, enums, soft refs all round-tripped. Returns "
+                       "{class, properties: {...}, count}. -32602 if path "
+                       "doesn't resolve.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // ---- Editor automation (Phase 4.6) ---------------------------------
     registerRemote(sage::mcp::Tool{
         .name = "editor.console_command",
