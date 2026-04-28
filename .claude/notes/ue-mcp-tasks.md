@@ -1,8 +1,8 @@
 # UE-MCP → Sage: 448 Action Per-Tool Task List
 
 > **Source:** `/Users/mahmutalemdar/Developer/alemdarlabs/ue-mcp` — TypeScript MCP server + C++ plugin, BUSL-1.1.
-> **Audit date:** 2026-04-28 (last update: Phase 4.2-r2c BP interface CRUD shipped).
-> **Status:** Sage 118 tools · UE-MCP 448 actions · ~108 covered (mostly via Phase 4) · **340 actions remain**.
+> **Audit date:** 2026-04-28 (last update: Phase 4.2-r2d BP graph management shipped).
+> **Status:** Sage 120 tools · UE-MCP 448 actions · ~110 covered (mostly via Phase 4) · **338 actions remain**.
 >
 > Earlier note had cited 562; actual enumeration of every `RegisterHandler` / dispatcher branch in the ue-mcp source landed on 448. The 562 number likely came from including duplicates / aliases / TS-side validation rules that don't materialise as distinct C++ handlers.
 
@@ -14,7 +14,7 @@
 | editor | 15 | 29 | 44 | 34 |
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
-| blueprint | 20 | 26 | 46 | 43 |
+| blueprint | 22 | 24 | 46 | 48 |
 | asset | 7 | 32 | 39 | 18 |
 | level | 10 | 22 | 32 | 31 |
 | niagara | 0 | 26 | 26 | 0 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **108** | **340** | **448** | **24** |
+| **TOTAL** | **110** | **338** | **448** | **25** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -255,7 +255,7 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `blueprint.set_variable_properties` — Edit instance/BP props · W
 - [ ] `blueprint.create_function` — Create user fn · W
 - [x] `blueprint.delete_function` → `bp.delete_function`
-- [ ] `blueprint.rename_function` — Rename fn · W
+- [x] `blueprint.rename_function` → `bp.rename_function` (Phase 4.2-r2d)
 - [x] `blueprint.add_node` → `bp.add_node` (Phase 4.2-r2a)
 - [x] `blueprint.delete_node` → `bp.delete_node`
 - [x] `blueprint.set_node_property` → `bp.set_node_property` (Phase 4.2-r2a)
@@ -275,7 +275,7 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [x] `blueprint.add_interface` → `bp.add_interface` (Phase 4.2-r2c)
 - [x] `blueprint.list_interfaces` → `bp.list_interfaces` (Phase 4.2-r2c, NEW vs ue-mcp)
 - [x] `blueprint.remove_interface` → `bp.remove_interface` (Phase 4.2-r2c, NEW vs ue-mcp)
-- [ ] `blueprint.list_graphs` — All graphs · R
+- [x] `blueprint.list_graphs` → `bp.list_graphs` (Phase 4.2-r2d; ubergraph/function/delegate/macro)
 - [ ] `blueprint.add_event_dispatcher` — Add dispatcher · W
 - [ ] `blueprint.duplicate` — Duplicate BP · W
 - [x] `blueprint.add_local_variable` → `bp.add_local_variable` (Phase 4.2-r2b)
@@ -296,7 +296,8 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - **r2a DONE (4 tools):** add_node + set_node_property + read_node_property + list_node_types. 12+3 smoke tests green on UE 5.7 SageTest. Branch (K2Node_IfThenElse) + CallFunction (with function_name/target_class) + GetVar/SetVar (with variable_name) spawn paths verified. Pin default round-trip (true→false→read) confirmed via Schema::TrySetDefaultValue.
 - **r2b DONE (3 tools):** list_local_variables + add_local_variable + delete_local_variable. 11/11 smoke green: empty list → add MyLocal:int=42 → add MyBool:bool=true → list 2 → duplicate add -32602 → delete 1 → delete missing removed=0 (idempotent) → list 1 → cleanup. Backed by FBlueprintEditorUtils::AddLocalVariable + direct UK2Node_FunctionEntry::LocalVariables removal (avoids UE 5.7 RemoveLocalVariable scope-param churn).
 - **r2c DONE (3 tools):** list_interfaces + add_interface + remove_interface. FBlueprintEditorUtils::ImplementNewInterface(BP, FTopLevelAssetPath) + RemoveInterface. UInterface guard via IsChildOf(UInterface::StaticClass()). 7-step round-trip green: add NavMovementInterface (already=false) → re-add (already=true, idempotent) → list 2 → remove (removed=1) → list 1 → re-remove (removed=0, idempotent) → cleanup. Plus error guards: missing path -32602, non-existent class -32602, non-UInterface class -32602.
-- **r2d remaining (~15 tools):** T3D pair, function I/O (add_function_parameter, list_function_parameters), rename_function, reparent_component, BP component CRUD via SCS path, validate, run_construction_script, dispatcher (add_event_dispatcher), get_dependencies, list_graphs, blueprint.create, blueprint.create_interface, set_variable_properties, read_component_properties, get_cdo_properties.
+- **r2d DONE (2 tools):** list_graphs (ubergraph/function/delegate/macro enumeration with node count) + rename_function (FBlueprintEditorUtils::RenameGraph w/ collision + same-name + missing guards). 9/9 smoke green: baseline list shows template's 4 graphs (EventGraph + UCS + Move + Aim) → add OldFn → rename OldFn→NewFn → verify list reflects → guards: nonexistent/collision/same-name all -32602.
+- **r2e remaining (~13 tools):** T3D import/export pair, function I/O (add/list/remove_function_parameter), reparent_component, BP component CRUD via SCS path, validate, run_construction_script, dispatcher (add_event_dispatcher + list/remove), blueprint.create, blueprint.create_interface, set_variable_properties, read_component_properties, get_cdo_properties, get_dependencies.
 
 ---
 

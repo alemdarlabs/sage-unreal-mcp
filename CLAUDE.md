@@ -73,7 +73,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Şu Anki Durum (Snapshot)
 
-> Tek satırda durum: **49 commit · 118 MCP tool · Phase 1+2+3 tamam · Phase 4 ~%55 (4.0/4.1/4.2-r1+r2a+r2b+r2c/4.3/4.5-r1/4.6-r1+r2)**.
+> Tek satırda durum: **50 commit · 120 MCP tool · Phase 1+2+3 tamam · Phase 4 ~%56 (4.0/4.1/4.2-r1+r2a..r2d/4.3/4.5-r1/4.6-r1+r2)**.
 
 - **Test ortamı**: `/Users/mahmutalemdar/Developer/alemdarlabs/SageTest/SageTest.uproject` (UE 5.7.4 Third Person + Blueprint).
 - **Knowledge graph (canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Real-time delta + query_graph + class_hierarchy çalışıyor.
@@ -101,6 +101,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 | 4.2-r2a | BP graph node CRUD (`bp.add_node` / set_node_property / read_node_property / list_node_types) | 4 |
 | 4.2-r2b | BP local variables (`bp.list_local_variables` / add_local_variable / delete_local_variable) | 3 |
 | 4.2-r2c | BP interface CRUD (`bp.list_interfaces` / add_interface / remove_interface) | 3 |
+| 4.2-r2d | BP graph management (`bp.list_graphs` / rename_function) | 2 |
 
 ## Build & Run Commands
 

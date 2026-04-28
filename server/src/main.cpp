@@ -1244,6 +1244,41 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // -- read+write — graph management (Phase 4.2 round 2d) --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.list_graphs",
+        .description = "Enumerate all UEdGraphs on the BP. Returns "
+                       "{graphs: [{name, kind, node_count}], count} where "
+                       "kind ∈ {ubergraph, function, delegate, macro}. "
+                       "Read-only.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.rename_function",
+        .description = "Rename a user function graph via "
+                       "FBlueprintEditorUtils::RenameGraph. Reflects on the "
+                       "compiled UFunction at next compile. -32602 if "
+                       "old_name not found, new_name already exists, or "
+                       "old_name == new_name. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"old_name", {{"type", "string"}}},
+                {"new_name", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "old_name", "new_name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // -- write — functions --
     registerRemote(sage::mcp::Tool{
         .name = "bp.add_function",

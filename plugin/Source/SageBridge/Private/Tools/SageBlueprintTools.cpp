@@ -811,6 +811,93 @@ FSageToolDispatch::FOutcome BpConnectPinsImpl(const TSharedPtr<FJsonObject>& Arg
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- bp.list_graphs + bp.rename_function (Phase 4.2 round 2d) -------------
+
+FSageToolDispatch::FOutcome BpListGraphsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    auto Append = [](TArray<TSharedPtr<FJsonValue>>& Out,
+                     const TArray<TObjectPtr<UEdGraph>>& Graphs,
+                     const TCHAR* Kind)
+    {
+        for (UEdGraph* G : Graphs)
+        {
+            if (!G) continue;
+            auto O = MakeShared<FJsonObject>();
+            O->SetStringField(TEXT("name"),       G->GetName());
+            O->SetStringField(TEXT("kind"),       Kind);
+            O->SetNumberField(TEXT("node_count"), G->Nodes.Num());
+            Out.Add(MakeShared<FJsonValueObject>(O));
+        }
+    };
+
+    TArray<TSharedPtr<FJsonValue>> Out;
+    Append(Out, BP->UbergraphPages,          TEXT("ubergraph"));
+    Append(Out, BP->FunctionGraphs,          TEXT("function"));
+    Append(Out, BP->DelegateSignatureGraphs, TEXT("delegate"));
+    Append(Out, BP->MacroGraphs,             TEXT("macro"));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetArrayField (TEXT("graphs"),    Out);
+    R->SetNumberField(TEXT("count"),     Out.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpRenameFunctionImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, OldName, NewName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("old_name"), OldName)
+        || !Args->TryGetStringField(TEXT("new_name"), NewName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'old_name', or 'new_name'"));
+    }
+    if (OldName == NewName)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("old_name and new_name are identical"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    UEdGraph* Graph = FindFunctionGraph(BP, OldName);
+    if (!Graph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("function graph not found: %s"), *OldName));
+    }
+    // Reject collision: target name already exists in any graph collection.
+    if (FindFunctionGraph(BP, NewName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("graph already exists with new_name: %s"), *NewName));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("BpRenameFn", "Sage: Rename BP Function"));
+    BP->Modify();
+    Graph->Modify();
+    FBlueprintEditorUtils::RenameGraph(Graph, NewName);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetStringField(TEXT("old_name"),  OldName);
+    R->SetStringField(TEXT("new_name"),  NewName);
+    R->SetStringField(TEXT("actual"),    Graph->GetName());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---- bp.list_interfaces + bp.add_interface + bp.remove_interface ----------
 // ---- (Phase 4.2 round 2c) ------------------------------------------------
 
@@ -1497,6 +1584,10 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("bp.list_interfaces"),      GT(&BpListInterfacesImpl));
     Dispatch.RegisterHandler(TEXT("bp.add_interface"),        GT(&BpAddInterfaceImpl));
     Dispatch.RegisterHandler(TEXT("bp.remove_interface"),     GT(&BpRemoveInterfaceImpl));
+
+    // Read+Write — graph management (Phase 4.2 round 2d)
+    Dispatch.RegisterHandler(TEXT("bp.list_graphs"),          GT(&BpListGraphsImpl));
+    Dispatch.RegisterHandler(TEXT("bp.rename_function"),      GT(&BpRenameFunctionImpl));
 
     // Write — functions
     Dispatch.RegisterHandler(TEXT("bp.add_function"),        GT(&BpAddFunctionImpl));

@@ -41,7 +41,7 @@ flowchart TB
   M17 ==Demo 1 ✓==> M21a
 
   %% Şu an
-  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>49 commit · 118 MCP tool<br/>Phase 1 + 2 + 3 + 4.0/4.1/4.2-r1+r2a+r2b+r2c/4.3/4.5-r1/4.6-r1+r2 CANLI<br/>SageTest UE 5.7 — 8K asset · 16K dep · 8337 class · 8336 inherit<br/>BP authoring + graph node + local vars + interfaces · Material · Asset · Editor · Dialog<br/>UE-MCP 448 action audit → Phase 4 yol haritası %55 done"]):::now
+  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>50 commit · 120 MCP tool<br/>Phase 1 + 2 + 3 + 4.0/4.1/4.2-r1+r2a+r2b+r2c+r2d/4.3/4.5-r1/4.6-r1+r2 CANLI<br/>SageTest UE 5.7 — 8K asset · 16K dep · 8337 class · 8336 inherit<br/>BP authoring + node + locals + interfaces + graph mgmt · Material · Asset · Editor · Dialog<br/>UE-MCP 448 action audit → Phase 4 yol haritası %56 done"]):::now
 
   %% Phase 1'den ertelenenler
   subgraph DEF["Storage / out-of-process gerektirenler"]
@@ -69,7 +69,7 @@ flowchart TB
     direction TB
     P40["4.0 UProperty collections ✓<br/>TArray/TMap/TSet · TObjectPtr/SoftObject · TSubclassOf<br/>FStruct shorthand · UEnum · raw-pointer dispatch"]:::done
     P41["4.1 Reflection ✓ (8 tool)<br/>reflect_class · reflect_struct · reflect_enum<br/>list_classes/structs/enums · find_implementers · CDO read"]:::done
-    P42["4.2 Blueprint authoring (round 1+2a+2b+2c) ✓ (27 tool)<br/>r1: read/list_vars/fns/function graph/components/search<br/>add/delete var·fn · delete_node · connect_pins<br/>set_cdo_property · reparent · compile<br/>r2a: add_node · set/read_node_property · list_node_types<br/>r2b: list/add/delete_local_variable<br/>r2c: list/add/remove_interface<br/><i>round 2d: ~15 tool kaldı (T3D, rename_fn, fn I/O, dispatcher, create...)</i>"]:::done
+    P42["4.2 Blueprint authoring (round 1+2a+2b+2c+2d) ✓ (29 tool)<br/>r1: read/list_vars/fns/function graph/components/search<br/>add/delete var·fn · delete_node · connect_pins<br/>set_cdo_property · reparent · compile<br/>r2a: add_node · set/read_node_property · list_node_types<br/>r2b: list/add/delete_local_variable<br/>r2c: list/add/remove_interface<br/>r2d: list_graphs · rename_function<br/><i>round 2e: ~13 tool kaldı (T3D, fn I/O, dispatcher, create*...)</i>"]:::done
     P43["4.3 Material round 1 ✓ (13 tool)<br/>read · params · expressions · create_instance<br/>add/delete/connect_expressions · set_base_color<br/>set_shading_model · validate · connect_texture<br/><i>round 2: build_graph · render_preview · shader_stats</i>"]:::done
     P45["4.5 Asset advanced round 1 ✓ (7 tool)<br/>mesh_bounds · mesh_collision · diagnose_registry<br/>list_redirectors · bulk_rename · move_folder · fixup_redirectors<br/><i>round 2: import_fbx/texture · datatable · FTS · sockets</i>"]:::done
     P46["4.6 Editor automation round 1+2 ✓ (11 tool)<br/>r1: console_command · take_screenshot · get_engine_version<br/>get_project_version · get_log_file_path · read_log<br/>r2 (dialog policy): set/clear/get_dialog_policy<br/>list_dialogs · respond_to_dialog<br/><i>round 3: sequencer · viewport · run_python · build_*</i>"]:::done
