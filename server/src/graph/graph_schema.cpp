@@ -33,6 +33,16 @@ constexpr const char* kV2Cypher = R"(
 CREATE NODE TABLE IF NOT EXISTS _IndexState(id INT64 PRIMARY KEY, last_indexed_at_ms INT64, asset_count INT64);
 )";
 
+// v3: T2 topology. DEPENDS_ON edge between Assets backs `impact_of` /
+// `references_to` (Phase 2.4). MANY_MANY because one asset can pull in
+// many dependencies, and one shared asset can be referenced from many.
+// Phase 2.3 adds dep_count to _IndexState so status queries don't need
+// a graph round-trip.
+constexpr const char* kV3Cypher = R"(
+CREATE REL TABLE IF NOT EXISTS DEPENDS_ON(FROM Asset TO Asset, MANY_MANY);
+ALTER TABLE _IndexState ADD dep_count INT64 DEFAULT 0;
+)";
+
 // Split a multi-statement Cypher blob on `;` boundaries, ignoring blanks
 // and Cypher line comments. Kuzu's Connection::query takes a single stmt.
 std::vector<std::string> splitStatements(std::string_view blob) {
@@ -124,6 +134,7 @@ const std::vector<Migration>& schemaMigrations() {
     static const std::vector<Migration> kMigrations = {
         {1, kV1Cypher},
         {2, kV2Cypher},
+        {3, kV3Cypher},
     };
     return kMigrations;
 }

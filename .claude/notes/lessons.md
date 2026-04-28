@@ -3,6 +3,33 @@
 > Per CLAUDE.md §Self-Improvement Loop. Patterns observed during implementation
 > that should change future behavior.
 
+## UE 5.7 — `AssetDependencyInfo.h` does not exist
+
+**Symptom**: `fatal error: 'AssetRegistry/AssetDependencyInfo.h' file not found`
+
+**Root**: Despite some online docs/snippets referencing it, UE 5.7 does not
+ship `AssetDependencyInfo.h`. The dependency-category enum
+(`UE::AssetRegistry::EDependencyCategory::{Package, SearchableName,
+Manage, ...}`) is declared inside `AssetRegistry/IAssetRegistry.h` — already
+pulled in by `AssetRegistryModule.h`.
+
+**Rule**: For AssetRegistry dependency APIs in UE 5.7, the include set is
+just `AssetRegistryModule.h` + `IAssetRegistry.h` + `AssetData.h`. Do not
+add a separate `AssetDependencyInfo.h`. If a stale snippet asks for one,
+the symbol is already visible from the modular include.
+
+## Kuzu Cypher string escape uses `\'`, not `''`
+
+**Symptom**: `Parser exception: Invalid input <CREATE (:Asset {path: '/Game/A''s_Folder/Asset'>: expected rule oC_SingleQuery`
+
+**Root**: Kuzu (0.11) follows C-style string escapes, *not* SQL-style
+quote-doubling. PostgreSQL/SQL: `'it''s'` is valid. Kuzu: `'it\'s'`. Backslash
+itself doubles to `\\`.
+
+**Rule**: When generating Cypher literals for Kuzu, escape order is `\` →
+`\\` first, then `'` → `\'`. The same `escapeCypherStr` works for kuzu's
+double-quoted form too if you ever switch.
+
 ## UE 5.7 — `UEditorLoadingAndSavingUtils` lives in `FileHelpers.h`
 
 **Symptom**: `fatal error: 'EditorLoadingAndSavingUtils.h' file not found`

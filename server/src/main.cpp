@@ -922,7 +922,9 @@ int main() {
 
             try {
                 auto& store = graphMgr->acquireSlot(*slot);
-                auto ingest = sage::graph::ingestAssets(store, payload["assets"]);
+                // payload already has the {assets, dependencies?} shape that
+                // ingestSnapshot expects.
+                auto ingest = sage::graph::ingestSnapshot(store, payload);
                 if (sage::graph::is_error(ingest)) {
                     return std::unexpected(sage::mcp::ErrorObject::fromCode(
                         sage::mcp::ErrorCode::InternalError,
