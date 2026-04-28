@@ -14,7 +14,7 @@
 | editor | 15 | 29 | 44 | 34 |
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
-| blueprint | 30 | 16 | 46 | 65 |
+| blueprint | 33 | 13 | 46 | 72 |
 | asset | 7 | 32 | 39 | 18 |
 | level | 10 | 22 | 32 | 31 |
 | niagara | 0 | 26 | 26 | 0 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **118** | **330** | **448** | **26** |
+| **TOTAL** | **121** | **327** | **448** | **27** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -263,7 +263,7 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [x] `blueprint.add_component` → `add_component` (Phase 1, runtime path; SCS path = `add_bp_component` not yet)
 - [x] `blueprint.remove_component` → `remove_component` (same caveat)
 - [x] `blueprint.set_component_property` → `modify_component_property`
-- [ ] `blueprint.get_component_property` — Read SCS/inherited prop · R
+- [x] `blueprint.get_component_property` → `bp.get_component_property` (Phase 4.2-r2g/p3)
 - [x] `blueprint.set_class_default` → `bp.set_cdo_property`
 - [x] `blueprint.delete_variable` → `bp.delete_variable`
 - [x] `blueprint.add_function_parameter` → `bp.add_function_parameter` (Phase 4.2-r2e; supports input + output; FunctionResult auto-spawn)
@@ -285,9 +285,9 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [x] `blueprint.add_local_variable` → `bp.add_local_variable` (Phase 4.2-r2b)
 - [x] `blueprint.list_local_variables` → `bp.list_local_variables` (Phase 4.2-r2b)
 - [ ] `blueprint.validate` — Compile-without-output · R
-- [ ] `blueprint.read_component_properties` — Dump ALL props on component · R
+- [x] `blueprint.read_component_properties` → `bp.read_component_properties` (Phase 4.2-r2g/p3; 58 props on SpringArmComponent verified)
 - [x] `blueprint.read_node_property` → `bp.read_node_property` (Phase 4.2-r2a)
-- [ ] `blueprint.reparent_component` — SCS hierarchy reparent · W
+- [x] `blueprint.reparent_component` → `bp.reparent_component` (Phase 4.2-r2g/p3; cycle guard + self guard)
 - [x] `blueprint.reparent` → `bp.reparent`
 - [ ] `blueprint.set_actor_tick_settings` — CDO tick settings · W
 - [x] `blueprint.export_nodes_t3d` → `bp.export_nodes_t3d` (Phase 4.2-r2g/p2; FEdGraphUtilities::ExportNodesToText, optional node_ids filter)

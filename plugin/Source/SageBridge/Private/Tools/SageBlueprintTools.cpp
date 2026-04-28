@@ -864,6 +864,171 @@ FSageToolDispatch::FOutcome BpConnectPinsImpl(const TSharedPtr<FJsonObject>& Arg
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- bp.read_component_properties + bp.get_component_property + ----------
+// ---- bp.reparent_component  (Phase 4.2 round 2g/p3) ----------------------
+
+USCS_Node* FindSCSNode(UBlueprint* BP, const FString& Name)
+{
+    if (!BP) return nullptr;
+    USimpleConstructionScript* SCS = BP->SimpleConstructionScript;
+    if (!SCS) return nullptr;
+    return SCS->FindSCSNode(FName(*Name));
+}
+
+FSageToolDispatch::FOutcome BpReadComponentPropertiesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, ComponentName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("component"), ComponentName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path' or 'component'"));
+    }
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    USCS_Node* Node = FindSCSNode(BP, ComponentName);
+    if (!Node) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("SCS component not found: %s"), *ComponentName));
+    UActorComponent* Template = Node->ComponentTemplate;
+    if (!Template) return FSageToolDispatch::FOutcome::MakeError(-32603,
+        TEXT("SCS node has no ComponentTemplate"));
+
+    auto Props = MakeShared<FJsonObject>();
+    int32 Count = 0;
+    for (TFieldIterator<FProperty> It(Template->GetClass()); It; ++It)
+    {
+        FProperty* P = *It;
+        if (!P) continue;
+        // Skip transient / editor-only / non-editable noise
+        if (P->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient)) continue;
+        const FString PropName = P->GetName();
+        TSharedPtr<FJsonValue> Value = detail::GetUPropertyAsJson(Template, P);
+        if (Value.IsValid())
+        {
+            Props->SetField(PropName, Value);
+            ++Count;
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"),    BP->GetName());
+    R->SetStringField(TEXT("component"),    ComponentName);
+    R->SetStringField(TEXT("class"),        Template->GetClass()->GetName());
+    R->SetObjectField(TEXT("properties"),   Props);
+    R->SetNumberField(TEXT("count"),        Count);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpGetComponentPropertyImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, ComponentName, PropName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("component"), ComponentName)
+        || !Args->TryGetStringField(TEXT("property"), PropName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'component', or 'property'"));
+    }
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    USCS_Node* Node = FindSCSNode(BP, ComponentName);
+    if (!Node) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("SCS component not found: %s"), *ComponentName));
+    UActorComponent* Template = Node->ComponentTemplate;
+    if (!Template) return FSageToolDispatch::FOutcome::MakeError(-32603,
+        TEXT("SCS node has no ComponentTemplate"));
+
+    FProperty* P = Template->GetClass()->FindPropertyByName(FName(*PropName));
+    if (!P) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("property not found: %s on %s"),
+                        *PropName, *Template->GetClass()->GetName()));
+
+    TSharedPtr<FJsonValue> Value = detail::GetUPropertyAsJson(Template, P);
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetStringField(TEXT("component"), ComponentName);
+    R->SetStringField(TEXT("property"),  PropName);
+    R->SetStringField(TEXT("type"),      P->GetClass()->GetName());
+    if (Value.IsValid())
+    {
+        R->SetField(TEXT("value"), Value);
+    }
+    else
+    {
+        R->SetField(TEXT("value"), MakeShared<FJsonValueNull>());
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpReparentComponentImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, ComponentName, NewParent;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("component"), ComponentName)
+        || !Args->TryGetStringField(TEXT("new_parent"), NewParent))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'component', or 'new_parent'"));
+    }
+    if (ComponentName == NewParent)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("component cannot be its own parent"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    USimpleConstructionScript* SCS = BP->SimpleConstructionScript;
+    if (!SCS) return FSageToolDispatch::FOutcome::MakeError(-32603,
+        TEXT("blueprint has no SimpleConstructionScript"));
+
+    USCS_Node* Node = SCS->FindSCSNode(FName(*ComponentName));
+    if (!Node) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("SCS component not found: %s"), *ComponentName));
+    USCS_Node* NewParentNode = SCS->FindSCSNode(FName(*NewParent));
+    if (!NewParentNode) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("new_parent not found: %s"), *NewParent));
+
+    // Cycle guard: walk up new_parent's chain and reject if we hit Node.
+    USCS_Node* Walk = NewParentNode;
+    while (Walk)
+    {
+        if (Walk == Node)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("reparent would create a cycle"));
+        }
+        Walk = SCS->FindParentNode(Walk);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("BpReparentComp", "Sage: Reparent BP Component"));
+    BP->Modify();
+    SCS->Modify();
+
+    // Detach from current parent (or root list).
+    if (USCS_Node* OldParent = SCS->FindParentNode(Node))
+    {
+        OldParent->RemoveChildNode(Node, /*bRemoveFromAllNodes*/ false);
+    }
+    else
+    {
+        SCS->RemoveNode(Node, /*bValidateSceneRootNodes*/ true);
+    }
+    // Attach to new parent.
+    NewParentNode->AddChildNode(Node, /*bAddToAllNodes*/ false);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"),  BP->GetName());
+    R->SetStringField(TEXT("component"),  ComponentName);
+    R->SetStringField(TEXT("new_parent"), NewParent);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---- bp.export_nodes_t3d + bp.import_nodes_t3d  (Phase 4.2 round 2g/p2) ---
 
 FSageToolDispatch::FOutcome BpExportNodesT3DImpl(const TSharedPtr<FJsonObject>& Args)
@@ -2399,6 +2564,11 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
     // Read+Write — T3D node clipboard (Phase 4.2 round 2g/p2)
     Dispatch.RegisterHandler(TEXT("bp.export_nodes_t3d"),           GT(&BpExportNodesT3DImpl));
     Dispatch.RegisterHandler(TEXT("bp.import_nodes_t3d"),           GT(&BpImportNodesT3DImpl));
+
+    // Read+Write — SCS component deep CRUD (Phase 4.2 round 2g/p3)
+    Dispatch.RegisterHandler(TEXT("bp.read_component_properties"),  GT(&BpReadComponentPropertiesImpl));
+    Dispatch.RegisterHandler(TEXT("bp.get_component_property"),     GT(&BpGetComponentPropertyImpl));
+    Dispatch.RegisterHandler(TEXT("bp.reparent_component"),         GT(&BpReparentComponentImpl));
 
     // Write — functions
     Dispatch.RegisterHandler(TEXT("bp.add_function"),        GT(&BpAddFunctionImpl));

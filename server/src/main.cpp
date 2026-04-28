@@ -1244,6 +1244,68 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // -- read+write — SCS component deep CRUD (Phase 4.2 round 2g/p3) --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.read_component_properties",
+        .description = "Dump every reflected UProperty on the BP's SCS "
+                       "component template (USCS_Node->ComponentTemplate). "
+                       "Skips transient / DuplicateTransient. Uses Sage's "
+                       "GetUPropertyAsJson — primitives, structs (Vector/"
+                       "Rotator/Transform/Color/...), object refs, "
+                       "TArray/TMap/TSet, enums all round-tripped. Returns "
+                       "{class, properties: {...}, count}. Read-only.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",      {{"type", "string"}}},
+                {"component", {{"type", "string"},
+                               {"description", "SCS variable name (e.g. 'Mesh', 'Capsule')"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "component"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.get_component_property",
+        .description = "Read a single UProperty on a SCS component "
+                       "template. Cheaper than bp.read_component_properties "
+                       "when only one value is needed. Returns "
+                       "{type (FProperty class name), value}. -32602 if "
+                       "the property doesn't exist on the component class.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",      {{"type", "string"}}},
+                {"component", {{"type", "string"}}},
+                {"property",  {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "component", "property"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.reparent_component",
+        .description = "Move a SCS component under a different parent in "
+                       "the BP's component hierarchy (USCS_Node tree). "
+                       "Cycle-guarded — rejects with -32602 if the new "
+                       "parent is a descendant of the moved component. "
+                       "Detaches from the current parent (or root list) "
+                       "and attaches to the new parent. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",       {{"type", "string"}}},
+                {"component",  {{"type", "string"}}},
+                {"new_parent", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "component", "new_parent"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // -- read+write — T3D node clipboard (Phase 4.2 round 2g/p2) --
     registerRemote(sage::mcp::Tool{
         .name = "bp.export_nodes_t3d",
