@@ -1189,6 +1189,61 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // -- read+write — interfaces (Phase 4.2 round 2c) --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.list_interfaces",
+        .description = "Enumerate UInterface classes implemented by the BP. "
+                       "Returns {interfaces: [{name, path, graph_count}], "
+                       "count}. Reads UBlueprint::ImplementedInterfaces.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.add_interface",
+        .description = "Implement a UInterface on the BP via "
+                       "FBlueprintEditorUtils::ImplementNewInterface. "
+                       "interface_path: '/Script/Foo.UMyInterface' or BP "
+                       "interface asset path. Idempotent — already-implemented "
+                       "returns {already: true}. Class must derive from "
+                       "UInterface or -32602. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",           {{"type", "string"}}},
+                {"interface_path", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "interface_path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.remove_interface",
+        .description = "Remove an implemented UInterface from the BP via "
+                       "FBlueprintEditorUtils::RemoveInterface. "
+                       "preserve_functions=true keeps the interface's "
+                       "function graphs as regular BP functions (default "
+                       "false: drops them). Returns {removed: 0|1} — 0 when "
+                       "the interface wasn't implemented (idempotent). "
+                       "PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",               {{"type", "string"}}},
+                {"interface_path",     {{"type", "string"}}},
+                {"preserve_functions", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "interface_path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // -- write — functions --
     registerRemote(sage::mcp::Tool{
         .name = "bp.add_function",

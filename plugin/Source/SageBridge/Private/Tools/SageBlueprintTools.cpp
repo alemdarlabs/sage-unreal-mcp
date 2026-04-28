@@ -811,6 +811,155 @@ FSageToolDispatch::FOutcome BpConnectPinsImpl(const TSharedPtr<FJsonObject>& Arg
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- bp.list_interfaces + bp.add_interface + bp.remove_interface ----------
+// ---- (Phase 4.2 round 2c) ------------------------------------------------
+
+UClass* ResolveInterfaceClass(const FString& Path)
+{
+    if (Path.IsEmpty()) return nullptr;
+    if (UClass* C = LoadObject<UClass>(nullptr, *Path)) return C;
+    FSoftObjectPath Soft(Path);
+    if (UObject* O = Soft.ResolveObject()) return Cast<UClass>(O);
+    if (UObject* O = Soft.TryLoad())       return Cast<UClass>(O);
+    return nullptr;
+}
+
+FSageToolDispatch::FOutcome BpListInterfacesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    TArray<TSharedPtr<FJsonValue>> Out;
+    for (const FBPInterfaceDescription& Impl : BP->ImplementedInterfaces)
+    {
+        auto O = MakeShared<FJsonObject>();
+        if (Impl.Interface)
+        {
+            O->SetStringField(TEXT("name"), Impl.Interface->GetName());
+            O->SetStringField(TEXT("path"), Impl.Interface->GetPathName());
+        }
+        else
+        {
+            O->SetStringField(TEXT("name"), TEXT("<unresolved>"));
+        }
+        O->SetNumberField(TEXT("graph_count"), Impl.Graphs.Num());
+        Out.Add(MakeShared<FJsonValueObject>(O));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"),  BP->GetName());
+    R->SetArrayField (TEXT("interfaces"), Out);
+    R->SetNumberField(TEXT("count"),      Out.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpAddInterfaceImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, IfacePath;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("interface_path"), IfacePath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path' or 'interface_path'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    UClass* IfaceCls = ResolveInterfaceClass(IfacePath);
+    if (!IfaceCls) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("interface class not found: %s"), *IfacePath));
+    if (!IfaceCls->IsChildOf(UInterface::StaticClass()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("class %s is not a UInterface"), *IfaceCls->GetName()));
+    }
+
+    // Idempotency: already implemented?
+    for (const FBPInterfaceDescription& Impl : BP->ImplementedInterfaces)
+    {
+        if (Impl.Interface == IfaceCls)
+        {
+            auto R = MakeShared<FJsonObject>();
+            R->SetStringField(TEXT("blueprint"),      BP->GetName());
+            R->SetStringField(TEXT("interface"),      IfaceCls->GetName());
+            R->SetStringField(TEXT("interface_path"), IfaceCls->GetPathName());
+            R->SetBoolField  (TEXT("already"),        true);
+            return FSageToolDispatch::FOutcome::MakeSuccess(R);
+        }
+    }
+
+    FScopedTransaction Tx(LOCTEXT("BpAddInterface", "Sage: Implement BP Interface"));
+    BP->Modify();
+    const FTopLevelAssetPath IfaceAssetPath(IfaceCls->GetPathName());
+    if (!FBlueprintEditorUtils::ImplementNewInterface(BP, IfaceAssetPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("ImplementNewInterface returned false"));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"),      BP->GetName());
+    R->SetStringField(TEXT("interface"),      IfaceCls->GetName());
+    R->SetStringField(TEXT("interface_path"), IfaceCls->GetPathName());
+    R->SetBoolField  (TEXT("already"),        false);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpRemoveInterfaceImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, IfacePath;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("interface_path"), IfacePath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path' or 'interface_path'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    UClass* IfaceCls = ResolveInterfaceClass(IfacePath);
+    if (!IfaceCls) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("interface class not found: %s"), *IfacePath));
+
+    bool bImplemented = false;
+    for (const FBPInterfaceDescription& Impl : BP->ImplementedInterfaces)
+    {
+        if (Impl.Interface == IfaceCls) { bImplemented = true; break; }
+    }
+    if (!bImplemented)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("blueprint"), BP->GetName());
+        R->SetStringField(TEXT("interface"), IfaceCls->GetName());
+        R->SetNumberField(TEXT("removed"),   0);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    bool bPreserveFunctions = false;
+    Args->TryGetBoolField(TEXT("preserve_functions"), bPreserveFunctions);
+
+    FScopedTransaction Tx(LOCTEXT("BpRemoveIface", "Sage: Remove BP Interface"));
+    BP->Modify();
+    const FTopLevelAssetPath IfaceAssetPath(IfaceCls->GetPathName());
+    FBlueprintEditorUtils::RemoveInterface(BP, IfaceAssetPath, bPreserveFunctions);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"),          BP->GetName());
+    R->SetStringField(TEXT("interface"),          IfaceCls->GetName());
+    R->SetNumberField(TEXT("removed"),            1);
+    R->SetBoolField  (TEXT("preserve_functions"), bPreserveFunctions);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---- bp.list_local_variables + bp.add_local_variable + --------------------
 // ---- bp.delete_local_variable  (Phase 4.2 round 2b) -----------------------
 
@@ -1343,6 +1492,11 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("bp.list_local_variables"), GT(&BpListLocalVariablesImpl));
     Dispatch.RegisterHandler(TEXT("bp.add_local_variable"),   GT(&BpAddLocalVariableImpl));
     Dispatch.RegisterHandler(TEXT("bp.delete_local_variable"),GT(&BpDeleteLocalVariableImpl));
+
+    // Read+Write — interface CRUD (Phase 4.2 round 2c)
+    Dispatch.RegisterHandler(TEXT("bp.list_interfaces"),      GT(&BpListInterfacesImpl));
+    Dispatch.RegisterHandler(TEXT("bp.add_interface"),        GT(&BpAddInterfaceImpl));
+    Dispatch.RegisterHandler(TEXT("bp.remove_interface"),     GT(&BpRemoveInterfaceImpl));
 
     // Write — functions
     Dispatch.RegisterHandler(TEXT("bp.add_function"),        GT(&BpAddFunctionImpl));
