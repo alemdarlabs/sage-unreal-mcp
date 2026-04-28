@@ -1417,6 +1417,103 @@ int main() {
         .inputSchema = bpPathSchema, .handler = nullptr, .remote = true,
     });
 
+    // ---- Asset advanced (Phase 4.5) ------------------------------------
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.get_mesh_bounds",
+        .description = "Static or skeletal mesh bounding box + extent + sphere "
+                       "radius + local-space min/max. Read-only.",
+        .inputSchema = bpPathSchema, .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.get_mesh_collision",
+        .description = "Mesh collision primitive counts (box/sphere/capsule/"
+                       "convex) + total + collision complexity flag. Read-only.",
+        .inputSchema = bpPathSchema, .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.list_redirectors",
+        .description = "List UObjectRedirector assets under a folder (default "
+                       "/Game). Returned for cleanup planning before "
+                       "fixup_redirectors.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"folder", {{"type", "string"}}}}},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.diagnose_registry",
+        .description = "AssetRegistry health snapshot: total, in_memory, "
+                       "on_disk_only, transient. Useful when the agent suspects "
+                       "stale registry state.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.bulk_rename",
+        .description = "Atomic multi-rename in a single transaction. "
+                       "renames=[{src, dst}]. Each entry uses the same "
+                       "UEditorAssetSubsystem::RenameAsset; failures are "
+                       "reported per-row with ok:false. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"renames", {
+                    {"type", "array"},
+                    {"minItems", 1},
+                    {"items", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"src", {{"type", "string"}}},
+                            {"dst", {{"type", "string"}}},
+                        }},
+                        {"required", nlohmann::json::array({"src","dst"})},
+                    }},
+                }},
+            }},
+            {"required", nlohmann::json::array({"renames"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.move_folder",
+        .description = "Move every asset under src into dst, preserving "
+                       "subfolder structure. UE leaves redirectors at the "
+                       "old paths automatically — pair with "
+                       "asset.fixup_redirectors to clean up. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"src", {{"type", "string"}}},
+                {"dst", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"src","dst"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.fixup_redirectors",
+        .description = "Resolve referencers and remove redirectors under the "
+                       "given folders (default /Game). Uses IAssetTools::"
+                       "FixupReferencers — referencing assets get re-saved "
+                       "to point at the new path, then the redirector is "
+                       "deleted. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"paths", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // Material parameter (Milestone 1.3c).
     registerRemote(sage::mcp::Tool{
         .name        = "modify_material_parameter",

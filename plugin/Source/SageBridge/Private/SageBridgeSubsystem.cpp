@@ -9,6 +9,7 @@
 #include "Tools/SageCompareSetTools.h"
 #include "Tools/SageCompileTools.h"
 #include "Tools/SageComponentTools.h"
+#include "Tools/SageAssetAdvancedTools.h"
 #include "Tools/SageBlueprintTools.h"
 #include "Tools/SageEditorTools.h"
 #include "Tools/SageIndexTools.h"
@@ -165,6 +166,7 @@ void USageBridgeSubsystem::RegisterBuiltinHandlers()
     sage::tools::RegisterReflectTools(ToolDispatch);
     sage::tools::RegisterBlueprintTools(ToolDispatch);
     sage::tools::RegisterMaterialGraphTools(ToolDispatch);
+    sage::tools::RegisterAssetAdvancedTools(ToolDispatch);
 }
 
 void USageBridgeSubsystem::BindAssetRegistryDeltaHooks()
