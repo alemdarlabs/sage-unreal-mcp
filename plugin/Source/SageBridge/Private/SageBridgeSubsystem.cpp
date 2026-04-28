@@ -11,6 +11,7 @@
 #include "Tools/SageComponentTools.h"
 #include "Tools/SageEditorTools.h"
 #include "Tools/SageIndexTools.h"
+#include "Tools/SageReflectTools.h"
 #include "Tools/SageMaterialTools.h"
 #include "Tools/SageQaTools.h"
 #include "Tools/SageScmTools.h"
@@ -159,6 +160,7 @@ void USageBridgeSubsystem::RegisterBuiltinHandlers()
     sage::tools::RegisterQaTools(ToolDispatch);
     sage::tools::RegisterScmTools(ToolDispatch);
     sage::tools::RegisterIndexTools(ToolDispatch);
+    sage::tools::RegisterReflectTools(ToolDispatch);
 }
 
 void USageBridgeSubsystem::BindAssetRegistryDeltaHooks()

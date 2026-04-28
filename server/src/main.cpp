@@ -868,6 +868,140 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // ---- Reflection (Phase 4.1) ----------------------------------------
+    registerRemote(sage::mcp::Tool{
+        .name        = "reflect_class",
+        .description = "Full UClass dump: name, parent, module, native/abstract/"
+                       "interface flags, interfaces implemented, all UProperties "
+                       "(type+category+access+replication+tooltip), all UFunctions "
+                       "(parameters+return+access+pure+network), and immediate "
+                       "child classes. Accepts engine path (/Script/Engine.Pawn) "
+                       "or BP generated-class path (/Game/.../BP_Foo.BP_Foo_C). "
+                       "Pair with `class_hierarchy` for transitive walks.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"class_path",       {{"type", "string"}}},
+                {"include_children", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"class_path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "reflect_struct",
+        .description = "USTRUCT dump: name, module, parent, all fields with full "
+                       "type + flags + tooltip. Accepts /Script/CoreUObject.Vector "
+                       "or any USTRUCT path.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"struct_path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"struct_path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "reflect_enum",
+        .description = "UENUM dump: name, module, cpp form, all entries (name + "
+                       "value + display name + tooltip). Synthetic _MAX entry "
+                       "skipped.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"enum_path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"enum_path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "list_classes",
+        .description = "Walk the live UClass registry. Filters: substring on name, "
+                       "base_class (only subclasses of), include_native, "
+                       "include_blueprint. SKEL_/REINST_/HOTRELOADED_ churn "
+                       "filtered out. Default 500 max, capped at 5000. Returns "
+                       "{name, path, module, is_native, parent}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"filter",            {{"type", "string"}}},
+                {"base_class",        {{"type", "string"}}},
+                {"include_native",    {{"type", "boolean"}}},
+                {"include_blueprint", {{"type", "boolean"}}},
+                {"max_results",       {{"type", "integer"},
+                                       {"minimum", 1}, {"maximum", 5000}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "list_structs",
+        .description = "Walk the live UScriptStruct registry. Substring filter, "
+                       "max_results 1..5000.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"filter",      {{"type", "string"}}},
+                {"max_results", {{"type", "integer"}, {"minimum",1}, {"maximum",5000}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "list_enums",
+        .description = "Walk the live UEnum registry. Substring filter, "
+                       "max_results 1..5000.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"filter",      {{"type", "string"}}},
+                {"max_results", {{"type", "integer"}, {"minimum",1}, {"maximum",5000}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "find_implementers",
+        .description = "Classes that implement the given UInterface. Distinct "
+                       "from class_hierarchy (which walks INHERITS_FROM); "
+                       "interfaces are a separate axis. Returns {name, path, "
+                       "module, is_native}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"interface_path", {{"type", "string"}}},
+                {"max_results",    {{"type", "integer"}, {"minimum",1}, {"maximum",5000}}},
+            }},
+            {"required", nlohmann::json::array({"interface_path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name        = "class_default_object",
+        .description = "Read the class default object's UProperty values as JSON. "
+                       "Skips Transient/Deprecated. Read-only; write via Phase 4.2 "
+                       "bp.set_cdo_property.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"class_path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"class_path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // Material parameter (Milestone 1.3c).
     registerRemote(sage::mcp::Tool{
         .name        = "modify_material_parameter",
