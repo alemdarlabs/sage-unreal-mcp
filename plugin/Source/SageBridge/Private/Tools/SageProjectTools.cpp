@@ -627,6 +627,254 @@ FSageToolDispatch::FOutcome ProjectListConfigTagsImpl(const TSharedPtr<FJsonObje
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// Phase 4.7-p4: INI write + plugin enable.
+
+// Atomic file write: write to <path>.tmp, then rename.
+bool AtomicWriteString(const FString& Path, const FString& Content, FString& OutError)
+{
+    const FString TempPath = Path + TEXT(".sage_tmp");
+    if (!FFileHelper::SaveStringToFile(Content, *TempPath,
+            FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+    {
+        OutError = FString::Printf(TEXT("could not write temp: %s"), *TempPath);
+        return false;
+    }
+    IFileManager& FM = IFileManager::Get();
+    if (FM.FileExists(*Path))
+    {
+        // Best-effort backup. If the user runs set_config on a freshly-
+        // generated INI the .bak gets overwritten on next call — that's
+        // fine, this isn't an undo log, just a one-shot safety net.
+        const FString BackupPath = Path + TEXT(".sage_bak");
+        FM.Delete(*BackupPath, /*RequireExists*/ false, /*EvenReadOnly*/ true, /*Quiet*/ true);
+        FM.Move(*BackupPath, *Path, /*bReplace*/ true, /*bEvenIfReadOnly*/ true,
+                /*bAttributes*/ false, /*bDoNotRetryOrError*/ true);
+    }
+    if (!FM.Move(*Path, *TempPath, /*bReplace*/ true, /*bEvenIfReadOnly*/ true,
+                 /*bAttributes*/ false, /*bDoNotRetryOrError*/ true))
+    {
+        OutError = FString::Printf(TEXT("rename failed: %s -> %s"), *TempPath, *Path);
+        return false;
+    }
+    return true;
+}
+
+// Modify or insert a key=value pair under [section] in INI text. Preserves
+// other lines verbatim. Modifier prefix (+/-/!/.) becomes part of the
+// emitted line if supplied. Returns true if anything changed.
+bool UpsertIniKey(FString& Content, const FString& Section, const FString& Key,
+                  const FString& Value, const FString& Modifier)
+{
+    TArray<FString> Lines;
+    Content.ParseIntoArrayLines(Lines, /*bCullEmpty*/ false);
+
+    const FString SectionHeader = FString::Printf(TEXT("[%s]"), *Section);
+    int32 SectionStart = INDEX_NONE;
+    int32 SectionEnd   = INDEX_NONE;
+    for (int32 i = 0; i < Lines.Num(); ++i)
+    {
+        const FString T = Lines[i].TrimStartAndEnd();
+        if (T == SectionHeader)
+        {
+            SectionStart = i;
+        }
+        else if (SectionStart != INDEX_NONE && T.StartsWith(TEXT("[")) && T.EndsWith(TEXT("]")))
+        {
+            SectionEnd = i - 1;
+            break;
+        }
+    }
+    if (SectionStart != INDEX_NONE && SectionEnd == INDEX_NONE)
+    {
+        SectionEnd = Lines.Num() - 1;
+    }
+
+    const FString Emit = Modifier + Key + TEXT("=") + Value;
+
+    // Section exists: replace first matching key (modifier-agnostic) or
+    // append at end of section.
+    if (SectionStart != INDEX_NONE)
+    {
+        for (int32 i = SectionStart + 1; i <= SectionEnd; ++i)
+        {
+            FString T = Lines[i];
+            T.TrimStartAndEndInline();
+            if (T.IsEmpty() || T.StartsWith(TEXT(";")) || T.StartsWith(TEXT("//"))) continue;
+            // strip leading modifier
+            int32 KeyStart = 0;
+            while (KeyStart < T.Len() &&
+                   (T[KeyStart] == TEXT('+') || T[KeyStart] == TEXT('-')
+                 || T[KeyStart] == TEXT('!') || T[KeyStart] == TEXT('.')))
+            {
+                ++KeyStart;
+            }
+            int32 EqIdx;
+            if (!T.FindChar(TEXT('='), EqIdx)) continue;
+            const FString ExistingKey = T.Mid(KeyStart, EqIdx - KeyStart).TrimStartAndEnd();
+            if (ExistingKey == Key)
+            {
+                Lines[i] = Emit;
+                Content = FString::Join(Lines, TEXT("\n"));
+                if (!Content.EndsWith(TEXT("\n"))) Content += TEXT("\n");
+                return true;
+            }
+        }
+        // Insert at end of section.
+        Lines.Insert(Emit, SectionEnd + 1);
+        Content = FString::Join(Lines, TEXT("\n"));
+        if (!Content.EndsWith(TEXT("\n"))) Content += TEXT("\n");
+        return true;
+    }
+
+    // Section absent: append a fresh section block.
+    if (!Content.IsEmpty() && !Content.EndsWith(TEXT("\n"))) Content += TEXT("\n");
+    if (!Content.IsEmpty()) Content += TEXT("\n");
+    Content += SectionHeader + TEXT("\n");
+    Content += Emit + TEXT("\n");
+    return true;
+}
+
+FSageToolDispatch::FOutcome ProjectSetConfigImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Name, Section, Key, Value, Modifier;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("name"),    Name)
+        || !Args->TryGetStringField(TEXT("section"), Section)
+        || !Args->TryGetStringField(TEXT("key"),     Key)
+        || !Args->TryGetStringField(TEXT("value"),   Value))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'name', 'section', 'key', or 'value'"));
+    }
+    Args->TryGetStringField(TEXT("modifier"), Modifier);
+    if (!Modifier.IsEmpty()
+        && Modifier != TEXT("+") && Modifier != TEXT("-")
+        && Modifier != TEXT("!") && Modifier != TEXT("."))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("modifier must be one of '', '+', '-', '!', '.'"));
+    }
+
+    const FString Path = ResolveConfigPath(Name);
+    FString Resolved = Path;
+    bool bCreated = false;
+    if (Resolved.IsEmpty())
+    {
+        // Fall back to the canonical location even when the file doesn't
+        // exist yet — set_config can also bootstrap a config.
+        FString Base = Name;
+        if (Base.EndsWith(TEXT(".ini"))) Base.LeftChopInline(4);
+        if (!Base.StartsWith(TEXT("Default"))) Base = FString(TEXT("Default")) + Base;
+        Resolved = FPaths::ConvertRelativePathToFull(
+            FPaths::ProjectDir() / TEXT("Config") / (Base + TEXT(".ini")));
+        bCreated = true;
+    }
+
+    FString Content;
+    if (!bCreated && !FFileHelper::LoadFileToString(Content, *Resolved))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("could not read existing INI: %s"), *Resolved));
+    }
+
+    UpsertIniKey(Content, Section, Key, Value, Modifier);
+
+    FString Err;
+    if (!AtomicWriteString(Resolved, Content, Err))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, Err);
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),     Resolved);
+    R->SetStringField(TEXT("section"),  Section);
+    R->SetStringField(TEXT("key"),      Key);
+    R->SetStringField(TEXT("value"),    Value);
+    R->SetBoolField  (TEXT("created"),  bCreated);
+    R->SetStringField(TEXT("backup"),   bCreated ? FString() : (Resolved + TEXT(".sage_bak")));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ProjectSetPluginEnabledImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString PluginName;
+    bool    bEnabled = false;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("plugin"), PluginName)
+        || !Args->TryGetBoolField  (TEXT("enabled"), bEnabled))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'plugin' or 'enabled'"));
+    }
+
+    const FString UProjectPath = FPaths::Combine(
+        FPaths::ProjectDir(),
+        FApp::GetProjectName() + FString(TEXT(".uproject")));
+
+    FString Content;
+    if (!FFileHelper::LoadFileToString(Content, *UProjectPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("could not read .uproject: %s"), *UProjectPath));
+    }
+
+    TSharedPtr<FJsonObject> UProj;
+    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Content);
+    if (!FJsonSerializer::Deserialize(Reader, UProj) || !UProj.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("malformed .uproject JSON"));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Plugins;
+    const TArray<TSharedPtr<FJsonValue>>* PluginsPtr = nullptr;
+    if (UProj->TryGetArrayField(TEXT("Plugins"), PluginsPtr))
+    {
+        Plugins = *PluginsPtr;
+    }
+
+    bool bUpdated = false;
+    for (TSharedPtr<FJsonValue>& V : Plugins)
+    {
+        const TSharedPtr<FJsonObject>* O = nullptr;
+        if (!V->TryGetObject(O) || !O->IsValid()) continue;
+        FString N;
+        if (!(*O)->TryGetStringField(TEXT("Name"), N) || N != PluginName) continue;
+        (*O)->SetBoolField(TEXT("Enabled"), bEnabled);
+        bUpdated = true;
+        break;
+    }
+    if (!bUpdated)
+    {
+        auto NewEntry = MakeShared<FJsonObject>();
+        NewEntry->SetStringField(TEXT("Name"),    PluginName);
+        NewEntry->SetBoolField  (TEXT("Enabled"), bEnabled);
+        Plugins.Add(MakeShared<FJsonValueObject>(NewEntry));
+    }
+    UProj->SetArrayField(TEXT("Plugins"), Plugins);
+
+    FString OutJson;
+    TSharedRef<TJsonWriter<>> Writer =
+        TJsonWriterFactory<>::Create(&OutJson);
+    FJsonSerializer::Serialize(UProj.ToSharedRef(), Writer);
+
+    FString Err;
+    if (!AtomicWriteString(UProjectPath, OutJson, Err))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, Err);
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("plugin"),         PluginName);
+    R->SetBoolField  (TEXT("enabled"),        bEnabled);
+    R->SetStringField(TEXT("uproject_path"),  UProjectPath);
+    R->SetBoolField  (TEXT("entry_existed"),  bUpdated);
+    R->SetStringField(TEXT("backup"),         UProjectPath + TEXT(".sage_bak"));
+    R->SetStringField(TEXT("note"),
+        TEXT("editor restart required for the change to take effect"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 FSageToolDispatch::FOutcome ProjectReadCppSourceImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString InPath;
@@ -705,6 +953,10 @@ void RegisterProjectTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("project.read_config"),         GT(&ProjectReadConfigImpl));
     Dispatch.RegisterHandler(TEXT("project.search_config"),       GT(&ProjectSearchConfigImpl));
     Dispatch.RegisterHandler(TEXT("project.list_config_tags"),    GT(&ProjectListConfigTagsImpl));
+
+    // Phase 4.7 batch 4: INI write + plugin enable
+    Dispatch.RegisterHandler(TEXT("project.set_config"),          GT(&ProjectSetConfigImpl));
+    Dispatch.RegisterHandler(TEXT("project.set_plugin_enabled"),  GT(&ProjectSetPluginEnabledImpl));
 }
 
 #undef LOCTEXT_NAMESPACE

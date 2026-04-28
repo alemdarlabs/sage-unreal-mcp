@@ -73,7 +73,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Şu Anki Durum (Snapshot)
 
-> Tek satırda durum: **61 commit · 149 MCP tool · Phase 1+2+3 tamam · Phase 4.2(r2) DONE · 4.4 ingest 7.5x · 4.7-p1+p2+p3 project+engine+INI introspection · Phase 4 ~%66**.
+> Tek satırda durum: **62 commit · 151 MCP tool · Phase 1+2+3 tamam · Phase 4.2(r2) DONE · 4.4 ingest 7.5x · 4.7 project DONE (13 tool, type-matrix 38/38 audited) · Phase 4 ~%67**.
 
 - **Test ortamı**: `/Users/mahmutalemdar/Developer/alemdarlabs/SageTest/SageTest.uproject` (UE 5.7.4 Third Person + Blueprint).
 - **Knowledge graph (canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Real-time delta + query_graph + class_hierarchy çalışıyor.
@@ -112,6 +112,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 | 4.7-p1 | Project introspection (`project.get_info` / `list_modules` / `read_cpp_header` / `read_cpp_source`) | 4 |
 | 4.7-p2 | Engine source + search (`project.search_cpp` / `list_engine_modules` / `read_engine_header` / `find_engine_symbol`) | 4 |
 | 4.7-p3 | INI config tree (`project.read_config` / `search_config` / `list_config_tags`) | 3 |
+| 4.7-p4 | INI write + plugin enable (`project.set_config` / `set_plugin_enabled`) | 2 |
 
 ## Build & Run Commands
 

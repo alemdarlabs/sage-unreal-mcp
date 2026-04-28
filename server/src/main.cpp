@@ -2319,6 +2319,59 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // ---- Project introspection batch 4 (Phase 4.7-p4 write) ------------
+    registerRemote(sage::mcp::Tool{
+        .name = "project.set_config",
+        .description = "Write a single key=value into a project INI under "
+                       "[section]. Backup-then-rename atomic: <path>.sage_bak "
+                       "captures the previous content, <path>.sage_tmp is "
+                       "the staging file. modifier ∈ {'', '+', '-', '!', "
+                       "'.'} captures UE's INI array-op tokens. If the "
+                       "file or section doesn't exist yet, both are "
+                       "bootstrapped — set_config can be the first writer. "
+                       "Editor must reload the config (restart_editor or "
+                       "manual reload) for the change to take effect at "
+                       "runtime.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"name",     {{"type", "string"},
+                              {"description", "Game / DefaultGame / DefaultGame.ini all resolve same"}}},
+                {"section",  {{"type", "string"},
+                              {"description", "Bracketed section header without brackets"}}},
+                {"key",      {{"type", "string"}}},
+                {"value",    {{"type", "string"},
+                              {"description", "Verbatim value — quote if it contains commas"}}},
+                {"modifier", {{"type", "string"},
+                              {"enum", nlohmann::json::array({"", "+", "-", "!", "."})}}},
+            }},
+            {"required", nlohmann::json::array({"name", "section", "key", "value"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "project.set_plugin_enabled",
+        .description = "Set a plugin's Enabled flag in .uproject's "
+                       "Plugins[] array. Updates an existing entry or "
+                       "appends a fresh {Name, Enabled} entry. Backup-"
+                       "then-rename atomic write of the .uproject. Editor "
+                       "restart is required for the new state to take "
+                       "effect (returned in the 'note' field). Returns "
+                       "{plugin, enabled, uproject_path, entry_existed, "
+                       "backup, note}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"plugin",  {{"type", "string"}}},
+                {"enabled", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"plugin", "enabled"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // ---- Editor automation (Phase 4.6) ---------------------------------
     registerRemote(sage::mcp::Tool{
         .name = "editor.console_command",

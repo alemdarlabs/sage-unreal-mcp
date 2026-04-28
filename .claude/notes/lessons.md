@@ -266,6 +266,40 @@ Confirmed live in SageTest UE 5.7.4: hook fires on `FMessageDialog::Open`
 calls; auto-respond + default-response paths both verified via
 LogSageBridge.
 
+## Test policy — type-matrix coverage for any pin / property handler change
+
+**The mistake**: Phase 4.2-r1's `bp.add_variable` was tested with
+`type='int'` and `type='bool'`. Both work via `PinCategory =
+FName(*UserStr)` direct assignment. Real / Float / Double need a sub-
+category that the direct path doesn't set. The bug stayed latent for
+**5 commits** (r2a → r2g/p5) until a smoke test happened to ship
+`type='real'`, at which point an Editor crash + 30-minute crash loop
+exposed it.
+
+**Rule**: Any change to `MakePinType` / `bp.add_variable` /
+`bp.add_local_variable` / `bp.add_function_parameter` / pin-type
+construction in general MUST be smoked across the full UE 5.7 type
+matrix. Specifically:
+- 8 primitives: bool, byte, int, int64, real, string, name, text
+- 5 references: object, class, interface, softobject, softclass
+  (each with a `type_object` like `/Script/Engine.Actor`)
+- ≥4 structs: Vector, Rotator, Transform, LinearColor
+- 2 enums: PC_Enum (modern) + PC_Byte-with-UEnum (legacy)
+- Each type also in array form (`is_array=true`)
+- Followed by `bp.compile` — its assertion path is what catches a
+  half-formed pin (e.g. PC_Real with PinSubCategory=None).
+
+**Apply**: `scripts/smoke/type_matrix.py` is the canonical runner.
+Before merging any pin-type change run:
+```
+python3 scripts/smoke/type_matrix.py
+```
+38/38 must pass + compile errors=0. The runner restores the
+DefaultGame.ini it touches from `.sage_bak`, so it's safe to repeat.
+
+**Do not** ship a "I tested with int and bool" claim again. The whole
+matrix or it didn't happen.
+
 ## Kuzu 0.11 — UNWIND+MATCH×2+CREATE is ~30x slower than COPY FROM CSV for bulk edge insert
 
 **Symptom**: `index_slot` on 8K-asset SageTest took ~30 seconds end-to-
