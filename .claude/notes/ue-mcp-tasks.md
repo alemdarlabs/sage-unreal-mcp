@@ -486,7 +486,7 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 
 - [x] `widget.read_tree` → `widget.read` (Phase 4.11-r1; UWidgetTree::GetAllWidgets + recursive root tree, panel children nested)
 - [ ] `widget.get_details` · R
-- [ ] `widget.set_property` · W
+- [x] `widget.set_property` → `widget.set_property` (Phase 4.11-r2; UProperty mutation via SetUPropertyFromJson; UWidgetTree::FindWidget by name; MarkBlueprintAsModified)
 - [x] `widget.list` → `widget.list` (Phase 4.11-r1; AssetRegistry FARFilter on /Script/UMGEditor.WidgetBlueprint)
 - [ ] `widget.read_animations` · R
 - [x] `widget.create` → `widget.create` (Phase 4.11-r1; UWidgetBlueprintFactory; parent_class must be UUserWidget subclass; -32602 if not)
@@ -494,8 +494,8 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `widget.run_utility_widget` · W
 - [ ] `widget.create_utility_blueprint` · W
 - [ ] `widget.run_utility_blueprint` · W
-- [ ] `widget.add_widget` · W
-- [ ] `widget.remove_widget` · W
+- [x] `widget.add_widget` → `widget.add_widget` (Phase 4.11-r2; UWidgetTree::ConstructWidget + UPanelWidget::AddChild; root attaches automatically when tree empty; abstract/non-UWidget rejected -32602)
+- [x] `widget.remove_widget` → `widget.remove_widget` (Phase 4.11-r2; UWidgetTree::FindWidgetParent + RemoveChild; clears RootWidget when target is root; cascades to children since parent's slot release detaches subtree)
 - [ ] `widget.move_widget` · W
 - [ ] `widget.list_classes` · R
 - [ ] `widget.list_runtime` · R

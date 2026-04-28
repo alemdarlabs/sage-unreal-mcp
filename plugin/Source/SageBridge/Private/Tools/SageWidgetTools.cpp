@@ -16,6 +16,7 @@
 #include "Modules/ModuleManager.h"
 #include "ScopedTransaction.h"
 #include "UObject/Package.h"
+#include "Kismet2/BlueprintEditorUtils.h"
 #include "WidgetBlueprint.h"
 #include "WidgetBlueprintFactory.h"
 
@@ -195,6 +196,244 @@ FSageToolDispatch::FOutcome ListWidgetsImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- widget.add_widget ---------------------------------------------------
+
+FSageToolDispatch::FOutcome AddWidgetImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString BPPath, ClassPath, Name, ParentName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("blueprint"), BPPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'blueprint'"));
+    }
+    if (!Args->TryGetStringField(TEXT("widget_class"), ClassPath) || ClassPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'widget_class'"));
+    }
+    Args->TryGetStringField(TEXT("name"), Name);
+    Args->TryGetStringField(TEXT("parent"), ParentName);
+
+    UWidgetBlueprint* WB = ResolveWidgetBlueprint(BPPath);
+    if (!WB || !WB->WidgetTree)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UWidgetBlueprint with a WidgetTree: %s"), *BPPath));
+    }
+
+    UClass* Cls = FindObject<UClass>(nullptr, *ClassPath);
+    if (!Cls) Cls = LoadObject<UClass>(nullptr, *ClassPath);
+    if (!Cls || !Cls->IsChildOf(UWidget::StaticClass()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("widget_class %s is not a UWidget subclass"), *ClassPath));
+    }
+    if (Cls->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("widget_class %s is abstract/deprecated"), *Cls->GetName()));
+    }
+
+    FName WidgetFName = Name.IsEmpty() ? NAME_None : FName(*Name);
+    if (!Name.IsEmpty() && WB->WidgetTree->FindWidget(WidgetFName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("widget '%s' already exists in tree"), *Name));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("AddWidget", "Add Widget"));
+    WB->Modify();
+    WB->WidgetTree->Modify();
+
+    UWidget* New = WB->WidgetTree->ConstructWidget<UWidget>(Cls, WidgetFName);
+    if (!New)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32000,
+            FString::Printf(TEXT("ConstructWidget failed for %s"), *Cls->GetName()));
+    }
+
+    FString AttachedTo;
+    if (!ParentName.IsEmpty())
+    {
+        UWidget* P = WB->WidgetTree->FindWidget(FName(*ParentName));
+        UPanelWidget* Panel = Cast<UPanelWidget>(P);
+        if (!Panel)
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("parent '%s' not a UPanelWidget"), *ParentName));
+        }
+        Panel->AddChild(New);
+        AttachedTo = Panel->GetName();
+    }
+    else
+    {
+        if (!WB->WidgetTree->RootWidget)
+        {
+            WB->WidgetTree->RootWidget = New;
+            AttachedTo = TEXT("(root)");
+        }
+        else if (UPanelWidget* RootPanel = Cast<UPanelWidget>(WB->WidgetTree->RootWidget))
+        {
+            RootPanel->AddChild(New);
+            AttachedTo = RootPanel->GetName();
+        }
+        else
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("root widget is not a UPanelWidget — supply 'parent' explicitly"));
+        }
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsModified(WB);
+    WB->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"),    WB->GetPathName());
+    R->SetStringField(TEXT("name"),         New->GetName());
+    R->SetStringField(TEXT("class"),        New->GetClass()->GetName());
+    R->SetStringField(TEXT("attached_to"),  AttachedTo);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- widget.remove_widget ------------------------------------------------
+
+FSageToolDispatch::FOutcome RemoveWidgetImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString BPPath, Name;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("blueprint"), BPPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'blueprint'"));
+    }
+    if (!Args->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+    }
+
+    UWidgetBlueprint* WB = ResolveWidgetBlueprint(BPPath);
+    if (!WB || !WB->WidgetTree)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UWidgetBlueprint: %s"), *BPPath));
+    }
+    UWidget* Target = WB->WidgetTree->FindWidget(FName(*Name));
+    if (!Target)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("widget '%s' not found in tree"), *Name));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("RemoveWidget", "Remove Widget"));
+    WB->Modify();
+    WB->WidgetTree->Modify();
+
+    int32 ChildIndex = INDEX_NONE;
+    UPanelWidget* Parent = UWidgetTree::FindWidgetParent(Target, ChildIndex);
+    bool bRemoved = false;
+    if (Parent)
+    {
+        bRemoved = Parent->RemoveChild(Target);
+    }
+    else if (Target == WB->WidgetTree->RootWidget)
+    {
+        WB->WidgetTree->RootWidget = nullptr;
+        bRemoved = true;
+    }
+    if (!bRemoved)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32000,
+            FString::Printf(TEXT("RemoveChild failed for '%s'"), *Name));
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsModified(WB);
+    WB->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), WB->GetPathName());
+    R->SetStringField(TEXT("removed"),   Name);
+    R->SetStringField(TEXT("parent"),    Parent ? Parent->GetName() : TEXT("(root)"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- widget.set_property -------------------------------------------------
+
+FSageToolDispatch::FOutcome SetWidgetPropertyImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString BPPath, Name, PropName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("blueprint"), BPPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'blueprint'"));
+    }
+    if (!Args->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+    }
+    if (!Args->TryGetStringField(TEXT("property"), PropName) || PropName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'property'"));
+    }
+    const TSharedPtr<FJsonValue> Value = Args->Values.FindRef(TEXT("value"));
+    if (!Value.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'value'"));
+    }
+
+    UWidgetBlueprint* WB = ResolveWidgetBlueprint(BPPath);
+    if (!WB || !WB->WidgetTree)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UWidgetBlueprint: %s"), *BPPath));
+    }
+    UWidget* Target = WB->WidgetTree->FindWidget(FName(*Name));
+    if (!Target)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("widget '%s' not found"), *Name));
+    }
+    FProperty* P = Target->GetClass()->FindPropertyByName(*PropName);
+    if (!P)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("property '%s' not on %s"),
+                            *PropName, *Target->GetClass()->GetName()));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SetWidgetProperty", "Set Widget Property"));
+    Target->Modify();
+    WB->Modify();
+
+    if (!detail::SetUPropertyFromJson(Target, P, Value))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("could not set %s.%s from given value"),
+                            *Target->GetClass()->GetName(), *PropName));
+    }
+    Target->PostEditChange();
+    FBlueprintEditorUtils::MarkBlueprintAsModified(WB);
+    WB->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), WB->GetPathName());
+    R->SetStringField(TEXT("widget"),    Name);
+    R->SetStringField(TEXT("property"),  PropName);
+    R->SetField(TEXT("new_value"),
+        detail::GetUPropertyAsJson(Target, P).IsValid()
+            ? detail::GetUPropertyAsJson(Target, P)
+            : MakeShared<FJsonValueNull>());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---- widget.read ---------------------------------------------------------
 
 FSageToolDispatch::FOutcome ReadWidgetImpl(const TSharedPtr<FJsonObject>& Args)
@@ -260,9 +499,12 @@ void RegisterWidgetTools(FSageToolDispatch& Dispatch)
         };
     };
 
-    Dispatch.RegisterHandler(TEXT("widget.create"), GT(&CreateWidgetImpl));
-    Dispatch.RegisterHandler(TEXT("widget.list"),   GT(&ListWidgetsImpl));
-    Dispatch.RegisterHandler(TEXT("widget.read"),   GT(&ReadWidgetImpl));
+    Dispatch.RegisterHandler(TEXT("widget.create"),        GT(&CreateWidgetImpl));
+    Dispatch.RegisterHandler(TEXT("widget.list"),          GT(&ListWidgetsImpl));
+    Dispatch.RegisterHandler(TEXT("widget.read"),          GT(&ReadWidgetImpl));
+    Dispatch.RegisterHandler(TEXT("widget.add_widget"),    GT(&AddWidgetImpl));
+    Dispatch.RegisterHandler(TEXT("widget.remove_widget"), GT(&RemoveWidgetImpl));
+    Dispatch.RegisterHandler(TEXT("widget.set_property"),  GT(&SetWidgetPropertyImpl));
 }
 
 #undef LOCTEXT_NAMESPACE

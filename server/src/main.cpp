@@ -2906,6 +2906,73 @@ int main() {
         .handler = nullptr, .remote = true,
     });
     registerRemote(sage::mcp::Tool{
+        .name = "widget.add_widget",
+        .description = "Construct a new UWidget and attach it to a "
+                       "WidgetBlueprint's tree. widget_class must be a "
+                       "concrete UWidget subclass. parent (optional) "
+                       "is the name of an existing UPanelWidget to host "
+                       "the new child; if omitted, attaches to the "
+                       "tree's root panel (or sets it as root if empty). "
+                       "name optional. Returns {name, class, attached_to}. "
+                       "Wrapped in FScopedTransaction. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"blueprint",    {{"type", "string"}}},
+                {"widget_class", {{"type", "string"}}},
+                {"name",         {{"type", "string"}}},
+                {"parent",       {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"blueprint", "widget_class"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "widget.remove_widget",
+        .description = "Remove a widget by name from a WidgetBlueprint's "
+                       "tree. Walks the tree to find the parent panel, "
+                       "calls UPanelWidget::RemoveChild. If the widget "
+                       "is the tree's root, clears RootWidget. Marks "
+                       "the BP modified afterwards. Returns "
+                       "{removed, parent}. -32602 if widget not found. "
+                       "PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"blueprint", {{"type", "string"}}},
+                {"name",      {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"blueprint", "name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "widget.set_property",
+        .description = "Mutate a UProperty on a named widget inside a "
+                       "WidgetBlueprint's tree. Routes through Sage's "
+                       "SetUPropertyFromJson — primitives, structs "
+                       "(Vector/Rotator/Color/LinearColor/Margin/...), "
+                       "TArray/TMap/TSet, enums, soft refs all "
+                       "supported. Wrapped in FScopedTransaction + "
+                       "MarkBlueprintAsModified + PostEditChange. "
+                       "Returns {widget, property, new_value} round-tripped "
+                       "through GetUPropertyAsJson. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"blueprint", {{"type", "string"}}},
+                {"name",      {{"type", "string"}}},
+                {"property",  {{"type", "string"}}},
+                {"value",     {}},
+            }},
+            {"required", nlohmann::json::array({"blueprint", "name", "property", "value"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
         .name = "widget.read",
         .description = "Read a UWidgetBlueprint's tree. Returns "
                        "{parent_class, root: {name, class, children: "

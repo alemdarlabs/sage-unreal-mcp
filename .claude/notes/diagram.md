@@ -41,7 +41,7 @@ flowchart TB
   M17 ==Demo 1 ✓==> M21a
 
   %% Şu an
-  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>77 commit · 194 MCP tool · index_slot 30s→4s (7.5x)<br/>Phase 1+2+3+4.0/4.1/4.2(r1+r2)/4.3/4.4/4.5-r1+r2-b1..b9/4.6(r1+r2+r3-b1..b5)/4.7/4.11-r1 CANLI<br/>SageTest UE 5.7 — 8K asset · 16K dep · 8337 class · 8336 inherit · 492 engine module<br/>Phase 4.11-r1: widget.create · widget.list · widget.read (UMG starter)<br/>UE-MCP 448 action audit → Phase 4 yol haritası %81 done"]):::now
+  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>78 commit · 197 MCP tool · index_slot 30s→4s (7.5x)<br/>Phase 1+2+3+4.0/4.1/4.2(r1+r2)/4.3/4.4/4.5-r1+r2-b1..b9/4.6(r1+r2+r3-b1..b5)/4.7/4.11-r1+r2 CANLI<br/>SageTest UE 5.7 — 8K asset · 16K dep · 8337 class · 8336 inherit · 492 engine module<br/>Phase 4.11-r2: widget.add_widget · remove_widget · set_property (Canvas→Button→Text)<br/>UE-MCP 448 action audit → Phase 4 yol haritası %82 done"]):::now
 
   %% Phase 1'den ertelenenler
   subgraph DEF["Storage / out-of-process gerektirenler"]
@@ -77,7 +77,7 @@ flowchart TB
     P48["4.8 Animation<br/>AnimBP · montage · sequence · blendspace<br/>IK Rig · ControlRig · skeleton · modifiers (~56 tool)"]:::todo
     P49["4.9 Niagara VFX<br/>system · emitter · modules · HLSL · renderer (~37 tool)"]:::todo
     P410["4.10 AI / Gameplay<br/>physics · nav · Enhanced Input · BT · EQS<br/>StateTree · SmartObject · perception · framework (~59 tool)"]:::todo
-    P411["4.11 UMG round 1 ✓ (3 tool)<br/>widget.create · widget.list · widget.read<br/>UWidgetBlueprintFactory + UWidgetTree walk<br/><i>round 2: add/remove_widget · set_property · open_designer</i><br/>4.12 PCG · 4.13 Landscape · 4.14 Foliage<br/>4.15 GAS · 4.16 Networking · 4.17 Audio"]:::done
+    P411["4.11 UMG round 1+2 ✓ (6 tool)<br/>r1: widget.create · widget.list · widget.read<br/>r2: widget.add_widget · remove_widget · set_property<br/>UWidgetTree::ConstructWidget + UPanelWidget::AddChild<br/><i>round 3: read_animations · move_widget · open_designer · run_utility</i><br/>4.12 PCG · 4.13 Landscape · 4.14 Foliage<br/>4.15 GAS · 4.16 Networking · 4.17 Audio"]:::done
     P419["4.19 Reporting / observability<br/>report_issue · session log · metrics"]:::todo
     P420["4.20 Headless test mode<br/>filesystem-only handlers + mock plugin coverage"]:::todo
     P44["4.4 Index perf — Kuzu COPY FROM CSV ✓<br/>30s → 4s (7.5x); DEPENDS_ON 12.5s→0.34s (37x);<br/>INHERITS_FROM 6s→0.12s (51x)"]:::done
