@@ -811,6 +811,158 @@ FSageToolDispatch::FOutcome BpConnectPinsImpl(const TSharedPtr<FJsonObject>& Arg
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- bp.list_local_variables + bp.add_local_variable + --------------------
+// ---- bp.delete_local_variable  (Phase 4.2 round 2b) -----------------------
+
+UK2Node_FunctionEntry* FindFunctionEntry(UEdGraph* Graph)
+{
+    if (!Graph) return nullptr;
+    for (UEdGraphNode* N : Graph->Nodes)
+    {
+        if (UK2Node_FunctionEntry* Entry = Cast<UK2Node_FunctionEntry>(N))
+        {
+            return Entry;
+        }
+    }
+    return nullptr;
+}
+
+FSageToolDispatch::FOutcome BpListLocalVariablesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, FnName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("function"), FnName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path' or 'function'"));
+    }
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    UEdGraph* Graph = FindFunctionGraph(BP, FnName);
+    if (!Graph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("graph not found"));
+
+    TArray<TSharedPtr<FJsonValue>> Vars;
+    if (UK2Node_FunctionEntry* Entry = FindFunctionEntry(Graph))
+    {
+        for (const FBPVariableDescription& V : Entry->LocalVariables)
+        {
+            Vars.Add(MakeShared<FJsonValueObject>(VariableToJson(V)));
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetStringField(TEXT("function"),  FnName);
+    R->SetArrayField (TEXT("variables"), Vars);
+    R->SetNumberField(TEXT("count"),     Vars.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpAddLocalVariableImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, FnName, VarName, TypeStr;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("function"), FnName)
+        || !Args->TryGetStringField(TEXT("name"), VarName)
+        || !Args->TryGetStringField(TEXT("type"), TypeStr))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'function', 'name', or 'type'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    UEdGraph* Graph = FindFunctionGraph(BP, FnName);
+    if (!Graph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("graph not found"));
+
+    FEdGraphPinType PinType;
+    PinType.PinCategory = FName(*TypeStr);
+    if (Args->HasField(TEXT("type_object")))
+    {
+        FString TypeObj;
+        Args->TryGetStringField(TEXT("type_object"), TypeObj);
+        PinType.PinSubCategoryObject = FindObject<UObject>(nullptr, *TypeObj);
+    }
+    if (Args->HasField(TEXT("is_array")))
+    {
+        bool bArr = false;
+        Args->TryGetBoolField(TEXT("is_array"), bArr);
+        if (bArr) PinType.ContainerType = EPinContainerType::Array;
+    }
+    FString DefaultValue;
+    Args->TryGetStringField(TEXT("default_value"), DefaultValue);
+
+    FScopedTransaction Tx(LOCTEXT("BpAddLocalVar", "Sage: Add BP Local Variable"));
+    BP->Modify();
+    const FName VName(*VarName);
+
+    // Pre-check duplicate; FBlueprintEditorUtils::AddLocalVariable silently
+    // appends in 5.7 and we want a clear -32602 if name collides.
+    if (UK2Node_FunctionEntry* Entry = FindFunctionEntry(Graph))
+    {
+        for (const FBPVariableDescription& V : Entry->LocalVariables)
+        {
+            if (V.VarName == VName)
+            {
+                return FSageToolDispatch::FOutcome::MakeError(-32602,
+                    FString::Printf(TEXT("local variable already exists: %s"), *VarName));
+            }
+        }
+    }
+
+    FBlueprintEditorUtils::AddLocalVariable(BP, Graph, VName, PinType, DefaultValue);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetStringField(TEXT("function"),  FnName);
+    R->SetStringField(TEXT("variable"),  VarName);
+    R->SetStringField(TEXT("type"),      TypeStr);
+    if (!DefaultValue.IsEmpty()) R->SetStringField(TEXT("default_value"), DefaultValue);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpDeleteLocalVariableImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, FnName, VarName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("function"), FnName)
+        || !Args->TryGetStringField(TEXT("name"), VarName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'function', or 'name'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    UEdGraph* Graph = FindFunctionGraph(BP, FnName);
+    if (!Graph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("graph not found"));
+    UK2Node_FunctionEntry* Entry = FindFunctionEntry(Graph);
+    if (!Entry) return FSageToolDispatch::FOutcome::MakeError(-32603,
+        TEXT("function entry node not found"));
+
+    const FName VName(*VarName);
+    FScopedTransaction Tx(LOCTEXT("BpDelLocalVar", "Sage: Remove BP Local Variable"));
+    Entry->Modify();
+    const int32 Removed = Entry->LocalVariables.RemoveAll(
+        [VName](const FBPVariableDescription& V) { return V.VarName == VName; });
+    if (Removed > 0)
+    {
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetStringField(TEXT("function"),  FnName);
+    R->SetStringField(TEXT("variable"),  VarName);
+    R->SetNumberField(TEXT("removed"),   Removed);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---- bp.add_node + bp.set_node_property + bp.read_node_property + ----------
 // ---- bp.list_node_types  (Phase 4.2 round 2a) ------------------------------
 
@@ -1184,10 +1336,13 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("bp.read_components"),     GT(&BpReadComponentsImpl));
     Dispatch.RegisterHandler(TEXT("bp.search_nodes"),        GT(&BpSearchNodesImpl));
 
-    // Write — variables
-    Dispatch.RegisterHandler(TEXT("bp.add_variable"),        GT(&BpAddVariableImpl));
-    Dispatch.RegisterHandler(TEXT("bp.delete_variable"),     GT(&BpDeleteVariableImpl));
-    Dispatch.RegisterHandler(TEXT("bp.set_variable_default"),GT(&BpSetVariableDefaultImpl));
+    // Write — variables (member + local)
+    Dispatch.RegisterHandler(TEXT("bp.add_variable"),         GT(&BpAddVariableImpl));
+    Dispatch.RegisterHandler(TEXT("bp.delete_variable"),      GT(&BpDeleteVariableImpl));
+    Dispatch.RegisterHandler(TEXT("bp.set_variable_default"), GT(&BpSetVariableDefaultImpl));
+    Dispatch.RegisterHandler(TEXT("bp.list_local_variables"), GT(&BpListLocalVariablesImpl));
+    Dispatch.RegisterHandler(TEXT("bp.add_local_variable"),   GT(&BpAddLocalVariableImpl));
+    Dispatch.RegisterHandler(TEXT("bp.delete_local_variable"),GT(&BpDeleteLocalVariableImpl));
 
     // Write — functions
     Dispatch.RegisterHandler(TEXT("bp.add_function"),        GT(&BpAddFunctionImpl));

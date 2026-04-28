@@ -1126,6 +1126,69 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // -- write — local variables (Phase 4.2 round 2b) --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.list_local_variables",
+        .description = "Enumerate function-scope (local) variables on the "
+                       "function's UK2Node_FunctionEntry. Returns "
+                       "{variables: [{name, type, type_object?, is_array?, "
+                       "is_map?, is_set?, category, default_value?, flags}], "
+                       "count}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"function", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "function"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.add_local_variable",
+        .description = "Add a function-scope variable via "
+                       "FBlueprintEditorUtils::AddLocalVariable. Same type "
+                       "shape as bp.add_variable: type (PinCategory: bool/"
+                       "int/float/double/string/name/object/struct/...), "
+                       "type_object? (sub-category UClass/UStruct/UEnum), "
+                       "is_array?, default_value?. -32602 on duplicate name. "
+                       "PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",          {{"type", "string"}}},
+                {"function",      {{"type", "string"}}},
+                {"name",          {{"type", "string"}}},
+                {"type",          {{"type", "string"}}},
+                {"type_object",   {{"type", "string"}}},
+                {"is_array",      {{"type", "boolean"}}},
+                {"default_value", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "function", "name", "type"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.delete_local_variable",
+        .description = "Remove a function-scope variable from the "
+                       "UK2Node_FunctionEntry::LocalVariables array. Returns "
+                       "{removed: int} (0 = name not found, no error). "
+                       "PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"function", {{"type", "string"}}},
+                {"name",     {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "function", "name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // -- write — functions --
     registerRemote(sage::mcp::Tool{
         .name = "bp.add_function",
