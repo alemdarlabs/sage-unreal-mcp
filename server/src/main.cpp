@@ -1236,6 +1236,187 @@ int main() {
         .inputSchema = bpPathSchema, .handler = nullptr, .remote = true,
     });
 
+    // ---- Material graph (Phase 4.3) ------------------------------------
+    registerRemote(sage::mcp::Tool{
+        .name = "mat.read",
+        .description = "Material/instance summary: domain, blend_mode, "
+                       "shading_model, two_sided, expression count, base "
+                       "material name.",
+        .inputSchema = bpPathSchema, .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "mat.list_parameters",
+        .description = "Scalar/vector/texture/static-switch parameters with name + kind.",
+        .inputSchema = bpPathSchema, .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "mat.list_expressions",
+        .description = "All graph nodes (UMaterialExpression*) with id, class, "
+                       "x/y position, and shorthand value when applicable "
+                       "(scalar/vector/parameter constants).",
+        .inputSchema = bpPathSchema, .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "mat.create_instance",
+        .description = "Create a UMaterialInstanceConstant from a parent material. "
+                       "destination is the new asset's path "
+                       "(e.g. /Game/Mats/MI_Foo). PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"parent",      {{"type", "string"}}},
+                {"destination", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"parent", "destination"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "mat.add_expression",
+        .description = "Add a UMaterialExpression node. expression_class accepts "
+                       "engine-path form (/Script/Engine.MaterialExpressionConstant). "
+                       "Returns the new node's expression_id (GUID). PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",             {{"type", "string"}}},
+                {"expression_class", {{"type", "string"}}},
+                {"x",                {{"type", "integer"}}},
+                {"y",                {{"type", "integer"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "expression_class"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "mat.delete_expression",
+        .description = "Remove an expression by GUID. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",          {{"type", "string"}}},
+                {"expression_id", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "expression_id"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "mat.connect_expressions",
+        .description = "Wire two expression outputs/inputs. from_output / to_input "
+                       "are pin name strings. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",        {{"type", "string"}}},
+                {"from_id",     {{"type", "string"}}},
+                {"to_id",       {{"type", "string"}}},
+                {"from_output", {{"type", "string"}}},
+                {"to_input",    {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array(
+                {"path","from_id","to_id","from_output","to_input"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "mat.connect_to_property",
+        .description = "Wire an expression output into a material property. "
+                       "property: BaseColor, Metallic, Roughness, Specular, "
+                       "EmissiveColor, Normal, Opacity, OpacityMask, "
+                       "WorldPositionOffset. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",        {{"type", "string"}}},
+                {"from_id",     {{"type", "string"}}},
+                {"from_output", {{"type", "string"}}},
+                {"property",    {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array(
+                {"path","from_id","from_output","property"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "mat.set_expression_value",
+        .description = "Edit a constant in the graph. Constant→number, "
+                       "Constant3Vector→[r,g,b]/[r,g,b,a], ScalarParameter→"
+                       "default value. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",          {{"type", "string"}}},
+                {"expression_id", {{"type", "string"}}},
+                {"value",         {{"description", "number / [r,g,b] / [r,g,b,a]"}}},
+            }},
+            {"required", nlohmann::json::array({"path","expression_id","value"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "mat.connect_texture",
+        .description = "Set the UTexture on a TextureBase expression "
+                       "(e.g. TextureSample). PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",          {{"type", "string"}}},
+                {"expression_id", {{"type", "string"}}},
+                {"texture",       {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array(
+                {"path","expression_id","texture"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "mat.set_shading_model",
+        .description = "Switch the base material's shading model (Unlit, "
+                       "DefaultLit, Subsurface, ClearCoat, Hair, Cloth, Eye, "
+                       "ThinTranslucent, ...). Recompiles. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",  {{"type", "string"}}},
+                {"model", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path","model"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "mat.set_base_color",
+        .description = "Adds a Constant3Vector at -300/0 and wires it into BaseColor. "
+                       "color: [r,g,b] or [r,g,b,a] (linear, 0..1). Recompiles. "
+                       "PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",  {{"type", "string"}}},
+                {"color", {{"type", "array"}, {"items", {{"type", "number"}}},
+                           {"minItems", 3}, {"maxItems", 4}}},
+            }},
+            {"required", nlohmann::json::array({"path","color"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "mat.validate",
+        .description = "Recompile the material (or refresh the instance) and "
+                       "report success.",
+        .inputSchema = bpPathSchema, .handler = nullptr, .remote = true,
+    });
+
     // Material parameter (Milestone 1.3c).
     registerRemote(sage::mcp::Tool{
         .name        = "modify_material_parameter",

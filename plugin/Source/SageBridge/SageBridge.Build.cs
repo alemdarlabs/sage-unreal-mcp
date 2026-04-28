@@ -35,6 +35,8 @@ public class SageBridge : ModuleRules
             "KismetCompiler",
             "BlueprintGraph",
             "GraphEditor",
+            // Material graph + instance creation (Phase 4.3)
+            "AssetTools",
         });
 
         // Live Coding ships only on Windows in UE 5.7; Mac/Linux use the

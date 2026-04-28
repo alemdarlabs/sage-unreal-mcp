@@ -41,7 +41,7 @@ flowchart TB
   M17 ==Demo 1 ✓==> M21a
 
   %% Şu an
-  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>38 commit · 52 MCP tool<br/>Phase 1 + 2 + 3-partial ÇALIŞIYOR<br/>SageTest UE 5.7 — 8K asset · 16K dep · 8337 class · 8336 inherit<br/>real-time delta · query_graph · class_hierarchy · restart_editor live<br/>UE-MCP 562 action audit → Phase 4 plan hazır"]):::now
+  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>40 commit · 77 MCP tool<br/>Phase 1 + 2 + 3-partial + 4.0/4.1/4.2-r1 CANLI<br/>SageTest UE 5.7 — 8K asset · 16K dep · 8337 class · 8336 inherit<br/>real-time delta · query_graph · class_hierarchy · restart_editor<br/>collections (TArray/TMap/TObjectPtr) · reflection · BP read+write<br/>UE-MCP 562 action audit → Phase 4 yol haritası canlı"]):::now
 
   %% Phase 1'den ertelenenler
   subgraph DEF["Storage / out-of-process gerektirenler"]
@@ -67,9 +67,9 @@ flowchart TB
   %% Phase 4 — full UE-MCP capability parity (no scope cuts)
   subgraph P4["Phase 4 — Full UE-MCP capability parity"]
     direction TB
-    P40["4.0 UProperty collections<br/>TArray · TMap · TSet · TObjectPtr · TSoftObjectPtr<br/>TSubclassOf · FInstancedStruct · FGameplayTag"]:::todo
-    P41["4.1 Reflection<br/>reflect_class · reflect_struct · reflect_enum<br/>list_classes · find_subclasses · find_implementers"]:::todo
-    P42["4.2 Blueprint (read + write)<br/>~50 tool · graph · variables · functions · components<br/>reparent · CDO · interfaces · compile · construction script<br/>T3D import/export"]:::todo
+    P40["4.0 UProperty collections ✓<br/>TArray/TMap/TSet · TObjectPtr/SoftObject · TSubclassOf<br/>FStruct shorthand · UEnum · raw-pointer dispatch"]:::done
+    P41["4.1 Reflection ✓ (8 tool)<br/>reflect_class · reflect_struct · reflect_enum<br/>list_classes/structs/enums · find_implementers · CDO read"]:::done
+    P42["4.2 Blueprint authoring (round 1) ✓ (17 tool)<br/>read · list_vars/fns · function graph · components · search<br/>add/delete var · add/delete fn · delete_node · connect_pins<br/>set_cdo_property · reparent · compile<br/><i>round 2: ~25 tool kaldı (add_node, T3D, rename, fn I/O, ...)</i>"]:::done
     P43["4.3 Material (read + write + graph + preview)<br/>~36 tool · expressions · connections · params<br/>build_graph · render_preview · shader_stats"]:::todo
     P45["4.5 Asset advanced<br/>mesh_bounds · collision · LOD · sockets<br/>bulk_rename · move_folder · FBX/texture import<br/>datatable · redirectors · FTS5 search"]:::todo
     P46["4.6 Editor automation<br/>console_command · run_python · dialog policy<br/>screenshot · viewport · log filter · sequencer"]:::todo
