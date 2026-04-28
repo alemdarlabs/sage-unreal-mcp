@@ -78,6 +78,34 @@ streaming sub-levels.
 returned value as void. Test results are reported asynchronously through
 the framework's delegates / log — there is no synchronous success bool.
 
+## KuzuDB v0.11 — header incompatible with C++23 + libc++
+
+**Symptom**: Compiling user code that includes `kuzu.hpp` under
+`-std=c++23` (AppleClang + libc++ 17+) fails with `static_assert(sizeof(_Tp) >= 0,
+"cannot delete an incomplete type")` from
+`unique_ptr<kuzu::common::ExtraTypeInfo>::~unique_ptr()`.
+
+**Root**: kuzu.hpp forward-declares `ExtraTypeInfo` and uses it via
+`std::unique_ptr` in default-argument positions (e.g. line 2601). Under
+C++23, `_LIBCPP_CONSTEXPR_SINCE_CXX23 ~unique_ptr()` becomes constexpr,
+and the constexpr static_assert fires at the declaration site rather than
+at first call. Pre-C++23 it only fires when actually destructing the
+unique_ptr in user code, which kuzu's surface never triggers.
+
+**Rule**: Compile any TU that includes `kuzu.hpp` with
+`CXX_STANDARD 20` (kuzu's own build standard). The rest of Sage stays
+on C++23 — only the graph translation units need the downgrade. Set per
+target:
+
+```cmake
+set_target_properties(sage-kuzu-* PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON)
+```
+
+Also: kuzu `Database(path)` v0.11 expects a *file* path, not a directory
+— create the parent dir, point at `graph.kuzu` inside it.
+
 ## vcpkg first-time install — surprisingly fast on this machine
 
 `ixwebsocket[core,sectransp,ssl]` + zlib + dependencies took 8 seconds via

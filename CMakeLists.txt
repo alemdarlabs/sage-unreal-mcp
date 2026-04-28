@@ -83,6 +83,30 @@ find_package(spdlog        CONFIG REQUIRED)
 find_package(httplib       CONFIG REQUIRED)
 find_package(ixwebsocket   CONFIG REQUIRED)
 
+# ---- KuzuDB (prebuilt via scripts/fetch-kuzu.sh) ----------------------------
+# vcpkg has no kuzu port; we use the upstream prebuilt release archive.
+set(KUZU_DIR "${CMAKE_SOURCE_DIR}/third_party/kuzu")
+if(NOT EXISTS "${KUZU_DIR}/kuzu.hpp")
+    message(FATAL_ERROR
+        "KuzuDB not found at ${KUZU_DIR}.\n"
+        "Run scripts/fetch-kuzu.sh (or .ps1 on Windows) before configuring.")
+endif()
+if(APPLE)
+    set(KUZU_LIB_NAME "libkuzu.dylib")
+elseif(UNIX)
+    set(KUZU_LIB_NAME "libkuzu.so")
+elseif(WIN32)
+    set(KUZU_LIB_NAME "kuzu.dll")
+endif()
+add_library(kuzu::kuzu SHARED IMPORTED GLOBAL)
+set_target_properties(kuzu::kuzu PROPERTIES
+    IMPORTED_LOCATION "${KUZU_DIR}/${KUZU_LIB_NAME}"
+    INTERFACE_INCLUDE_DIRECTORIES "${KUZU_DIR}")
+if(WIN32)
+    set_target_properties(kuzu::kuzu PROPERTIES
+        IMPORTED_IMPLIB "${KUZU_DIR}/kuzu_shared.lib")
+endif()
+
 # ---- Subdirectories ---------------------------------------------------------
 add_subdirectory(server)
 

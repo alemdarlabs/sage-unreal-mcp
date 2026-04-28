@@ -1,185 +1,95 @@
-# Sage — Big Picture
+# Sage Phase 1 Durum — Şu Anda Neredeyiz
 
-> Bu dosya scratch — her yeni diyagram sürekli buraya yazılır (önceki overwrite olur).
-> Kalıcı diyagramlar `.claude/docs/` veya `.claude/decisions/` içine embed edilir.
-> VS Code'da `Cmd+Shift+V` ile preview aç, "Markdown Preview Mermaid Support" extension yüklü olsun.
-
----
-
-## 1. System Topology — Bileşenler ve Bağlantılar
-
-Kullanıcıdan Unreal Editor'e tüm yol. Sage server kalıcı, editor ephemeral, knowledge graph slot başına izole.
+> Scratch — diyagram her güncellemede overwrite. VS Code preview'da render olur (Markdown Preview Mermaid Support).
 
 ```mermaid
-flowchart TD
-    subgraph User["👤 Kullanıcı / Geliştirici"]
-        Term["Terminal<br/>(Claude Code, Cursor)"]
-    end
+flowchart TB
+  classDef done    fill:#16a34a,stroke:#15803d,color:#fff
+  classDef now     fill:#f59e0b,stroke:#d97706,color:#fff
+  classDef todo    fill:#cbd5e1,stroke:#64748b,color:#0f172a
+  classDef hold    fill:#fde68a,stroke:#d97706,color:#0f172a,stroke-dasharray: 6 4
+  classDef moat    fill:#a855f7,stroke:#7c3aed,color:#fff
 
-    subgraph Server["🟪 Sage Server (kalıcı C++23 prosesi)"]
-        MCP[MCP Protocol Layer]
-        Router[Tool Router]
-        Tools[Tool Implementations]
-        Lifecycle[Editor Lifecycle Manager]
-        WSS[WebSocket Server]
-        OpQ[(Operation Queue<br/>SQLite)]
-        Audit[(Audit Log<br/>SQLite)]
-        Slot[(Slot Index<br/>SQLite)]
-        KG[(Knowledge Graph<br/>KuzuDB - Phase 2)]
+  %% Phase 1 spine
+  subgraph P1["Phase 1 — Execution Full ✓"]
+    direction TB
+    M11["1.1 Server scaffolding<br/>HTTP+SSE · MCP · 4 base tool"]:::done
+    M12["1.2 Plugin scaffolding<br/>UPlugin · WS client · handshake · heartbeat"]:::done
+    M13a["1.3a Plugin↔Server bridge<br/>ixwebsocket · welcome + heartbeat_ack"]:::done
+    M13b["1.3b Tool dispatch<br/>server route + UE plugin handler + e2e mock"]:::done
+    M13c["1.3c Domain mutation tools<br/>5 actor · 5 component · 8 asset · 6 editor · 2 level · 2 PIE · 1 material"]:::done
+    M14["1.4 Transaction layer<br/>begin/commit/rollback · bulk_modify · compare_and_set"]:::done
+    M15a["1.5a Multi-editor MCP<br/>list/get/set_active_editor"]:::done
+    M16a["1.6a Compile coordination<br/>Live Coding wrapper (Win) · Mac stub (-32007)"]:::done
+    M17["1.7 QA + Source Control<br/>list_tests · run_tests · checkout_files"]:::done
+  end
 
-        MCP --> Router
-        Router --> Tools
-        Tools --> OpQ
-        Tools --> Audit
-        Tools -.-> KG
-        Router --> Lifecycle
-        Lifecycle --> Slot
-        Lifecycle --> WSS
-    end
+  M11 --> M12 --> M13a --> M13b --> M13c --> M14 --> M15a --> M16a --> M17
 
-    subgraph EditorA["🟧 UE Editor — host"]
-        PluginA["Sage Bridge Plugin (C++)"]
-        ARLA[AssetRegistry Listener]
-        TxA[UTransactor Wrapper]
-        WSCA[WS Client]
-        PluginA --> ARLA
-        PluginA --> TxA
-        PluginA --> WSCA
-    end
+  %% Şu an
+  M17 --> NOW(["ŞİMDİ BURADA<br/>24 commit · 44 tool<br/>Demo 1 SageTest&apos;te ÇALIŞIYOR<br/>actor_count fix verified"]):::now
 
-    subgraph EditorB["🟧 UE Editor — client (opsiyonel)"]
-        PluginB[Sage Bridge Plugin]
-    end
+  %% Phase 1 deferred
+  subgraph DEF["Phase 2 storage gerektirenler"]
+    direction TB
+    M15b["1.5b Slot management<br/>merge/migrate/prune<br/><i>SQLite slot store gerek</i>"]:::hold
+    M16b["1.6b Full restart orchestration<br/>save→shutdown→UBT→relaunch<br/><i>out-of-process compile</i>"]:::hold
+  end
 
-    Term -->|"MCP / HTTP+SSE<br/>kalıcı bağlantı"| MCP
-    WSS <-->|"WebSocket / JSON-RPC<br/>localhost"| WSCA
-    WSS <-->|"WebSocket / JSON-RPC"| PluginB
+  M15a -.uçucu→persistent.-> M15b
+  M16a -.LC alternatif.-> M16b
 
-    classDef store fill:#e1f5ff,stroke:#0288d1,color:#000
-    classDef phase2 stroke-dasharray: 5 5
-    class OpQ,Audit,Slot,KG store
-    class KG phase2
+  %% Phase 2 moat
+  subgraph P2["Phase 2 — Knowledge Layer (intelligence moat)"]
+    direction TB
+    M21["2.1 KuzuDB integration<br/>embedded · schema migration · slot-scoped"]:::todo
+    M22["2.2 T1 indexing (eager)<br/>AssetRegistry full scan → Asset/Class/Module/Plugin"]:::todo
+    M23["2.3 T2 topology + real-time delta<br/>depends_on / inherits_from / implements + AssetRegistry events"]:::todo
+    M24["2.4 High-level query tools<br/>impact_of · references_to · class_hierarchy · find_unused"]:::moat
+    M25["2.5 Cypher subset (Layer 2)<br/>read-only AST whitelist · bounded *1..N · 8K cap"]:::todo
+  end
+
+  M21 --> M22 --> M23 --> M24 --> M25
+
+  NOW ==yarın Windows test ve<br/>Phase 2 başlat==> M21
+
+  %% Demo hedefleri
+  M17 -. Demo 1 .- DEMO1[/"Demo 1 ispatlandı<br/>spawn · CAS · transactions · bulk · PIE guard"/]:::done
+  M24 -. Demo 2 .- DEMO2[/"Demo 2 — moat<br/>impact_of(BP_Enemy) → safe delete"/]:::moat
+
+  %% Bu turda eklenenler
+  subgraph TOOLS["Bu turda eklenenler"]
+    direction LR
+    SK1["/unreal-close skill"]:::done
+    SK2["/unreal-open skill"]:::done
+    BUG["actor_count fix<br/>(sparse array)"]:::done
+  end
+
+  NOW --- TOOLS
 ```
 
-> Kesik çizgili kutu (KuzuDB) = Phase 2'de devreye girer. Phase 1'de minimum slot identity tracking var, knowledge graph queries yok.
-
----
-
-## 2. Tool Taxonomy — Hangi Yetenekler Hangi Katmanda
-
-3 ana grup: Phase 1 execution, Phase 2 knowledge, Phase 0 (her zaman) infrastructure.
+## Phase 1 tool yüzeyi (44 tool)
 
 ```mermaid
-flowchart TD
-    Sage((Sage MCP)) --> P1[Phase 1<br/>Execution Tools]
-    Sage --> P2[Phase 2<br/>Knowledge Tools]
-    Sage --> Inf[Infrastructure Tools]
-
-    P1 --> Mut["Mutation<br/>actor / component / asset / material"]
-    P1 --> Tx["Transactions<br/>begin / commit / rollback / bulk"]
-    P1 --> Life["Lifecycle<br/>list_editors / slot mgmt / compile"]
-    P1 --> St["Editor State<br/>world / viewport / PIE / tests"]
-    P1 --> Save["Save & Source Control<br/>save_assets / auto-checkout"]
-
-    P2 --> HL["High-level Queries<br/>impact_of / references_to /<br/>class_hierarchy / find_*"]
-    P2 --> CS["Cypher Subset<br/>query() — read-only sandbox"]
-
-    Inf --> Disc["Discovery<br/>list_editors / get_active / set_active"]
-    Inf --> Idx["Indexing<br/>status / reindex / configure"]
-    Inf --> Aud["Audit<br/>history / inspect / revert"]
-
-    classDef phase1 fill:#fff3e0,stroke:#e65100,color:#000
-    classDef phase2 fill:#e8f5e9,stroke:#2e7d32,color:#000
-    classDef infra fill:#e3f2fd,stroke:#0277bd,color:#000
-    classDef root fill:#f3e5f5,stroke:#6a1b9a,color:#000,font-weight:bold
-    class Sage root
-    class P1,Mut,Tx,Life,St,Save phase1
-    class P2,HL,CS phase2
-    class Inf,Disc,Idx,Aud infra
+pie title Tool Domain Dağılımı
+  "Actor mutation" : 5
+  "Component mutation" : 5
+  "Asset mutation+lifecycle" : 8
+  "Editor state+selection" : 6
+  "Level" : 2
+  "PIE" : 2
+  "Material" : 1
+  "Transactions+bulk+CAS" : 6
+  "Multi-editor (local)" : 3
+  "Compile (LC)" : 2
+  "QA" : 2
+  "Source control" : 2
 ```
 
----
+## Renk kodu
 
-## 3. MVP Roadmap — Zaman Çizelgesi
-
-ADR-012'ye göre execution-first. Phase 1 tamamlandığında Demo 1 ("AI ne dersem yapıyor"), Phase 2 sonunda Demo 2 ("AI projeyi anlıyor + yapıyor").
-
-```mermaid
-gantt
-    title Sage MVP Roadmap
-    dateFormat YYYY-MM-DD
-    axisFormat %b %d
-
-    section Phase 1 — Execution Full
-    1.1 Server scaffolding         :p1a, 2026-04-28, 7d
-    1.2 Plugin scaffolding         :p1b, after p1a, 7d
-    1.3 Core mutation tools        :p1c, after p1b, 7d
-    1.4 Transaction layer          :p1d, after p1c, 7d
-    1.5 Multi-editor + lifecycle   :p1e, after p1d, 7d
-    1.6 Compile coordination       :p1f, after p1e, 7d
-    1.7 PIE + tests + SCM (buffer) :p1g, after p1f, 7d
-    Demo 1 — Full execution        :milestone, m1, after p1g, 0d
-
-    section Phase 2 — Knowledge Layer
-    2.1 KuzuDB integration         :p2a, after m1, 7d
-    2.2 T1 indexing                :p2b, after p2a, 7d
-    2.3 T2 + AssetRegistry events  :p2c, after p2b, 7d
-    2.4 High-level queries         :p2d, after p2c, 7d
-    2.5 Cypher subset Layer 2      :p2e, after p2d, 7d
-    Demo 2 — Moat proven           :milestone, m2, after p2e, 0d
-```
-
----
-
-## 4. Örnek Tool Call Akışı
-
-Kullanıcı "BP_Enemy'nin Health'ini 200 yap" dediğinde sistemin uçtan uca akışı. Tek bir mutation tool çağrısı, transaction layer ve audit log dahil.
-
-```mermaid
-sequenceDiagram
-    actor User as 👤 Kullanıcı
-    participant Claude as Claude Code
-    participant Server as Sage Server
-    participant Audit as Audit Log
-    participant Plugin as UE Plugin
-    participant Editor as Unreal Editor
-
-    User->>Claude: "BP_Enemy'nin Health'ini 200 yap"
-    Claude->>Server: modify_actor_property(actor, "Health", 200)
-    activate Server
-    Server->>Server: validate args, route to slot
-    Server->>Audit: log tx start (status: pending)
-    Server->>Plugin: { tx_id, tool, args }
-    activate Plugin
-    Plugin->>Editor: FScopedTransaction open
-    Plugin->>Editor: Actor->Modify() (snapshot)
-    Plugin->>Editor: Actor->Health = 200
-    Plugin->>Editor: scope close (commit)
-    Plugin->>Server: { tx_id, status: "committed", hashes }
-    deactivate Plugin
-    Server->>Audit: log tx complete
-    Server->>Claude: { tx_id, success, undo_handle }
-    deactivate Server
-    Claude->>User: "Done. Ctrl+Z ile geri alabilirsin."
-
-    Note over User,Editor: Phase 2'de bu akışa<br/>knowledge graph update'i eklenir
-```
-
----
-
-## Özet: Sage Nedir?
-
-**Sözel:** Unreal Engine için MCP server family'sinin ilk üyesi. AI agent'ların Unreal projesini anlayıp güvenli mutate etmesini sağlar.
-
-**Mimari özet:**
-- Persistent C++23 server + UE C++ plugin köprüsü
-- HTTP+SSE (Claude'a) + WebSocket (plugin'e) transports
-- KuzuDB (knowledge graph) + SQLite (audit, slot index)
-- Multi-editor support, transaction-safe, undo-integrated
-
-**Yol haritası:**
-- Phase 1 (~7 hafta): Full execution — agent komut alıp eyleyebilir
-- Phase 2 (~5 hafta): Knowledge layer — agent projeyi anlayabilir
-- Toplam ~12 hafta MVP, sonra Sage Unity / Sage Godot family
-
-**Moat:** Çoğu engine MCP tool'u sadece execution. Sage'in tezi: anlama + eylem birleşimi. Phase 2 olmadan iddia, Phase 2 ile kanıt.
+- 🟢 **Yeşil** — bitti, gerçek UE 5.7 SageTest projesinde doğrulandı
+- 🟠 **Turuncu** — şu anki çekilme noktası (hemen Phase 2'ye veya Windows test'e geçiş)
+- ⚫ **Gri** — Phase 2 todo
+- 🟡 **Sarı kesikli** — Phase 1 spec'inde olan ama Phase 2 storage layer'ına bağımlı (KuzuDB / SQLite gelmeden anlamsız)
+- 🟣 **Mor** — Sage moat (intelligence layer farkı, execution'dan ayrışma)

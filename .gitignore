@@ -3,6 +3,9 @@ build/
 out/
 cmake-build-*/
 
+# Prebuilt third-party (fetch via scripts/fetch-kuzu.sh)
+third_party/
+
 # vcpkg
 vcpkg_installed/
 .vcpkg-root

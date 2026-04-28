@@ -43,3 +43,30 @@ target_link_libraries(sage-bridge-mock-plugin
 target_compile_features(sage-bridge-mock-plugin PRIVATE cxx_std_23)
 set_target_properties(sage-bridge-mock-plugin PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+# ---- Kuzu smoke (Phase 2 baseline) --------------------------------------
+# Kuzu's bundled header forward-declares `kuzu::common::ExtraTypeInfo` and
+# uses it through `std::unique_ptr` in default arguments. Under C++23 with
+# libc++, `~unique_ptr()` becomes constexpr, which triggers the
+# `cannot delete an incomplete type` static_assert. Compile this target as
+# C++20 (kuzu is built that way upstream) — the rest of Sage stays C++23.
+# Sanitizers are also intentionally omitted (kuzu's prebuilt is not ASan-
+# instrumented; ODR violations would surface at link time).
+add_executable(sage-kuzu-smoke
+    integration/kuzu_smoke.cpp
+)
+target_link_libraries(sage-kuzu-smoke
+    PRIVATE kuzu::kuzu)
+set_target_properties(sage-kuzu-smoke PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    BUILD_RPATH   "${KUZU_DIR}"
+    INSTALL_RPATH "@executable_path")
+# Copy the kuzu shared lib next to the executable so default loader paths
+# work without setting DYLD_LIBRARY_PATH at runtime.
+add_custom_command(TARGET sage-kuzu-smoke POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${KUZU_DIR}/${KUZU_LIB_NAME}"
+        "$<TARGET_FILE_DIR:sage-kuzu-smoke>/${KUZU_LIB_NAME}")
