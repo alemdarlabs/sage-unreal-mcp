@@ -2514,6 +2514,45 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // ---- Runtime state mutation (Phase 4.6 round 3 batch 2) ------------
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.set_property",
+        .description = "Write a UProperty on any UObject by SoftObjectPath. "
+                       "Routes through Sage's SetUPropertyFromJson — "
+                       "structured JSON value (numbers / booleans / nested "
+                       "structs / TArray / object refs) instead of "
+                       "ImportText strings. PIE rejected. -32602 on path / "
+                       "property miss or type-coercion failure. "
+                       "MarkPackageDirty after write so the editor re-saves.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"},
+                              {"description", "SoftObjectPath (e.g. /Game/Foo.Foo or /Script/Engine.Default__Actor)"}}},
+                {"property", {{"type", "string"}}},
+                {"value",    {{"description", "Any JSON — Sage coerces by FProperty type"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "property", "value"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.set_pie_time_scale",
+        .description = "Set the PIE world's global time dilation. factor > "
+                       "0; lifts AWorldSettings::Min/MaxGlobalTimeDilation "
+                       "caps so high values don't clamp silently. -32004 "
+                       "if no PIE session is active (start with run_pie). "
+                       "Returns {factor, min_cap, max_cap, world}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"factor", {{"type", "number"}, {"exclusiveMinimum", 0}}}}},
+            {"required", nlohmann::json::array({"factor"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // ---- Dialog policy (Phase 4.6 round 2) -----------------------------
     // Hooks FCoreDelegates::ModalMessageDialog so unattended agent flows
     // don't stall on Save?/Reload?/Confirm Delete? modals. Lazy install

@@ -11,7 +11,7 @@
 | Category | Have | Need | Total | % |
 |---|---:|---:|---:|---:|
 | project | 15 | 14 | 29 | 52 |
-| editor | 19 | 25 | 44 | 43 |
+| editor | 21 | 23 | 44 | 48 |
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
 | blueprint | 38 | 8 | 46 | 83 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **143** | **305** | **448** | **32** |
+| **TOTAL** | **145** | **303** | **448** | **32** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -91,10 +91,10 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [x] `editor.execute_command` — Console command · W · Sage `editor.console_command`
 - [ ] `editor.execute_python` — Run Python in editor · W
 - [ ] `editor.run_python_file` — Run Python script · W
-- [ ] `editor.set_property` — Set UObject property by path · W
+- [x] `editor.set_property` → `editor.set_property` (Phase 4.6-r3-b2; SetUPropertyFromJson via FProperty reflection, structured JSON value, PIE rejected)
 - [x] `editor.play_in_editor` — PIE control · W · Sage `run_pie`/`stop_pie`
 - [~] `editor.get_runtime_value` — Read PIE actor property · R · Sage `get_pie_state` (partial)
-- [ ] `editor.set_pie_time_scale` — PIE time dilation · W
+- [x] `editor.set_pie_time_scale` → `editor.set_pie_time_scale` (Phase 4.6-r3-b2; AWorldSettings caps lifted + SetGlobalTimeDilation, requires active PIE)
 - [ ] `editor.hot_reload` — Hot reload C++ · W
 - [x] `editor.undo` → `editor.undo` (Phase 4.6-r3-b1; GEditor->UndoTransaction(true))
 - [x] `editor.redo` → `editor.redo` (Phase 4.6-r3-b1; GEditor->RedoTransaction)

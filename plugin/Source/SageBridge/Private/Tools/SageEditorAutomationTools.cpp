@@ -10,7 +10,9 @@
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
+#include "GameFramework/WorldSettings.h"
 #include "GenericPlatform/GenericPlatformMisc.h"
+#include "Kismet/GameplayStatics.h"
 #include "LevelEditorViewport.h"
 #include "GenericPlatform/GenericPlatformOutputDevices.h"
 #include "HAL/PlatformFileManager.h"
@@ -194,6 +196,109 @@ FSageToolDispatch::FOutcome ReadLogImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- editor.set_property / editor.set_pie_time_scale  (Phase 4.6-r3 b2) --
+
+FSageToolDispatch::FOutcome SetPropertyImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, PropName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("property"), PropName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path' or 'property'"));
+    }
+    TSharedPtr<FJsonValue> ValueJson = Args->TryGetField(TEXT("value"));
+    if (!ValueJson.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'value'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (sage::tools::detail::RejectIfPie(PieErr)) return PieErr;
+
+    // Resolve UObject. Accept asset paths and engine class paths.
+    UObject* Obj = nullptr;
+    {
+        FSoftObjectPath Soft(Path);
+        Obj = Soft.ResolveObject();
+        if (!Obj) Obj = Soft.TryLoad();
+    }
+    if (!Obj)
+    {
+        Obj = LoadObject<UObject>(nullptr, *Path);
+    }
+    if (!Obj)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("object not found: %s"), *Path));
+    }
+
+    FProperty* Prop = Obj->GetClass()->FindPropertyByName(FName(*PropName));
+    if (!Prop)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("property not found: %s on %s"),
+                            *PropName, *Obj->GetClass()->GetName()));
+    }
+
+    Obj->Modify();
+    const bool bOk = sage::tools::detail::SetUPropertyFromJson(Obj, Prop, ValueJson);
+    if (!bOk)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("could not coerce JSON value into property %s"), *PropName));
+    }
+    Obj->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),     Path);
+    R->SetStringField(TEXT("property"), PropName);
+    R->SetStringField(TEXT("class"),    Obj->GetClass()->GetName());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetPieTimeScaleImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    double Factor = 1.0;
+    if (!Args.IsValid() || !Args->TryGetNumberField(TEXT("factor"), Factor))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'factor'"));
+    }
+    if (Factor <= 0.0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("'factor' must be > 0"));
+    }
+    if (!GEditor)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
+    }
+    UWorld* World = GEditor->PlayWorld;
+    if (!World)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32004,
+            TEXT("no PIE world active — start PIE first (run_pie)"));
+    }
+    AWorldSettings* WS = World->GetWorldSettings();
+    if (!WS)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("WorldSettings unavailable on PIE world"));
+    }
+
+    // Lift dilation caps so 'Factor' isn't clamped silently.
+    const float Cap = FMath::Max(1000.0f, static_cast<float>(Factor) * 2.0f);
+    WS->MaxGlobalTimeDilation = FMath::Max(WS->MaxGlobalTimeDilation, Cap);
+    WS->MinGlobalTimeDilation = FMath::Min(WS->MinGlobalTimeDilation, 0.0001f);
+    UGameplayStatics::SetGlobalTimeDilation(World, static_cast<float>(Factor));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetNumberField(TEXT("factor"),  Factor);
+    R->SetNumberField(TEXT("max_cap"), WS->MaxGlobalTimeDilation);
+    R->SetNumberField(TEXT("min_cap"), WS->MinGlobalTimeDilation);
+    R->SetStringField(TEXT("world"),   World->GetName());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---- editor.undo / editor.redo  (Phase 4.6-r3) ---------------------------
 
 FSageToolDispatch::FOutcome UndoImpl(const TSharedPtr<FJsonObject>& /*Args*/)
@@ -312,6 +417,10 @@ void RegisterEditorAutomationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("editor.redo"),               GT(&RedoImpl));
     Dispatch.RegisterHandler(TEXT("editor.focus_on_actor"),     GT(&FocusOnActorImpl));
     Dispatch.RegisterHandler(TEXT("editor.set_viewport"),       GT(&SetViewportImpl));
+
+    // Phase 4.6-r3 batch 2: runtime state mutation
+    Dispatch.RegisterHandler(TEXT("editor.set_property"),       GT(&SetPropertyImpl));
+    Dispatch.RegisterHandler(TEXT("editor.set_pie_time_scale"), GT(&SetPieTimeScaleImpl));
 }
 
 #undef LOCTEXT_NAMESPACE
