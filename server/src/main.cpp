@@ -2490,6 +2490,69 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // Phase 4.5-r2 batch 3: textures
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.list_textures",
+        .description = "Enumerate UTexture / UTexture2D assets under a "
+                       "content directory (recursive). Returns "
+                       "{textures: [{path, name, kind}], returned, total, "
+                       "capped}. Use asset.get_texture_info for per-asset "
+                       "metadata.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"directory",   {{"type", "string"}}},
+                {"max_results", {{"type", "integer"}, {"minimum", 1}, {"maximum", 50000}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.get_texture_info",
+        .description = "Read a UTexture's import/runtime settings. "
+                       "Returns {compression (TC_*), address_x/y "
+                       "(Wrap/Clamp/Mirror), filter (Nearest/Bilinear/"
+                       "Trilinear/Default), srgb, never_stream, lod_bias, "
+                       "compression_quality}. UTexture2D adds {width, "
+                       "height, num_mips, pixel_format}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.set_texture_settings",
+        .description = "Mutate UTexture settings. Each field optional; "
+                       "only provided ones are applied. compression "
+                       "(case-insensitive: Default/Normalmap/Masks/"
+                       "Grayscale/HDR/BC7/HalfFloat/LQ/SingleFloat/"
+                       "HDR_F32/...). address_x|y (Wrap/Clamp/Mirror, "
+                       "UTexture2D only). filter (Nearest/Bilinear/"
+                       "Trilinear/Default). srgb, never_stream (bool). "
+                       "lod_bias (int). FScopedTransaction wrapped + "
+                       "PostEditChange propagated. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",         {{"type", "string"}}},
+                {"compression",  {{"type", "string"}}},
+                {"address_x",    {{"type", "string"}}},
+                {"address_y",    {{"type", "string"}}},
+                {"filter",       {{"type", "string"}}},
+                {"srgb",         {{"type", "boolean"}}},
+                {"never_stream", {{"type", "boolean"}}},
+                {"lod_bias",     {{"type", "integer"}}},
+            }},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // ---- Editor automation (Phase 4.6) ---------------------------------
     registerRemote(sage::mcp::Tool{
         .name = "editor.console_command",

@@ -73,7 +73,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Şu Anki Durum (Snapshot)
 
-> Tek satırda durum: **69 commit · 173 MCP tool · Phase 1+2+3 tamam · 4.2(r2) DONE · 4.4 ingest 7.5x · 4.5(r2-b1 query · r2-b2 sockets) · 4.6(r3 inc Python) · 4.7 DONE · Phase 4 ~%73**.
+> Tek satırda durum: **70 commit · 176 MCP tool · Phase 1+2+3 tamam · 4.2(r2) DONE · 4.4 ingest 7.5x · 4.5(r2-b1 query · r2-b2 sockets · r2-b3 textures) · 4.6(r3 inc Python) · 4.7 DONE · Phase 4 ~%74**.
 
 - **Test ortamı**: `/Users/mahmutalemdar/Developer/alemdarlabs/SageTest/SageTest.uproject` (UE 5.7.4 Third Person + Blueprint).
 - **Knowledge graph (canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Real-time delta + query_graph + class_hierarchy çalışıyor.
@@ -85,7 +85,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
   - [`.claude/notes/lessons.md`](.claude/notes/lessons.md) — kabul edilen kuralların kayıtlı olduğu dosya (en kritik: "MVP scope-cut yapma", BP/Material write GameThread'de marshal et)
 - **Yeni session devraldığında ilk bakılacak**: bu dosya → `.claude/notes/diagram.md` → `.claude/notes/ue-mcp-tasks.md` → son commit `git log --oneline | head -10`.
 
-## Tool Tablosu (özet — 173 toplam)
+## Tool Tablosu (özet — 176 toplam)
 
 | Phase | Domain | Tool sayısı |
 |---|---|---|
@@ -120,6 +120,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 | 4.6-r3-b5 | Python scripting (`editor.run_python`) | 1 |
 | 4.5-r2-b1 | Asset query (`asset.list` / `asset.search` / `asset.read_properties`) | 3 |
 | 4.5-r2-b2 | Mesh sockets (`asset.list_sockets` / `add_socket` / `remove_socket` — Static + Skeletal) | 3 |
+| 4.5-r2-b3 | Textures (`asset.list_textures` / `get_texture_info` / `set_texture_settings`) | 3 |
 
 ## Build & Run Commands
 

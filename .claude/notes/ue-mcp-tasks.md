@@ -332,9 +332,9 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `asset.read_datatable` — Read rows · R
 - [ ] `asset.create_datatable` — Create asset · W
 - [ ] `asset.reimport_datatable` — From JSON · W
-- [ ] `asset.list_textures` — List textures · R
-- [ ] `asset.get_texture_info` — Settings · R
-- [ ] `asset.set_texture_settings` — Compression/LOD/sRGB · W
+- [x] `asset.list_textures` → `asset.list_textures` (Phase 4.5-r2-b3; AssetRegistry FARFilter on Texture/Texture2D, recursive classes for Texture2DArray/Cube)
+- [x] `asset.get_texture_info` → `asset.get_texture_info` (Phase 4.5-r2-b3; compression/address/filter/srgb/lod_bias + Texture2D width/height/num_mips/pixel_format)
+- [x] `asset.set_texture_settings` → `asset.set_texture_settings` (Phase 4.5-r2-b3; partial fields, FScopedTransaction + PostEditChange, PIE rejected, unknown values -> -32602)
 - [x] `asset.add_socket` → `asset.add_socket` (Phase 4.5-r2-b2; UStaticMeshSocket + USkeletalMeshSocket via NewObject + AddSocket/MeshOnly list, FScopedTransaction wrapped, PIE rejected)
 - [x] `asset.remove_socket` → `asset.remove_socket` (Phase 4.5-r2-b2; FindSocket + RemoveSocket / mesh-only list scan, FScopedTransaction wrapped, PIE rejected)
 - [x] `asset.list_sockets` → `asset.list_sockets` (Phase 4.5-r2-b2; reads UStaticMesh::Sockets / USkeletalMesh::GetMeshOnlySocketList — skeleton-derived sockets excluded)

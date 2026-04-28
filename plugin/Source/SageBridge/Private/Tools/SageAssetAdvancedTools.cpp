@@ -16,6 +16,7 @@
 #include "Engine/SkeletalMesh.h"
 #include "Engine/SkeletalMeshSocket.h"
 #include "Engine/Texture.h"
+#include "Engine/Texture2D.h"
 #include "FileHelpers.h"
 #include "IAssetTools.h"
 #include "Modules/ModuleManager.h"
@@ -498,6 +499,293 @@ FSageToolDispatch::FOutcome ReadAssetPropertiesImpl(const TSharedPtr<FJsonObject
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- asset.list_textures / asset.get_texture_info / asset.set_texture_settings
+// ---- (Phase 4.5 round 2 batch 3) -----------------------------------------
+
+namespace tex_helpers
+{
+    const TCHAR* CompressionToStr(TextureCompressionSettings C)
+    {
+        switch (C)
+        {
+            case TC_Default:                return TEXT("Default");
+            case TC_Normalmap:              return TEXT("Normalmap");
+            case TC_Masks:                  return TEXT("Masks");
+            case TC_Grayscale:              return TEXT("Grayscale");
+            case TC_Displacementmap:        return TEXT("Displacementmap");
+            case TC_VectorDisplacementmap:  return TEXT("VectorDisplacementmap");
+            case TC_HDR:                    return TEXT("HDR");
+            case TC_EditorIcon:             return TEXT("EditorIcon");
+            case TC_Alpha:                  return TEXT("Alpha");
+            case TC_DistanceFieldFont:      return TEXT("DistanceFieldFont");
+            case TC_HDR_Compressed:         return TEXT("HDR_Compressed");
+            case TC_BC7:                    return TEXT("BC7");
+            case TC_HalfFloat:              return TEXT("HalfFloat");
+            case TC_LQ:                     return TEXT("LQ");
+            case TC_EncodedReflectionCapture: return TEXT("EncodedReflectionCapture");
+            case TC_SingleFloat:            return TEXT("SingleFloat");
+            case TC_HDR_F32:                return TEXT("HDR_F32");
+            default:                        return TEXT("Unknown");
+        }
+    }
+
+    bool ParseCompression(const FString& S, TextureCompressionSettings& Out)
+    {
+        const FString L = S.ToLower();
+        if      (L == TEXT("default"))                 Out = TC_Default;
+        else if (L == TEXT("normalmap"))               Out = TC_Normalmap;
+        else if (L == TEXT("masks"))                   Out = TC_Masks;
+        else if (L == TEXT("grayscale"))               Out = TC_Grayscale;
+        else if (L == TEXT("displacementmap"))         Out = TC_Displacementmap;
+        else if (L == TEXT("vectordisplacementmap"))   Out = TC_VectorDisplacementmap;
+        else if (L == TEXT("hdr"))                     Out = TC_HDR;
+        else if (L == TEXT("editoricon"))              Out = TC_EditorIcon;
+        else if (L == TEXT("alpha"))                   Out = TC_Alpha;
+        else if (L == TEXT("distancefieldfont"))       Out = TC_DistanceFieldFont;
+        else if (L == TEXT("hdr_compressed"))          Out = TC_HDR_Compressed;
+        else if (L == TEXT("bc7"))                     Out = TC_BC7;
+        else if (L == TEXT("halffloat"))               Out = TC_HalfFloat;
+        else if (L == TEXT("lq"))                      Out = TC_LQ;
+        else if (L == TEXT("singlefloat"))             Out = TC_SingleFloat;
+        else if (L == TEXT("hdr_f32"))                 Out = TC_HDR_F32;
+        else return false;
+        return true;
+    }
+
+    const TCHAR* AddressToStr(TextureAddress A)
+    {
+        switch (A)
+        {
+            case TA_Wrap:   return TEXT("Wrap");
+            case TA_Clamp:  return TEXT("Clamp");
+            case TA_Mirror: return TEXT("Mirror");
+            default:        return TEXT("Unknown");
+        }
+    }
+
+    bool ParseAddress(const FString& S, TextureAddress& Out)
+    {
+        const FString L = S.ToLower();
+        if      (L == TEXT("wrap"))   Out = TA_Wrap;
+        else if (L == TEXT("clamp"))  Out = TA_Clamp;
+        else if (L == TEXT("mirror")) Out = TA_Mirror;
+        else return false;
+        return true;
+    }
+
+    const TCHAR* FilterToStr(TextureFilter F)
+    {
+        switch (F)
+        {
+            case TF_Nearest:   return TEXT("Nearest");
+            case TF_Bilinear:  return TEXT("Bilinear");
+            case TF_Trilinear: return TEXT("Trilinear");
+            case TF_Default:   return TEXT("Default");
+            default:           return TEXT("Unknown");
+        }
+    }
+
+    bool ParseFilter(const FString& S, TextureFilter& Out)
+    {
+        const FString L = S.ToLower();
+        if      (L == TEXT("nearest"))   Out = TF_Nearest;
+        else if (L == TEXT("bilinear"))  Out = TF_Bilinear;
+        else if (L == TEXT("trilinear")) Out = TF_Trilinear;
+        else if (L == TEXT("default"))   Out = TF_Default;
+        else return false;
+        return true;
+    }
+}
+
+FSageToolDispatch::FOutcome ListTexturesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Dir = TEXT("/Game");
+    if (Args.IsValid()) Args->TryGetStringField(TEXT("directory"), Dir);
+    int32 MaxResults = 1000;
+    if (Args.IsValid())
+    {
+        double N = 0;
+        if (Args->TryGetNumberField(TEXT("max_results"), N))
+        {
+            MaxResults = FMath::Clamp(static_cast<int32>(N), 1, 50000);
+        }
+    }
+
+    FAssetRegistryModule& Module = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(
+        TEXT("AssetRegistry"));
+    IAssetRegistry& Registry = Module.Get();
+
+    FARFilter Filter;
+    Filter.PackagePaths.Add(FName(*Dir));
+    Filter.bRecursivePaths = true;
+    Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.Texture2D")));
+    Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.Texture")));
+    Filter.bRecursiveClasses = true;
+
+    TArray<FAssetData> Found;
+    Registry.GetAssets(Filter, Found);
+
+    TArray<TSharedPtr<FJsonValue>> Out;
+    for (const FAssetData& A : Found)
+    {
+        if (Out.Num() >= MaxResults) break;
+        auto O = MakeShared<FJsonObject>();
+        O->SetStringField(TEXT("path"), A.GetSoftObjectPath().ToString());
+        O->SetStringField(TEXT("name"), A.AssetName.ToString());
+        O->SetStringField(TEXT("kind"), A.AssetClassPath.GetAssetName().ToString());
+        Out.Add(MakeShared<FJsonValueObject>(O));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("directory"), Dir);
+    R->SetArrayField (TEXT("textures"),  Out);
+    R->SetNumberField(TEXT("returned"),  Out.Num());
+    R->SetNumberField(TEXT("total"),     Found.Num());
+    R->SetBoolField  (TEXT("capped"),    Out.Num() < Found.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome GetTextureInfoImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UObject* Asset = ResolveAsset(Path);
+    UTexture* Tex = Cast<UTexture>(Asset);
+    if (!Tex) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("not a UTexture: %s"),
+                        Asset ? *Asset->GetClass()->GetName() : TEXT("<not found>")));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),         Tex->GetPathName());
+    R->SetStringField(TEXT("class"),        Tex->GetClass()->GetName());
+    R->SetStringField(TEXT("compression"),  tex_helpers::CompressionToStr(Tex->CompressionSettings));
+    R->SetStringField(TEXT("address_x"),    tex_helpers::AddressToStr(static_cast<TextureAddress>(Tex->GetTextureAddressX())));
+    R->SetStringField(TEXT("address_y"),    tex_helpers::AddressToStr(static_cast<TextureAddress>(Tex->GetTextureAddressY())));
+    R->SetStringField(TEXT("filter"),       tex_helpers::FilterToStr(Tex->Filter));
+    R->SetBoolField  (TEXT("srgb"),         Tex->SRGB);
+    R->SetBoolField  (TEXT("never_stream"), Tex->NeverStream);
+    R->SetNumberField(TEXT("lod_bias"),     Tex->LODBias);
+    R->SetNumberField(TEXT("compression_quality"), Tex->CompressionQuality);
+
+    if (UTexture2D* Tex2D = Cast<UTexture2D>(Asset))
+    {
+        R->SetNumberField(TEXT("width"),  Tex2D->GetSizeX());
+        R->SetNumberField(TEXT("height"), Tex2D->GetSizeY());
+        R->SetNumberField(TEXT("num_mips"), Tex2D->GetNumMips());
+        EPixelFormat PF = Tex2D->GetPixelFormat();
+        R->SetStringField(TEXT("pixel_format"), GetPixelFormatString(PF));
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetTextureSettingsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UObject* Asset = ResolveAsset(Path);
+    UTexture* Tex = Cast<UTexture>(Asset);
+    if (!Tex) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("not a UTexture: %s"),
+                        Asset ? *Asset->GetClass()->GetName() : TEXT("<not found>")));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Tex->GetPathName());
+
+    bool bChanged = false;
+    {
+        FScopedTransaction Tx(LOCTEXT("SetTextureSettings", "Set Texture Settings"));
+        Tex->Modify();
+
+        FString S;
+        if (Args->TryGetStringField(TEXT("compression"), S))
+        {
+            TextureCompressionSettings V;
+            if (!tex_helpers::ParseCompression(S, V))
+            {
+                return FSageToolDispatch::FOutcome::MakeError(-32602,
+                    FString::Printf(TEXT("unknown compression '%s'"), *S));
+            }
+            Tex->CompressionSettings = V;
+            R->SetStringField(TEXT("compression_set"), S);
+            bChanged = true;
+        }
+        if (Args->TryGetStringField(TEXT("address_x"), S))
+        {
+            TextureAddress V;
+            if (!tex_helpers::ParseAddress(S, V))
+            {
+                return FSageToolDispatch::FOutcome::MakeError(-32602,
+                    FString::Printf(TEXT("unknown address_x '%s'"), *S));
+            }
+            if (UTexture2D* Tex2D = Cast<UTexture2D>(Asset)) Tex2D->AddressX = V;
+            R->SetStringField(TEXT("address_x_set"), S);
+            bChanged = true;
+        }
+        if (Args->TryGetStringField(TEXT("address_y"), S))
+        {
+            TextureAddress V;
+            if (!tex_helpers::ParseAddress(S, V))
+            {
+                return FSageToolDispatch::FOutcome::MakeError(-32602,
+                    FString::Printf(TEXT("unknown address_y '%s'"), *S));
+            }
+            if (UTexture2D* Tex2D = Cast<UTexture2D>(Asset)) Tex2D->AddressY = V;
+            R->SetStringField(TEXT("address_y_set"), S);
+            bChanged = true;
+        }
+        if (Args->TryGetStringField(TEXT("filter"), S))
+        {
+            TextureFilter V;
+            if (!tex_helpers::ParseFilter(S, V))
+            {
+                return FSageToolDispatch::FOutcome::MakeError(-32602,
+                    FString::Printf(TEXT("unknown filter '%s'"), *S));
+            }
+            Tex->Filter = V;
+            R->SetStringField(TEXT("filter_set"), S);
+            bChanged = true;
+        }
+        bool B = false;
+        if (Args->TryGetBoolField(TEXT("srgb"), B))
+        {
+            Tex->SRGB = B;
+            R->SetBoolField(TEXT("srgb_set"), B);
+            bChanged = true;
+        }
+        if (Args->TryGetBoolField(TEXT("never_stream"), B))
+        {
+            Tex->NeverStream = B;
+            R->SetBoolField(TEXT("never_stream_set"), B);
+            bChanged = true;
+        }
+        double N = 0;
+        if (Args->TryGetNumberField(TEXT("lod_bias"), N))
+        {
+            Tex->LODBias = static_cast<int32>(N);
+            R->SetNumberField(TEXT("lod_bias_set"), N);
+            bChanged = true;
+        }
+
+        if (bChanged)
+        {
+            Tex->PostEditChange();
+            Tex->MarkPackageDirty();
+        }
+    }
+
+    R->SetBoolField(TEXT("changed"), bChanged);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---- asset.list_sockets / asset.add_socket / asset.remove_socket --------
 // ---- (Phase 4.5 round 2 batch 2: static + skeletal mesh sockets) --------
 
@@ -758,6 +1046,11 @@ void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("asset.list_sockets"),       GT(&ListSocketsImpl));
     Dispatch.RegisterHandler(TEXT("asset.add_socket"),         GT(&AddSocketImpl));
     Dispatch.RegisterHandler(TEXT("asset.remove_socket"),      GT(&RemoveSocketImpl));
+
+    // Phase 4.5-r2 batch 3: textures
+    Dispatch.RegisterHandler(TEXT("asset.list_textures"),         GT(&ListTexturesImpl));
+    Dispatch.RegisterHandler(TEXT("asset.get_texture_info"),      GT(&GetTextureInfoImpl));
+    Dispatch.RegisterHandler(TEXT("asset.set_texture_settings"),  GT(&SetTextureSettingsImpl));
 
     // Write
     Dispatch.RegisterHandler(TEXT("asset.bulk_rename"),        GT(&BulkRenameImpl));
