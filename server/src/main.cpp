@@ -2524,6 +2524,73 @@ int main() {
         },
         .handler = nullptr, .remote = true,
     });
+    // Phase 4.5-r2 batch 5: mesh material slots
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.list_mesh_materials",
+        .description = "List material slots on a UStaticMesh or "
+                       "USkeletalMesh. Returns {kind, slots: [{index, "
+                       "slot_name, imported_name, material}], count}. "
+                       "material is the asset path of the bound "
+                       "UMaterialInterface or empty string.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.set_mesh_material",
+        .description = "Bind a UMaterialInterface to a UStaticMesh "
+                       "material slot via UStaticMesh::SetMaterial. "
+                       "Empty material clears the slot. Errors -32602 "
+                       "if slot is out of range or the material can't "
+                       "be resolved. FScopedTransaction wrapped, "
+                       "PostEditChange propagated. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"slot",     {{"type", "integer"}, {"minimum", 0}}},
+                {"material", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "slot"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.set_sk_material_slots",
+        .description = "Bulk-edit USkeletalMesh material slots — for "
+                       "each item in slots, sets material (empty=clear) "
+                       "and optionally slot_name. Returns {applied: "
+                       "[{index, material}], count}. -32602 if any "
+                       "index is out of range or material can't be "
+                       "resolved (whole batch rolls back). PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",  {{"type", "string"}}},
+                {"slots", {
+                    {"type", "array"},
+                    {"items", {
+                        {"type", "object"},
+                        {"properties", {
+                            {"index",     {{"type", "integer"}, {"minimum", 0}}},
+                            {"material",  {{"type", "string"}}},
+                            {"slot_name", {{"type", "string"}}},
+                        }},
+                        {"required", nlohmann::json::array({"index"})},
+                    }},
+                }},
+            }},
+            {"required", nlohmann::json::array({"path", "slots"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // Phase 4.5-r2 batch 4: write essentials
     registerRemote(sage::mcp::Tool{
         .name = "asset.create_data_asset",

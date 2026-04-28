@@ -18,6 +18,7 @@
 #include "Engine/Texture.h"
 #include "Engine/Texture2D.h"
 #include "Engine/DataAsset.h"
+#include "Materials/MaterialInterface.h"
 #include "FileHelpers.h"
 #include "IAssetTools.h"
 #include "Modules/ModuleManager.h"
@@ -498,6 +499,216 @@ FSageToolDispatch::FOutcome ReadAssetPropertiesImpl(const TSharedPtr<FJsonObject
     R->SetStringField(TEXT("class"),      Obj->GetClass()->GetName());
     R->SetObjectField(TEXT("properties"), Props);
     R->SetNumberField(TEXT("count"),      Count);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- asset.list_mesh_materials / asset.set_mesh_material / asset.set_sk_material_slots
+// ---- (Phase 4.5 round 2 batch 5) -----------------------------------------
+
+namespace mat_helpers
+{
+    UMaterialInterface* ResolveMaterial(const FString& Path)
+    {
+        if (Path.IsEmpty()) return nullptr;
+        FSoftObjectPath Soft(Path);
+        UObject* Obj = Soft.ResolveObject();
+        if (!Obj) Obj = Soft.TryLoad();
+        return Cast<UMaterialInterface>(Obj);
+    }
+}
+
+FSageToolDispatch::FOutcome ListMeshMaterialsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UObject* Asset = ResolveAsset(Path);
+    if (!Asset) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("asset not found"));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Asset->GetPathName());
+    TArray<TSharedPtr<FJsonValue>> Slots;
+
+    if (UStaticMesh* SM = Cast<UStaticMesh>(Asset))
+    {
+        const TArray<FStaticMaterial>& Mats = SM->GetStaticMaterials();
+        for (int32 I = 0; I < Mats.Num(); ++I)
+        {
+            const FStaticMaterial& M = Mats[I];
+            auto S = MakeShared<FJsonObject>();
+            S->SetNumberField(TEXT("index"),         I);
+            S->SetStringField(TEXT("slot_name"),     M.MaterialSlotName.ToString());
+            S->SetStringField(TEXT("imported_name"), M.ImportedMaterialSlotName.ToString());
+            S->SetStringField(TEXT("material"),
+                M.MaterialInterface ? M.MaterialInterface->GetPathName() : TEXT(""));
+            Slots.Add(MakeShared<FJsonValueObject>(S));
+        }
+        R->SetStringField(TEXT("kind"), TEXT("static_mesh"));
+    }
+    else if (USkeletalMesh* SK = Cast<USkeletalMesh>(Asset))
+    {
+        TArray<FSkeletalMaterial>& Mats = SK->GetMaterials();
+        for (int32 I = 0; I < Mats.Num(); ++I)
+        {
+            const FSkeletalMaterial& M = Mats[I];
+            auto S = MakeShared<FJsonObject>();
+            S->SetNumberField(TEXT("index"),         I);
+            S->SetStringField(TEXT("slot_name"),     M.MaterialSlotName.ToString());
+            S->SetStringField(TEXT("imported_name"), M.ImportedMaterialSlotName.ToString());
+            S->SetStringField(TEXT("material"),
+                M.MaterialInterface ? M.MaterialInterface->GetPathName() : TEXT(""));
+            Slots.Add(MakeShared<FJsonValueObject>(S));
+        }
+        R->SetStringField(TEXT("kind"), TEXT("skeletal_mesh"));
+    }
+    else
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("asset is %s, expected StaticMesh or SkeletalMesh"),
+                            *Asset->GetClass()->GetName()));
+    }
+
+    R->SetArrayField (TEXT("slots"), Slots);
+    R->SetNumberField(TEXT("count"), Slots.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetMeshMaterialImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    double SlotN = -1;
+    if (!Args->TryGetNumberField(TEXT("slot"), SlotN))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'slot'"));
+    }
+    int32 Slot = static_cast<int32>(SlotN);
+    FString MaterialPath;
+    Args->TryGetStringField(TEXT("material"), MaterialPath);
+
+    UObject* Asset = ResolveAsset(Path);
+    UStaticMesh* SM = Cast<UStaticMesh>(Asset);
+    if (!SM) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("not a UStaticMesh: %s"),
+                        Asset ? *Asset->GetClass()->GetName() : TEXT("<not found>")));
+
+    if (Slot < 0 || Slot >= SM->GetStaticMaterials().Num())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("slot %d out of range (have %d)"),
+                            Slot, SM->GetStaticMaterials().Num()));
+    }
+
+    UMaterialInterface* Mat = nullptr;
+    if (!MaterialPath.IsEmpty())
+    {
+        Mat = mat_helpers::ResolveMaterial(MaterialPath);
+        if (!Mat)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("material not found: %s"), *MaterialPath));
+        }
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SetMeshMaterial", "Set Mesh Material"));
+    SM->Modify();
+    SM->SetMaterial(Slot, Mat);  // nullptr clears slot
+    SM->MarkPackageDirty();
+    SM->PostEditChange();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),     SM->GetPathName());
+    R->SetNumberField(TEXT("slot"),     Slot);
+    R->SetStringField(TEXT("material"), Mat ? Mat->GetPathName() : TEXT(""));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetSkMaterialSlotsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    const TArray<TSharedPtr<FJsonValue>>* SlotArr = nullptr;
+    if (!Args->TryGetArrayField(TEXT("slots"), SlotArr) || !SlotArr || SlotArr->Num() == 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing/empty 'slots'"));
+    }
+
+    UObject* Asset = ResolveAsset(Path);
+    USkeletalMesh* SK = Cast<USkeletalMesh>(Asset);
+    if (!SK) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("not a USkeletalMesh: %s"),
+                        Asset ? *Asset->GetClass()->GetName() : TEXT("<not found>")));
+
+    TArray<FSkeletalMaterial>& Mats = SK->GetMaterials();
+
+    FScopedTransaction Tx(LOCTEXT("SetSkMaterialSlots", "Set SK Material Slots"));
+    SK->Modify();
+
+    int32 NumApplied = 0;
+    TArray<TSharedPtr<FJsonValue>> Applied;
+    for (const TSharedPtr<FJsonValue>& V : *SlotArr)
+    {
+        const TSharedPtr<FJsonObject>* Item = nullptr;
+        if (!V.IsValid() || !V->TryGetObject(Item) || !Item || !Item->IsValid()) continue;
+        double IndexN = -1;
+        if (!(*Item)->TryGetNumberField(TEXT("index"), IndexN)) continue;
+        int32 Index = static_cast<int32>(IndexN);
+        if (Index < 0 || Index >= Mats.Num())
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("slot %d out of range (have %d)"),
+                                Index, Mats.Num()));
+        }
+        FString MatPath;
+        (*Item)->TryGetStringField(TEXT("material"), MatPath);
+
+        if (!MatPath.IsEmpty())
+        {
+            UMaterialInterface* Mat = mat_helpers::ResolveMaterial(MatPath);
+            if (!Mat)
+            {
+                return FSageToolDispatch::FOutcome::MakeError(-32602,
+                    FString::Printf(TEXT("material not found: %s"), *MatPath));
+            }
+            Mats[Index].MaterialInterface = Mat;
+        }
+        else
+        {
+            Mats[Index].MaterialInterface = nullptr;
+        }
+        FString SlotName;
+        if ((*Item)->TryGetStringField(TEXT("slot_name"), SlotName))
+        {
+            Mats[Index].MaterialSlotName = FName(*SlotName);
+        }
+        ++NumApplied;
+        auto E = MakeShared<FJsonObject>();
+        E->SetNumberField(TEXT("index"),    Index);
+        E->SetStringField(TEXT("material"), Mats[Index].MaterialInterface
+            ? Mats[Index].MaterialInterface->GetPathName() : TEXT(""));
+        Applied.Add(MakeShared<FJsonValueObject>(E));
+    }
+    SK->MarkPackageDirty();
+    SK->PostEditChange();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),    SK->GetPathName());
+    R->SetArrayField (TEXT("applied"), Applied);
+    R->SetNumberField(TEXT("count"),   NumApplied);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1247,6 +1458,11 @@ void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("asset.create_data_asset"),     GT(&CreateDataAssetImpl));
     Dispatch.RegisterHandler(TEXT("asset.delete_batch"),          GT(&DeleteBatchImpl));
     Dispatch.RegisterHandler(TEXT("asset.reload_package"),        GT(&ReloadPackageImpl));
+
+    // Phase 4.5-r2 batch 5: mesh material slots
+    Dispatch.RegisterHandler(TEXT("asset.list_mesh_materials"),   GT(&ListMeshMaterialsImpl));
+    Dispatch.RegisterHandler(TEXT("asset.set_mesh_material"),     GT(&SetMeshMaterialImpl));
+    Dispatch.RegisterHandler(TEXT("asset.set_sk_material_slots"), GT(&SetSkMaterialSlotsImpl));
 
     // Write
     Dispatch.RegisterHandler(TEXT("asset.bulk_rename"),        GT(&BulkRenameImpl));

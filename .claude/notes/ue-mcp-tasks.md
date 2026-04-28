@@ -322,7 +322,7 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [x] `asset.delete_batch` → `asset.delete_batch` (Phase 4.5-r2-b4; UEditorAssetSubsystem::DeleteAsset per path inside one FScopedTransaction; missing paths soft-tolerated; returns deleted/missing/failed/total)
 - [x] `asset.create_data_asset` → `asset.create_data_asset` (Phase 4.5-r2-b4; manual CreatePackage + NewObject<UObject>(Pkg, Cls) — no AssetTools factory dep; rejects non-UDataAsset, deprecated, duplicate package)
 - [x] `asset.save` → `save_assets`
-- [ ] `asset.set_mesh_material` — Material on slot · W
+- [x] `asset.set_mesh_material` → `asset.set_mesh_material` (Phase 4.5-r2-b5; UStaticMesh::SetMaterial; nullptr clears slot; out-of-range/missing-material -> -32602)
 - [ ] `asset.recenter_pivot` — Mesh pivot to center · W
 - [ ] `asset.import_static_mesh` — From FBX/OBJ · W
 - [ ] `asset.import_skeletal_mesh` — From FBX · W
@@ -343,7 +343,8 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `asset.search_fts` — SQLite FTS5 ranked search · R
 - [ ] `asset.reindex_fts` — Rebuild FTS index · W
 - [~] `asset.get_referencers` → `references_to` (Phase 2 graph; semantic match)
-- [ ] `asset.set_sk_material_slots` — Skeletal mesh slots · W
+- [x] `asset.set_sk_material_slots` → `asset.set_sk_material_slots` (Phase 4.5-r2-b5; bulk USkeletalMesh::GetMaterials() edit; per-slot {index, material, slot_name}; whole-batch atomic; PIE rejected)
+- [x] (NEW) `asset.list_mesh_materials` — list slots on Static or Skeletal mesh (Phase 4.5-r2-b5)
 - [x] `asset.diagnose_registry` → `asset.diagnose_registry`
 - [x] `asset.get_mesh_bounds` → `asset.get_mesh_bounds`
 - [x] `asset.get_mesh_collision` → `asset.get_mesh_collision`
