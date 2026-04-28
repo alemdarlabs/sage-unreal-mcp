@@ -10,7 +10,7 @@
 
 | Category | Have | Need | Total | % |
 |---|---:|---:|---:|---:|
-| project | 10 | 19 | 29 | 34 |
+| project | 13 | 16 | 29 | 45 |
 | editor | 15 | 29 | 44 | 34 |
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **134** | **314** | **448** | **30** |
+| **TOTAL** | **137** | **311** | **448** | **31** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -57,9 +57,9 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [~] `project.get_status` — Server mode + editor connection · R · Sage `get_world` (partial, different scope)
 - [ ] `project.set_project` — Switch project + reconnect · W
 - [x] `project.get_info` → `project.get_info` (Phase 4.7-p1; .uproject parse, plugins, declared modules)
-- [ ] `project.read_config` — Read INI by name with sections · R
-- [ ] `project.search_config` — Substring search across INIs · R
-- [ ] `project.list_config_tags` — Extract gameplay tags from config · R
+- [x] `project.read_config` → `project.read_config` (Phase 4.7-p3; sectioned parse + raw mode + UE INI +/-/!/. modifier capture)
+- [x] `project.search_config` → `project.search_config` (Phase 4.7-p3; substring across all *.ini under Config/)
+- [x] `project.list_config_tags` → `project.list_config_tags` (Phase 4.7-p3; +GameplayTagList=(Tag="...") pattern scan)
 - [x] `project.read_cpp_header` → `project.read_cpp_header` (Phase 4.7-p1; heuristic regex UCLASS/USTRUCT/UENUM scan)
 - [ ] `project.read_module` — Read module source with header/source counts · R
 - [x] `project.list_modules` → `project.list_modules` (Phase 4.7-p1; Source/<X>/<X>.Build.cs scan with header/source counts)

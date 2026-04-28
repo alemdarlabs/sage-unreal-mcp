@@ -2264,6 +2264,61 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // ---- Project introspection batch 3 (Phase 4.7 batch 3) -------------
+    registerRemote(sage::mcp::Tool{
+        .name = "project.read_config",
+        .description = "Read a UE INI config file from the project's "
+                       "Config/ directory. name accepts 'Game' / "
+                       "'DefaultGame' / 'DefaultGame.ini' (all resolve to "
+                       "Config/DefaultGame.ini). raw=true returns the "
+                       "verbatim file content; default returns parsed "
+                       "{sections: [{name, entries: [{key, value, "
+                       "modifier?}]}]}. modifier captures leading +/-/!/. "
+                       "tokens (UE INI array op syntax). -32602 on missing "
+                       "file.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"name", {{"type", "string"}}},
+                {"raw",  {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "project.search_config",
+        .description = "Substring search across all *.ini under "
+                       "Config/. Returns same {hits, count, capped} shape "
+                       "as project.search_cpp.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"query",       {{"type", "string"}}},
+                {"max_results", {{"type", "integer"},
+                                 {"minimum", 1}, {"maximum", 500}}},
+            }},
+            {"required", nlohmann::json::array({"query"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "project.list_config_tags",
+        .description = "Enumerate gameplay tags declared across all INI "
+                       "files in the project's Config/ tree. Parses lines "
+                       "of the form '+GameplayTagList=(Tag=\"Foo.Bar\", "
+                       "DevComment=\"...\")'. Returns "
+                       "{tags: [{tag, dev_comment?, source, line}], count}. "
+                       "Read-only.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // ---- Editor automation (Phase 4.6) ---------------------------------
     registerRemote(sage::mcp::Tool{
         .name = "editor.console_command",

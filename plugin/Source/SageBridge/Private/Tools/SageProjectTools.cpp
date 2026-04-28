@@ -415,6 +415,218 @@ FSageToolDispatch::FOutcome ProjectFindEngineSymbolImpl(const TSharedPtr<FJsonOb
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// Phase 4.7-p3: INI config introspection.
+
+// Resolve config name -> full path. Accepts:
+//   "Game"             -> ProjectDir/Config/DefaultGame.ini
+//   "DefaultGame"      -> ProjectDir/Config/DefaultGame.ini
+//   "DefaultGame.ini"  -> ProjectDir/Config/DefaultGame.ini
+//   "Engine"           -> ProjectDir/Config/DefaultEngine.ini
+// Returns empty FString if the resolved file doesn't exist.
+FString ResolveConfigPath(const FString& Name)
+{
+    const FString Dir = FPaths::ProjectDir() / TEXT("Config");
+    FString Base = Name;
+    if (Base.EndsWith(TEXT(".ini"))) Base.LeftChopInline(4);
+    if (!Base.StartsWith(TEXT("Default"))) Base = FString(TEXT("Default")) + Base;
+    const FString Full = Dir / (Base + TEXT(".ini"));
+    if (!IFileManager::Get().FileExists(*Full)) return FString();
+    return FPaths::ConvertRelativePathToFull(Full);
+}
+
+// Parse INI text into [{section, entries: [{key, value}]}]. UE INI is
+// loose: handles +Key=Val (array append) and -Key=Val (array remove) by
+// collapsing both to the bare key with a leading-char prefix in value
+// metadata. Bracket-section header on its own line; comments start with
+// `;` or `//`. We don't expand env vars or process .Build.cs-style
+// includes — that's out of scope.
+TSharedRef<FJsonObject> ParseIniContent(const FString& Content)
+{
+    auto Root = MakeShared<FJsonObject>();
+    TArray<TSharedPtr<FJsonValue>> Sections;
+
+    TArray<FString> Lines;
+    Content.ParseIntoArrayLines(Lines, /*bCullEmpty*/ false);
+
+    TSharedPtr<FJsonObject> CurrentSection;
+    TArray<TSharedPtr<FJsonValue>> CurrentEntries;
+    auto FlushSection = [&]() {
+        if (CurrentSection.IsValid())
+        {
+            CurrentSection->SetArrayField(TEXT("entries"), CurrentEntries);
+            Sections.Add(MakeShared<FJsonValueObject>(CurrentSection));
+        }
+        CurrentSection.Reset();
+        CurrentEntries.Empty();
+    };
+
+    for (const FString& Raw : Lines)
+    {
+        FString L = Raw;
+        L.TrimStartAndEndInline();
+        if (L.IsEmpty()) continue;
+        if (L.StartsWith(TEXT(";")) || L.StartsWith(TEXT("//"))) continue;
+
+        if (L.StartsWith(TEXT("[")) && L.EndsWith(TEXT("]")))
+        {
+            FlushSection();
+            CurrentSection = MakeShared<FJsonObject>();
+            CurrentSection->SetStringField(TEXT("name"), L.Mid(1, L.Len() - 2));
+            continue;
+        }
+
+        // Key=Value line. Allow leading +/- modifiers.
+        FString Mod;
+        if (!L.IsEmpty() && (L[0] == TEXT('+') || L[0] == TEXT('-') || L[0] == TEXT('!') || L[0] == TEXT('.')))
+        {
+            Mod = FString(1, &L[0]);
+            L.RemoveAt(0);
+        }
+        int32 EqIdx;
+        if (!L.FindChar(TEXT('='), EqIdx)) continue;
+        const FString Key = L.Left(EqIdx).TrimStartAndEnd();
+        const FString Val = L.Mid(EqIdx + 1);  // value preserved verbatim (may contain quotes / commas)
+
+        auto E = MakeShared<FJsonObject>();
+        E->SetStringField(TEXT("key"),   Key);
+        E->SetStringField(TEXT("value"), Val);
+        if (!Mod.IsEmpty()) E->SetStringField(TEXT("modifier"), Mod);
+        CurrentEntries.Add(MakeShared<FJsonValueObject>(E));
+    }
+    FlushSection();
+
+    Root->SetArrayField(TEXT("sections"), Sections);
+    Root->SetNumberField(TEXT("section_count"), Sections.Num());
+    return Root;
+}
+
+FSageToolDispatch::FOutcome ProjectReadConfigImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Name;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+    }
+    const FString Path = ResolveConfigPath(Name);
+    if (Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("config not found: %s (resolved miss)"), *Name));
+    }
+
+    FString Content;
+    if (!FFileHelper::LoadFileToString(Content, *Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("could not read: %s"), *Path));
+    }
+
+    bool bRaw = false;
+    Args->TryGetBoolField(TEXT("raw"), bRaw);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("name"), Name);
+    R->SetStringField(TEXT("path"), Path);
+    R->SetNumberField(TEXT("size_bytes"), Content.Len());
+    if (bRaw)
+    {
+        R->SetStringField(TEXT("content"), Content);
+    }
+    else
+    {
+        const TSharedRef<FJsonObject> Parsed = ParseIniContent(Content);
+        R->SetArrayField (TEXT("sections"),       Parsed->GetArrayField(TEXT("sections")));
+        R->SetNumberField(TEXT("section_count"),  Parsed->GetNumberField(TEXT("section_count")));
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ProjectSearchConfigImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Query;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("query"), Query) || Query.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing/empty 'query'"));
+    }
+    int32 MaxResults = 50;
+    double Num = 0;
+    if (Args->TryGetNumberField(TEXT("max_results"), Num))
+    {
+        MaxResults = FMath::Clamp(static_cast<int32>(Num), 1, 500);
+    }
+
+    const FString ConfigDir = FPaths::ProjectDir() / TEXT("Config");
+
+    TArray<FSearchHit> Hits;
+    SearchInDir(ConfigDir, Query, {TEXT(".ini")}, MaxResults, 200, Hits);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("query"),    Query);
+    R->SetStringField(TEXT("root"),     FPaths::ConvertRelativePathToFull(ConfigDir));
+    R->SetArrayField (TEXT("hits"),     SearchHitsToJson(Hits));
+    R->SetNumberField(TEXT("count"),    Hits.Num());
+    R->SetBoolField  (TEXT("capped"),   Hits.Num() >= MaxResults);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ProjectListConfigTagsImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    // Read DefaultGameplayTags.ini. Lines look like:
+    //   +GameplayTagList=(Tag="Foo.Bar", DevComment="optional")
+    // Some projects also use additional INI files under Config/Tags/ —
+    // we scan all *.ini in Config/ for safety and grab any GameplayTag
+    // / GameplayTagList line.
+    const FString ConfigDir = FPaths::ProjectDir() / TEXT("Config");
+    IFileManager& FileMgr   = IFileManager::Get();
+
+    TArray<FString> IniFiles;
+    FileMgr.FindFilesRecursive(IniFiles, *ConfigDir, TEXT("*.ini"), true, false);
+
+    TArray<TSharedPtr<FJsonValue>> Out;
+    for (const FString& IniPath : IniFiles)
+    {
+        FString Content;
+        if (!FFileHelper::LoadFileToString(Content, *IniPath)) continue;
+        if (!Content.Contains(TEXT("GameplayTag"))) continue;
+
+        TArray<FString> Lines;
+        Content.ParseIntoArrayLines(Lines, false);
+        for (int32 i = 0; i < Lines.Num(); ++i)
+        {
+            const FString& L = Lines[i];
+            const int32 TagIdx = L.Find(TEXT("Tag=\""));
+            if (TagIdx == INDEX_NONE) continue;
+            const int32 NameStart = TagIdx + 5;
+            int32 EndQuote = L.Find(TEXT("\""), ESearchCase::IgnoreCase, ESearchDir::FromStart, NameStart);
+            if (EndQuote == INDEX_NONE) continue;
+            const FString Tag = L.Mid(NameStart, EndQuote - NameStart);
+            if (Tag.IsEmpty()) continue;
+
+            FString Comment;
+            const int32 ComIdx = L.Find(TEXT("DevComment=\""));
+            if (ComIdx != INDEX_NONE)
+            {
+                const int32 CStart = ComIdx + 12;
+                const int32 CEnd = L.Find(TEXT("\""), ESearchCase::IgnoreCase, ESearchDir::FromStart, CStart);
+                if (CEnd != INDEX_NONE) Comment = L.Mid(CStart, CEnd - CStart);
+            }
+
+            auto O = MakeShared<FJsonObject>();
+            O->SetStringField(TEXT("tag"),     Tag);
+            if (!Comment.IsEmpty()) O->SetStringField(TEXT("dev_comment"), Comment);
+            O->SetStringField(TEXT("source"),  FPaths::ConvertRelativePathToFull(IniPath));
+            O->SetNumberField(TEXT("line"),    i + 1);
+            Out.Add(MakeShared<FJsonValueObject>(O));
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("config_dir"), FPaths::ConvertRelativePathToFull(ConfigDir));
+    R->SetArrayField (TEXT("tags"),       Out);
+    R->SetNumberField(TEXT("count"),      Out.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 FSageToolDispatch::FOutcome ProjectReadCppSourceImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString InPath;
@@ -488,6 +700,11 @@ void RegisterProjectTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("project.list_engine_modules"), GT(&ProjectListEngineModulesImpl));
     Dispatch.RegisterHandler(TEXT("project.read_engine_header"),  GT(&ProjectReadEngineHeaderImpl));
     Dispatch.RegisterHandler(TEXT("project.find_engine_symbol"),  GT(&ProjectFindEngineSymbolImpl));
+
+    // Phase 4.7 batch 3: INI config tree
+    Dispatch.RegisterHandler(TEXT("project.read_config"),         GT(&ProjectReadConfigImpl));
+    Dispatch.RegisterHandler(TEXT("project.search_config"),       GT(&ProjectSearchConfigImpl));
+    Dispatch.RegisterHandler(TEXT("project.list_config_tags"),    GT(&ProjectListConfigTagsImpl));
 }
 
 #undef LOCTEXT_NAMESPACE
