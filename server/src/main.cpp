@@ -2132,6 +2132,70 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // ---- Project introspection (Phase 4.7 batch 1) -----------------------
+    registerRemote(sage::mcp::Tool{
+        .name = "project.get_info",
+        .description = "Read .uproject metadata: project_name, project_dir, "
+                       "engine_dir, engine_association, description, "
+                       "category, declared_modules[], plugins[]. Read-only.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "project.list_modules",
+        .description = "Walk Source/<Module>/<Module>.Build.cs and report "
+                       "each native module: {name, module_dir, "
+                       "build_cs_path, header_count, source_count}. "
+                       "Lightweight discovery before drilling into a "
+                       "specific module via read_cpp_header.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "project.read_cpp_header",
+        .description = "Read a .h file and regex-scan for UCLASS / "
+                       "USTRUCT / UENUM declarations + #include directives. "
+                       "path is relative to project root or absolute "
+                       "(must be under ProjectDir or EngineDir for "
+                       "safety). Returns {classes[], structs[], enums[], "
+                       "includes[], line_count}. Each declaration is "
+                       "{name, line}. NOT a full UHT parse — heuristic "
+                       "regex; gets ~95% of common UE headers right.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "project.read_cpp_source",
+        .description = "Read a .h / .cpp / .inl source file as a string, "
+                       "capped at max_bytes (default 64KB, clamped "
+                       "1KB..512KB). Path same form as read_cpp_header. "
+                       "Returns {content, size_bytes, truncated, "
+                       "max_bytes}. truncated=true means orig file was "
+                       "larger and content has been Left()'d.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",      {{"type", "string"}}},
+                {"max_bytes", {{"type", "integer"},
+                               {"minimum", 1024}, {"maximum", 524288}}},
+            }},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // ---- Editor automation (Phase 4.6) ---------------------------------
     registerRemote(sage::mcp::Tool{
         .name = "editor.console_command",

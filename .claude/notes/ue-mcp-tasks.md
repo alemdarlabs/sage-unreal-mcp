@@ -10,7 +10,7 @@
 
 | Category | Have | Need | Total | % |
 |---|---:|---:|---:|---:|
-| project | 2 | 27 | 29 | 7 |
+| project | 6 | 23 | 29 | 21 |
 | editor | 15 | 29 | 44 | 34 |
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **126** | **322** | **448** | **28** |
+| **TOTAL** | **130** | **318** | **448** | **29** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -56,13 +56,13 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 
 - [~] `project.get_status` — Server mode + editor connection · R · Sage `get_world` (partial, different scope)
 - [ ] `project.set_project` — Switch project + reconnect · W
-- [ ] `project.get_info` — Read .uproject metadata · R
+- [x] `project.get_info` → `project.get_info` (Phase 4.7-p1; .uproject parse, plugins, declared modules)
 - [ ] `project.read_config` — Read INI by name with sections · R
 - [ ] `project.search_config` — Substring search across INIs · R
 - [ ] `project.list_config_tags` — Extract gameplay tags from config · R
-- [ ] `project.read_cpp_header` — Parse .h for classes/structs/enums · R
+- [x] `project.read_cpp_header` → `project.read_cpp_header` (Phase 4.7-p1; heuristic regex UCLASS/USTRUCT/UENUM scan)
 - [ ] `project.read_module` — Read module source with header/source counts · R
-- [ ] `project.list_modules` — List C++ modules in project · R
+- [x] `project.list_modules` → `project.list_modules` (Phase 4.7-p1; Source/<X>/<X>.Build.cs scan with header/source counts)
 - [ ] `project.search_cpp` — Search .h/.cpp for query · R
 - [ ] `project.read_engine_header` — Parse engine source .h · R
 - [ ] `project.find_engine_symbol` — Grep engine source for symbol · R
@@ -76,7 +76,7 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `project.live_coding_compile` — Trigger LC compile · W
 - [ ] `project.live_coding_status` — LC availability · R · Sage has `get_live_coding_status` (Phase 1) — **mark as `[x]`** instead
 - [ ] `project.write_cpp_file` — Write .h/.cpp/.inl under Source/ · W
-- [ ] `project.read_cpp_source` — Read .cpp from Source/ · R
+- [x] `project.read_cpp_source` → `project.read_cpp_source` (Phase 4.7-p1; .h/.cpp/.inl read with max_bytes cap + path safety guard)
 - [ ] `project.add_module_dependency` — Append to Build.cs deps · W
 
 **Phase 4.7 candidates:** read_cpp_header, read_module, list_modules, search_cpp, read_engine_header, find_engine_symbol, read_config, search_config, list_config_tags, get_info, set_config, list_project_modules. ~12 read-side tools, mostly filesystem-only / no UE editor needed → **headless-friendly**.

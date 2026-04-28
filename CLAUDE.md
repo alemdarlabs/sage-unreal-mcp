@@ -73,7 +73,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Şu Anki Durum (Snapshot)
 
-> Tek satırda durum: **58 commit · 138 MCP tool · Phase 1+2+3 tamam · Phase 4.2 round 2g DONE · Phase 4.4 Kuzu COPY ingest 30s→4s (7.5x) · Phase 4 ~%63**.
+> Tek satırda durum: **59 commit · 142 MCP tool · Phase 1+2+3 tamam · Phase 4.2(r2) DONE · 4.4 ingest 7.5x · 4.7-p1 project introspection · Phase 4 ~%64**.
 
 - **Test ortamı**: `/Users/mahmutalemdar/Developer/alemdarlabs/SageTest/SageTest.uproject` (UE 5.7.4 Third Person + Blueprint).
 - **Knowledge graph (canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Real-time delta + query_graph + class_hierarchy çalışıyor.
@@ -109,6 +109,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 | 4.2-r2g/p3 | BP SCS-component deep CRUD (`bp.read_component_properties` / `get_component_property` / `reparent_component`) | 3 |
 | 4.2-r2g/p4 | BP diagnostics + dry-run (`bp.validate` / `bp.run_construction_script`) | 2 |
 | 4.2-r2g/p5 | BP var-flag + CDO + deps (`bp.set_variable_properties` / `bp.get_cdo_properties` / `bp.get_dependencies`) + UE 5.0 PC_Real subcategory fix | 3 |
+| 4.7-p1 | Project introspection (`project.get_info` / `list_modules` / `read_cpp_header` / `read_cpp_source`) | 4 |
 
 ## Build & Run Commands
 
