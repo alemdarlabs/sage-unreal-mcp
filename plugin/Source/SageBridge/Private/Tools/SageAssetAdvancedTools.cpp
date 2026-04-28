@@ -19,6 +19,9 @@
 #include "Engine/Texture2D.h"
 #include "Engine/DataAsset.h"
 #include "Materials/MaterialInterface.h"
+#include "Engine/DataTable.h"
+#include "HAL/FileManager.h"
+#include "Misc/FileHelper.h"
 #include "FileHelpers.h"
 #include "IAssetTools.h"
 #include "Modules/ModuleManager.h"
@@ -499,6 +502,210 @@ FSageToolDispatch::FOutcome ReadAssetPropertiesImpl(const TSharedPtr<FJsonObject
     R->SetStringField(TEXT("class"),      Obj->GetClass()->GetName());
     R->SetObjectField(TEXT("properties"), Props);
     R->SetNumberField(TEXT("count"),      Count);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- asset.read_datatable / asset.create_datatable / asset.reimport_datatable
+// ---- (Phase 4.5 round 2 batch 6) -----------------------------------------
+
+FSageToolDispatch::FOutcome ReadDataTableImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UObject* Asset = ResolveAsset(Path);
+    UDataTable* DT = Cast<UDataTable>(Asset);
+    if (!DT) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("not a UDataTable: %s"),
+                        Asset ? *Asset->GetClass()->GetName() : TEXT("<not found>")));
+
+    int32 MaxRows = 1000;
+    if (Args.IsValid())
+    {
+        double N = 0;
+        if (Args->TryGetNumberField(TEXT("max_rows"), N))
+        {
+            MaxRows = FMath::Clamp(static_cast<int32>(N), 1, 100000);
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), DT->GetPathName());
+    R->SetStringField(TEXT("row_struct"),
+        DT->RowStruct ? DT->RowStruct->GetPathName() : TEXT(""));
+
+    TArray<FName> RowNames = DT->GetRowNames();
+    R->SetNumberField(TEXT("row_count"), RowNames.Num());
+
+    TArray<TSharedPtr<FJsonValue>> Rows;
+    int32 Returned = 0;
+    if (DT->RowStruct)
+    {
+        for (const FName& Name : RowNames)
+        {
+            if (Returned >= MaxRows) break;
+            const uint8* RowData = DT->GetRowMap().FindRef(Name);
+            if (!RowData) continue;
+
+            auto Row = MakeShared<FJsonObject>();
+            Row->SetStringField(TEXT("name"), Name.ToString());
+            auto Fields = MakeShared<FJsonObject>();
+            for (TFieldIterator<FProperty> It(DT->RowStruct); It; ++It)
+            {
+                FProperty* P = *It;
+                if (!P) continue;
+                const void* Value = P->ContainerPtrToValuePtr<const void>(RowData);
+                TSharedPtr<FJsonValue> JV = detail::GetPropertyValueAtPtr(P, Value);
+                if (JV.IsValid())
+                {
+                    Fields->SetField(P->GetName(), JV);
+                }
+            }
+            Row->SetObjectField(TEXT("fields"), Fields);
+            Rows.Add(MakeShared<FJsonValueObject>(Row));
+            ++Returned;
+        }
+    }
+    R->SetArrayField(TEXT("rows"),     Rows);
+    R->SetNumberField(TEXT("returned"), Returned);
+    R->SetBoolField  (TEXT("capped"),   Returned < RowNames.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome CreateDataTableImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, StructPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("row_struct"), StructPath) || StructPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'row_struct'"));
+    }
+
+    UScriptStruct* RowStruct = FindObject<UScriptStruct>(nullptr, *StructPath);
+    if (!RowStruct) RowStruct = LoadObject<UScriptStruct>(nullptr, *StructPath);
+    if (!RowStruct)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("row_struct not found: %s"), *StructPath));
+    }
+    if (!RowStruct->IsChildOf(FTableRowBase::StaticStruct()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("%s is not a FTableRowBase subclass"),
+                            *RowStruct->GetName()));
+    }
+
+    FString PackagePath, AssetName;
+    if (!Path.Split(TEXT("/"), &PackagePath, &AssetName, ESearchCase::IgnoreCase, ESearchDir::FromEnd) ||
+        PackagePath.IsEmpty() || AssetName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("path must be /Folder/AssetName form"));
+    }
+    if (FindPackage(nullptr, *(PackagePath / AssetName)))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("package already exists: %s/%s"), *PackagePath, *AssetName));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("CreateDataTable", "Create Data Table"));
+    UPackage* Pkg = CreatePackage(*(PackagePath / AssetName));
+    if (!Pkg)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32000,
+            FString::Printf(TEXT("CreatePackage failed for %s/%s"), *PackagePath, *AssetName));
+    }
+    Pkg->FullyLoad();
+    Pkg->Modify();
+
+    UDataTable* DT = NewObject<UDataTable>(Pkg, *AssetName,
+        RF_Public | RF_Standalone | RF_Transactional);
+    if (!DT)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32000, TEXT("NewObject<UDataTable> failed"));
+    }
+    DT->RowStruct = RowStruct;
+    FAssetRegistryModule::AssetCreated(DT);
+    DT->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),       DT->GetPathName());
+    R->SetStringField(TEXT("row_struct"), RowStruct->GetPathName());
+    R->SetStringField(TEXT("name"),       DT->GetName());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ReimportDataTableImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, JsonOrFile;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UObject* Asset = ResolveAsset(Path);
+    UDataTable* DT = Cast<UDataTable>(Asset);
+    if (!DT) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("not a UDataTable: %s"),
+                        Asset ? *Asset->GetClass()->GetName() : TEXT("<not found>")));
+    if (!DT->RowStruct)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("data table has no RowStruct set"));
+    }
+
+    FString JsonString;
+    bool bGotInline = Args->TryGetStringField(TEXT("json"), JsonString);
+    FString JsonFile;
+    bool bGotFile = Args->TryGetStringField(TEXT("json_file"), JsonFile);
+    if (!bGotInline && !bGotFile)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("provide 'json' (inline) or 'json_file' (path on disk)"));
+    }
+    if (bGotFile)
+    {
+        if (!FFileHelper::LoadFileToString(JsonString, *JsonFile))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("failed to read json_file: %s"), *JsonFile));
+        }
+    }
+
+    bool bClearFirst = true;
+    Args->TryGetBoolField(TEXT("clear_first"), bClearFirst);
+
+    FScopedTransaction Tx(LOCTEXT("ReimportDataTable", "Reimport Data Table"));
+    DT->Modify();
+    if (bClearFirst) DT->EmptyTable();
+    TArray<FString> Problems = DT->CreateTableFromJSONString(JsonString);
+    DT->MarkPackageDirty();
+    DT->PostEditChange();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),      DT->GetPathName());
+    R->SetNumberField(TEXT("row_count"), DT->GetRowNames().Num());
+    R->SetBoolField  (TEXT("cleared"),   bClearFirst);
+
+    TArray<TSharedPtr<FJsonValue>> ProblemsJson;
+    for (const FString& P : Problems)
+    {
+        ProblemsJson.Add(MakeShared<FJsonValueString>(P));
+    }
+    R->SetArrayField (TEXT("problems"),       ProblemsJson);
+    R->SetNumberField(TEXT("problem_count"),  Problems.Num());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1463,6 +1670,11 @@ void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("asset.list_mesh_materials"),   GT(&ListMeshMaterialsImpl));
     Dispatch.RegisterHandler(TEXT("asset.set_mesh_material"),     GT(&SetMeshMaterialImpl));
     Dispatch.RegisterHandler(TEXT("asset.set_sk_material_slots"), GT(&SetSkMaterialSlotsImpl));
+
+    // Phase 4.5-r2 batch 6: datatable read/create/reimport
+    Dispatch.RegisterHandler(TEXT("asset.read_datatable"),        GT(&ReadDataTableImpl));
+    Dispatch.RegisterHandler(TEXT("asset.create_datatable"),      GT(&CreateDataTableImpl));
+    Dispatch.RegisterHandler(TEXT("asset.reimport_datatable"),    GT(&ReimportDataTableImpl));
 
     // Write
     Dispatch.RegisterHandler(TEXT("asset.bulk_rename"),        GT(&BulkRenameImpl));

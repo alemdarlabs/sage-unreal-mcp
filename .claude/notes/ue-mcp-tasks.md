@@ -329,9 +329,9 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `asset.import_animation` — From FBX · W
 - [ ] `asset.import_texture` — From image · W
 - [ ] `asset.reimport` — Reimport from source · W
-- [ ] `asset.read_datatable` — Read rows · R
-- [ ] `asset.create_datatable` — Create asset · W
-- [ ] `asset.reimport_datatable` — From JSON · W
+- [x] `asset.read_datatable` → `asset.read_datatable` (Phase 4.5-r2-b6; iterates RowStruct properties via Sage GetPropertyValueAtPtr; TArray/TMap/TSet/structs/enums round-tripped; max_rows clamped 1..100000)
+- [x] `asset.create_datatable` → `asset.create_datatable` (Phase 4.5-r2-b6; manual CreatePackage + NewObject<UDataTable> + RowStruct binding; rejects non-FTableRowBase; PIE rejected)
+- [x] `asset.reimport_datatable` → `asset.reimport_datatable` (Phase 4.5-r2-b6; UDataTable::CreateTableFromJSONString; inline 'json' or filesystem 'json_file'; clear_first toggle; reports problems[])
 - [x] `asset.list_textures` → `asset.list_textures` (Phase 4.5-r2-b3; AssetRegistry FARFilter on Texture/Texture2D, recursive classes for Texture2DArray/Cube)
 - [x] `asset.get_texture_info` → `asset.get_texture_info` (Phase 4.5-r2-b3; compression/address/filter/srgb/lod_bias + Texture2D width/height/num_mips/pixel_format)
 - [x] `asset.set_texture_settings` → `asset.set_texture_settings` (Phase 4.5-r2-b3; partial fields, FScopedTransaction + PostEditChange, PIE rejected, unknown values -> -32602)

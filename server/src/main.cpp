@@ -2524,6 +2524,69 @@ int main() {
         },
         .handler = nullptr, .remote = true,
     });
+    // Phase 4.5-r2 batch 6: datatable read/create/reimport
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.read_datatable",
+        .description = "Read all rows of a UDataTable. Returns "
+                       "{row_struct (path), row_count, rows: [{name, "
+                       "fields: {<col>: <value>}}], returned, capped}. "
+                       "Each row's fields go through Sage's reflection "
+                       "(structs/arrays/enums round-trip). max_rows "
+                       "clamped 1..100000 (default 1000).",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"max_rows", {{"type", "integer"}, {"minimum", 1}, {"maximum", 100000}}},
+            }},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.create_datatable",
+        .description = "Create an empty UDataTable bound to a "
+                       "UScriptStruct row type. row_struct must derive "
+                       "from FTableRowBase (UPROPERTY-tagged USTRUCT). "
+                       "Wrapped in FScopedTransaction. -32602 if "
+                       "row_struct is missing/not a row struct, or "
+                       "package already exists. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",       {{"type", "string"}}},
+                {"row_struct", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "row_struct"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.reimport_datatable",
+        .description = "Repopulate a UDataTable from JSON string or "
+                       "from a JSON file on disk. Provide either 'json' "
+                       "(inline) OR 'json_file' (filesystem path). "
+                       "clear_first defaults true (EmptyTable + "
+                       "CreateTableFromJSONString). Returns "
+                       "{row_count, problems: [...], cleared}. The "
+                       "table's RowStruct must already be set (use "
+                       "asset.create_datatable first). PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",        {{"type", "string"}}},
+                {"json",        {{"type", "string"}}},
+                {"json_file",   {{"type", "string"}}},
+                {"clear_first", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // Phase 4.5-r2 batch 5: mesh material slots
     registerRemote(sage::mcp::Tool{
         .name = "asset.list_mesh_materials",
