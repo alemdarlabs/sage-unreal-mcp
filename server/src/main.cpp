@@ -19,11 +19,14 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <string>
 
 namespace {
@@ -984,6 +987,224 @@ int main() {
     };
     if (auto r = registry->registerTool(std::move(indexStatusTool)); !r.has_value()) {
         spdlog::warn("Failed to register 'index_status'");
+    }
+
+    // ---- Knowledge layer query tools (Milestone 2.4) -------------------
+    // Cypher escape helper (kept inline to avoid pulling sage-graph internals
+    // into the public surface; refactored into a util header in 2.5).
+    auto escCypher = [](std::string_view s) {
+        std::string out;
+        out.reserve(s.size() + 2);
+        out.push_back('\'');
+        for (char c : s) {
+            if (c == '\\')      out.append("\\\\");
+            else if (c == '\'') out.append("\\'");
+            else                out.push_back(c);
+        }
+        out.push_back('\'');
+        return out;
+    };
+
+    sage::mcp::Tool impactOfTool{
+        .name        = "impact_of",
+        .description = "Reverse-traversal of DEPENDS_ON. Returns assets that "
+                       "would be affected if `asset_path` changed — i.e. "
+                       "transitive referencers up to `max_depth` hops "
+                       "(default 3, range 1..10). Result is a deduplicated "
+                       "list ordered by path; `truncated:true` indicates the "
+                       "limit was hit. Use this before edits as the safety "
+                       "check for delete/rename/refactor.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"asset_path",  {{"type", "string"},
+                                 {"description", "/Game/.../Asset.Asset (SoftObjectPath form)"}}},
+                {"max_depth",   {{"type", "integer"},
+                                 {"minimum", 1}, {"maximum", 10}}},
+                {"max_results", {{"type", "integer"},
+                                 {"minimum", 1}, {"maximum", 500}}},
+                {"slot_id",     {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"asset_path"})},
+            {"additionalProperties", false},
+        },
+        .handler = [graphMgr, resolveSlotId, escCypher](const nlohmann::json& params)
+            -> sage::mcp::ToolResult {
+            if (!params.is_object() || !params.contains("asset_path")
+                || !params["asset_path"].is_string()) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InvalidParams, "missing 'asset_path'"));
+            }
+            const auto path = params["asset_path"].get<std::string>();
+            const int  maxDepth   = std::clamp(params.value("max_depth",   3), 1, 10);
+            const int  maxResults = std::clamp(params.value("max_results", 100), 1, 500);
+
+            auto slot = resolveSlotId(params);
+            if (!slot.has_value()) return std::unexpected(slot.error());
+
+            try {
+                auto& store = graphMgr->acquireSlot(*slot);
+                std::ostringstream q;
+                q << "MATCH (target:Asset {path: " << escCypher(path)
+                  << "})<-[:DEPENDS_ON*1.." << maxDepth << "]-(impacted:Asset) "
+                  << "RETURN DISTINCT impacted.path AS path, impacted.kind AS kind "
+                  << "ORDER BY path LIMIT " << maxResults << ";";
+
+                auto r = store.execute(q.str());
+                if (sage::graph::is_error(r)) {
+                    return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                        sage::mcp::ErrorCode::InternalError,
+                        sage::graph::error_of(r).message));
+                }
+                const auto& env = sage::graph::value_of(r);
+                nlohmann::json out = nlohmann::json::object();
+                out["target"]    = path;
+                out["max_depth"] = maxDepth;
+                out["impacted"]  = env["rows"];
+                out["count"]     = env["row_count"];
+                out["truncated"] = env["row_count"].get<int64_t>() == maxResults;
+                out["slot_id"]   = *slot;
+                return out;
+            } catch (const std::exception& ex) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InternalError,
+                    std::string{"impact_of failed: "} + ex.what()));
+            }
+        },
+        .remote = false,
+    };
+    if (auto r = registry->registerTool(std::move(impactOfTool)); !r.has_value()) {
+        spdlog::warn("Failed to register 'impact_of'");
+    }
+
+    sage::mcp::Tool referencesToTool{
+        .name        = "references_to",
+        .description = "Direct (1-hop) inbound references. Returns the assets "
+                       "that explicitly DEPENDS_ON `asset_path` — equivalent "
+                       "to impact_of with max_depth=1 but cheaper. Use for "
+                       "'who imports this' surveys; use impact_of for safety "
+                       "before destructive edits.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"asset_path",  {{"type", "string"}}},
+                {"max_results", {{"type", "integer"},
+                                 {"minimum", 1}, {"maximum", 500}}},
+                {"slot_id",     {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"asset_path"})},
+            {"additionalProperties", false},
+        },
+        .handler = [graphMgr, resolveSlotId, escCypher](const nlohmann::json& params)
+            -> sage::mcp::ToolResult {
+            if (!params.is_object() || !params.contains("asset_path")
+                || !params["asset_path"].is_string()) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InvalidParams, "missing 'asset_path'"));
+            }
+            const auto path = params["asset_path"].get<std::string>();
+            const int  maxResults = std::clamp(params.value("max_results", 100), 1, 500);
+
+            auto slot = resolveSlotId(params);
+            if (!slot.has_value()) return std::unexpected(slot.error());
+
+            try {
+                auto& store = graphMgr->acquireSlot(*slot);
+                std::ostringstream q;
+                q << "MATCH (target:Asset {path: " << escCypher(path)
+                  << "})<-[:DEPENDS_ON]-(ref:Asset) "
+                  << "RETURN ref.path AS path, ref.kind AS kind "
+                  << "ORDER BY path LIMIT " << maxResults << ";";
+
+                auto r = store.execute(q.str());
+                if (sage::graph::is_error(r)) {
+                    return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                        sage::mcp::ErrorCode::InternalError,
+                        sage::graph::error_of(r).message));
+                }
+                const auto& env = sage::graph::value_of(r);
+                nlohmann::json out = nlohmann::json::object();
+                out["target"]     = path;
+                out["references"] = env["rows"];
+                out["count"]      = env["row_count"];
+                out["truncated"]  = env["row_count"].get<int64_t>() == maxResults;
+                out["slot_id"]    = *slot;
+                return out;
+            } catch (const std::exception& ex) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InternalError,
+                    std::string{"references_to failed: "} + ex.what()));
+            }
+        },
+        .remote = false,
+    };
+    if (auto r = registry->registerTool(std::move(referencesToTool)); !r.has_value()) {
+        spdlog::warn("Failed to register 'references_to'");
+    }
+
+    sage::mcp::Tool findUnusedTool{
+        .name        = "find_unused",
+        .description = "Assets with no incoming DEPENDS_ON edge — candidates "
+                       "for cleanup. CAVEAT: only catches asset-to-asset "
+                       "references tracked by AssetRegistry. C++ code "
+                       "references (e.g. UClass::FindObject('/Game/...')), "
+                       "config files, and runtime-string lookups are NOT "
+                       "in the graph; never auto-delete from this list — "
+                       "treat it as a triage view, not a kill list.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"kind",        {{"type", "string"},
+                                 {"description", "Optional: filter by asset kind (e.g. 'Texture2D')"}}},
+                {"max_results", {{"type", "integer"},
+                                 {"minimum", 1}, {"maximum", 500}}},
+                {"slot_id",     {{"type", "string"}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = [graphMgr, resolveSlotId, escCypher](const nlohmann::json& params)
+            -> sage::mcp::ToolResult {
+            const int maxResults = std::clamp(params.value("max_results", 100), 1, 500);
+            std::optional<std::string> kindFilter;
+            if (params.is_object() && params.contains("kind") && params["kind"].is_string()) {
+                kindFilter = params["kind"].get<std::string>();
+            }
+
+            auto slot = resolveSlotId(params);
+            if (!slot.has_value()) return std::unexpected(slot.error());
+
+            try {
+                auto& store = graphMgr->acquireSlot(*slot);
+                std::ostringstream q;
+                q << "MATCH (a:Asset) WHERE NOT EXISTS { MATCH (a)<-[:DEPENDS_ON]-() }";
+                if (kindFilter) q << " AND a.kind = " << escCypher(*kindFilter);
+                q << " RETURN a.path AS path, a.kind AS kind ORDER BY path LIMIT "
+                  << maxResults << ";";
+
+                auto r = store.execute(q.str());
+                if (sage::graph::is_error(r)) {
+                    return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                        sage::mcp::ErrorCode::InternalError,
+                        sage::graph::error_of(r).message));
+                }
+                const auto& env = sage::graph::value_of(r);
+                nlohmann::json out = nlohmann::json::object();
+                out["unused"]    = env["rows"];
+                out["count"]     = env["row_count"];
+                out["truncated"] = env["row_count"].get<int64_t>() == maxResults;
+                out["slot_id"]   = *slot;
+                if (kindFilter) out["kind"] = *kindFilter;
+                return out;
+            } catch (const std::exception& ex) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InternalError,
+                    std::string{"find_unused failed: "} + ex.what()));
+            }
+        },
+        .remote = false,
+    };
+    if (auto r = registry->registerTool(std::move(findUnusedTool)); !r.has_value()) {
+        spdlog::warn("Failed to register 'find_unused'");
     }
 
     // ---- HTTP+SSE transport (Claude ↔ server) ---------------------------
