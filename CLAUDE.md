@@ -73,7 +73,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Şu Anki Durum (Snapshot)
 
-> Tek satırda durum: **82 commit · 444 MCP tool · Phase 1+2+3+4 TAMAM · 10 yeni domain (Level/Gameplay/Animation/Niagara/PCG/Landscape/Foliage/Audio/Networking/GAS) · BUILD SUCCESSFUL**.
+> Tek satırda durum: **85 commit · 443 plugin tool · 456 server schema · Phase 1+2+3+4 TAMAM · 10 yeni domain (Level/Gameplay/Animation/Niagara/PCG/Landscape/Foliage/Audio/Networking/GAS) · BUILD SUCCESSFUL**.
 
 - **Test ortamı**: `/Users/mahmutalemdar/Developer/alemdarlabs/SageTest/SageTest.uproject` (UE 5.7.4 Third Person + Blueprint).
 - **Knowledge graph (canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Real-time delta + query_graph + class_hierarchy çalışıyor.
