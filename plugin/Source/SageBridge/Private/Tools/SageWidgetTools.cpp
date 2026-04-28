@@ -6,7 +6,9 @@
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
+#include "AssetToolsModule.h"
 #include "Blueprint/UserWidget.h"
+#include "IAssetTools.h"
 #include "Blueprint/WidgetTree.h"
 #include "Components/Widget.h"
 #include "Components/PanelWidget.h"
@@ -484,6 +486,392 @@ FSageToolDispatch::FOutcome ReadWidgetImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- widget.get_details ----------------------------------------------------
+
+FSageToolDispatch::FOutcome GetWidgetDetailsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    UWidgetBlueprint* WB = ResolveWidgetBlueprint(Path);
+    if (!WB) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("WidgetBlueprint not found: %s"), *Path));
+
+    TArray<TSharedPtr<FJsonValue>> Props;
+    for (TFieldIterator<FProperty> It(WB->GetClass()); It; ++It)
+    {
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("name"), It->GetName());
+        TSharedPtr<FJsonValue> Val = detail::GetUPropertyAsJson(WB, *It);
+        if (Val) J->SetField(TEXT("value"), Val);
+        Props.Add(MakeShared<FJsonValueObject>(J));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),       WB->GetPathName());
+    R->SetArrayField (TEXT("properties"), Props);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- widget.read_animations ------------------------------------------------
+
+FSageToolDispatch::FOutcome ReadWidgetAnimationsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    UWidgetBlueprint* WB = ResolveWidgetBlueprint(Path);
+    if (!WB) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("WidgetBlueprint not found: %s"), *Path));
+
+    TArray<TSharedPtr<FJsonValue>> Anims;
+    // Animations stored as UWidgetAnimation objects in the generated class
+    for (TFieldIterator<FProperty> It(WB->GetClass()); It; ++It)
+    {
+        FObjectProperty* ObjProp = CastField<FObjectProperty>(*It);
+        if (!ObjProp) continue;
+        if (ObjProp->PropertyClass && ObjProp->PropertyClass->GetName().Contains(TEXT("WidgetAnimation")))
+        {
+            auto J = MakeShared<FJsonObject>();
+            J->SetStringField(TEXT("name"), It->GetName());
+            Anims.Add(MakeShared<FJsonValueObject>(J));
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),       WB->GetPathName());
+    R->SetArrayField (TEXT("animations"), Anims);
+    R->SetNumberField(TEXT("count"),      Anims.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- widget.create_utility_widget ------------------------------------------
+
+FSageToolDispatch::FOutcome CreateUtilityWidgetImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    UClass* EUWCls = FindObject<UClass>(nullptr,
+        TEXT("/Script/Blutility.EditorUtilityWidget"));
+    if (!EUWCls) EUWCls = LoadObject<UClass>(nullptr,
+        TEXT("/Script/Blutility.EditorUtilityWidget"));
+    if (!EUWCls) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        TEXT("EditorUtilityWidget not found — Blutility plugin required"));
+
+    FString PackagePath, AssetName;
+    if (!Path.Split(TEXT("/"), &PackagePath, &AssetName,
+        ESearchCase::IgnoreCase, ESearchDir::FromEnd))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("invalid path"));
+
+    // Use WidgetBlueprintFactory with EditorUtilityWidget parent
+    UWidgetBlueprintFactory* Factory = NewObject<UWidgetBlueprintFactory>();
+    Factory->ParentClass = EUWCls;
+
+    IAssetTools& AT = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+    UObject* NewObj = AT.CreateAsset(AssetName, PackagePath, nullptr, Factory);
+    if (!NewObj) return FSageToolDispatch::FOutcome::MakeError(-32000, TEXT("CreateAsset failed"));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),         NewObj->GetPathName());
+    R->SetStringField(TEXT("parent_class"), TEXT("EditorUtilityWidget"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- widget.run_utility_widget ---------------------------------------------
+
+FSageToolDispatch::FOutcome RunUtilityWidgetImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    UClass* EUWSCls = FindObject<UClass>(nullptr,
+        TEXT("/Script/Blutility.EditorUtilityWidgetBlueprint"));
+    if (!EUWSCls) EUWSCls = LoadObject<UClass>(nullptr,
+        TEXT("/Script/Blutility.EditorUtilityWidgetBlueprint"));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Path);
+    R->SetStringField(TEXT("note"),
+        TEXT("Use editor.run_python: 'import unreal; "
+             "unreal.EditorUtilitySubsystem.spawn_and_register_tab(asset)' "
+             "or trigger via editor right-click context menu"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- widget.create_utility_blueprint ---------------------------------------
+
+FSageToolDispatch::FOutcome CreateUtilityBlueprintImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    UClass* EUBCls = FindObject<UClass>(nullptr,
+        TEXT("/Script/Blutility.GlobalEditorUtilityBase"));
+    if (!EUBCls) EUBCls = LoadObject<UClass>(nullptr,
+        TEXT("/Script/Blutility.GlobalEditorUtilityBase"));
+    if (!EUBCls) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        TEXT("GlobalEditorUtilityBase not found — Blutility plugin required"));
+
+    FString PackagePath, AssetName;
+    if (!Path.Split(TEXT("/"), &PackagePath, &AssetName,
+        ESearchCase::IgnoreCase, ESearchDir::FromEnd))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("invalid path"));
+
+    IAssetTools& AT = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+    UObject* NewObj = AT.CreateAsset(AssetName, PackagePath, EUBCls, nullptr);
+    if (!NewObj) return FSageToolDispatch::FOutcome::MakeError(-32000, TEXT("CreateAsset failed"));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),         NewObj->GetPathName());
+    R->SetStringField(TEXT("parent_class"), TEXT("GlobalEditorUtilityBase"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- widget.run_utility_blueprint ------------------------------------------
+
+FSageToolDispatch::FOutcome RunUtilityBlueprintImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    FSoftObjectPath Soft(Path);
+    UObject* Obj = Soft.TryLoad();
+    if (!Obj) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("asset not found: %s"), *Path));
+
+    // Try to find and call Run() method via reflection
+    UFunction* RunFn = Obj->FindFunction(TEXT("Run"));
+    if (!RunFn) RunFn = Obj->FindFunction(TEXT("Execute"));
+    if (RunFn)
+    {
+        Obj->ProcessEvent(RunFn, nullptr);
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"),    Obj->GetPathName());
+        R->SetBoolField  (TEXT("invoked"), true);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Obj->GetPathName());
+    R->SetStringField(TEXT("note"), TEXT("No Run/Execute function found; call via editor context menu or UEditorUtilityLibrary"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- widget.move_widget ----------------------------------------------------
+
+FSageToolDispatch::FOutcome MoveWidgetImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, WidgetName, NewParentName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"),           Path)
+        || !Args->TryGetStringField(TEXT("widget_name"),    WidgetName)
+        || !Args->TryGetStringField(TEXT("new_parent"),     NewParentName))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'widget_name', or 'new_parent'"));
+
+    UWidgetBlueprint* WB = ResolveWidgetBlueprint(Path);
+    if (!WB) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("WidgetBlueprint not found: %s"), *Path));
+
+    if (!WB->WidgetTree)
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("WidgetTree missing"));
+
+    UWidget* Target = nullptr;
+    UPanelWidget* NewParent = nullptr;
+    TArray<UWidget*> All;
+    WB->WidgetTree->GetAllWidgets(All);
+    for (UWidget* W : All)
+    {
+        if (!Target && W->GetName() == WidgetName) Target = W;
+        if (!NewParent && W->GetName() == NewParentName) NewParent = Cast<UPanelWidget>(W);
+    }
+
+    if (!Target) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("widget not found: %s"), *WidgetName));
+    if (!NewParent) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("parent not found or not a panel: %s"), *NewParentName));
+
+    FScopedTransaction Tx(LOCTEXT("MoveWidget", "Move Widget"));
+    WB->Modify();
+    WB->WidgetTree->Modify();
+
+    // Remove from current parent
+    if (UPanelWidget* OldParent = Target->GetParent())
+    {
+        OldParent->Modify();
+        OldParent->RemoveChild(Target);
+    }
+    NewParent->Modify();
+    NewParent->AddChild(Target);
+    WB->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("widget"),     WidgetName);
+    R->SetStringField(TEXT("new_parent"), NewParentName);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- widget.list_classes ---------------------------------------------------
+
+FSageToolDispatch::FOutcome ListWidgetClassesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Filter;
+    if (Args.IsValid()) Args->TryGetStringField(TEXT("filter"), Filter);
+
+    TArray<TSharedPtr<FJsonValue>> Classes;
+    for (TObjectIterator<UClass> It; It; ++It)
+    {
+        UClass* Cls = *It;
+        if (!Cls || !Cls->IsChildOf(UWidget::StaticClass())) continue;
+        if (Cls->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated)) continue;
+        FString Name = Cls->GetName();
+        if (!Filter.IsEmpty() && !Name.Contains(Filter, ESearchCase::IgnoreCase)) continue;
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("name"),  Name);
+        J->SetStringField(TEXT("path"),  FSoftObjectPath(Cls).ToString());
+        Classes.Add(MakeShared<FJsonValueObject>(J));
+        if (Classes.Num() >= 200) break;
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetArrayField (TEXT("classes"), Classes);
+    R->SetNumberField(TEXT("count"),   Classes.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- widget.list_runtime ---------------------------------------------------
+
+FSageToolDispatch::FOutcome ListRuntimeWidgetsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    // List widgets active in PIE world
+    UWorld* PieWorld = nullptr;
+    if (GEngine)
+    {
+        for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+        {
+            if (Ctx.WorldType == EWorldType::PIE && Ctx.World())
+            {
+                PieWorld = Ctx.World(); break;
+            }
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    if (!PieWorld)
+    {
+        R->SetStringField(TEXT("note"), TEXT("no PIE world active; widget.list_runtime requires active Play session"));
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    // Query via player controller viewport client
+    TArray<TSharedPtr<FJsonValue>> Widgets;
+    for (TObjectIterator<UUserWidget> It; It; ++It)
+    {
+        UUserWidget* W = *It;
+        if (!W->IsInViewport()) continue;
+        if (W->GetWorld() != PieWorld) continue;
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("name"),  W->GetName());
+        J->SetStringField(TEXT("class"), W->GetClass()->GetName());
+        Widgets.Add(MakeShared<FJsonValueObject>(J));
+    }
+
+    R->SetArrayField (TEXT("widgets"), Widgets);
+    R->SetNumberField(TEXT("count"),   Widgets.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- widget.get_runtime ----------------------------------------------------
+
+FSageToolDispatch::FOutcome GetRuntimeWidgetImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString WidgetName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("name"), WidgetName))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+
+    UUserWidget* Found = nullptr;
+    for (TObjectIterator<UUserWidget> It; It; ++It)
+    {
+        UUserWidget* Candidate = *It;
+        if (Candidate->GetName() == WidgetName)
+        {
+            Found = Candidate; break;
+        }
+    }
+
+    if (!Found) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("runtime widget not found: %s"), *WidgetName));
+
+    TArray<TSharedPtr<FJsonValue>> Props;
+    for (TFieldIterator<FProperty> It(Found->GetClass()); It; ++It)
+    {
+        if (It->HasAnyPropertyFlags(CPF_Transient | CPF_Deprecated)) continue;
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("name"), It->GetName());
+        TSharedPtr<FJsonValue> Val = detail::GetUPropertyAsJson(Found, *It);
+        if (Val) J->SetField(TEXT("value"), Val);
+        Props.Add(MakeShared<FJsonValueObject>(J));
+        if (Props.Num() >= 100) break;
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("name"),        Found->GetName());
+    R->SetStringField(TEXT("class"),       Found->GetClass()->GetName());
+    R->SetBoolField  (TEXT("in_viewport"), Found->IsInViewport());
+    R->SetArrayField (TEXT("properties"),  Props);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- widget.get_runtime_delegates ------------------------------------------
+
+FSageToolDispatch::FOutcome GetRuntimeDelegatesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    UWidgetBlueprint* WB = ResolveWidgetBlueprint(Path);
+    if (!WB) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("WidgetBlueprint not found: %s"), *Path));
+
+    TArray<TSharedPtr<FJsonValue>> Delegates;
+    UClass* SearchClass = WB->GeneratedClass
+        ? (UClass*)WB->GeneratedClass
+        : WB->GetClass();
+    for (TFieldIterator<FProperty> It(SearchClass); It; ++It)
+    {
+        FMulticastDelegateProperty* Prop = CastField<FMulticastDelegateProperty>(*It);
+        if (!Prop) continue;
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("name"), Prop->GetName());
+        FString ExtendedType;
+        J->SetStringField(TEXT("cpp_type"), Prop->GetCPPType(&ExtendedType, 0));
+        Delegates.Add(MakeShared<FJsonValueObject>(J));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),      WB->GetPathName());
+    R->SetArrayField (TEXT("delegates"), Delegates);
+    R->SetNumberField(TEXT("count"),     Delegates.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 }  // namespace (anonymous)
 
 void RegisterWidgetTools(FSageToolDispatch& Dispatch)
@@ -505,6 +893,19 @@ void RegisterWidgetTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("widget.add_widget"),    GT(&AddWidgetImpl));
     Dispatch.RegisterHandler(TEXT("widget.remove_widget"), GT(&RemoveWidgetImpl));
     Dispatch.RegisterHandler(TEXT("widget.set_property"),  GT(&SetWidgetPropertyImpl));
+
+    // Trailing widget tools
+    Dispatch.RegisterHandler(TEXT("widget.get_details"),            GT(&GetWidgetDetailsImpl));
+    Dispatch.RegisterHandler(TEXT("widget.read_animations"),        GT(&ReadWidgetAnimationsImpl));
+    Dispatch.RegisterHandler(TEXT("widget.create_utility_widget"),  GT(&CreateUtilityWidgetImpl));
+    Dispatch.RegisterHandler(TEXT("widget.run_utility_widget"),     GT(&RunUtilityWidgetImpl));
+    Dispatch.RegisterHandler(TEXT("widget.create_utility_blueprint"),GT(&CreateUtilityBlueprintImpl));
+    Dispatch.RegisterHandler(TEXT("widget.run_utility_blueprint"),  GT(&RunUtilityBlueprintImpl));
+    Dispatch.RegisterHandler(TEXT("widget.move_widget"),            GT(&MoveWidgetImpl));
+    Dispatch.RegisterHandler(TEXT("widget.list_classes"),           GT(&ListWidgetClassesImpl));
+    Dispatch.RegisterHandler(TEXT("widget.list_runtime"),           GT(&ListRuntimeWidgetsImpl));
+    Dispatch.RegisterHandler(TEXT("widget.get_runtime"),            GT(&GetRuntimeWidgetImpl));
+    Dispatch.RegisterHandler(TEXT("widget.get_runtime_delegates"),  GT(&GetRuntimeDelegatesImpl));
 }
 
 #undef LOCTEXT_NAMESPACE

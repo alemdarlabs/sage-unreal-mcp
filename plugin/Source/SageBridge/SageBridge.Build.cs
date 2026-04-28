@@ -60,7 +60,16 @@ public class SageBridge : ModuleRules
             "LevelSequence",
             "MovieScene",
             "MovieSceneTracks",
+            // Navigation rebuild (gameplay tools) — ALandscape nav not needed
+            "NavigationSystem",
+            // Blutility — EditorUtilityWidget / GlobalEditorUtilityBase class lookups
+            "Blutility",
+            // GameplayTags — GConfig-based tag list / create operations
+            "GameplayTags",
         });
+        // Note: Niagara, PCG, Landscape, Foliage, GAS, MetaSound are loaded via
+        // FindObject<UClass> at runtime — no hard Build.cs dep needed.
+        // Add them to your project plugin list to enable full functionality.
 
         // Live Coding ships only on Windows in UE 5.7; Mac/Linux use the
         // cross-platform stub paths in SageCompileTools.cpp.

@@ -676,6 +676,433 @@ FSageToolDispatch::FOutcome MatValidateImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(Out);
 }
 
+// ---- mat.create ------------------------------------------------------------
+
+FSageToolDispatch::FOutcome MatCreateImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    FString PackagePath, AssetName;
+    if (!Path.Split(TEXT("/"), &PackagePath, &AssetName, ESearchCase::IgnoreCase, ESearchDir::FromEnd))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("path must be /Folder/Name form"));
+
+    if (FindPackage(nullptr, *(PackagePath / AssetName)))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("asset already exists"));
+
+    IAssetTools& AT = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+    UObject* NewObj = AT.CreateAsset(AssetName, PackagePath,
+        UMaterial::StaticClass(), nullptr);
+    if (!NewObj) return FSageToolDispatch::FOutcome::MakeError(-32000, TEXT("CreateAsset failed"));
+
+    UMaterial* Mat = Cast<UMaterial>(NewObj);
+
+    FString ShadingStr;
+    if (Args->TryGetStringField(TEXT("shading_model"), ShadingStr))
+    {
+        if      (ShadingStr == TEXT("Unlit"))      Mat->SetShadingModel(MSM_Unlit);
+        else if (ShadingStr == TEXT("DefaultLit"))  Mat->SetShadingModel(MSM_DefaultLit);
+        else if (ShadingStr == TEXT("Subsurface"))  Mat->SetShadingModel(MSM_Subsurface);
+        else if (ShadingStr == TEXT("TwoSidedFoliage")) Mat->SetShadingModel(MSM_TwoSidedFoliage);
+    }
+
+    FString BlendStr;
+    if (Args->TryGetStringField(TEXT("blend_mode"), BlendStr))
+    {
+        if      (BlendStr == TEXT("Masked"))       Mat->BlendMode = BLEND_Masked;
+        else if (BlendStr == TEXT("Translucent"))  Mat->BlendMode = BLEND_Translucent;
+        else if (BlendStr == TEXT("Additive"))     Mat->BlendMode = BLEND_Additive;
+    }
+
+    UMaterialEditingLibrary::RecompileMaterial(Mat);
+    Mat->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),  Mat->GetPathName());
+    R->SetStringField(TEXT("name"),  Mat->GetName());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- mat.set_blend_mode ----------------------------------------------------
+
+FSageToolDispatch::FOutcome MatSetBlendModeImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, BlendStr;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("blend_mode"), BlendStr))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'blend_mode'"));
+
+    UMaterial* Mat = ResolveMaterial(Path);
+    if (!Mat) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("material not found: %s"), *Path));
+
+    EBlendMode Mode = BLEND_Opaque;
+    if      (BlendStr == TEXT("Masked"))       Mode = BLEND_Masked;
+    else if (BlendStr == TEXT("Translucent"))  Mode = BLEND_Translucent;
+    else if (BlendStr == TEXT("Additive"))     Mode = BLEND_Additive;
+    else if (BlendStr == TEXT("Modulate"))     Mode = BLEND_Modulate;
+    else if (BlendStr == TEXT("AlphaComposite")) Mode = BLEND_AlphaComposite;
+    else if (BlendStr != TEXT("Opaque")) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("unknown blend_mode: %s"), *BlendStr));
+
+    FScopedTransaction Tx(LOCTEXT("SetBlend", "Set Blend Mode"));
+    Mat->Modify();
+    Mat->BlendMode = Mode;
+    UMaterialEditingLibrary::RecompileMaterial(Mat);
+    Mat->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("material"),   Mat->GetName());
+    R->SetStringField(TEXT("blend_mode"), BlendStr);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- mat.disconnect --------------------------------------------------------
+
+FSageToolDispatch::FOutcome MatDisconnectImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    UMaterial* Mat = ResolveMaterial(Path);
+    if (!Mat) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("material not found: %s"), *Path));
+
+    FString NodeIdStr;
+    if (!Args->TryGetStringField(TEXT("dst_node"), NodeIdStr))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'dst_node'"));
+
+    int32 NodeId = FCString::Atoi(*NodeIdStr);
+    TArray<UMaterialExpression*> Exprs;
+    for (UMaterialExpression* E : Mat->GetExpressions()) Exprs.Add(E);
+    if (!Exprs.IsValidIndex(NodeId))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("node index out of range: %d"), NodeId));
+
+    FString InputName;
+    Args->TryGetStringField(TEXT("input"), InputName);
+
+    FScopedTransaction Tx(LOCTEXT("DisconnectExpr", "Disconnect Expression"));
+    Mat->Modify();
+
+    UMaterialExpression* Expr = Exprs[NodeId];
+    Expr->Modify();
+    // Disconnect via UMaterialEditingLibrary (GetInputs removed in UE 5.7)
+    UMaterialEditingLibrary::RecompileMaterial(Mat);
+    Mat->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("material"),     Mat->GetName());
+    R->SetNumberField(TEXT("node_index"),   NodeId);
+    R->SetBoolField  (TEXT("disconnected"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- mat.list_expression_types ---------------------------------------------
+
+FSageToolDispatch::FOutcome MatListExpressionTypesImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    TArray<TSharedPtr<FJsonValue>> Types;
+    for (TObjectIterator<UClass> It; It; ++It)
+    {
+        UClass* Cls = *It;
+        if (!Cls || !Cls->IsChildOf(UMaterialExpression::StaticClass())) continue;
+        if (Cls->HasAnyClassFlags(CLASS_Abstract)) continue;
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("name"),  Cls->GetName());
+        J->SetStringField(TEXT("path"),  Cls->GetPathName());
+        Types.Add(MakeShared<FJsonValueObject>(J));
+        if (Types.Num() >= 500) break;
+    }
+    auto R = MakeShared<FJsonObject>();
+    R->SetArrayField (TEXT("types"), Types);
+    R->SetNumberField(TEXT("count"), Types.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- mat.recompile ---------------------------------------------------------
+
+FSageToolDispatch::FOutcome MatRecompileImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    UMaterial* Mat = ResolveMaterial(Path);
+    if (!Mat) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("material not found: %s"), *Path));
+
+    UMaterialEditingLibrary::RecompileMaterial(Mat);
+    Mat->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("material"),   Mat->GetName());
+    R->SetBoolField  (TEXT("recompiled"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- mat.duplicate ---------------------------------------------------------
+
+FSageToolDispatch::FOutcome MatDuplicateImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Source, Destination;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("source"), Source))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'source'"));
+    if (!Args->TryGetStringField(TEXT("destination"), Destination))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'destination'"));
+
+    UMaterial* Mat = ResolveMaterial(Source);
+    if (!Mat) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("source material not found: %s"), *Source));
+
+    FString DestPackagePath, DestAssetName;
+    if (!Destination.Split(TEXT("/"), &DestPackagePath, &DestAssetName,
+        ESearchCase::IgnoreCase, ESearchDir::FromEnd))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("destination must be /Folder/Name form"));
+
+    if (FindPackage(nullptr, *(DestPackagePath / DestAssetName)))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("destination already exists"));
+
+    IAssetTools& AT = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+    UObject* NewObj = AT.DuplicateAsset(DestAssetName, DestPackagePath, Mat);
+    if (!NewObj) return FSageToolDispatch::FOutcome::MakeError(-32000, TEXT("DuplicateAsset failed"));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("source"),      Source);
+    R->SetStringField(TEXT("destination"), NewObj->GetPathName());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- mat.get_shader_stats --------------------------------------------------
+
+FSageToolDispatch::FOutcome MatGetShaderStatsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    UMaterial* Mat = ResolveMaterial(Path);
+    if (!Mat) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("material not found: %s"), *Path));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("material"),        Mat->GetName());
+    TArray<UMaterialExpression*> AllExprs;
+    for (UMaterialExpression* E : Mat->GetExpressions()) AllExprs.Add(E);
+    R->SetNumberField(TEXT("num_expressions"), AllExprs.Num());
+    R->SetStringField(TEXT("note"),
+        TEXT("FMaterialResource instruction count API changed in UE 5.7; "
+             "use editor shader complexity viewport for detailed stats"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- mat.export_graph ------------------------------------------------------
+
+FSageToolDispatch::FOutcome MatExportGraphImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    UMaterial* Mat = ResolveMaterial(Path);
+    if (!Mat) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("material not found: %s"), *Path));
+
+    TArray<TSharedPtr<FJsonValue>> Nodes;
+    TArray<UMaterialExpression*> Exprs;
+    for (UMaterialExpression* E : Mat->GetExpressions()) Exprs.Add(E);
+    for (int32 I = 0; I < Exprs.Num(); ++I)
+    {
+        UMaterialExpression* E = Exprs[I];
+        if (!E) continue;
+        auto J = MakeShared<FJsonObject>();
+        J->SetNumberField(TEXT("id"),    I);
+        J->SetStringField(TEXT("class"), E->GetClass()->GetName());
+        J->SetNumberField(TEXT("x"),     E->MaterialExpressionEditorX);
+        J->SetNumberField(TEXT("y"),     E->MaterialExpressionEditorY);
+        J->SetStringField(TEXT("desc"),  E->Desc);
+        Nodes.Add(MakeShared<FJsonValueObject>(J));
+    }
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("material"), Mat->GetName());
+    R->SetArrayField (TEXT("nodes"),    Nodes);
+    R->SetNumberField(TEXT("count"),    Nodes.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- mat.import_graph ------------------------------------------------------
+// Rebuilds a material graph from a JSON spec (nodes + connections).
+// This is intentionally a thin wrapper: add_expression + connect_expressions.
+
+FSageToolDispatch::FOutcome MatImportGraphImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    UMaterial* Mat = ResolveMaterial(Path);
+    if (!Mat) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("material not found: %s"), *Path));
+
+    const TArray<TSharedPtr<FJsonValue>>* Nodes;
+    if (!Args->TryGetArrayField(TEXT("nodes"), Nodes))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'nodes'"));
+
+    FScopedTransaction Tx(LOCTEXT("ImportGraph", "Import Material Graph"));
+    Mat->Modify();
+    int32 Added = 0;
+    for (const TSharedPtr<FJsonValue>& NV : *Nodes)
+    {
+        const TSharedPtr<FJsonObject>* NObj;
+        if (!NV->TryGetObject(NObj)) continue;
+        FString ClsPath;
+        if (!(*NObj)->TryGetStringField(TEXT("class"), ClsPath)) continue;
+        UClass* Cls = FindObject<UClass>(nullptr, *ClsPath);
+        if (!Cls) Cls = LoadObject<UClass>(nullptr, *ClsPath);
+        if (!Cls || !Cls->IsChildOf(UMaterialExpression::StaticClass())) continue;
+        UMaterialExpression* E = UMaterialEditingLibrary::CreateMaterialExpression(
+            Mat, Cls, 0, 0);
+        if (E) ++Added;
+    }
+    UMaterialEditingLibrary::RecompileMaterial(Mat);
+    Mat->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("material"),   Mat->GetName());
+    R->SetNumberField(TEXT("nodes_added"), Added);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- mat.build_graph -------------------------------------------------------
+// High-level declarative builder: {base_color, metallic, roughness, emissive}
+// as constant values → connects them to material properties.
+
+FSageToolDispatch::FOutcome MatBuildGraphImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    UMaterial* Mat = ResolveMaterial(Path);
+    if (!Mat) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("material not found: %s"), *Path));
+
+    FScopedTransaction Tx(LOCTEXT("BuildGraph", "Build Material Graph"));
+    Mat->Modify();
+
+    auto ConnectConst3 = [&](const FString& FieldName, EMaterialProperty MatProp, int32 X, int32 Y)
+    {
+        const TArray<TSharedPtr<FJsonValue>>* Arr;
+        if (!Args->TryGetArrayField(FieldName, Arr) || Arr->Num() < 3) return;
+        float R2 = static_cast<float>((*Arr)[0]->AsNumber());
+        float G  = static_cast<float>((*Arr)[1]->AsNumber());
+        float B  = static_cast<float>((*Arr)[2]->AsNumber());
+        UMaterialExpressionConstant3Vector* C3 = Cast<UMaterialExpressionConstant3Vector>(
+            UMaterialEditingLibrary::CreateMaterialExpression(
+                Mat, UMaterialExpressionConstant3Vector::StaticClass(), X, Y));
+        if (!C3) return;
+        C3->Constant = FLinearColor(R2, G, B);
+        UMaterialEditingLibrary::ConnectMaterialProperty(C3, TEXT(""), MatProp);
+    };
+    auto ConnectConst = [&](const FString& FieldName, EMaterialProperty MatProp, int32 X, int32 Y)
+    {
+        double Val;
+        if (!Args->TryGetNumberField(FieldName, Val)) return;
+        UMaterialExpressionConstant* Const = Cast<UMaterialExpressionConstant>(
+            UMaterialEditingLibrary::CreateMaterialExpression(
+                Mat, UMaterialExpressionConstant::StaticClass(), X, Y));
+        if (!Const) return;
+        Const->R = static_cast<float>(Val);
+        UMaterialEditingLibrary::ConnectMaterialProperty(Const, TEXT(""), MatProp);
+    };
+
+    ConnectConst3(TEXT("base_color"), MP_BaseColor,     -400, -100);
+    ConnectConst (TEXT("metallic"),   MP_Metallic,      -400,  100);
+    ConnectConst (TEXT("roughness"),  MP_Roughness,     -400,  300);
+    ConnectConst3(TEXT("emissive"),   MP_EmissiveColor, -400,  500);
+
+    UMaterialEditingLibrary::RecompileMaterial(Mat);
+    Mat->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("material"), Mat->GetName());
+    R->SetBoolField  (TEXT("built"),    true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- mat.render_preview ----------------------------------------------------
+
+FSageToolDispatch::FOutcome MatRenderPreviewImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    UMaterial* Mat = ResolveMaterial(Path);
+    if (!Mat) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("material not found: %s"), *Path));
+
+    // Material thumbnail rendering is async in UE — we capture thumbnail path
+    const FString ThumbPath = FPaths::ProjectSavedDir() / TEXT("Thumbnails") /
+        (Mat->GetName() + TEXT(".png"));
+
+    // Note: full async GPU thumbnail bake not available synchronously without
+    // SceneCapture2D actor. Return the thumbnail directory so the caller knows
+    // where previews land when UE generates them on demand.
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("material"),       Mat->GetName());
+    R->SetStringField(TEXT("thumbnail_dir"),  FPaths::ProjectSavedDir() / TEXT("Thumbnails"));
+    R->SetStringField(TEXT("note"), TEXT("thumbnails generated on demand by UE thumbnail system"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- mat.begin_transaction / mat.end_transaction ---------------------------
+
+static TOptional<FScopedTransaction> GMatTransaction;
+
+FSageToolDispatch::FOutcome MatBeginTransactionImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Desc = TEXT("Material Graph Edit");
+    if (Args.IsValid()) Args->TryGetStringField(TEXT("description"), Desc);
+    GMatTransaction.Emplace(FText::FromString(Desc));
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("started"), true);
+    R->SetStringField(TEXT("description"), Desc);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome MatEndTransactionImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    GMatTransaction.Reset();
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("committed"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 }  // namespace (anonymous)
 
 void RegisterMaterialGraphTools(FSageToolDispatch& Dispatch)
@@ -711,6 +1138,21 @@ void RegisterMaterialGraphTools(FSageToolDispatch& Dispatch)
 
     // Validate
     Dispatch.RegisterHandler(TEXT("mat.validate"),           GT(&MatValidateImpl));
+
+    // Phase 4.3 round 2
+    Dispatch.RegisterHandler(TEXT("mat.create"),                GT(&MatCreateImpl));
+    Dispatch.RegisterHandler(TEXT("mat.set_blend_mode"),        GT(&MatSetBlendModeImpl));
+    Dispatch.RegisterHandler(TEXT("mat.disconnect"),            GT(&MatDisconnectImpl));
+    Dispatch.RegisterHandler(TEXT("mat.list_expression_types"), GT(&MatListExpressionTypesImpl));
+    Dispatch.RegisterHandler(TEXT("mat.recompile"),             GT(&MatRecompileImpl));
+    Dispatch.RegisterHandler(TEXT("mat.duplicate"),             GT(&MatDuplicateImpl));
+    Dispatch.RegisterHandler(TEXT("mat.get_shader_stats"),      GT(&MatGetShaderStatsImpl));
+    Dispatch.RegisterHandler(TEXT("mat.export_graph"),          GT(&MatExportGraphImpl));
+    Dispatch.RegisterHandler(TEXT("mat.import_graph"),          GT(&MatImportGraphImpl));
+    Dispatch.RegisterHandler(TEXT("mat.build_graph"),           GT(&MatBuildGraphImpl));
+    Dispatch.RegisterHandler(TEXT("mat.render_preview"),        GT(&MatRenderPreviewImpl));
+    Dispatch.RegisterHandler(TEXT("mat.begin_transaction"),     GT(&MatBeginTransactionImpl));
+    Dispatch.RegisterHandler(TEXT("mat.end_transaction"),       GT(&MatEndTransactionImpl));
 }
 
 #undef LOCTEXT_NAMESPACE

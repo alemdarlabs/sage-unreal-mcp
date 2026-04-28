@@ -18,6 +18,8 @@
 #include "GenericPlatform/GenericPlatformOutputDevices.h"
 #include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformOutputDevices.h"
+#include "Subsystems/AssetEditorSubsystem.h"
+#include "Subsystems/EditorAssetSubsystem.h"
 #include "HighResScreenshot.h"
 #include "Misc/EngineVersion.h"
 #include "Misc/Paths.h"
@@ -763,6 +765,190 @@ FSageToolDispatch::FOutcome SetViewportImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- editor.hot_reload -----------------------------------------------------
+
+FSageToolDispatch::FOutcome HotReloadImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    // Trigger Live Coding / hot reload via console command
+    GEditor->Exec(GEditor->GetEditorWorldContext().World(),
+        TEXT("LiveCoding.Compile"), *GLog);
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("triggered"), true);
+    R->SetStringField(TEXT("note"), TEXT("hot reload triggered via LiveCoding.Compile"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- editor.get_perf_stats -------------------------------------------------
+
+FSageToolDispatch::FOutcome GetPerfStatsImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    auto R = MakeShared<FJsonObject>();
+    R->SetNumberField(TEXT("fps"),              1.0f / FApp::GetDeltaTime());
+    R->SetNumberField(TEXT("frame_time_ms"),    FApp::GetDeltaTime() * 1000.0);
+    R->SetNumberField(TEXT("real_time"),        FApp::GetCurrentTime());
+    R->SetBoolField  (TEXT("is_pie"),           GEditor && GEditor->IsPlayingSessionInEditor());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- editor.set_scalability ------------------------------------------------
+
+FSageToolDispatch::FOutcome SetScalabilityImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString GroupStr;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("group"), GroupStr))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'group' (e.g. 'sg.ResolutionQuality')"));
+
+    double Level;
+    if (!Args->TryGetNumberField(TEXT("level"), Level))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'level' (0-3 or 0-100)"));
+
+    FString Cmd = FString::Printf(TEXT("%s %g"), *GroupStr, Level);
+    GEditor->Exec(GEditor->GetEditorWorldContext().World(), *Cmd, *GLog);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("group"),   GroupStr);
+    R->SetNumberField(TEXT("level"),   Level);
+    R->SetBoolField  (TEXT("applied"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- editor.capture_scene_png ----------------------------------------------
+
+FSageToolDispatch::FOutcome CaptureScenePngImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString OutputPath = FPaths::ProjectSavedDir() / TEXT("Screenshots") / TEXT("scene_capture.png");
+    if (Args.IsValid()) Args->TryGetStringField(TEXT("output_path"), OutputPath);
+
+    double SizeD = 512;
+    if (Args.IsValid()) Args->TryGetNumberField(TEXT("size"), SizeD);
+    int32 Size = FMath::Clamp((int32)SizeD, 32, 4096);
+
+    // Use high-res screenshot system
+    FHighResScreenshotConfig& HRSS = GetHighResScreenshotConfig();
+    HRSS.FilenameOverride = OutputPath;
+    GEditor->Exec(GEditor->GetEditorWorldContext().World(),
+        *FString::Printf(TEXT("HighResShot %d"), Size), *GLog);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("output_path"), OutputPath);
+    R->SetNumberField(TEXT("size"),        Size);
+    R->SetBoolField  (TEXT("triggered"),   true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- editor.play_sequence --------------------------------------------------
+
+FSageToolDispatch::FOutcome PlaySequenceImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    // Trigger via console command - USequencer not easily accessible headlessly
+    FString Cmd = FString::Printf(TEXT("Sequencer.PlaySequence %s"), *Path);
+    GEditor->Exec(GEditor->GetEditorWorldContext().World(), *Cmd, *GLog);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),    Path);
+    R->SetBoolField  (TEXT("playing"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- editor.validate_assets ------------------------------------------------
+
+FSageToolDispatch::FOutcome ValidateAssetsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Directory = TEXT("/Game");
+    if (Args.IsValid()) Args->TryGetStringField(TEXT("directory"), Directory);
+
+    // Run via editor subsystem
+    if (UEditorAssetSubsystem* Sub =
+        GEditor->GetEditorSubsystem<UEditorAssetSubsystem>())
+    {
+        // DoesAssetExist validates path resolution
+        bool bResult = Sub->DoesDirectoryExist(Directory);
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("directory"),       Directory);
+        R->SetBoolField  (TEXT("directory_exists"), bResult);
+        R->SetStringField(TEXT("note"), TEXT("use editor.console_command with 'AssetCheck' for full validation"));
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+    return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("UEditorAssetSubsystem not available"));
+}
+
+// ---- editor.cook_content ---------------------------------------------------
+
+FSageToolDispatch::FOutcome CookContentImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Platform = TEXT("WindowsNoEditor");
+    if (Args.IsValid()) Args->TryGetStringField(TEXT("platform"), Platform);
+
+    FString Cmd = FString::Printf(TEXT("cook -TargetPlatform=%s"), *Platform);
+    // Cook is typically triggered via UAT — surface the command
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("platform"),  Platform);
+    R->SetBoolField  (TEXT("triggered"), false);
+    R->SetStringField(TEXT("note"),
+        TEXT("use UAT: RunUAT BuildCookRun -cook -TargetPlatform=<platform>"));
+    R->SetStringField(TEXT("uat_command"), Cmd);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- editor.get_message_log ------------------------------------------------
+
+FSageToolDispatch::FOutcome GetMessageLogImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Category = TEXT("AssetCheck");
+    if (Args.IsValid()) Args->TryGetStringField(TEXT("category"), Category);
+
+    // Message log is Slate-based; we surface recent log lines from the output log
+    // that match the category prefix as a proxy.
+    FString LogPath = FPlatformOutputDevices::GetAbsoluteLogFilename();
+    TArray<FString> Lines;
+    FFileHelper::LoadFileToStringArray(Lines, *LogPath);
+
+    TArray<TSharedPtr<FJsonValue>> Messages;
+    for (int32 I = Lines.Num() - 1; I >= 0 && Messages.Num() < 50; --I)
+    {
+        if (Lines[I].Contains(Category))
+            Messages.Insert(MakeShared<FJsonValueString>(Lines[I]), 0);
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("category"), Category);
+    R->SetArrayField (TEXT("messages"), Messages);
+    R->SetNumberField(TEXT("count"),    Messages.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- editor.open_asset -----------------------------------------------------
+
+FSageToolDispatch::FOutcome OpenAssetImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    FSoftObjectPath Soft(Path);
+    UObject* Asset = Soft.ResolveObject();
+    if (!Asset) Asset = Soft.TryLoad();
+    if (!Asset) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("asset not found: %s"), *Path));
+
+    if (GEditor)
+        GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(Asset);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),   Asset->GetPathName());
+    R->SetStringField(TEXT("class"),  Asset->GetClass()->GetName());
+    R->SetBoolField  (TEXT("opened"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 }  // namespace (anonymous)
 
 void RegisterEditorAutomationTools(FSageToolDispatch& Dispatch)
@@ -810,6 +996,17 @@ void RegisterEditorAutomationTools(FSageToolDispatch& Dispatch)
 
     // Phase 4.6-r3 batch 5: Python scripting
     Dispatch.RegisterHandler(TEXT("editor.run_python"),         GT(&RunPythonImpl));
+
+    // Phase 4.6 remaining
+    Dispatch.RegisterHandler(TEXT("editor.hot_reload"),         GT(&HotReloadImpl));
+    Dispatch.RegisterHandler(TEXT("editor.get_perf_stats"),     GT(&GetPerfStatsImpl));
+    Dispatch.RegisterHandler(TEXT("editor.set_scalability"),    GT(&SetScalabilityImpl));
+    Dispatch.RegisterHandler(TEXT("editor.capture_scene_png"),  GT(&CaptureScenePngImpl));
+    Dispatch.RegisterHandler(TEXT("editor.play_sequence"),      GT(&PlaySequenceImpl));
+    Dispatch.RegisterHandler(TEXT("editor.validate_assets"),    GT(&ValidateAssetsImpl));
+    Dispatch.RegisterHandler(TEXT("editor.cook_content"),       GT(&CookContentImpl));
+    Dispatch.RegisterHandler(TEXT("editor.get_message_log"),    GT(&GetMessageLogImpl));
+    Dispatch.RegisterHandler(TEXT("editor.open_asset"),         GT(&OpenAssetImpl));
 }
 
 #undef LOCTEXT_NAMESPACE

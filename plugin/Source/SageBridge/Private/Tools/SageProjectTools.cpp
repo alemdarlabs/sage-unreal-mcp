@@ -923,6 +923,369 @@ FSageToolDispatch::FOutcome ProjectReadCppSourceImpl(const TSharedPtr<FJsonObjec
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- project.set_project ---------------------------------------------------
+
+FSageToolDispatch::FOutcome ProjectSetProjectImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    if (!Args.IsValid())
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing args"));
+
+    FString Err;
+    const FString ConfigPath = FPaths::ConvertRelativePathToFull(
+        FPaths::ProjectConfigDir() / TEXT("DefaultGame.ini"));
+
+    int32 Applied = 0;
+    for (const auto& Pair : Args->Values)
+    {
+        if (Pair.Key.IsEmpty()) continue;
+        FString Val = Pair.Value->AsString();
+        // Write to DefaultGame.ini [/Script/EngineSettings.GeneralProjectSettings]
+        GConfig->SetString(
+            TEXT("/Script/EngineSettings.GeneralProjectSettings"),
+            *Pair.Key, *Val, ConfigPath);
+        ++Applied;
+    }
+    GConfig->Flush(false, ConfigPath);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetNumberField(TEXT("settings_applied"), Applied);
+    R->SetStringField(TEXT("config_path"),      ConfigPath);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- project.read_module ---------------------------------------------------
+
+FSageToolDispatch::FOutcome ProjectReadModuleImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString ModuleName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("module"), ModuleName))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'module'"));
+
+    // Search source directories for <ModuleName>.Build.cs
+    TArray<FString> SearchRoots = {
+        FPaths::GameSourceDir(),
+        FPaths::ProjectPluginsDir(),
+        FPaths::ProjectDir() / TEXT("Plugins"),
+    };
+    FString BuildCsPath;
+    for (const FString& Root : SearchRoots)
+    {
+        TArray<FString> Found;
+        IFileManager::Get().FindFilesRecursive(Found, *Root,
+            *(ModuleName + TEXT(".Build.cs")), true, false);
+        if (!Found.IsEmpty()) { BuildCsPath = Found[0]; break; }
+    }
+
+    if (BuildCsPath.IsEmpty())
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("Build.cs not found for module: %s"), *ModuleName));
+
+    FString Content;
+    if (!FFileHelper::LoadFileToString(Content, *BuildCsPath))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("could not read: %s"), *BuildCsPath));
+
+    if (Content.Len() > 65536) Content.LeftInline(65536);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("module"),    ModuleName);
+    R->SetStringField(TEXT("path"),      BuildCsPath);
+    R->SetStringField(TEXT("content"),   Content);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- project.search_engine_cpp ---------------------------------------------
+
+FSageToolDispatch::FOutcome ProjectSearchEngineCppImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Query;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("query"), Query))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'query'"));
+
+    FString SearchRoot = FPaths::EngineSourceDir();
+    FString SubPath;
+    if (Args->TryGetStringField(TEXT("path"), SubPath) && !SubPath.IsEmpty())
+        SearchRoot = FPaths::ConvertRelativePathToFull(SearchRoot / SubPath);
+
+    int32 MaxResults = 20;
+    if (Args.IsValid())
+    {
+        double N; if (Args->TryGetNumberField(TEXT("max_results"), N)) MaxResults = (int32)N;
+    }
+
+    TArray<FString> AllFiles;
+    IFileManager::Get().FindFilesRecursive(AllFiles, *SearchRoot,
+        TEXT("*.h"), true, false);
+    TArray<FString> CppFiles;
+    IFileManager::Get().FindFilesRecursive(CppFiles, *SearchRoot,
+        TEXT("*.cpp"), true, false);
+    AllFiles.Append(CppFiles);
+
+    TArray<TSharedPtr<FJsonValue>> Matches;
+    for (const FString& FilePath : AllFiles)
+    {
+        if (Matches.Num() >= MaxResults) break;
+        FString Content;
+        if (!FFileHelper::LoadFileToString(Content, *FilePath)) continue;
+        if (!Content.Contains(Query, ESearchCase::CaseSensitive)) continue;
+
+        TArray<FString> Lines;
+        Content.ParseIntoArrayLines(Lines);
+        TArray<TSharedPtr<FJsonValue>> LineMatches;
+        int32 LineNum = 1;
+        for (const FString& Line : Lines)
+        {
+            if (Line.Contains(Query, ESearchCase::CaseSensitive))
+            {
+                auto LJ = MakeShared<FJsonObject>();
+                LJ->SetNumberField(TEXT("line"), LineNum);
+                LJ->SetStringField(TEXT("text"), Line.TrimStartAndEnd());
+                LineMatches.Add(MakeShared<FJsonValueObject>(LJ));
+                if (LineMatches.Num() >= 5) break;
+            }
+            ++LineNum;
+        }
+        if (!LineMatches.IsEmpty())
+        {
+            auto FJ = MakeShared<FJsonObject>();
+            FJ->SetStringField(TEXT("file"),  FilePath);
+            FJ->SetArrayField (TEXT("lines"), LineMatches);
+            Matches.Add(MakeShared<FJsonValueObject>(FJ));
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("query"),   Query);
+    R->SetArrayField (TEXT("matches"), Matches);
+    R->SetNumberField(TEXT("count"),   Matches.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- project.generate_project_files ----------------------------------------
+
+FSageToolDispatch::FOutcome ProjectGenerateProjectFilesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("note"),
+        TEXT("Run GenerateProjectFiles.command (Mac) / GenerateProjectFiles.bat (Win) "
+             "from the project directory, or use editor.run_python with "
+             "unreal.PythonScriptLibrary.exec_on_project_update()"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- project.create_cpp_class ----------------------------------------------
+
+FSageToolDispatch::FOutcome ProjectCreateCppClassImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString ClassName, ParentClass, ModuleName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("class_name"), ClassName)
+        || ClassName.IsEmpty())
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'class_name'"));
+
+    Args->TryGetStringField(TEXT("parent_class"), ParentClass);
+    Args->TryGetStringField(TEXT("module"),       ModuleName);
+
+    if (ParentClass.IsEmpty()) ParentClass = TEXT("UObject");
+    if (ModuleName.IsEmpty())  ModuleName  = FApp::GetProjectName();
+
+    // Locate module source dir
+    FString SrcDir = FPaths::GameSourceDir() / ModuleName;
+    if (!FPaths::DirectoryExists(SrcDir))
+        SrcDir = FPaths::GameSourceDir();
+
+    FString Subfolder;
+    Args->TryGetStringField(TEXT("subfolder"), Subfolder);
+    if (!Subfolder.IsEmpty()) SrcDir = SrcDir / Subfolder;
+
+    FString HeaderPath = SrcDir / ClassName + TEXT(".h");
+    FString SourcePath = SrcDir / ClassName + TEXT(".cpp");
+
+    if (FPaths::FileExists(HeaderPath))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("file already exists: %s"), *HeaderPath));
+
+    FString ModuleUpper = ModuleName.ToUpper();
+    FString Header = FString::Printf(
+        TEXT("#pragma once\n#include \"CoreMinimal.h\"\n#include \"%s.generated.h\"\n\n"
+             "UCLASS()\nclass %s_API %s : public %s\n{\n    GENERATED_BODY()\n};\n"),
+        *ClassName, *ModuleUpper, *ClassName, *ParentClass);
+
+    FString Source = FString::Printf(
+        TEXT("#include \"%s.h\"\n"), *ClassName);
+
+    if (!FFileHelper::SaveStringToFile(Header, *HeaderPath))
+        return FSageToolDispatch::FOutcome::MakeError(-32000,
+            FString::Printf(TEXT("could not write: %s"), *HeaderPath));
+    if (!FFileHelper::SaveStringToFile(Source, *SourcePath))
+        return FSageToolDispatch::FOutcome::MakeError(-32000,
+            FString::Printf(TEXT("could not write: %s"), *SourcePath));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("class_name"),   ClassName);
+    R->SetStringField(TEXT("header_path"),  HeaderPath);
+    R->SetStringField(TEXT("source_path"),  SourcePath);
+    R->SetStringField(TEXT("parent_class"), ParentClass);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- project.list_project_modules ------------------------------------------
+
+FSageToolDispatch::FOutcome ProjectListProjectModulesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    // Parse .uproject JSON for Modules array
+    FString UProjectPath = FPaths::GetProjectFilePath();
+    FString UProjectContent;
+    if (!FFileHelper::LoadFileToString(UProjectContent, *UProjectPath))
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("could not read .uproject"));
+
+    TSharedPtr<FJsonObject> UProj;
+    TSharedRef<TJsonReader<>> JR = TJsonReaderFactory<>::Create(UProjectContent);
+    if (!FJsonSerializer::Deserialize(JR, UProj) || !UProj.IsValid())
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("failed to parse .uproject"));
+
+    const TArray<TSharedPtr<FJsonValue>>* ModArr = nullptr;
+    TArray<TSharedPtr<FJsonValue>> Modules;
+
+    if (UProj->TryGetArrayField(TEXT("Modules"), ModArr))
+    {
+        for (const auto& MV : *ModArr)
+        {
+            if (!MV.IsValid()) continue;
+            const TSharedPtr<FJsonObject>* MObj;
+            if (MV->TryGetObject(MObj))
+                Modules.Add(MakeShared<FJsonValueObject>(*MObj));
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetArrayField (TEXT("modules"), Modules);
+    R->SetNumberField(TEXT("count"),   Modules.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- project.live_coding_compile -------------------------------------------
+
+FSageToolDispatch::FOutcome ProjectLiveCodingCompileImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    if (!GEditor)
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no GEditor"));
+
+    GEditor->Exec(GEditor->GetEditorWorldContext().World(),
+        TEXT("LiveCoding.Compile"), *GLog);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("triggered"), true);
+    R->SetStringField(TEXT("note"), TEXT("live coding compile dispatched; check Output Log for result"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- project.write_cpp_file ------------------------------------------------
+
+FSageToolDispatch::FOutcome ProjectWriteCppFileImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString RelPath, Content;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), RelPath)
+        || !Args->TryGetStringField(TEXT("content"), Content))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path' or 'content'"));
+
+    FString Err;
+    const FString Abs = ResolveSafeSourcePath(RelPath, Err);
+    if (Abs.IsEmpty())
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+
+    if (!FFileHelper::SaveStringToFile(Content, *Abs))
+        return FSageToolDispatch::FOutcome::MakeError(-32000,
+            FString::Printf(TEXT("could not write: %s"), *Abs));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),         Abs);
+    R->SetNumberField(TEXT("bytes_written"), Content.Len());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- project.add_module_dependency -----------------------------------------
+
+FSageToolDispatch::FOutcome ProjectAddModuleDependencyImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString ModuleName, Dependency;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("module"),     ModuleName)
+        || !Args->TryGetStringField(TEXT("dependency"), Dependency))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'module' or 'dependency'"));
+
+    // Find Build.cs
+    TArray<FString> SearchRoots = { FPaths::GameSourceDir(), FPaths::ProjectPluginsDir() };
+    FString BuildCsPath;
+    for (const FString& Root : SearchRoots)
+    {
+        TArray<FString> Found;
+        IFileManager::Get().FindFilesRecursive(Found, *Root,
+            *(ModuleName + TEXT(".Build.cs")), true, false);
+        if (!Found.IsEmpty()) { BuildCsPath = Found[0]; break; }
+    }
+
+    if (BuildCsPath.IsEmpty())
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("Build.cs not found for: %s"), *ModuleName));
+
+    FString Content;
+    if (!FFileHelper::LoadFileToString(Content, *BuildCsPath))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("could not read Build.cs"));
+
+    // Check if already present
+    if (Content.Contains(*Dependency))
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("module"),        ModuleName);
+        R->SetStringField(TEXT("dependency"),    Dependency);
+        R->SetBoolField  (TEXT("already_present"), true);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    // Insert into PublicDependencyModuleNames or PrivateDependencyModuleNames
+    FString InsertTarget = TEXT("PublicDependencyModuleNames.AddRange");
+    int32 Idx = Content.Find(InsertTarget);
+    if (Idx == INDEX_NONE)
+    {
+        InsertTarget = TEXT("PublicDependencyModuleNames.Add");
+        Idx = Content.Find(InsertTarget);
+    }
+
+    bool bPatched = false;
+    if (Idx != INDEX_NONE)
+    {
+        // Find the closing paren/bracket of this call
+        int32 End = Content.Find(TEXT(");"), ESearchCase::IgnoreCase, ESearchDir::FromStart, Idx);
+        if (End != INDEX_NONE)
+        {
+            FString Insert = FString::Printf(TEXT("\n            \"%s\","), *Dependency);
+            Content.InsertAt(End, Insert);
+            bPatched = true;
+        }
+    }
+
+    if (!bPatched)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("note"),
+            FString::Printf(TEXT("could not auto-patch Build.cs; add \"%s\" manually to "
+                "PublicDependencyModuleNames in %s"), *Dependency, *BuildCsPath));
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    if (!FFileHelper::SaveStringToFile(Content, *BuildCsPath))
+        return FSageToolDispatch::FOutcome::MakeError(-32000, TEXT("could not write Build.cs"));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("module"),     ModuleName);
+    R->SetStringField(TEXT("dependency"), Dependency);
+    R->SetStringField(TEXT("build_cs"),   BuildCsPath);
+    R->SetBoolField  (TEXT("patched"),    true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 }  // namespace (anonymous)
 
 void RegisterProjectTools(FSageToolDispatch& Dispatch)
@@ -957,6 +1320,17 @@ void RegisterProjectTools(FSageToolDispatch& Dispatch)
     // Phase 4.7 batch 4: INI write + plugin enable
     Dispatch.RegisterHandler(TEXT("project.set_config"),          GT(&ProjectSetConfigImpl));
     Dispatch.RegisterHandler(TEXT("project.set_plugin_enabled"),  GT(&ProjectSetPluginEnabledImpl));
+
+    // Trailing project tools
+    Dispatch.RegisterHandler(TEXT("project.set_project"),             GT(&ProjectSetProjectImpl));
+    Dispatch.RegisterHandler(TEXT("project.read_module"),             GT(&ProjectReadModuleImpl));
+    Dispatch.RegisterHandler(TEXT("project.search_engine_cpp"),       GT(&ProjectSearchEngineCppImpl));
+    Dispatch.RegisterHandler(TEXT("project.generate_project_files"),  GT(&ProjectGenerateProjectFilesImpl));
+    Dispatch.RegisterHandler(TEXT("project.create_cpp_class"),        GT(&ProjectCreateCppClassImpl));
+    Dispatch.RegisterHandler(TEXT("project.list_project_modules"),    GT(&ProjectListProjectModulesImpl));
+    Dispatch.RegisterHandler(TEXT("project.live_coding_compile"),     GT(&ProjectLiveCodingCompileImpl));
+    Dispatch.RegisterHandler(TEXT("project.write_cpp_file"),          GT(&ProjectWriteCppFileImpl));
+    Dispatch.RegisterHandler(TEXT("project.add_module_dependency"),   GT(&ProjectAddModuleDependencyImpl));
 }
 
 #undef LOCTEXT_NAMESPACE

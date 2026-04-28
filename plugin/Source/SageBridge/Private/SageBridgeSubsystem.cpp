@@ -22,6 +22,16 @@
 #include "Tools/SageQaTools.h"
 #include "Tools/SageScmTools.h"
 #include "Tools/SageTransactionTools.h"
+#include "Tools/SageAnimationTools.h"
+#include "Tools/SageAudioTools.h"
+#include "Tools/SageFoliageTools.h"
+#include "Tools/SageGameplayTools.h"
+#include "Tools/SageGasTools.h"
+#include "Tools/SageLandscapeTools.h"
+#include "Tools/SageLevelTools.h"
+#include "Tools/SageNetworkingTools.h"
+#include "Tools/SageNiagaraTools.h"
+#include "Tools/SagePcgTools.h"
 #include "Tools/SageSequencerTools.h"
 #include "Tools/SageWidgetTools.h"
 
@@ -177,6 +187,18 @@ void USageBridgeSubsystem::RegisterBuiltinHandlers()
     sage::tools::RegisterProjectTools(ToolDispatch);
     sage::tools::RegisterWidgetTools(ToolDispatch);
     sage::tools::RegisterSequencerTools(ToolDispatch);
+
+    // Phase 4 domain expansions
+    sage::tools::RegisterLevelTools(ToolDispatch);
+    sage::tools::RegisterGameplayTools(ToolDispatch);
+    sage::tools::RegisterAnimationTools(ToolDispatch);
+    sage::tools::RegisterNiagaraTools(ToolDispatch);
+    sage::tools::RegisterPcgTools(ToolDispatch);
+    sage::tools::RegisterLandscapeTools(ToolDispatch);
+    sage::tools::RegisterFoliageTools(ToolDispatch);
+    sage::tools::RegisterAudioTools(ToolDispatch);
+    sage::tools::RegisterNetworkingTools(ToolDispatch);
+    sage::tools::RegisterGasTools(ToolDispatch);
 }
 
 void USageBridgeSubsystem::BindAssetRegistryDeltaHooks()

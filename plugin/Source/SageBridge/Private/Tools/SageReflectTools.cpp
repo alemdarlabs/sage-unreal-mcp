@@ -649,6 +649,96 @@ FSageToolDispatch::FOutcome ClassDefaultObjectImpl(const TSharedPtr<FJsonObject>
     return FSageToolDispatch::FOutcome::MakeSuccess(Result);
 }
 
+// ---- reflection.list_tags --------------------------------------------------
+
+FSageToolDispatch::FOutcome ListTagsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Filter;
+    if (Args.IsValid()) Args->TryGetStringField(TEXT("filter"), Filter);
+
+    // UGameplayTagsManager is in GameplayTags module — use soft lookup
+    // We access via GConfig from DefaultGameplayTags.ini
+    TArray<TSharedPtr<FJsonValue>> Tags;
+
+    TArray<FString> TagLines;
+    FString ConfigPath = FPaths::ProjectConfigDir() / TEXT("DefaultGameplayTags.ini");
+    if (FPaths::FileExists(ConfigPath))
+    {
+        GConfig->GetArray(TEXT("/Script/GameplayTags.GameplayTagsList"),
+            TEXT("GameplayTagList"), TagLines, ConfigPath);
+    }
+
+    // Also check DefaultEngine.ini
+    FString EngineConfigPath = FPaths::ProjectConfigDir() / TEXT("DefaultEngine.ini");
+    TArray<FString> EngineTagLines;
+    GConfig->GetArray(TEXT("/Script/GameplayTags.GameplayTagsList"),
+        TEXT("GameplayTagList"), EngineTagLines, EngineConfigPath);
+    TagLines.Append(EngineTagLines);
+
+    for (const FString& Line : TagLines)
+    {
+        // Tag format: (TagName="Category.Tag",DevComment="",bRestrictedTag=False)
+        FString TagName;
+        if (FParse::Value(*Line, TEXT("TagName=\""), TagName))
+        {
+            int32 End = TagName.Find(TEXT("\""));
+            if (End != INDEX_NONE) TagName.LeftInline(End);
+            if (!Filter.IsEmpty() && !TagName.Contains(Filter, ESearchCase::IgnoreCase)) continue;
+            Tags.Add(MakeShared<FJsonValueString>(TagName));
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetArrayField (TEXT("tags"),  Tags);
+    R->SetNumberField(TEXT("count"), Tags.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- reflection.create_tag -------------------------------------------------
+
+FSageToolDispatch::FOutcome CreateTagImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString TagName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("tag"), TagName))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'tag'"));
+
+    FString Comment;
+    Args->TryGetStringField(TEXT("comment"), Comment);
+
+    // Write to DefaultGameplayTags.ini
+    FString ConfigPath = FPaths::ProjectConfigDir() / TEXT("DefaultGameplayTags.ini");
+    FString TagEntry = FString::Printf(
+        TEXT("(TagName=\"%s\",DevComment=\"%s\",bRestrictedTag=False)"),
+        *TagName, *Comment);
+
+    TArray<FString> Existing;
+    GConfig->GetArray(TEXT("/Script/GameplayTags.GameplayTagsList"),
+        TEXT("GameplayTagList"), Existing, ConfigPath);
+
+    // Check duplicate
+    for (const FString& E : Existing)
+    {
+        if (E.Contains(TagName))
+        {
+            auto R = MakeShared<FJsonObject>();
+            R->SetStringField(TEXT("tag"),           TagName);
+            R->SetBoolField  (TEXT("already_exists"), true);
+            return FSageToolDispatch::FOutcome::MakeSuccess(R);
+        }
+    }
+
+    Existing.Add(TagEntry);
+    GConfig->SetArray(TEXT("/Script/GameplayTags.GameplayTagsList"),
+        TEXT("GameplayTagList"), Existing, ConfigPath);
+    GConfig->Flush(false, ConfigPath);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("tag"),     TagName);
+    R->SetBoolField  (TEXT("created"), true);
+    R->SetStringField(TEXT("config"),  ConfigPath);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 }  // namespace (anonymous)
 
 void RegisterReflectTools(FSageToolDispatch& Dispatch)
@@ -661,6 +751,8 @@ void RegisterReflectTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("list_enums"),          &ListEnumsImpl);
     Dispatch.RegisterHandler(TEXT("find_implementers"),   &FindImplementersImpl);
     Dispatch.RegisterHandler(TEXT("class_default_object"),&ClassDefaultObjectImpl);
+    Dispatch.RegisterHandler(TEXT("reflection.list_tags"), &ListTagsImpl);
+    Dispatch.RegisterHandler(TEXT("reflection.create_tag"),&CreateTagImpl);
 }
 
 }  // namespace sage::tools

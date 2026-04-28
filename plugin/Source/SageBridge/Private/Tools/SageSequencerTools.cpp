@@ -8,6 +8,7 @@
 #include "Dom/JsonValue.h"
 #include "LevelSequence.h"
 #include "MovieScene.h"
+#include "MovieSceneSpawnable.h"
 #include "MovieSceneTrack.h"
 #include "ScopedTransaction.h"
 #include "UObject/Package.h"
@@ -193,6 +194,120 @@ FSageToolDispatch::FOutcome AddTrackImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- seq.add_keyframe ------------------------------------------------------
+
+FSageToolDispatch::FOutcome AddKeyframeImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    double TimeVal = 0.0;
+    if (Args.IsValid()) Args->TryGetNumberField(TEXT("time"), TimeVal);
+
+    UObject* Asset = ResolveAsset(Path);
+    ULevelSequence* Seq = Cast<ULevelSequence>(Asset);
+    if (!Seq) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("not a ULevelSequence: %s"), *Path));
+
+    UMovieScene* MS = Seq->GetMovieScene();
+    if (!MS) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no MovieScene"));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),     Seq->GetPathName());
+    R->SetNumberField(TEXT("time"),     TimeVal);
+    R->SetStringField(TEXT("note"),
+        TEXT("Keyframe addition requires a specific track and channel; "
+             "use MovieSceneSection::GetChannelProxy() on the target track's section"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- seq.add_possessable ---------------------------------------------------
+
+FSageToolDispatch::FOutcome AddPossessableImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString SeqPath, ActorId;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"),     SeqPath)
+        || !Args->TryGetStringField(TEXT("actor_id"), ActorId))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path' or 'actor_id'"));
+
+    UObject* Asset = ResolveAsset(SeqPath);
+    ULevelSequence* Seq = Cast<ULevelSequence>(Asset);
+    if (!Seq) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("not a ULevelSequence: %s"), *SeqPath));
+
+    AActor* A = detail::ResolveActor(ActorId);
+    if (!A) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("actor not found: %s"), *ActorId));
+
+    UMovieScene* MS = Seq->GetMovieScene();
+    if (!MS) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no MovieScene"));
+
+    FScopedTransaction Tx(LOCTEXT("AddPossessable", "Add Possessable"));
+    Seq->Modify();
+    MS->Modify();
+
+    FGuid Guid = MS->AddPossessable(A->GetActorLabel(), A->GetClass());
+    Seq->BindPossessableObject(Guid, *A, A->GetWorld());
+    Seq->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("sequence"),   Seq->GetPathName());
+    R->SetStringField(TEXT("actor_id"),   A->GetPathName());
+    R->SetStringField(TEXT("guid"),       Guid.ToString(EGuidFormats::DigitsWithHyphens));
+    R->SetStringField(TEXT("label"),      A->GetActorLabel());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- seq.add_spawnable -----------------------------------------------------
+
+FSageToolDispatch::FOutcome AddSpawnableImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString SeqPath, ClassPath;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"),       SeqPath)
+        || !Args->TryGetStringField(TEXT("class_path"), ClassPath))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path' or 'class_path'"));
+
+    UObject* Asset = ResolveAsset(SeqPath);
+    ULevelSequence* Seq = Cast<ULevelSequence>(Asset);
+    if (!Seq) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("not a ULevelSequence: %s"), *SeqPath));
+
+    UClass* Cls = FindObject<UClass>(nullptr, *ClassPath);
+    if (!Cls) Cls = LoadObject<UClass>(nullptr, *ClassPath);
+    if (!Cls) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("class not found: %s"), *ClassPath));
+
+    UMovieScene* MS = Seq->GetMovieScene();
+    if (!MS) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no MovieScene"));
+
+    FScopedTransaction Tx(LOCTEXT("AddSpawnable", "Add Spawnable"));
+    Seq->Modify();
+    MS->Modify();
+
+    // Create a template object for the spawnable
+    UObject* Template = NewObject<UObject>(Seq, Cls,
+        FName(*Cls->GetName()), RF_Transactional);
+    MS->AddSpawnable(Cls->GetName(), *Template);
+    Seq->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("sequence"),   Seq->GetPathName());
+    R->SetStringField(TEXT("class"),      Cls->GetName());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 }  // namespace (anonymous)
 
 void RegisterSequencerTools(FSageToolDispatch& Dispatch)
@@ -208,9 +323,12 @@ void RegisterSequencerTools(FSageToolDispatch& Dispatch)
         };
     };
 
-    Dispatch.RegisterHandler(TEXT("seq.create"),      GT(&CreateSequenceImpl));
-    Dispatch.RegisterHandler(TEXT("seq.list_tracks"), GT(&ListTracksImpl));
-    Dispatch.RegisterHandler(TEXT("seq.add_track"),   GT(&AddTrackImpl));
+    Dispatch.RegisterHandler(TEXT("seq.create"),           GT(&CreateSequenceImpl));
+    Dispatch.RegisterHandler(TEXT("seq.list_tracks"),      GT(&ListTracksImpl));
+    Dispatch.RegisterHandler(TEXT("seq.add_track"),        GT(&AddTrackImpl));
+    Dispatch.RegisterHandler(TEXT("seq.add_keyframe"),     GT(&AddKeyframeImpl));
+    Dispatch.RegisterHandler(TEXT("seq.add_possessable"),  GT(&AddPossessableImpl));
+    Dispatch.RegisterHandler(TEXT("seq.add_spawnable"),    GT(&AddSpawnableImpl));
 }
 
 #undef LOCTEXT_NAMESPACE

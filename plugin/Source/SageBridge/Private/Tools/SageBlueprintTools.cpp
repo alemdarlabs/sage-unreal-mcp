@@ -36,6 +36,7 @@
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Kismet2/KismetReinstanceUtilities.h"
 #include "ScopedTransaction.h"
+#include "GameFramework/Actor.h"
 #include "UObject/Class.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectIterator.h"
@@ -2876,6 +2877,231 @@ FSageToolDispatch::FOutcome BpReparentImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- bp.create_function  (new user-defined function in a Blueprint) --------
+
+FSageToolDispatch::FOutcome BpCreateFunctionImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, FnName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("name"), FnName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path' or 'name'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    if (FindFunctionGraph(BP, FnName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("function already exists: %s"), *FnName));
+    }
+
+    FString Access = TEXT("public");
+    Args->TryGetStringField(TEXT("access"), Access);
+
+    FScopedTransaction Tx(LOCTEXT("BpCreateFn", "Sage: Create BP Function"));
+    BP->Modify();
+    UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(
+        BP, FName(*FnName),
+        UEdGraph::StaticClass(),
+        UEdGraphSchema_K2::StaticClass());
+    FBlueprintEditorUtils::AddFunctionGraph<UClass>(BP, NewGraph,
+        /*bIsUserCreated*/ true, nullptr);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("function_name"), FnName);
+    R->SetStringField(TEXT("access"),        Access);
+    R->SetStringField(TEXT("graph_guid"),    NewGraph->GraphGuid.ToString());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- bp.read_graph_summary  (lightweight summary, read-only) ---------------
+
+FSageToolDispatch::FOutcome BpReadGraphSummaryImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, FnName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("fn_name"), FnName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path' or 'fn_name'"));
+    }
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    UEdGraph* Graph = FindFunctionGraph(BP, FnName);
+    if (!Graph) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("function graph not found: %s"), *FnName));
+
+    int32 PinCount = 0;
+    for (UEdGraphNode* N : Graph->Nodes)
+    {
+        if (N) PinCount += N->Pins.Num();
+    }
+
+    // BFS exec-chain length from entry node.
+    int32 ExecLen = 0;
+    TSet<UEdGraphNode*> Visited;
+    TArray<UEdGraphNode*> Frontier;
+    for (UEdGraphNode* N : Graph->Nodes)
+    {
+        if (Cast<UK2Node_FunctionEntry>(N) || Cast<UK2Node_Event>(N))
+        {
+            Frontier.Add(N);
+        }
+    }
+    while (Frontier.Num() > 0)
+    {
+        TArray<UEdGraphNode*> Next;
+        for (UEdGraphNode* N : Frontier)
+        {
+            if (!N || Visited.Contains(N)) continue;
+            Visited.Add(N);
+            ++ExecLen;
+            for (UEdGraphPin* Pin : N->Pins)
+            {
+                if (!Pin || Pin->Direction != EGPD_Output) continue;
+                if (Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec) continue;
+                for (UEdGraphPin* L : Pin->LinkedTo)
+                {
+                    if (L && L->GetOwningNode()) Next.Add(L->GetOwningNode());
+                }
+            }
+        }
+        Frontier = Next;
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("fn_name"),           FnName);
+    R->SetNumberField(TEXT("node_count"),         Graph->Nodes.Num());
+    R->SetNumberField(TEXT("pin_count"),          PinCount);
+    R->SetNumberField(TEXT("exec_chain_length"),  ExecLen);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- bp.duplicate  (duplicate a Blueprint asset) ---------------------------
+
+FSageToolDispatch::FOutcome BpDuplicateImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Source, Destination;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("source"), Source)
+        || !Args->TryGetStringField(TEXT("destination"), Destination))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'source' or 'destination'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+
+    UBlueprint* OrigBP = ResolveBlueprint(Source);
+    if (!OrigBP) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("source blueprint not found: %s"), *Source));
+
+    if (ResolveBlueprint(Destination))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("destination already exists: %s"), *Destination));
+    }
+
+    FString PackagePath, AssetName;
+    if (!SplitAssetPath(Destination, PackagePath, AssetName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("malformed destination path: %s"), *Destination));
+    }
+
+    FAssetToolsModule& Module = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
+    IAssetTools& Tools = Module.Get();
+
+    FScopedTransaction Tx(LOCTEXT("BpDuplicate", "Sage: Duplicate Blueprint"));
+    UObject* Dup = Tools.DuplicateAsset(AssetName, PackagePath, OrigBP);
+    if (!Dup)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("DuplicateAsset returned nullptr"));
+    }
+    UBlueprint* NewBP = Cast<UBlueprint>(Dup);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("source"),      Source);
+    R->SetStringField(TEXT("destination"), Dup->GetPathName());
+    R->SetStringField(TEXT("class"),       NewBP && NewBP->ParentClass
+                                               ? NewBP->ParentClass->GetName()
+                                               : Dup->GetClass()->GetName());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- bp.set_actor_tick_settings  (CDO tick config on Actor BP) -------------
+
+FSageToolDispatch::FOutcome BpSetActorTickSettingsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    if (!BP->GeneratedClass || !BP->GeneratedClass->IsChildOf(AActor::StaticClass()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("blueprint is not Actor-derived"));
+    }
+
+    AActor* CDO = Cast<AActor>(BP->GeneratedClass->GetDefaultObject());
+    if (!CDO) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("CDO unavailable"));
+
+    FScopedTransaction Tx(LOCTEXT("BpTickSettings", "Sage: Set Actor Tick Settings"));
+    CDO->Modify();
+
+    bool bCanTick = CDO->PrimaryActorTick.bCanEverTick;
+    if (Args->TryGetBoolField(TEXT("can_tick"), bCanTick))
+    {
+        CDO->PrimaryActorTick.bCanEverTick = bCanTick;
+    }
+
+    double TickInterval = 0.0;
+    if (Args->TryGetNumberField(TEXT("tick_interval"), TickInterval))
+    {
+        CDO->PrimaryActorTick.TickInterval = static_cast<float>(TickInterval);
+    }
+
+    FString TickGroupStr;
+    if (Args->TryGetStringField(TEXT("tick_group"), TickGroupStr))
+    {
+        ETickingGroup Group = TG_PrePhysics;
+        if      (TickGroupStr == TEXT("PrePhysics"))    Group = TG_PrePhysics;
+        else if (TickGroupStr == TEXT("DuringPhysics")) Group = TG_DuringPhysics;
+        else if (TickGroupStr == TEXT("PostPhysics"))   Group = TG_PostPhysics;
+        else if (TickGroupStr == TEXT("PostUpdateWork"))Group = TG_PostUpdateWork;
+        else
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("unknown tick_group: %s "
+                    "(valid: PrePhysics/DuringPhysics/PostPhysics/PostUpdateWork)"),
+                    *TickGroupStr));
+        }
+        CDO->PrimaryActorTick.TickGroup = Group;
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"),    BP->GetName());
+    R->SetBoolField  (TEXT("can_tick"),     CDO->PrimaryActorTick.bCanEverTick);
+    R->SetNumberField(TEXT("tick_interval"),CDO->PrimaryActorTick.TickInterval);
+    R->SetNumberField(TEXT("tick_group"),   static_cast<int32>(CDO->PrimaryActorTick.TickGroup));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 }  // namespace (anonymous)
 
 void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
@@ -2969,6 +3195,16 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
     // Write — class shape
     Dispatch.RegisterHandler(TEXT("bp.set_cdo_property"),    GT(&BpSetCdoPropertyImpl));
     Dispatch.RegisterHandler(TEXT("bp.reparent"),            GT(&BpReparentImpl));
+
+    // Write — function creation + actor tick
+    Dispatch.RegisterHandler(TEXT("bp.create_function"),           GT(&BpCreateFunctionImpl));
+    Dispatch.RegisterHandler(TEXT("bp.set_actor_tick_settings"),   GT(&BpSetActorTickSettingsImpl));
+
+    // Write — asset duplication
+    Dispatch.RegisterHandler(TEXT("bp.duplicate"),                 GT(&BpDuplicateImpl));
+
+    // Read — lightweight graph summary
+    Dispatch.RegisterHandler(TEXT("bp.read_graph_summary"),        GT(&BpReadGraphSummaryImpl));
 
     // Compile
     Dispatch.RegisterHandler(TEXT("bp.compile"),             GT(&BpCompileImpl));

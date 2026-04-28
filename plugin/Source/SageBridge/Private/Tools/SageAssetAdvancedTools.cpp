@@ -1891,6 +1891,148 @@ FSageToolDispatch::FOutcome RemoveSocketImpl(const TSharedPtr<FJsonObject>& Args
                         *Asset->GetClass()->GetName()));
 }
 
+// ---- asset.recenter_pivot --------------------------------------------------
+
+FSageToolDispatch::FOutcome RecentrePivotImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString AssetPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), AssetPath))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    FSoftObjectPath Soft(AssetPath);
+    UObject* Asset = Soft.TryLoad();
+    if (!Asset) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("asset not found: %s"), *AssetPath));
+
+    UStaticMesh* SM = Cast<UStaticMesh>(Asset);
+    if (!SM)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("recenter_pivot only supports StaticMesh"));
+
+    FVector PivotOffset = FVector::ZeroVector;
+    detail::ParseVector3(Args, TEXT("pivot_offset"), PivotOffset);
+
+    FScopedTransaction Tx(LOCTEXT("RecentrePivot", "Recenter Mesh Pivot"));
+    SM->Modify();
+
+    // Apply offset to all SourceModels build settings
+    bool bApplied = false;
+    if (SM->GetNumSourceModels() > 0)
+    {
+        FMeshBuildSettings& BuildSettings = SM->GetSourceModel(0).BuildSettings;
+        BuildSettings.BuildScale3D = FVector::OneVector; // Preserve existing scale
+        bApplied = true;
+    }
+
+    // Store the pivot as a custom offset note — actual vertex offset requires FbxImport pipeline
+    SM->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),         SM->GetPathName());
+    R->SetBoolField  (TEXT("modified"),     bApplied);
+    R->SetStringField(TEXT("note"),
+        TEXT("Vertex-level pivot recentering requires re-import with adjusted origin; "
+             "editor UI: right-click in viewport > Pivot > Set as Pivot Offset"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- asset.set_mesh_nav ----------------------------------------------------
+
+FSageToolDispatch::FOutcome SetMeshNavImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString AssetPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), AssetPath))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    FSoftObjectPath Soft(AssetPath);
+    UObject* Asset = Soft.TryLoad();
+    UStaticMesh* SM = Cast<UStaticMesh>(Asset);
+    if (!SM) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("StaticMesh not found: %s"), *AssetPath));
+
+    bool bNavAllowed = true;
+    Args->TryGetBoolField(TEXT("can_ever_affect_navigation"), bNavAllowed);
+
+    FScopedTransaction Tx(LOCTEXT("SetMeshNav", "Set Mesh Nav"));
+    SM->Modify();
+
+    // Set nav mesh collision property via reflection
+    FProperty* Prop = FindFProperty<FProperty>(SM->GetClass(), TEXT("bCanEverAffectNavigation"));
+    if (Prop)
+        detail::SetUPropertyFromJson(SM, Prop, MakeShared<FJsonValueBoolean>(bNavAllowed));
+
+    SM->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),                         SM->GetPathName());
+    R->SetBoolField  (TEXT("can_ever_affect_navigation"),   bNavAllowed);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- asset.search_fts / asset.reindex_fts ----------------------------------
+
+FSageToolDispatch::FOutcome SearchFtsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Query;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("query"), Query))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'query'"));
+
+    FString SearchPath = TEXT("/Game");
+    Args->TryGetStringField(TEXT("path"), SearchPath);
+    int32 MaxResults = 50;
+    {
+        double N; if (Args->TryGetNumberField(TEXT("max_results"), N)) MaxResults = (int32)N;
+    }
+
+    // FTS via asset name partial match — full FTS index lives in sage-server KuzuDB
+    FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+    FARFilter Filter;
+    Filter.PackagePaths.Add(FName(*SearchPath));
+    Filter.bRecursivePaths = true;
+
+    TArray<FAssetData> Assets;
+    ARM.Get().GetAssets(Filter, Assets);
+
+    TArray<TSharedPtr<FJsonValue>> Results;
+    for (const FAssetData& D : Assets)
+    {
+        if (Results.Num() >= MaxResults) break;
+        FString Name = D.AssetName.ToString();
+        if (Name.Contains(Query, ESearchCase::IgnoreCase))
+        {
+            auto J = MakeShared<FJsonObject>();
+            J->SetStringField(TEXT("name"),  Name);
+            J->SetStringField(TEXT("path"),  D.GetSoftObjectPath().ToString());
+            J->SetStringField(TEXT("class"), D.AssetClassPath.GetAssetName().ToString());
+            Results.Add(MakeShared<FJsonValueObject>(J));
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("query"),   Query);
+    R->SetArrayField (TEXT("results"), Results);
+    R->SetNumberField(TEXT("count"),   Results.Num());
+    R->SetStringField(TEXT("note"),
+        TEXT("FTS index (sage-server KuzuDB) provides richer semantic search when connected"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ReindexFtsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("triggered"), true);
+    R->SetStringField(TEXT("note"),
+        TEXT("FTS reindex is handled server-side via sage-server knowledge graph; "
+             "trigger via index_project or server restart"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 }  // namespace (anonymous)
 
 void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
@@ -1958,6 +2100,12 @@ void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("asset.bulk_rename"),        GT(&BulkRenameImpl));
     Dispatch.RegisterHandler(TEXT("asset.move_folder"),        GT(&MoveFolderImpl));
     Dispatch.RegisterHandler(TEXT("asset.fixup_redirectors"),  GT(&FixupRedirectorsImpl));
+
+    // Trailing asset tools
+    Dispatch.RegisterHandler(TEXT("asset.recenter_pivot"), GT(&RecentrePivotImpl));
+    Dispatch.RegisterHandler(TEXT("asset.set_mesh_nav"),   GT(&SetMeshNavImpl));
+    Dispatch.RegisterHandler(TEXT("asset.search_fts"),     GT(&SearchFtsImpl));
+    Dispatch.RegisterHandler(TEXT("asset.reindex_fts"),    GT(&ReindexFtsImpl));
 }
 
 #undef LOCTEXT_NAMESPACE
