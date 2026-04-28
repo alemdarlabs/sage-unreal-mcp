@@ -864,6 +864,127 @@ FSageToolDispatch::FOutcome BpConnectPinsImpl(const TSharedPtr<FJsonObject>& Arg
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- bp.validate + bp.run_construction_script  (Phase 4.2 round 2g/p4) ---
+
+FSageToolDispatch::FOutcome BpValidateImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    FCompilerResultsLog Log;
+    Log.bSilentMode = true;
+    FKismetEditorUtilities::CompileBlueprint(BP, EBlueprintCompileOptions::SkipSave, &Log);
+
+    TArray<TSharedPtr<FJsonValue>> Messages;
+    for (TSharedRef<FTokenizedMessage> Msg : Log.Messages)
+    {
+        auto O = MakeShared<FJsonObject>();
+        const EMessageSeverity::Type Sev = Msg->GetSeverity();
+        const TCHAR* SevStr =
+            (Sev == EMessageSeverity::Error)            ? TEXT("error")
+          : (Sev == EMessageSeverity::Warning)          ? TEXT("warning")
+          : (Sev == EMessageSeverity::PerformanceWarning) ? TEXT("perf")
+          : TEXT("info");
+        O->SetStringField(TEXT("severity"), SevStr);
+        O->SetStringField(TEXT("message"),  Msg->ToText().ToString());
+        Messages.Add(MakeShared<FJsonValueObject>(O));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"),     BP->GetName());
+    R->SetBoolField  (TEXT("valid"),         Log.NumErrors == 0);
+    R->SetNumberField(TEXT("error_count"),   Log.NumErrors);
+    R->SetNumberField(TEXT("warning_count"), Log.NumWarnings);
+    R->SetArrayField (TEXT("messages"),      Messages);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpRunConstructionScriptImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    if (!BP->GeneratedClass)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("blueprint has no GeneratedClass (compile first?)"));
+    }
+    if (!BP->GeneratedClass->IsChildOf(AActor::StaticClass()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("blueprint is not Actor-derived; nothing to spawn"));
+    }
+    if (!GEditor)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
+    }
+    UWorld* World = GEditor->GetEditorWorldContext().World();
+    if (!World)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("editor world unavailable"));
+    }
+
+    FVector Loc = FVector::ZeroVector;
+    detail::ParseVector3(Args, TEXT("location"), Loc);
+
+    FActorSpawnParameters Spawn;
+    Spawn.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+    Spawn.bNoFail        = true;
+    Spawn.ObjectFlags   |= RF_Transient;  // Don't dirty/persist this throwaway
+
+    AActor* Temp = World->SpawnActor<AActor>(BP->GeneratedClass, Loc, FRotator::ZeroRotator, Spawn);
+    if (!Temp)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("SpawnActor returned nullptr"));
+    }
+    // SpawnActor calls UCS automatically; this is a belt-and-braces re-run
+    // in case the agent passes a pre-spawned, mutated transform later.
+    Temp->RerunConstructionScripts();
+
+    TArray<TSharedPtr<FJsonValue>> Comps;
+    TArray<UActorComponent*> ActorComps;
+    Temp->GetComponents(ActorComps);
+    for (UActorComponent* C : ActorComps)
+    {
+        if (!C) continue;
+        auto O = MakeShared<FJsonObject>();
+        O->SetStringField(TEXT("name"),  C->GetName());
+        O->SetStringField(TEXT("class"), C->GetClass()->GetName());
+        if (USceneComponent* SC = Cast<USceneComponent>(C))
+        {
+            const FTransform T = SC->GetRelativeTransform();
+            O->SetField(TEXT("location"), detail::Vec3ToJson(T.GetLocation()));
+            O->SetField(TEXT("rotation"), detail::Rot3ToJson(T.GetRotation().Rotator()));
+            O->SetField(TEXT("scale"),    detail::Vec3ToJson(T.GetScale3D()));
+            O->SetBoolField(TEXT("is_root"), SC == Temp->GetRootComponent());
+        }
+        Comps.Add(MakeShared<FJsonValueObject>(O));
+    }
+
+    World->DestroyActor(Temp);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"),  BP->GetName());
+    R->SetStringField(TEXT("class"),      BP->GeneratedClass->GetName());
+    R->SetArrayField (TEXT("components"), Comps);
+    R->SetNumberField(TEXT("count"),      Comps.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---- bp.read_component_properties + bp.get_component_property + ----------
 // ---- bp.reparent_component  (Phase 4.2 round 2g/p3) ----------------------
 
@@ -2569,6 +2690,10 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("bp.read_component_properties"),  GT(&BpReadComponentPropertiesImpl));
     Dispatch.RegisterHandler(TEXT("bp.get_component_property"),     GT(&BpGetComponentPropertyImpl));
     Dispatch.RegisterHandler(TEXT("bp.reparent_component"),         GT(&BpReparentComponentImpl));
+
+    // Read+Write — diagnostics + dry-run (Phase 4.2 round 2g/p4)
+    Dispatch.RegisterHandler(TEXT("bp.validate"),                   GT(&BpValidateImpl));
+    Dispatch.RegisterHandler(TEXT("bp.run_construction_script"),    GT(&BpRunConstructionScriptImpl));
 
     // Write — functions
     Dispatch.RegisterHandler(TEXT("bp.add_function"),        GT(&BpAddFunctionImpl));

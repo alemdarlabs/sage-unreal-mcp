@@ -14,7 +14,7 @@
 | editor | 15 | 29 | 44 | 34 |
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
-| blueprint | 33 | 13 | 46 | 72 |
+| blueprint | 35 | 11 | 46 | 76 |
 | asset | 7 | 32 | 39 | 18 |
 | level | 10 | 22 | 32 | 31 |
 | niagara | 0 | 26 | 26 | 0 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **121** | **327** | **448** | **27** |
+| **TOTAL** | **123** | **325** | **448** | **27** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -284,7 +284,7 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `blueprint.duplicate` — Duplicate BP · W
 - [x] `blueprint.add_local_variable` → `bp.add_local_variable` (Phase 4.2-r2b)
 - [x] `blueprint.list_local_variables` → `bp.list_local_variables` (Phase 4.2-r2b)
-- [ ] `blueprint.validate` — Compile-without-output · R
+- [x] `blueprint.validate` → `bp.validate` (Phase 4.2-r2g/p4; SkipSave + silent FCompilerResultsLog)
 - [x] `blueprint.read_component_properties` → `bp.read_component_properties` (Phase 4.2-r2g/p3; 58 props on SpringArmComponent verified)
 - [x] `blueprint.read_node_property` → `bp.read_node_property` (Phase 4.2-r2a)
 - [x] `blueprint.reparent_component` → `bp.reparent_component` (Phase 4.2-r2g/p3; cycle guard + self guard)
@@ -294,7 +294,7 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [x] `blueprint.import_nodes_t3d` → `bp.import_nodes_t3d` (Phase 4.2-r2g/p2; CanImportNodesFromText pre-flight, fresh GUIDs, optional pos_x/pos_y re-center)
 - [x] `blueprint.set_cdo_property` → `bp.set_cdo_property`
 - [ ] `blueprint.get_cdo_properties` — Read C++ class CDO · R
-- [ ] `blueprint.run_construction_script` — Spawn temp + run CS · R
+- [x] `blueprint.run_construction_script` → `bp.run_construction_script` (Phase 4.2-r2g/p4; transient SpawnActor + RerunConstructionScripts + DestroyActor; Actor-derived guard)
 
 **Phase 4.2 round 2 progress:**
 - **r2a DONE (4 tools):** add_node + set_node_property + read_node_property + list_node_types. 12+3 smoke tests green on UE 5.7 SageTest. Branch (K2Node_IfThenElse) + CallFunction (with function_name/target_class) + GetVar/SetVar (with variable_name) spawn paths verified. Pin default round-trip (true→false→read) confirmed via Schema::TrySetDefaultValue.

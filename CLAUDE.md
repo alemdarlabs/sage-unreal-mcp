@@ -73,7 +73,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Şu Anki Durum (Snapshot)
 
-> Tek satırda durum: **55 commit · 133 MCP tool · Phase 1+2+3 tamam · Phase 4 ~%60 (4.0/4.1/4.2-r1+r2a..r2g(p1+p2+p3)/4.3/4.5-r1/4.6-r1+r2)**.
+> Tek satırda durum: **56 commit · 135 MCP tool · Phase 1+2+3 tamam · Phase 4 ~%61 (4.0/4.1/4.2-r1+r2a..r2g(p1..p4)/4.3/4.5-r1/4.6-r1+r2)**.
 
 - **Test ortamı**: `/Users/mahmutalemdar/Developer/alemdarlabs/SageTest/SageTest.uproject` (UE 5.7.4 Third Person + Blueprint).
 - **Knowledge graph (canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Real-time delta + query_graph + class_hierarchy çalışıyor.
@@ -107,6 +107,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 | 4.2-r2g/p1 | BP event dispatcher CRUD (`bp.list_event_dispatchers` / add_event_dispatcher / remove_event_dispatcher) | 3 |
 | 4.2-r2g/p2 | BP T3D node clipboard (`bp.export_nodes_t3d` / `bp.import_nodes_t3d`) | 2 |
 | 4.2-r2g/p3 | BP SCS-component deep CRUD (`bp.read_component_properties` / `get_component_property` / `reparent_component`) | 3 |
+| 4.2-r2g/p4 | BP diagnostics + dry-run (`bp.validate` / `bp.run_construction_script`) | 2 |
 
 ## Build & Run Commands
 

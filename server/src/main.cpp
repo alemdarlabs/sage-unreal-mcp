@@ -1244,6 +1244,52 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // -- read+write — diagnostics + dry-run (Phase 4.2 round 2g/p4) --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.validate",
+        .description = "Compile the BP via FKismetEditorUtilities::"
+                       "CompileBlueprint with SkipSave + a silent "
+                       "FCompilerResultsLog and return the diagnostics. "
+                       "Useful before bp.compile to surface errors / "
+                       "warnings without dirtying the package. Returns "
+                       "{valid, error_count, warning_count, messages: "
+                       "[{severity, message}]} — severity ∈ {error, "
+                       "warning, perf, info}. PIE rejected (compile is "
+                       "still a write operation under the hood).",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.run_construction_script",
+        .description = "Spawn a transient instance of the BP into the "
+                       "editor world, let SpawnActor + RerunConstruction"
+                       "Scripts run, snapshot the resulting components + "
+                       "transforms, then destroy. Useful to inspect what "
+                       "the construction script produces without leaving "
+                       "an actor in the level. location {x,y,z} optional "
+                       "(default origin). BP must be Actor-derived. "
+                       "Returns {class, components: [{name, class, "
+                       "location, rotation, scale, is_root}], count}. "
+                       "PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"location", {{"type", "array"},
+                              {"items", {{"type", "number"}}},
+                              {"minItems", 3}, {"maxItems", 3}}},
+            }},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // -- read+write — SCS component deep CRUD (Phase 4.2 round 2g/p3) --
     registerRemote(sage::mcp::Tool{
         .name = "bp.read_component_properties",
