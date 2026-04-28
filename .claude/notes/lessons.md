@@ -29,6 +29,40 @@ user might exercise. Group them by shared infrastructure, not by guessed
 calendar weeks. Phases land when the work lands; the graph of work is
 the plan, the timeline is a side effect.
 
+## UE Blueprint mutation must be on the GameThread
+
+**Symptom**: First call to `bp.add_variable` (FBlueprintEditorUtils::
+AddMemberVariable) deadlocked the editor and crashed it on the next tick;
+WebSocket dispatch had been calling UE editor APIs from the bridge worker
+thread.
+
+**Rule**: All UE editor mutations (UObject Modify, FBlueprintEditorUtils::*,
+SCS edits, transaction begin/commit, package marks dirty, etc.) must be
+marshalled to the game thread. Wrap dispatch lambdas with
+`detail::RunOnGameThread([&]() { ... })`. The Phase-1 SageActorTools
+already followed this pattern; SageBlueprintTools missed it on the first
+pass and crashed on the very first write call.
+
+Reads-only that touch the reflection registry (`TObjectIterator<UClass>`)
+appear to work off-thread, but it's fragile — when in doubt, marshal.
+
+## Don't pass nullptr to FBlueprintEditorUtils::PropertyValueFromString_Direct
+
+**Symptom**: SIGSEGV at 0x8 inside `FBlueprintEditorUtils::
+PropertyValueFromString_Direct(FProperty const*, FString const&, unsigned
+char*, UObject*, int)` after a duplicate-asset → bp.add_variable sequence.
+The first arg was passed `nullptr` to satisfy a "set the default" intent.
+
+**Root**: `_Direct` writes the parsed value into a raw byte buffer offset
+of a non-null `FProperty*`. Passing nullptr Property + nullptr buffer
+makes it deref the property's class on a null receiver.
+
+**Rule**: BP variable defaults are persistent serialised strings on
+`FBPVariableDescription::DefaultValue`. Just set the string field; the
+compiler reads it at the next compile pass. Do not call
+PropertyValueFromString_Direct unless you have a real FProperty + real
+buffer pointer.
+
 ## File-local helper shadows the public version
 
 **Symptom**: `nm` showed two `SetUPropertyFromJson` symbols in the plugin

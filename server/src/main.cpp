@@ -1002,6 +1002,240 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // ---- Blueprint authoring (Phase 4.2 — read + write) ---------------
+    auto bpPathSchema = nlohmann::json{
+        {"type", "object"},
+        {"properties", {{"path", {{"type", "string"}}}}},
+        {"required", nlohmann::json::array({"path"})},
+        {"additionalProperties", false},
+    };
+    auto bpPathFnSchema = nlohmann::json{
+        {"type", "object"},
+        {"properties", {
+            {"path",     {{"type", "string"}}},
+            {"function", {{"type", "string"}}},
+        }},
+        {"required", nlohmann::json::array({"path", "function"})},
+        {"additionalProperties", false},
+    };
+
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.read",
+        .description = "Blueprint summary: name, parent class, generated class, "
+                       "variable/function/event-graph counts, implemented interfaces.",
+        .inputSchema = bpPathSchema, .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.list_variables",
+        .description = "All UCLASS variables: name, type, default, category, flags "
+                       "(EditAnywhere, Replicated, RepNotify, Transient, ...).",
+        .inputSchema = bpPathSchema, .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.list_functions",
+        .description = "All BP-side function/event/macro graphs with kind + node count.",
+        .inputSchema = bpPathSchema, .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.read_function_graph",
+        .description = "All nodes + pins + connections for one graph (function or "
+                       "event_graph). Each pin reports direction, type, default, "
+                       "and link list with target node id + pin name.",
+        .inputSchema = bpPathFnSchema, .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.get_execution_flow",
+        .description = "BFS exec-pin walk from FunctionEntry / Event nodes — easier "
+                       "for the agent than parsing the full graph. Returns ordered "
+                       "[{order, id, class, title}].",
+        .inputSchema = bpPathFnSchema, .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.read_components",
+        .description = "SCS hierarchy: name, class, parent, attach socket per node. "
+                       "Recursive walk from root nodes.",
+        .inputSchema = bpPathSchema, .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.search_nodes",
+        .description = "Substring search across all of a Blueprint's graphs "
+                       "(function + event + macro). Returns hits with graph, "
+                       "graph_kind, id, title, class.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",    {{"type", "string"}}},
+                {"keyword", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "keyword"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    // -- write — variables --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.add_variable",
+        .description = "Add a member variable. type=PinCategory string ('bool', "
+                       "'int', 'float', 'string', 'object', 'struct', ...). "
+                       "type_object resolves a UClass/UStruct path for object/"
+                       "struct types. is_array=true for TArray. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",          {{"type", "string"}}},
+                {"name",          {{"type", "string"}}},
+                {"type",          {{"type", "string"}}},
+                {"type_object",   {{"type", "string"}}},
+                {"is_array",      {{"type", "boolean"}}},
+                {"default_value", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "name", "type"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.delete_variable",
+        .description = "Remove a member variable + fix up references. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path", {{"type", "string"}}},
+                {"name", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.set_variable_default",
+        .description = "Set a member variable's default value (string-coerced). "
+                       "PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",  {{"type", "string"}}},
+                {"name",  {{"type", "string"}}},
+                {"value", {{"description", "JSON value (string/number/bool)"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "name", "value"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    // -- write — functions --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.add_function",
+        .description = "Create a new user function graph. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path", {{"type", "string"}}},
+                {"name", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.delete_function",
+        .description = "Remove a user function graph. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path", {{"type", "string"}}},
+                {"name", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    // -- write — graph nodes --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.delete_node",
+        .description = "Remove a node from a graph by GUID. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"function", {{"type", "string"}}},
+                {"node_id",  {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "function", "node_id"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.connect_pins",
+        .description = "Connect two pins. Schema-validated; rejects type-incompatible "
+                       "links. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",      {{"type", "string"}}},
+                {"function",  {{"type", "string"}}},
+                {"from_node", {{"type", "string"}}},
+                {"from_pin",  {{"type", "string"}}},
+                {"to_node",   {{"type", "string"}}},
+                {"to_pin",    {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array(
+                {"path","function","from_node","from_pin","to_node","to_pin"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    // -- write — class shape --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.set_cdo_property",
+        .description = "Write a property on the BP's class default object. Goes "
+                       "through Phase 4.0 reflection (TArray/TMap/TObjectPtr/"
+                       "FStruct/UEnum all supported). Marks BP structurally "
+                       "modified. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"property", {{"type", "string"}}},
+                {"value",    {{"description", "JSON value matching property type"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "property", "value"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.reparent",
+        .description = "Change BP's parent class. Refreshes all nodes for the new "
+                       "parent's interface. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",             {{"type", "string"}}},
+                {"new_parent_class", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "new_parent_class"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    // -- compile --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.compile",
+        .description = "Trigger full BP compile. Returns {success, errors, "
+                       "warnings, notes}. PIE rejected.",
+        .inputSchema = bpPathSchema, .handler = nullptr, .remote = true,
+    });
+
     // Material parameter (Milestone 1.3c).
     registerRemote(sage::mcp::Tool{
         .name        = "modify_material_parameter",

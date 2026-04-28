@@ -30,6 +30,11 @@ public class SageBridge : ModuleRules
             "Json",
             "JsonUtilities",
             "Projects",
+            // Blueprint read + write (Phase 4.2)
+            "Kismet",
+            "KismetCompiler",
+            "BlueprintGraph",
+            "GraphEditor",
         });
 
         // Live Coding ships only on Windows in UE 5.7; Mac/Linux use the
