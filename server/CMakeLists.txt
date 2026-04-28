@@ -41,6 +41,30 @@ target_link_libraries(sage-tools
     PUBLIC  sage-mcp
     PRIVATE sage-warnings sage-sanitizers)
 
+# ---- graph library (KuzuDB embedded; Phase 2 knowledge layer) ----
+# Compiled as C++20 — kuzu.hpp's forward-declared ExtraTypeInfo trips libc++
+# constexpr ~unique_ptr static_assert under C++23. The rest of Sage stays on
+# C++23; only this TU needs the downgrade. See .claude/notes/lessons.md.
+add_library(sage-graph STATIC
+    src/graph/kuzu_graph_store.cpp
+)
+target_include_directories(sage-graph
+    PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+target_link_libraries(sage-graph
+    PUBLIC  nlohmann_json::nlohmann_json
+            kuzu::kuzu
+    PRIVATE spdlog::spdlog
+            sage-warnings)
+# Compiled as C++20: kuzu.hpp's forward-declared ExtraTypeInfo + default-arg
+# unique_ptr trips libc++'s constexpr ~unique_ptr static_assert under C++23.
+# GraphResult therefore uses std::variant (C++17) rather than std::expected
+# (C++23) so the public header is version-neutral. The rest of Sage stays
+# C++23. See .claude/notes/lessons.md.
+set_target_properties(sage-graph PROPERTIES
+    CXX_STANDARD          20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS        OFF)
+
 # ---- bridge library (plugin↔server WebSocket, ADR-015) ----
 add_library(sage-bridge STATIC
     src/bridge/protocol.cpp

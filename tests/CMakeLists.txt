@@ -70,3 +70,22 @@ add_custom_command(TARGET sage-kuzu-smoke POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${KUZU_DIR}/${KUZU_LIB_NAME}"
         "$<TARGET_FILE_DIR:sage-kuzu-smoke>/${KUZU_LIB_NAME}")
+
+# ---- GraphStore abstraction smoke ----
+# Driver doesn't include kuzu.hpp directly (sage-graph forwards-declares the
+# kuzu types in its public header), so this TU stays C++23. No sanitizers —
+# transitively links libkuzu (not ASan-instrumented).
+add_executable(sage-graph-smoke
+    integration/graph_store_smoke.cpp
+)
+target_link_libraries(sage-graph-smoke
+    PRIVATE sage-graph)
+target_compile_features(sage-graph-smoke PRIVATE cxx_std_23)
+set_target_properties(sage-graph-smoke PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    BUILD_RPATH   "${KUZU_DIR}"
+    INSTALL_RPATH "@executable_path")
+add_custom_command(TARGET sage-graph-smoke POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${KUZU_DIR}/${KUZU_LIB_NAME}"
+        "$<TARGET_FILE_DIR:sage-graph-smoke>/${KUZU_LIB_NAME}")
