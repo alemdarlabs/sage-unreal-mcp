@@ -15,6 +15,7 @@
 #include "mcp/server.h"
 #include "mcp/tool_registry.h"
 #include "tools/builtin.h"
+#include "tools/phase4_schemas.h"
 #include "tools/restart_orchestrator.h"
 #include "transport/http_sse_server.h"
 
@@ -78,6 +79,7 @@ int main() {
 
     auto registry = std::make_shared<sage::mcp::ToolRegistry>();
     sage::tools::registerBuiltins(*registry);
+    sage::tools::registerPhase4Schemas(*registry);
     spdlog::info("Registered {} built-in tool(s)", registry->size());
 
     sage::mcp::MCPServer mcpServer(

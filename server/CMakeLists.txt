@@ -33,6 +33,7 @@ target_link_libraries(sage-transport
 # ---- tools library ----
 add_library(sage-tools STATIC
     src/tools/builtin.cpp
+    src/tools/phase4_schemas.cpp
 )
 target_include_directories(sage-tools
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
