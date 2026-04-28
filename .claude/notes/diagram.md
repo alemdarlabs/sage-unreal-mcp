@@ -41,7 +41,7 @@ flowchart TB
   M17 ==Demo 1 ✓==> M21a
 
   %% Şu an
-  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>40 commit · 77 MCP tool<br/>Phase 1 + 2 + 3-partial + 4.0/4.1/4.2-r1 CANLI<br/>SageTest UE 5.7 — 8K asset · 16K dep · 8337 class · 8336 inherit<br/>real-time delta · query_graph · class_hierarchy · restart_editor<br/>collections (TArray/TMap/TObjectPtr) · reflection · BP read+write<br/>UE-MCP 562 action audit → Phase 4 yol haritası canlı"]):::now
+  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>43 commit · 103 MCP tool<br/>Phase 1 + 2 + 3 + 4.0/4.1/4.2/4.3/4.5/4.6 CANLI<br/>SageTest UE 5.7 — 8K asset · 16K dep · 8337 class · 8336 inherit<br/>BP authoring · Material graph · Asset bulk · Editor automation<br/>UE-MCP 562 action audit → Phase 4 yol haritası %50+ done"]):::now
 
   %% Phase 1'den ertelenenler
   subgraph DEF["Storage / out-of-process gerektirenler"]
@@ -70,9 +70,9 @@ flowchart TB
     P40["4.0 UProperty collections ✓<br/>TArray/TMap/TSet · TObjectPtr/SoftObject · TSubclassOf<br/>FStruct shorthand · UEnum · raw-pointer dispatch"]:::done
     P41["4.1 Reflection ✓ (8 tool)<br/>reflect_class · reflect_struct · reflect_enum<br/>list_classes/structs/enums · find_implementers · CDO read"]:::done
     P42["4.2 Blueprint authoring (round 1) ✓ (17 tool)<br/>read · list_vars/fns · function graph · components · search<br/>add/delete var · add/delete fn · delete_node · connect_pins<br/>set_cdo_property · reparent · compile<br/><i>round 2: ~25 tool kaldı (add_node, T3D, rename, fn I/O, ...)</i>"]:::done
-    P43["4.3 Material (read + write + graph + preview)<br/>~36 tool · expressions · connections · params<br/>build_graph · render_preview · shader_stats"]:::todo
-    P45["4.5 Asset advanced<br/>mesh_bounds · collision · LOD · sockets<br/>bulk_rename · move_folder · FBX/texture import<br/>datatable · redirectors · FTS5 search"]:::todo
-    P46["4.6 Editor automation<br/>console_command · run_python · dialog policy<br/>screenshot · viewport · log filter · sequencer"]:::todo
+    P43["4.3 Material round 1 ✓ (13 tool)<br/>read · params · expressions · create_instance<br/>add/delete/connect_expressions · set_base_color<br/>set_shading_model · validate · connect_texture<br/><i>round 2: build_graph · render_preview · shader_stats</i>"]:::done
+    P45["4.5 Asset advanced round 1 ✓ (7 tool)<br/>mesh_bounds · mesh_collision · diagnose_registry<br/>list_redirectors · bulk_rename · move_folder · fixup_redirectors<br/><i>round 2: import_fbx/texture · datatable · FTS · sockets</i>"]:::done
+    P46["4.6 Editor automation round 1 ✓ (6 tool)<br/>console_command (whitelist) · take_screenshot<br/>get_engine_version · get_project_version<br/>get_log_file_path · read_log<br/><i>round 2: dialog policy · sequencer · viewport · run_python</i>"]:::done
     P47["4.7 Project / engine introspection<br/>read_cpp_header · read_module · search_cpp<br/>engine source · INI tree · plugin enable/disable"]:::todo
     P48["4.8 Animation<br/>AnimBP · montage · sequence · blendspace<br/>IK Rig · ControlRig · skeleton · modifiers (~56 tool)"]:::todo
     P49["4.9 Niagara VFX<br/>system · emitter · modules · HLSL · renderer (~37 tool)"]:::todo
