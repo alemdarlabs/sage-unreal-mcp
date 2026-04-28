@@ -495,3 +495,44 @@ widget tree (SButton / STextBlock / SWindow) must add `Slate, SlateCore,
 ApplicationCore, InputCore` to `PrivateDependencyModuleNames` in the
 `.Build.cs`. See SageBridge.Build.cs (Phase 4.6 r2) for the canonical
 form.
+
+## Plugin restart loop — UE Editor must be relaunched after .dylib swap
+
+**Symptom**: `tools/list` returns 200 tools (instead of 456); calling
+`audio.create_cue` returns `unknown tool: audio.create_cue` even though
+the plugin has registered the handler and the new server schemas list it.
+
+**Root**: macOS keeps the plugin .dylib memory-mapped while UE Editor is
+running. A fresh build/copy into `SageTest/Plugins/SageBridge/Binaries/Mac/`
+does NOT take effect until the editor process exits and reloads. Server
+restart alone is insufficient — plugin handlers live in the editor.
+
+**Rule**: After ANY change that touches `plugin/Source/`, run the
+`unreal-close` skill, then `unreal-open`. Wait until the second
+`Bridge handshake:` line appears in `/tmp/sage-server.log` before
+issuing tool calls — the first one is the old editor's stale connection.
+Both the server (if newer) AND the editor must be cycled.
+
+## Phase 4 domain smoke — read C++ before writing Python tests
+
+**Symptom**: First-pass smoke for `animation.read_bone_track` used
+`bone` as the JSON field name (matching the high-level concept). The
+plugin handler reads `bone_name`. Same drift on `add_curve` (`name` vs
+`curve_name`), `add_notify` (no `notify_class`), `add_virtual_bone`
+(`source_bone` / `target_bone` vs `parent_name` / `target_name`),
+`get_physics_asset` (expects USkeletalMesh path, not the PhysicsAsset
+itself). Several iterations of "run → fix → run" before all 46 tools
+dispatched cleanly.
+
+**Rule**: When writing a domain smoke (Phase 4 onward), `grep -B1 -A12
+"FSageToolDispatch::FOutcome <Tool>Impl"` in the matching
+`Sage<Domain>Tools.cpp` BEFORE drafting the call. The argument names in
+`Args->TryGetStringField(TEXT("..."))` are the schema, full stop —
+documentation guesses don't survive a real call.
+
+**How to apply**: For any new smoke, the workflow is (a) list all
+handler names via `grep "RegisterHandler"`, (b) for each non-trivial
+handler, read the impl's first 10–15 lines to capture required field
+names + plugin-gated `NotAvailable()` paths, (c) wrap plugin-gated
+calls in try/except so the smoke can pass when the plugin isn't loaded
+in SageTest (PCG, GAS, SmartObjects, PoseSearch are common gaps).

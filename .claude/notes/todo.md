@@ -255,6 +255,29 @@ Phase 1–3 sonrası 443 tool handler'a ulaşıldı. UE-MCP (448 action) ile %99
 
 **Kalan açık maddeler (Phase 5 adayları):**
 - End-to-end entegrasyon test suite
-- Her domain için smoke test script'leri
+- ~~Her domain için smoke test script'leri~~ ✓ 2026-04-28 (10/10 PASS)
 - `docs/` (public-facing) getting-started yazısı
 - License kararı (ADR-016 Apache-2.0 önerim)
+
+---
+
+## Phase 4 Domain Smoke Tests Tamamlandı (2026-04-28)
+
+10 yeni domain için Python smoke script'leri eklendi (`scripts/smoke/`):
+
+| Domain | Tools | Kapsam |
+|---|---|---|
+| audio.py | 5/5 | create_cue/metasound · list · spawn_ambient · play_at_location |
+| foliage.py | 7/7 | create_type · list_types · get/set_settings + 3 stub note |
+| gas.py | 9/9 | create_ability/effect/cue · add_asc · get_info (graceful skip GAS plugin) |
+| networking.py | 11/11 | tüm replication flag round-trip + get_info readback |
+| level.py | 22/22 | spawn_light/volume · set_world_settings · fog · outliner · count_actors |
+| landscape.py | 11/11 | get_info · list_layers · note-only paths (no landscape in level) |
+| pcg.py | 16/16 | create_graph · add_volume + 7 note stub (graceful skip PCG plugin) |
+| niagara.py | 26/26 | create system+emitter · spawn · 13 note stub · list_system_parameters |
+| animation.py | 46/46 | create_anim_blueprint/sequence/montage/blendspace/composite/ik_rig/retargeter + 21 mutation tools |
+| gameplay.py | 45/45 | AI assets · framework BPs · IMC · physics · navmesh · PIE error path |
+
+Master runner: `scripts/smoke/run_phase4_domains.py` — 10/10 PASS (gerçek UE editor + sage-server üzerinde).
+
+Plugin-gated graceful skip pattern'ı: GAS, PCG, SmartObjects, PoseSearch plugin'leri SageTest'te yüklü değil, smoke test'ler bunu yakalayıp skip ediyor.
