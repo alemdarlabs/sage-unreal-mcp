@@ -1,8 +1,8 @@
 # UE-MCP → Sage: 448 Action Per-Tool Task List
 
 > **Source:** `/Users/mahmutalemdar/Developer/alemdarlabs/ue-mcp` — TypeScript MCP server + C++ plugin, BUSL-1.1.
-> **Audit date:** 2026-04-28.
-> **Status:** Sage 103 tools · UE-MCP 448 actions · ~96 covered (mostly via Phase 4) · **352 actions remain**.
+> **Audit date:** 2026-04-28 (last update: Phase 4.6-r2 dialog policy quartet shipped).
+> **Status:** Sage 108 tools · UE-MCP 448 actions · ~101 covered (mostly via Phase 4) · **347 actions remain**.
 >
 > Earlier note had cited 562; actual enumeration of every `RegisterHandler` / dispatcher branch in the ue-mcp source landed on 448. The 562 number likely came from including duplicates / aliases / TS-side validation rules that don't materialise as distinct C++ handlers.
 
@@ -11,7 +11,7 @@
 | Category | Have | Need | Total | % |
 |---|---:|---:|---:|---:|
 | project | 2 | 27 | 29 | 7 |
-| editor | 10 | 34 | 44 | 23 |
+| editor | 15 | 29 | 44 | 34 |
 | gameplay | 2 | 43 | 45 | 4 |
 | animation | 0 | 46 | 46 | 0 |
 | blueprint | 13 | 33 | 46 | 28 |
@@ -29,7 +29,7 @@
 | audio | 0 | 5 | 5 | 0 |
 | feedback | 0 | 1 | 1 | 0 |
 | demo | 0 | 2 | 2 | 0 |
-| **TOTAL** | **96** | **352** | **448** | **21** |
+| **TOTAL** | **101** | **347** | **448** | **23** |
 
 Highest leverage (raw action count missing): gameplay (+43), animation (+46), blueprint (+33), editor (+34), asset (+32), project (+27), niagara (+26), pcg (+16), material (+16), widget (+17).
 
@@ -122,15 +122,17 @@ C++ source / header / config / build introspection. Largest pure-read surface in
 - [ ] `editor.list_crashes` — List crash reports · R
 - [ ] `editor.get_crash_info` — Crash details by folder · R
 - [ ] `editor.check_for_crashes` — Recent crashes? · R
-- [ ] `editor.set_dialog_policy` — Auto-respond modals · W (**critical for headless**)
-- [ ] `editor.clear_dialog_policy` — Clear policies · W
-- [ ] `editor.get_dialog_policy` — Get policies · R
-- [ ] `editor.list_dialogs` — Active modals · R
-- [ ] `editor.respond_to_dialog` — Click button · W
+- [x] `editor.set_dialog_policy` → `editor.set_dialog_policy` (Phase 4.6-r2)
+- [x] `editor.clear_dialog_policy` → `editor.clear_dialog_policy` (Phase 4.6-r2)
+- [x] `editor.get_dialog_policy` → `editor.get_dialog_policy` (Phase 4.6-r2)
+- [x] `editor.list_dialogs` → `editor.list_dialogs` (Phase 4.6-r2)
+- [x] `editor.respond_to_dialog` → `editor.respond_to_dialog` (Phase 4.6-r2)
 - [ ] `editor.open_asset` — Open asset in its editor · W
 - [ ] `editor.reload_bridge` — Hot-reload Python bridge · W · *not applicable (we're C++)*
 
-**Phase 4.6 round 2 candidates:** dialog_policy quartet (set/clear/get/list/respond_to_dialog), set_property, undo/redo, focus_on_actor, set_viewport, sequence_*, build_*, set_dialog_policy, set_pie_time_scale, validate_assets, get_perf_stats. dialog_policy is the highest-priority — without it, headless agent flow stalls on UE's "Save?"/"Reload?"/"Discard?" prompts.
+**Phase 4.6 round 2 — DONE (5 tools, 4.6-r2 commit):** dialog_policy quartet (set/clear/get/list_dialogs/respond_to_dialog) — `FCoreDelegates::ModalMessageDialog` hook + Slate widget tree traversal + button click simulation. Lazy install on first set_dialog_policy. Conservative default-response (no/cancel) when no policy matches.
+
+**Phase 4.6 round 3 candidates:** set_property, undo/redo, focus_on_actor, set_viewport, sequence_*, build_*, set_pie_time_scale, validate_assets, get_perf_stats, run_python.
 
 ---
 

@@ -37,6 +37,14 @@ public class SageBridge : ModuleRules
             "GraphEditor",
             // Material graph + instance creation (Phase 4.3)
             "AssetTools",
+            // Dialog tools (Phase 4.6 r2): SWindow / SButton / STextBlock /
+            // FSlateApplication for active modal traversal + button click
+            // simulation. Slate is transitively available via UnrealEd, but
+            // SButton's OnMouseButtonDown/Up live in Slate proper.
+            "Slate",
+            "SlateCore",
+            "ApplicationCore",
+            "InputCore",
         });
 
         // Live Coding ships only on Windows in UE 5.7; Mac/Linux use the

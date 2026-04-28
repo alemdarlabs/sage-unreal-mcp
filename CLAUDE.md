@@ -73,7 +73,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Şu Anki Durum (Snapshot)
 
-> Tek satırda durum: **44 commit · 103 MCP tool · Phase 1+2+3 tamam · Phase 4 ~%50 (4.0/4.1/4.2-r1/4.3/4.5-r1/4.6-r1)**.
+> Tek satırda durum: **46 commit · 108 MCP tool · Phase 1+2+3 tamam · Phase 4 ~%52 (4.0/4.1/4.2-r1/4.3/4.5-r1/4.6-r1+r2)**.
 
 - **Test ortamı**: `/Users/mahmutalemdar/Developer/alemdarlabs/SageTest/SageTest.uproject` (UE 5.7.4 Third Person + Blueprint).
 - **Knowledge graph (canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Real-time delta + query_graph + class_hierarchy çalışıyor.
@@ -85,7 +85,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
   - [`.claude/notes/lessons.md`](.claude/notes/lessons.md) — kabul edilen kuralların kayıtlı olduğu dosya (en kritik: "MVP scope-cut yapma", BP/Material write GameThread'de marshal et)
 - **Yeni session devraldığında ilk bakılacak**: bu dosya → `.claude/notes/diagram.md` → `.claude/notes/ue-mcp-tasks.md` → son commit `git log --oneline | head -10`.
 
-## Tool Tablosu (özet — 103 toplam)
+## Tool Tablosu (özet — 108 toplam)
 
 | Phase | Domain | Tool sayısı |
 |---|---|---|
@@ -97,6 +97,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 | 4.3 | Material graph authoring (`mat.*`) | 13 |
 | 4.5-r1 | Asset advanced round 1 (`asset.*`) | 7 |
 | 4.6-r1 | Editor automation round 1 (`editor.*`) | 6 |
+| 4.6-r2 | Dialog policy (`editor.set_dialog_policy` / clear / get / list_dialogs / respond_to_dialog) | 5 |
 
 ## Build & Run Commands
 

@@ -1595,6 +1595,85 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // ---- Dialog policy (Phase 4.6 round 2) -----------------------------
+    // Hooks FCoreDelegates::ModalMessageDialog so unattended agent flows
+    // don't stall on Save?/Reload?/Confirm Delete? modals. Lazy install
+    // on first set_dialog_policy call; hook stays bound for the editor
+    // session lifetime and is unbound on plugin module shutdown.
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.set_dialog_policy",
+        .description = "Auto-respond to any modal whose title or message "
+                       "contains 'pattern' (substring). response ∈ "
+                       "{yes, no, ok, cancel, retry, continue, yesall, "
+                       "noall}. Replaces an existing policy with the same "
+                       "pattern. First call lazy-installs the dialog hook.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"pattern",  {{"type", "string"}}},
+                {"response", {{"type", "string"},
+                              {"enum", nlohmann::json::array({
+                                  "yes", "no", "ok", "cancel", "retry",
+                                  "continue", "yesall", "noall"})}}},
+            }},
+            {"required", nlohmann::json::array({"pattern", "response"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.clear_dialog_policy",
+        .description = "Remove a policy by exact-pattern match, or all "
+                       "policies when 'pattern' is omitted. Returns "
+                       "{removed, policy_count}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"pattern", {{"type", "string"}}}}},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.get_dialog_policy",
+        .description = "List active dialog policies and the hook install "
+                       "status. Returns {policies[], count, hook_installed}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.list_dialogs",
+        .description = "Walk Slate to describe the currently-active modal "
+                       "(UE shows at most one). Returns {dialogs: [{title, "
+                       "message, buttons[]}], count}.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.respond_to_dialog",
+        .description = "Click a button on the active modal. Provide "
+                       "button_index (0-based), button_label (substring), "
+                       "or action='escape' to dismiss. -32004 if no modal "
+                       "is active; -32602 with available_buttons[] if no "
+                       "match.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"button_index", {{"type", "integer"}, {"minimum", 0}}},
+                {"button_label", {{"type", "string"}}},
+                {"action",       {{"type", "string"},
+                                  {"enum", nlohmann::json::array({"escape"})}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // Material parameter (Milestone 1.3c).
     registerRemote(sage::mcp::Tool{
         .name        = "modify_material_parameter",
