@@ -12,6 +12,7 @@
 #include "GameFramework/Actor.h"
 #include "GameFramework/WorldSettings.h"
 #include "GenericPlatform/GenericPlatformMisc.h"
+#include "IPythonScriptPlugin.h"
 #include "Kismet/GameplayStatics.h"
 #include "LevelEditorViewport.h"
 #include "GenericPlatform/GenericPlatformOutputDevices.h"
@@ -193,6 +194,49 @@ FSageToolDispatch::FOutcome ReadLogImpl(const TSharedPtr<FJsonObject>& Args)
     R->SetArrayField (TEXT("lines"),     Out);
     R->SetNumberField(TEXT("count"),     Out.Num());
     R->SetNumberField(TEXT("total_lines"), Lines.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- editor.run_python  (Phase 4.6-r3 batch 5) ---------------------------
+
+FSageToolDispatch::FOutcome RunPythonImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Code;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("code"), Code) || Code.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing/empty 'code'"));
+    }
+
+    IPythonScriptPlugin* Py = IPythonScriptPlugin::Get();
+    if (!Py || !Py->IsPythonAvailable())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("Python scripting unavailable. Enable the PythonScriptPlugin "
+                 "in the project's .uproject and restart the editor."));
+    }
+
+    FPythonCommandEx Cmd;
+    Cmd.Command            = Code;
+    Cmd.ExecutionMode      = EPythonCommandExecutionMode::ExecuteFile;
+    Cmd.FileExecutionScope = EPythonFileExecutionScope::Public;
+
+    const bool bOk = Py->ExecPythonCommandEx(Cmd);
+
+    TArray<TSharedPtr<FJsonValue>> Logs;
+    for (const FPythonLogOutputEntry& E : Cmd.LogOutput)
+    {
+        auto O = MakeShared<FJsonObject>();
+        // EPythonLogOutputType: Info / Warning / Error
+        O->SetStringField(TEXT("type"),   LexToString(E.Type));
+        O->SetStringField(TEXT("output"), E.Output);
+        Logs.Add(MakeShared<FJsonValueObject>(O));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),     bOk);
+    R->SetStringField(TEXT("result"),      Cmd.CommandResult);
+    R->SetArrayField (TEXT("log_output"),  Logs);
+    R->SetNumberField(TEXT("log_count"),   Logs.Num());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -763,6 +807,9 @@ void RegisterEditorAutomationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("editor.build_lighting"),     GT(&BuildLightingImpl));
     Dispatch.RegisterHandler(TEXT("editor.build_hlod"),         GT(&BuildHlodImpl));
     Dispatch.RegisterHandler(TEXT("editor.get_build_status"),   GT(&GetBuildStatusImpl));
+
+    // Phase 4.6-r3 batch 5: Python scripting
+    Dispatch.RegisterHandler(TEXT("editor.run_python"),         GT(&RunPythonImpl));
 }
 
 #undef LOCTEXT_NAMESPACE

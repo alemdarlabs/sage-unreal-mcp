@@ -46,6 +46,11 @@ public class SageBridge : ModuleRules
             "SlateCore",
             "ApplicationCore",
             "InputCore",
+            // Python scripting (Phase 4.6 r3 b5) — IPythonScriptPlugin.
+            // Module ships with the engine; if the project hasn't enabled
+            // the Python plugin, IPythonScriptPlugin::Get()->IsPythonAvailable()
+            // returns false and our handler reports a graceful error.
+            "PythonScriptPlugin",
         });
 
         // Live Coding ships only on Windows in UE 5.7; Mac/Linux use the

@@ -2688,6 +2688,26 @@ int main() {
         .handler = nullptr, .remote = true,
     });
 
+    // ---- Python scripting (Phase 4.6 round 3 batch 5) ------------------
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.run_python",
+        .description = "Run a Python snippet inside the editor's "
+                       "PythonScriptPlugin host. Returns {success, "
+                       "result (last expression), log_output[] (entries: "
+                       "type ∈ Info/Warning/Error, output)}. -32603 if "
+                       "the project hasn't enabled the PythonScriptPlugin "
+                       "(IsPythonAvailable=false). The agent gets full "
+                       "access to UE Python API including unreal module — "
+                       "treat as a powerful but unsandboxed tool.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"code", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"code"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
     // ---- Dialog policy (Phase 4.6 round 2) -----------------------------
     // Hooks FCoreDelegates::ModalMessageDialog so unattended agent flows
     // don't stall on Save?/Reload?/Confirm Delete? modals. Lazy install
