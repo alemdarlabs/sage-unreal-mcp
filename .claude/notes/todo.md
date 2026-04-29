@@ -299,6 +299,9 @@ Phase 1–3 sonrası 443 tool handler'a ulaşıldı. UE-MCP (448 action) ile %99
 - ~~Her domain için smoke test script'leri~~ ✓ 2026-04-28 (10/10 PASS)
 - `docs/` (public-facing) getting-started yazısı
 - License kararı (ADR-016 Apache-2.0 önerim)
+- `asset.migrate` tool — `FAssetToolsModule::MigratePackages` wrapper, source/dest editor session ile cross-project transfer (per-call _editor ile artık doğal entegrasyon)
+- MCP transport polish — `Mcp-Session-Id` header + GET /mcp SSE endpoint + OAuth metadata stub + `Mcp-Protocol-Version` header (paketleme öncesi şart)
+- `project.get_info` disconnected mode — şu an sadece bağlı editör için çalışıyor; bağlanma sorunu teşhisi için bağlı olmayan projenin uproject'ini okumak gerekebiliyor (yan not, dogfooding loop'unda diğer Claude tespit etti 2026-04-29)
 
 ---
 
