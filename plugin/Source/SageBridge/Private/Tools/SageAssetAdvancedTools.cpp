@@ -360,16 +360,43 @@ FSageToolDispatch::FOutcome DiagnoseRegistryImpl(const TSharedPtr<FJsonObject>& 
 FSageToolDispatch::FOutcome ListAssetsImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString Dir = TEXT("/Game");
-    if (Args.IsValid()) Args->TryGetStringField(TEXT("directory"), Dir);
     bool bRecursive = true;
-    if (Args.IsValid()) Args->TryGetBoolField(TEXT("recursive"), bRecursive);
     int32 MaxResults = 1000;
+    int32 Offset = 0;
+    FString ClassFilter;
+    TSet<FString> KindFilter;
+    TSet<FString> FieldsFilter;
+
     if (Args.IsValid())
     {
+        Args->TryGetStringField(TEXT("directory"), Dir);
+        Args->TryGetBoolField  (TEXT("recursive"), bRecursive);
+        Args->TryGetStringField(TEXT("class"),     ClassFilter);
+
         double N = 0;
         if (Args->TryGetNumberField(TEXT("max_results"), N))
         {
             MaxResults = FMath::Clamp(static_cast<int32>(N), 1, 50000);
+        }
+        if (Args->TryGetNumberField(TEXT("offset"), N))
+        {
+            Offset = FMath::Max(0, static_cast<int32>(N));
+        }
+
+        const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+        if (Args->TryGetArrayField(TEXT("kind"), Arr) && Arr)
+        {
+            for (const auto& V : *Arr)
+            {
+                if (V.IsValid() && V->Type == EJson::String) KindFilter.Add(V->AsString());
+            }
+        }
+        if (Args->TryGetArrayField(TEXT("fields"), Arr) && Arr)
+        {
+            for (const auto& V : *Arr)
+            {
+                if (V.IsValid() && V->Type == EJson::String) FieldsFilter.Add(V->AsString());
+            }
         }
     }
 
@@ -378,48 +405,77 @@ FSageToolDispatch::FOutcome ListAssetsImpl(const TSharedPtr<FJsonObject>& Args)
     IAssetRegistry& Registry = Module.Get();
 
     TArray<FAssetData> Found;
-    Registry.GetAssetsByPath(FName(*Dir), Found, bRecursive, /*bIncludeOnlyOnDiskAssets*/ false);
+    if (!ClassFilter.IsEmpty())
+    {
+        FARFilter Filter;
+        Filter.PackagePaths.Add(FName(*Dir));
+        Filter.bRecursivePaths = bRecursive;
+        Filter.ClassPaths.Add(FTopLevelAssetPath(ClassFilter));
+        Registry.GetAssets(Filter, Found);
+    }
+    else
+    {
+        Registry.GetAssetsByPath(FName(*Dir), Found, bRecursive, /*bIncludeOnlyOnDiskAssets*/ false);
+    }
+
+    auto WantField = [&](const TCHAR* Name)
+    {
+        return FieldsFilter.Num() == 0 || FieldsFilter.Contains(FString(Name));
+    };
 
     TArray<TSharedPtr<FJsonValue>> Out;
-    int32 Total = Found.Num();
-    int32 Returned = 0;
+    int32 Total = 0;
+    int32 SkippedForOffset = 0;
     for (const FAssetData& A : Found)
     {
-        if (Returned >= MaxResults) break;
+        const FString Kind = A.AssetClassPath.GetAssetName().ToString();
+        if (KindFilter.Num() > 0 && !KindFilter.Contains(Kind)) continue;
+        ++Total;
+        if (SkippedForOffset < Offset) { ++SkippedForOffset; continue; }
+        if (Out.Num() >= MaxResults) continue;
+
         auto O = MakeShared<FJsonObject>();
-        O->SetStringField(TEXT("path"),  A.GetSoftObjectPath().ToString());
-        O->SetStringField(TEXT("kind"),  A.AssetClassPath.GetAssetName().ToString());
-        O->SetStringField(TEXT("name"),  A.AssetName.ToString());
+        if (WantField(TEXT("path"))) O->SetStringField(TEXT("path"), A.GetSoftObjectPath().ToString());
+        if (WantField(TEXT("kind"))) O->SetStringField(TEXT("kind"), Kind);
+        if (WantField(TEXT("name"))) O->SetStringField(TEXT("name"), A.AssetName.ToString());
         Out.Add(MakeShared<FJsonValueObject>(O));
-        ++Returned;
     }
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("directory"), Dir);
     R->SetBoolField  (TEXT("recursive"), bRecursive);
+    if (!ClassFilter.IsEmpty()) R->SetStringField(TEXT("class"), ClassFilter);
     R->SetArrayField (TEXT("assets"),    Out);
-    R->SetNumberField(TEXT("returned"),  Returned);
+    R->SetNumberField(TEXT("returned"),  Out.Num());
+    R->SetNumberField(TEXT("offset"),    Offset);
     R->SetNumberField(TEXT("total"),     Total);
-    R->SetBoolField  (TEXT("capped"),    Returned < Total);
+    R->SetBoolField  (TEXT("capped"),    (Offset + Out.Num()) < Total);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 FSageToolDispatch::FOutcome SearchAssetsImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString Query;
-    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("query"), Query) || Query.IsEmpty())
-    {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing/empty 'query'"));
-    }
+    if (Args.IsValid()) Args->TryGetStringField(TEXT("query"), Query);
     FString ClassFilter;
-    Args->TryGetStringField(TEXT("class"), ClassFilter);
+    if (Args.IsValid()) Args->TryGetStringField(TEXT("class"), ClassFilter);
     FString Dir = TEXT("/Game");
-    Args->TryGetStringField(TEXT("directory"), Dir);
-    int32 MaxResults = 200;
-    double N = 0;
-    if (Args->TryGetNumberField(TEXT("max_results"), N))
+    if (Args.IsValid()) Args->TryGetStringField(TEXT("directory"), Dir);
+
+    if (Query.IsEmpty() && ClassFilter.IsEmpty())
     {
-        MaxResults = FMath::Clamp(static_cast<int32>(N), 1, 5000);
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("at least one of 'query' or 'class' must be provided"));
+    }
+
+    int32 MaxResults = 200;
+    if (Args.IsValid())
+    {
+        double N = 0;
+        if (Args->TryGetNumberField(TEXT("max_results"), N))
+        {
+            MaxResults = FMath::Clamp(static_cast<int32>(N), 1, 5000);
+        }
     }
 
     FAssetRegistryModule& Module = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(
@@ -437,26 +493,30 @@ FSageToolDispatch::FOutcome SearchAssetsImpl(const TSharedPtr<FJsonObject>& Args
     TArray<FAssetData> Found;
     Registry.GetAssets(Filter, Found);
 
-    TArray<TSharedPtr<FJsonValue>> Out;
+    const bool bSubstring = !Query.IsEmpty();
     const FString QLower = Query.ToLower();
+    TArray<TSharedPtr<FJsonValue>> Out;
     int32 Total = 0;
     for (const FAssetData& A : Found)
     {
-        const FString Name = A.AssetName.ToString();
-        const FString Path = A.GetSoftObjectPath().ToString();
-        if (!Name.ToLower().Contains(QLower) && !Path.ToLower().Contains(QLower)) continue;
+        if (bSubstring)
+        {
+            const FString Name = A.AssetName.ToString();
+            const FString Path = A.GetSoftObjectPath().ToString();
+            if (!Name.ToLower().Contains(QLower) && !Path.ToLower().Contains(QLower)) continue;
+        }
         ++Total;
         if (Out.Num() >= MaxResults) continue;
 
         auto O = MakeShared<FJsonObject>();
-        O->SetStringField(TEXT("path"), Path);
+        O->SetStringField(TEXT("path"), A.GetSoftObjectPath().ToString());
         O->SetStringField(TEXT("kind"), A.AssetClassPath.GetAssetName().ToString());
-        O->SetStringField(TEXT("name"), Name);
+        O->SetStringField(TEXT("name"), A.AssetName.ToString());
         Out.Add(MakeShared<FJsonValueObject>(O));
     }
 
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("query"),     Query);
+    if (!Query.IsEmpty()) R->SetStringField(TEXT("query"), Query);
     if (!ClassFilter.IsEmpty()) R->SetStringField(TEXT("class"), ClassFilter);
     R->SetStringField(TEXT("directory"), Dir);
     R->SetArrayField (TEXT("matches"),   Out);

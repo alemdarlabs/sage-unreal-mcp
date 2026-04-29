@@ -2378,18 +2378,28 @@ int main() {
     registerRemote(sage::mcp::Tool{
         .name = "asset.list",
         .description = "Enumerate assets under a content directory via "
-                       "AssetRegistry::GetAssetsByPath. directory defaults "
-                       "to '/Game' (project content root); '/Engine', "
-                       "'/Plugin/<Name>' also accepted. recursive=true "
-                       "(default) descends. max_results clamped 1..50000 "
-                       "(default 1000). Returns {assets: [{path, kind, "
-                       "name}], returned, total, capped}.",
+                       "AssetRegistry. directory defaults to '/Game' "
+                       "(project content root); '/Engine', '/Plugin/<Name>' "
+                       "also accepted. recursive=true (default). "
+                       "Server-side filters: class (FTopLevelAssetPath, "
+                       "e.g. '/Script/Engine.Blueprint') and kind (asset "
+                       "class simple-name array, e.g. ['Blueprint',"
+                       "'AnimBlueprint']). Pagination via offset (>=0, "
+                       "default 0) + max_results (1..50000, default 1000). "
+                       "fields projects output rows (subset of "
+                       "['path','kind','name'], empty = all). Returns "
+                       "{assets, returned, offset, total, capped, "
+                       "directory, recursive, class?}.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
                 {"directory",   {{"type", "string"}}},
                 {"recursive",   {{"type", "boolean"}}},
+                {"class",       {{"type", "string"}}},
+                {"kind",        {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"offset",      {{"type", "integer"}, {"minimum", 0}}},
                 {"max_results", {{"type", "integer"}, {"minimum", 1}, {"maximum", 50000}}},
+                {"fields",      {{"type", "array"}, {"items", {{"type", "string"}}}}},
             }},
             {"additionalProperties", false},
         },
@@ -2400,8 +2410,12 @@ int main() {
         .description = "Substring search assets by name OR path under the "
                        "given directory (case-insensitive). Optional "
                        "class filter is a TopLevelAssetPath (e.g. "
-                       "'/Script/Engine.Blueprint'). Returns same shape "
-                       "as asset.list plus {query, class?} echo.",
+                       "'/Script/Engine.Blueprint'). At least one of "
+                       "'query' or 'class' must be provided — if only "
+                       "class is given, all assets of that class under "
+                       "directory are returned (no substring filter). "
+                       "Returns same shape as asset.list plus {query?, "
+                       "class?} echo.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
@@ -2410,7 +2424,6 @@ int main() {
                 {"directory",   {{"type", "string"}}},
                 {"max_results", {{"type", "integer"}, {"minimum", 1}, {"maximum", 5000}}},
             }},
-            {"required", nlohmann::json::array({"query"})},
             {"additionalProperties", false},
         },
         .handler = nullptr, .remote = true,
