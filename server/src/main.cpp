@@ -2153,9 +2153,11 @@ int main() {
     });
     registerRemote(sage::mcp::Tool{
         .name = "project.list_modules",
-        .description = "Walk Source/<Module>/<Module>.Build.cs and report "
-                       "each native module: {name, module_dir, "
-                       "build_cs_path, header_count, source_count}. "
+        .description = "Walk Source/<Module>/<Module>.Build.cs AND "
+                       "Plugins/<X>/Source/<Module>/<Module>.Build.cs and "
+                       "report each native module: {name, module_dir, "
+                       "build_cs_path, header_count, source_count, plugin?}. "
+                       "Plugin-owned modules carry the parent plugin's name. "
                        "Lightweight discovery before drilling into a "
                        "specific module via read_cpp_header.",
         .inputSchema = nlohmann::json{
@@ -2206,17 +2208,20 @@ int main() {
     // ---- Project introspection batch 2 (Phase 4.7 batch 2) -------------
     registerRemote(sage::mcp::Tool{
         .name = "project.search_cpp",
-        .description = "Substring search across the project's Source/ "
-                       "subtree (.h, .cpp, .inl). Case-sensitive. Returns "
-                       "{hits: [{file, line, snippet}], count, capped}. "
-                       "max_results clamped 1..500 (default 50). Snippet "
-                       "trimmed/capped at 200 chars.",
+        .description = "Substring search across the project's Source/ subtree "
+                       "(.h, .cpp, .inl). Case-sensitive. By default also "
+                       "scans every project-local plugin's Source/ folder "
+                       "(Plugins/<X>/Source/) — opt out with "
+                       "include_plugins=false. Returns {hits, count, capped, "
+                       "root, plugin_roots?}. max_results clamped 1..500 "
+                       "(default 50). Snippet trimmed/capped at 200 chars.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
-                {"query",       {{"type", "string"}}},
-                {"max_results", {{"type", "integer"},
-                                 {"minimum", 1}, {"maximum", 500}}},
+                {"query",           {{"type", "string"}}},
+                {"max_results",     {{"type", "integer"},
+                                     {"minimum", 1}, {"maximum", 500}}},
+                {"include_plugins", {{"type", "boolean"}}},
             }},
             {"required", nlohmann::json::array({"query"})},
             {"additionalProperties", false},

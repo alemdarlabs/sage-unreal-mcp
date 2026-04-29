@@ -104,37 +104,69 @@ FSageToolDispatch::FOutcome ProjectGetInfoImpl(const TSharedPtr<FJsonObject>& /*
 
 FSageToolDispatch::FOutcome ProjectListModulesImpl(const TSharedPtr<FJsonObject>& /*Args*/)
 {
-    const FString SourceDir = FPaths::ProjectDir() / TEXT("Source");
-    IFileManager& FileMgr   = IFileManager::Get();
+    IFileManager& FileMgr = IFileManager::Get();
 
-    TArray<FString> SubDirs;
-    FileMgr.FindFiles(SubDirs, *(SourceDir / TEXT("*")), false, true);
-
-    TArray<TSharedPtr<FJsonValue>> Out;
-    for (const FString& Dir : SubDirs)
+    auto AddModule = [&](const FString& Name, const FString& ModuleDir,
+                         const FString& BuildCsPath, const FString& Plugin,
+                         TArray<TSharedPtr<FJsonValue>>& Out)
     {
-        const FString ModuleDir   = SourceDir / Dir;
-        const FString BuildCsPath = ModuleDir / (Dir + TEXT(".Build.cs"));
-        if (!FileMgr.FileExists(*BuildCsPath)) continue;
-
         auto O = MakeShared<FJsonObject>();
-        O->SetStringField(TEXT("name"),          Dir);
+        O->SetStringField(TEXT("name"),          Name);
         O->SetStringField(TEXT("module_dir"),    FPaths::ConvertRelativePathToFull(ModuleDir));
         O->SetStringField(TEXT("build_cs_path"), FPaths::ConvertRelativePathToFull(BuildCsPath));
+        if (!Plugin.IsEmpty()) O->SetStringField(TEXT("plugin"), Plugin);
 
-        // Quick file count split (Public / Private / .h / .cpp counts).
         TArray<FString> Headers, Sources;
         FileMgr.FindFilesRecursive(Headers, *ModuleDir, TEXT("*.h"),   true, false);
         FileMgr.FindFilesRecursive(Sources, *ModuleDir, TEXT("*.cpp"), true, false);
         O->SetNumberField(TEXT("header_count"), Headers.Num());
         O->SetNumberField(TEXT("source_count"), Sources.Num());
-
         Out.Add(MakeShared<FJsonValueObject>(O));
+    };
+
+    TArray<TSharedPtr<FJsonValue>> Out;
+
+    // 1. Project-side modules: Source/<Module>/<Module>.Build.cs
+    const FString SourceDir = FPaths::ProjectDir() / TEXT("Source");
+    {
+        TArray<FString> SubDirs;
+        FileMgr.FindFiles(SubDirs, *(SourceDir / TEXT("*")), false, true);
+        for (const FString& Dir : SubDirs)
+        {
+            const FString ModuleDir   = SourceDir / Dir;
+            const FString BuildCsPath = ModuleDir / (Dir + TEXT(".Build.cs"));
+            if (!FileMgr.FileExists(*BuildCsPath)) continue;
+            AddModule(Dir, ModuleDir, BuildCsPath, /*plugin*/ FString{}, Out);
+        }
+    }
+
+    // 2. Project-local plugin modules: Plugins/<Plugin>/Source/<Module>/<Module>.Build.cs
+    const FString PluginsDir = FPaths::ProjectPluginsDir();
+    if (FileMgr.DirectoryExists(*PluginsDir))
+    {
+        TArray<FString> PluginDirs;
+        FileMgr.FindFiles(PluginDirs, *(PluginsDir / TEXT("*")), false, true);
+        for (const FString& Plugin : PluginDirs)
+        {
+            const FString PluginSrc = PluginsDir / Plugin / TEXT("Source");
+            if (!FileMgr.DirectoryExists(*PluginSrc)) continue;
+
+            TArray<FString> ModuleDirs;
+            FileMgr.FindFiles(ModuleDirs, *(PluginSrc / TEXT("*")), false, true);
+            for (const FString& Dir : ModuleDirs)
+            {
+                const FString ModuleDir   = PluginSrc / Dir;
+                const FString BuildCsPath = ModuleDir / (Dir + TEXT(".Build.cs"));
+                if (!FileMgr.FileExists(*BuildCsPath)) continue;
+                AddModule(Dir, ModuleDir, BuildCsPath, Plugin, Out);
+            }
+        }
     }
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("project_name"), FApp::GetProjectName());
     R->SetStringField(TEXT("source_dir"),   FPaths::ConvertRelativePathToFull(SourceDir));
+    R->SetStringField(TEXT("plugins_dir"),  FPaths::ConvertRelativePathToFull(PluginsDir));
     R->SetArrayField (TEXT("modules"),      Out);
     R->SetNumberField(TEXT("count"),        Out.Num());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
@@ -297,6 +329,7 @@ FSageToolDispatch::FOutcome ProjectSearchCppImpl(const TSharedPtr<FJsonObject>& 
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing/empty 'query'"));
     }
     int32 MaxResults = 50;
+    bool  bIncludePlugins = true;
     if (Args.IsValid())
     {
         double N = 0;
@@ -304,18 +337,41 @@ FSageToolDispatch::FOutcome ProjectSearchCppImpl(const TSharedPtr<FJsonObject>& 
         {
             MaxResults = FMath::Clamp(static_cast<int32>(N), 1, 500);
         }
+        Args->TryGetBoolField(TEXT("include_plugins"), bIncludePlugins);
     }
 
-    const FString SourceDir = FPaths::ProjectDir() / TEXT("Source");
+    const FString SourceDir  = FPaths::ProjectDir() / TEXT("Source");
+    const FString PluginsDir = FPaths::ProjectPluginsDir();
 
     TArray<FSearchHit> Hits;
-    SearchInDir(SourceDir, Query,
-        {TEXT(".h"), TEXT(".cpp"), TEXT(".inl")},
-        MaxResults, 200, Hits);
+    const TArray<FString> Exts{TEXT(".h"), TEXT(".cpp"), TEXT(".inl")};
+    SearchInDir(SourceDir, Query, Exts, MaxResults, 200, Hits);
+
+    // Project-local plugins (Plugins/<X>/Source/) — opt out via include_plugins=false.
+    TArray<FString> PluginRoots;
+    if (bIncludePlugins && IFileManager::Get().DirectoryExists(*PluginsDir))
+    {
+        TArray<FString> PluginDirs;
+        IFileManager::Get().FindFiles(PluginDirs, *(PluginsDir / TEXT("*")), false, true);
+        for (const FString& Plugin : PluginDirs)
+        {
+            const FString PluginSrc = PluginsDir / Plugin / TEXT("Source");
+            if (!IFileManager::Get().DirectoryExists(*PluginSrc)) continue;
+            if (Hits.Num() >= MaxResults) break;
+            SearchInDir(PluginSrc, Query, Exts, MaxResults, 200, Hits);
+            PluginRoots.Add(FPaths::ConvertRelativePathToFull(PluginSrc));
+        }
+    }
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("query"),    Query);
     R->SetStringField(TEXT("root"),     FPaths::ConvertRelativePathToFull(SourceDir));
+    if (PluginRoots.Num() > 0)
+    {
+        TArray<TSharedPtr<FJsonValue>> Roots;
+        for (const FString& P : PluginRoots) Roots.Add(MakeShared<FJsonValueString>(P));
+        R->SetArrayField(TEXT("plugin_roots"), Roots);
+    }
     R->SetArrayField (TEXT("hits"),     SearchHitsToJson(Hits));
     R->SetNumberField(TEXT("count"),    Hits.Num());
     R->SetBoolField  (TEXT("capped"),   Hits.Num() >= MaxResults);
@@ -1075,6 +1131,193 @@ FSageToolDispatch::FOutcome ProjectGenerateProjectFilesImpl(const TSharedPtr<FJs
 
 // ---- project.create_cpp_class ----------------------------------------------
 
+// ---- bootstrap helpers (BP-only project → C++ project upgrade) -------------
+
+// Default Build.cs content for a freshly-bootstrapped Game module.
+static FString MakeBuildCsContent(const FString& ModuleName)
+{
+    return FString::Printf(
+        TEXT("using UnrealBuildTool;\n\n"
+             "public class %s : ModuleRules\n"
+             "{\n"
+             "    public %s(ReadOnlyTargetRules Target) : base(Target)\n"
+             "    {\n"
+             "        PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;\n\n"
+             "        PublicDependencyModuleNames.AddRange(new string[] {\n"
+             "            \"Core\", \"CoreUObject\", \"Engine\", \"InputCore\"\n"
+             "        });\n\n"
+             "        PrivateDependencyModuleNames.AddRange(new string[] { });\n"
+             "    }\n"
+             "}\n"),
+        *ModuleName, *ModuleName);
+}
+
+static FString MakeGameTargetCsContent(const FString& ProjectName, const FString& ModuleName)
+{
+    return FString::Printf(
+        TEXT("using UnrealBuildTool;\nusing System.Collections.Generic;\n\n"
+             "public class %sTarget : TargetRules\n"
+             "{\n"
+             "    public %sTarget(TargetInfo Target) : base(Target)\n"
+             "    {\n"
+             "        Type = TargetType.Game;\n"
+             "        DefaultBuildSettings = BuildSettingsVersion.V5;\n"
+             "        IncludeOrderVersion = EngineIncludeOrderVersion.Latest;\n"
+             "        ExtraModuleNames.AddRange(new string[] { \"%s\" });\n"
+             "    }\n"
+             "}\n"),
+        *ProjectName, *ProjectName, *ModuleName);
+}
+
+static FString MakeEditorTargetCsContent(const FString& ProjectName, const FString& ModuleName)
+{
+    return FString::Printf(
+        TEXT("using UnrealBuildTool;\nusing System.Collections.Generic;\n\n"
+             "public class %sEditorTarget : TargetRules\n"
+             "{\n"
+             "    public %sEditorTarget(TargetInfo Target) : base(Target)\n"
+             "    {\n"
+             "        Type = TargetType.Editor;\n"
+             "        DefaultBuildSettings = BuildSettingsVersion.V5;\n"
+             "        IncludeOrderVersion = EngineIncludeOrderVersion.Latest;\n"
+             "        ExtraModuleNames.AddRange(new string[] { \"%s\" });\n"
+             "    }\n"
+             "}\n"),
+        *ProjectName, *ProjectName, *ModuleName);
+}
+
+static FString MakeModuleHeaderContent(const FString& ModuleName)
+{
+    return FString::Printf(
+        TEXT("#pragma once\n\n#include \"CoreMinimal.h\"\n#include \"Modules/ModuleManager.h\"\n\n"
+             "class F%sModule : public IModuleInterface\n"
+             "{\n"
+             "public:\n"
+             "    virtual void StartupModule() override {}\n"
+             "    virtual void ShutdownModule() override {}\n"
+             "};\n"),
+        *ModuleName);
+}
+
+static FString MakeModuleSourceContent(const FString& ModuleName)
+{
+    return FString::Printf(
+        TEXT("#include \"%s.h\"\n\n"
+             "IMPLEMENT_PRIMARY_GAME_MODULE(F%sModule, %s, \"%s\");\n"),
+        *ModuleName, *ModuleName, *ModuleName, *ModuleName);
+}
+
+// Patch the .uproject: ensure Modules[] contains an entry for ModuleName.
+// Returns true if the file was actually modified.
+static bool PatchUProjectAddModule(const FString& ModuleName, FString& OutErr)
+{
+    const FString UProjectPath = FPaths::GetProjectFilePath();
+    FString Content;
+    if (!FFileHelper::LoadFileToString(Content, *UProjectPath))
+    {
+        OutErr = TEXT("could not read .uproject");
+        return false;
+    }
+    TSharedPtr<FJsonObject> Root;
+    auto Reader = TJsonReaderFactory<>::Create(Content);
+    if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+    {
+        OutErr = TEXT("could not parse .uproject");
+        return false;
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Modules;
+    if (Root->HasField(TEXT("Modules")))
+    {
+        const TArray<TSharedPtr<FJsonValue>>* Existing = nullptr;
+        if (Root->TryGetArrayField(TEXT("Modules"), Existing))
+        {
+            for (const auto& V : *Existing)
+            {
+                const TSharedPtr<FJsonObject>* MObj = nullptr;
+                if (V.IsValid() && V->TryGetObject(MObj))
+                {
+                    FString Name;
+                    (*MObj)->TryGetStringField(TEXT("Name"), Name);
+                    if (Name == ModuleName)
+                    {
+                        // Already present — nothing to do.
+                        return true;
+                    }
+                    Modules.Add(V);
+                }
+            }
+        }
+    }
+    auto NewMod = MakeShared<FJsonObject>();
+    NewMod->SetStringField(TEXT("Name"),         ModuleName);
+    NewMod->SetStringField(TEXT("Type"),         TEXT("Runtime"));
+    NewMod->SetStringField(TEXT("LoadingPhase"), TEXT("Default"));
+    Modules.Add(MakeShared<FJsonValueObject>(NewMod));
+    Root->SetArrayField(TEXT("Modules"), Modules);
+
+    FString Out;
+    auto Writer = TJsonWriterFactory<>::Create(&Out);
+    if (!FJsonSerializer::Serialize(Root.ToSharedRef(), Writer))
+    {
+        OutErr = TEXT("could not serialize .uproject");
+        return false;
+    }
+    if (!FFileHelper::SaveStringToFile(Out, *UProjectPath))
+    {
+        OutErr = FString::Printf(TEXT("could not write .uproject: %s"), *UProjectPath);
+        return false;
+    }
+    return true;
+}
+
+// Bootstrap a freshly-scaffolded native module under Source/<ModuleName>/.
+// Writes Build.cs + module .h/.cpp; writes Source/<Project>.Target.cs +
+// <Project>Editor.Target.cs; patches the .uproject. Returns the list of
+// files actually written.
+static TArray<FString> BootstrapNativeModule(const FString& ModuleName, FString& OutErr)
+{
+    TArray<FString> Written;
+    const FString SrcRoot   = FPaths::GameSourceDir();
+    const FString ModuleDir = SrcRoot / ModuleName;
+    const FString ProjectName = FApp::GetProjectName();
+
+    if (!IFileManager::Get().DirectoryExists(*ModuleDir))
+    {
+        if (!IFileManager::Get().MakeDirectory(*ModuleDir, /*Tree*/ true))
+        {
+            OutErr = FString::Printf(TEXT("could not create module dir: %s"), *ModuleDir);
+            return Written;
+        }
+    }
+
+    auto WriteIfMissing = [&](const FString& Path, const FString& Body) -> bool
+    {
+        if (FPaths::FileExists(Path)) return true;
+        if (!FFileHelper::SaveStringToFile(Body, *Path))
+        {
+            OutErr = FString::Printf(TEXT("could not write: %s"), *Path);
+            return false;
+        }
+        Written.Add(Path);
+        return true;
+    };
+
+    if (!WriteIfMissing(ModuleDir / (ModuleName + TEXT(".Build.cs")),
+                        MakeBuildCsContent(ModuleName))) return Written;
+    if (!WriteIfMissing(ModuleDir / (ModuleName + TEXT(".h")),
+                        MakeModuleHeaderContent(ModuleName))) return Written;
+    if (!WriteIfMissing(ModuleDir / (ModuleName + TEXT(".cpp")),
+                        MakeModuleSourceContent(ModuleName))) return Written;
+    if (!WriteIfMissing(SrcRoot / (ProjectName + TEXT(".Target.cs")),
+                        MakeGameTargetCsContent(ProjectName, ModuleName))) return Written;
+    if (!WriteIfMissing(SrcRoot / (ProjectName + TEXT("Editor.Target.cs")),
+                        MakeEditorTargetCsContent(ProjectName, ModuleName))) return Written;
+
+    if (!PatchUProjectAddModule(ModuleName, OutErr)) return Written;
+    return Written;
+}
+
 FSageToolDispatch::FOutcome ProjectCreateCppClassImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString ClassName, ParentClass, ModuleName;
@@ -1086,32 +1329,66 @@ FSageToolDispatch::FOutcome ProjectCreateCppClassImpl(const TSharedPtr<FJsonObje
     Args->TryGetStringField(TEXT("parent_class"), ParentClass);
     Args->TryGetStringField(TEXT("module"),       ModuleName);
 
+    bool bBootstrap = false;
+    Args.IsValid() && Args->TryGetBoolField(TEXT("bootstrap_module"), bBootstrap);
+
     if (ParentClass.IsEmpty()) ParentClass = TEXT("UObject");
     if (ModuleName.IsEmpty())  ModuleName  = FApp::GetProjectName();
 
-    // Locate module source dir
-    FString SrcDir = FPaths::GameSourceDir() / ModuleName;
-    if (!FPaths::DirectoryExists(SrcDir))
-        SrcDir = FPaths::GameSourceDir();
+    const FString SrcRoot   = FPaths::GameSourceDir();
+    const FString ModuleDir = SrcRoot / ModuleName;
+    const FString BuildCs   = ModuleDir / (ModuleName + TEXT(".Build.cs"));
 
+    // Bootstrap path: if no module exists and caller asked for it, scaffold
+    // a fresh native module (Build.cs + module .h/.cpp + Target.cs +
+    // EditorTarget.cs + .uproject Modules[] patch). This converts a BP-only
+    // project into a C++-capable one in one shot.
+    bool bDidBootstrap = false;
+    TArray<FString> ScaffoldFiles;
+    if (!FPaths::FileExists(BuildCs))
+    {
+        if (!bBootstrap)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("module '%s' has no Source/%s/%s.Build.cs; "
+                                     "pass bootstrap_module=true to scaffold it "
+                                     "(creates Build.cs, Target.cs files, and "
+                                     "patches the .uproject) — editor restart "
+                                     "required afterward to compile."),
+                                *ModuleName, *ModuleName, *ModuleName));
+        }
+        FString Err;
+        ScaffoldFiles = BootstrapNativeModule(ModuleName, Err);
+        if (!Err.IsEmpty())
+            return FSageToolDispatch::FOutcome::MakeError(-32603, Err);
+        bDidBootstrap = true;
+    }
+
+    // Class lives under Source/<Module>/[<subfolder>/].
     FString Subfolder;
     Args->TryGetStringField(TEXT("subfolder"), Subfolder);
-    if (!Subfolder.IsEmpty()) SrcDir = SrcDir / Subfolder;
+    FString TargetDir = ModuleDir;
+    if (!Subfolder.IsEmpty())
+    {
+        TargetDir = TargetDir / Subfolder;
+        if (!IFileManager::Get().DirectoryExists(*TargetDir))
+            IFileManager::Get().MakeDirectory(*TargetDir, /*Tree*/ true);
+    }
 
-    FString HeaderPath = SrcDir / ClassName + TEXT(".h");
-    FString SourcePath = SrcDir / ClassName + TEXT(".cpp");
+    const FString HeaderPath = TargetDir / ClassName + TEXT(".h");
+    const FString SourcePath = TargetDir / ClassName + TEXT(".cpp");
 
     if (FPaths::FileExists(HeaderPath))
         return FSageToolDispatch::FOutcome::MakeError(-32602,
             FString::Printf(TEXT("file already exists: %s"), *HeaderPath));
 
-    FString ModuleUpper = ModuleName.ToUpper();
-    FString Header = FString::Printf(
+    const FString ModuleUpper = ModuleName.ToUpper();
+    const FString Header = FString::Printf(
         TEXT("#pragma once\n#include \"CoreMinimal.h\"\n#include \"%s.generated.h\"\n\n"
              "UCLASS()\nclass %s_API %s : public %s\n{\n    GENERATED_BODY()\n};\n"),
         *ClassName, *ModuleUpper, *ClassName, *ParentClass);
 
-    FString Source = FString::Printf(
+    const FString Source = FString::Printf(
         TEXT("#include \"%s.h\"\n"), *ClassName);
 
     if (!FFileHelper::SaveStringToFile(Header, *HeaderPath))
@@ -1126,6 +1403,18 @@ FSageToolDispatch::FOutcome ProjectCreateCppClassImpl(const TSharedPtr<FJsonObje
     R->SetStringField(TEXT("header_path"),  HeaderPath);
     R->SetStringField(TEXT("source_path"),  SourcePath);
     R->SetStringField(TEXT("parent_class"), ParentClass);
+    R->SetStringField(TEXT("module"),       ModuleName);
+    R->SetBoolField  (TEXT("bootstrapped"), bDidBootstrap);
+    if (bDidBootstrap)
+    {
+        TArray<TSharedPtr<FJsonValue>> ScaffoldArr;
+        for (const FString& F : ScaffoldFiles)
+            ScaffoldArr.Add(MakeShared<FJsonValueString>(F));
+        R->SetArrayField(TEXT("scaffold_files"), ScaffoldArr);
+        R->SetStringField(TEXT("note"),
+            TEXT("Project upgraded to C++. Editor restart required (reopen "
+                 ".uproject); UE will detect new modules and prompt to compile."));
+    }
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 

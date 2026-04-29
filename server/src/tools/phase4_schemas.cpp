@@ -1224,8 +1224,18 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="project.create_cpp_class",
-        .description="Create a UCLASS .h + .cpp pair in a project module.",
-        .inputSchema=obj({{"module",str()},{"name",str()},{"parent",str()},{"public",bln()}},{"module","name"}),
+        .description="Create a UCLASS .h + .cpp pair in a project module. "
+                     "Required: class_name. Optional: parent_class (default UObject), "
+                     "module (default = project name), subfolder (under Source/<Module>/). "
+                     "If the module's Build.cs doesn't exist, pass bootstrap_module=true "
+                     "to scaffold a fresh native module: writes Build.cs + module .h/.cpp + "
+                     "<Project>.Target.cs + <Project>Editor.Target.cs and patches the "
+                     ".uproject Modules[] array. Editor restart required afterward to "
+                     "compile (Mac: no live coding, must rebuild from terminal or via "
+                     "restart_editor MCP tool).",
+        .inputSchema=obj({{"class_name",str()},{"parent_class",str()},{"module",str()},
+                          {"subfolder",str()},{"bootstrap_module",bln()}},
+                         {"class_name"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="project.list_project_modules",
