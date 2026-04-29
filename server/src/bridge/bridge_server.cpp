@@ -87,12 +87,21 @@ std::optional<EditorSession> BridgeServer::snapshotSession(std::string_view sess
 
 std::optional<EditorSession> BridgeServer::findByIdOrLabel(std::string_view idOrLabel) const {
     std::lock_guard lk(sessionsMu_);
+    // 1. session_id direct hit (map key)
     if (auto it = sessions_.find(std::string{idOrLabel}); it != sessions_.end()) {
         return it->second;
     }
+    // 2. label, full instance_id, or project-name prefix of instance_id
+    //    (e.g. "Kale" matches instance_id "Kale@83610251" — friendlier than
+    //    forcing callers to know the per-restart hash suffix).
     for (const auto& [_, s] : sessions_) {
         if (s.label == idOrLabel) return s;
         if (s.instance_id == idOrLabel) return s;
+        const auto atPos = s.instance_id.find('@');
+        if (atPos != std::string::npos &&
+            std::string_view{s.instance_id}.substr(0, atPos) == idOrLabel) {
+            return s;
+        }
     }
     return std::nullopt;
 }
