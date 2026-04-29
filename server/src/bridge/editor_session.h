@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <string>
 
+namespace ix { class WebSocket; }
+
 namespace sage::bridge {
 
 // A connected editor instance. Created on `hello` handshake, removed on close.
@@ -20,6 +22,11 @@ struct EditorSession {
 
     std::chrono::system_clock::time_point connected_at;
     std::chrono::system_clock::time_point last_heartbeat;
+
+    // Raw pointer to the bridge WebSocket; lifetime managed by ix::WebSocketServer.
+    // Cleared via close-callback erase before the underlying object is destroyed.
+    // Used by dispatchTool() to route per-call to a specific editor (ADR-004 §2).
+    ix::WebSocket* ws = nullptr;
 };
 
 }  // namespace sage::bridge

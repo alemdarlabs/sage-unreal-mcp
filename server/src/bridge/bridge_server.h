@@ -49,8 +49,11 @@ struct BridgeConfig {
 //   - Both share `pending_` (mutex) and `sessions_` (mutex).
 //   - Promises bridge the two: dispatchTool() awaits future, callback resolves promise.
 //
-// Multi-editor routing (slot-aware) lands in Milestone 1.5; today dispatchTool()
-// targets the first active session.
+// Multi-editor routing (slot-aware, per-call) — ADR-004 §2 + Milestone 1.5b:
+// `dispatchTool` accepts an optional target id/label; when empty, falls back to
+// the active session pointer; if no active and exactly one editor connected,
+// uses that one implicitly; if multiple are connected without an active, returns
+// EditorNotConnected with an "ambiguous target" message.
 class BridgeServer {
 public:
     explicit BridgeServer(BridgeConfig cfg);
@@ -79,14 +82,20 @@ public:
     [[nodiscard]] const BridgeConfig& config() const noexcept { return cfg_; }
     [[nodiscard]] bool running() const noexcept { return running_.load(); }
 
-    // Synchronous tool dispatch: send `tool_call` to the first active session,
-    // block until matching `tool_result` arrives or `timeout` fires. On no
-    // active plugin, returns ErrorCode::EditorNotConnected.
+    // Synchronous tool dispatch with explicit target editor (ADR-004 §2).
+    // `targetIdOrLabel` may be a session_id, label, or instance_id; empty
+    // means "use the active session pointer (or the only connected editor)".
+    [[nodiscard]] mcp::ToolResult dispatchTool(std::string_view tool,
+                                                const nlohmann::json& args,
+                                                std::chrono::milliseconds timeout,
+                                                std::string_view targetIdOrLabel);
+
+    // Convenience: target=active, caller-supplied timeout.
     [[nodiscard]] mcp::ToolResult dispatchTool(std::string_view tool,
                                                 const nlohmann::json& args,
                                                 std::chrono::milliseconds timeout);
 
-    // Convenience: uses BridgeConfig::defaultDispatchTimeout.
+    // Convenience: target=active, default timeout.
     [[nodiscard]] mcp::ToolResult dispatchTool(std::string_view tool,
                                                 const nlohmann::json& args);
 

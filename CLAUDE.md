@@ -246,4 +246,4 @@ curl -s -X POST -H 'Content-Type: application/json' \
 - [Transactions](.claude/docs/transactions.md) — Transaction layer detayı
 - [Compile Coordination](.claude/docs/compile-coordination.md) — Live Coding vs full restart
 - [MVP Roadmap](.claude/docs/mvp-roadmap.md) — Phase 1 + Phase 2 milestone breakdown, risk register
-- [Decisions (ADR)](.claude/decisions/) — Architectural Decision Records (16 ADRs · son: ADR-016 distribution-channel-npm)
+- [Decisions (ADR)](.claude/decisions/) — Architectural Decision Records (17 ADRs · son: ADR-017 multi-editor-routing-impl)

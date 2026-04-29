@@ -114,23 +114,74 @@ std::size_t BridgeServer::pendingCount() const {
 
 mcp::ToolResult BridgeServer::dispatchTool(std::string_view tool,
                                             const nlohmann::json& args) {
-    return dispatchTool(tool, args, cfg_.defaultDispatchTimeout);
+    return dispatchTool(tool, args, cfg_.defaultDispatchTimeout, std::string_view{});
 }
 
 mcp::ToolResult BridgeServer::dispatchTool(std::string_view tool,
                                             const nlohmann::json& args,
                                             std::chrono::milliseconds timeout) {
+    return dispatchTool(tool, args, timeout, std::string_view{});
+}
+
+mcp::ToolResult BridgeServer::dispatchTool(std::string_view tool,
+                                            const nlohmann::json& args,
+                                            std::chrono::milliseconds timeout,
+                                            std::string_view targetIdOrLabel) {
     if (!running_.load()) {
         return std::unexpected(mcp::ErrorObject::fromCode(
             mcp::ErrorCode::InternalError, "bridge not running"));
     }
 
-    auto clients = server_->getClients();
-    if (clients.empty()) {
-        return std::unexpected(mcp::ErrorObject::fromCode(
-            mcp::ErrorCode::EditorNotConnected, "no plugin connected"));
+    // Resolve target editor (ADR-004 §2):
+    //   1. explicit targetIdOrLabel → findByIdOrLabel
+    //   2. fallback to active session pointer
+    //   3. fallback to the only connected editor
+    //   4. error if multiple connected and no preference set
+    std::string targetSessionId;
+    if (!targetIdOrLabel.empty()) {
+        auto session = findByIdOrLabel(targetIdOrLabel);
+        if (!session.has_value()) {
+            std::string msg = "no editor session matches '";
+            msg += std::string{targetIdOrLabel};
+            msg += "' (use list_editors)";
+            return std::unexpected(mcp::ErrorObject::fromCode(
+                mcp::ErrorCode::EditorNotConnected, std::move(msg)));
+        }
+        targetSessionId = session->session_id;
+    } else {
+        targetSessionId = activeSession();
+        if (targetSessionId.empty()) {
+            const auto sessions = snapshotSessions();
+            if (sessions.empty()) {
+                return std::unexpected(mcp::ErrorObject::fromCode(
+                    mcp::ErrorCode::EditorNotConnected, "no plugin connected"));
+            }
+            if (sessions.size() == 1) {
+                targetSessionId = sessions[0].session_id;
+            } else {
+                return std::unexpected(mcp::ErrorObject::fromCode(
+                    mcp::ErrorCode::EditorNotConnected,
+                    "multiple editors connected and no active one set; "
+                    "pass _editor or call set_active_editor"));
+            }
+        }
     }
-    auto ws = *clients.begin();
+
+    // Look up the WebSocket for this session.
+    ix::WebSocket* targetWs = nullptr;
+    {
+        std::lock_guard lk(sessionsMu_);
+        auto it = sessions_.find(targetSessionId);
+        if (it != sessions_.end()) {
+            targetWs = it->second.ws;
+        }
+    }
+    if (targetWs == nullptr) {
+        // Session erased between resolution and lookup, or ws never recorded.
+        return std::unexpected(mcp::ErrorObject::fromCode(
+            mcp::ErrorCode::EditorNotConnected,
+            "target editor session no longer connected"));
+    }
 
     const std::string txId = nextTxId();
     std::future<mcp::ToolResult> future;
@@ -140,8 +191,9 @@ mcp::ToolResult BridgeServer::dispatchTool(std::string_view tool,
     }
 
     const auto envelope = toolCallMessage(txId, std::string{tool}, args);
-    ws->send(envelope.dump());
-    spdlog::debug("Bridge: dispatched tool='{}' tx={}", tool, txId);
+    targetWs->send(envelope.dump());
+    spdlog::debug("Bridge: dispatched tool='{}' tx={} target={}",
+                  tool, txId, targetSessionId);
 
     if (future.wait_for(timeout) != std::future_status::ready) {
         std::lock_guard lk(pendingMu_);
@@ -233,6 +285,7 @@ void BridgeServer::handleHello(ix::WebSocket& ws,
     s.slot_id        = hello.slot_id;
     s.connected_at   = std::chrono::system_clock::now();
     s.last_heartbeat = s.connected_at;
+    s.ws             = &ws;  // ADR-004 §2: per-call routing needs ws-by-session lookup.
 
     if (hello.editor.is_object()) {
         s.instance_id    = hello.editor.value("id", "");

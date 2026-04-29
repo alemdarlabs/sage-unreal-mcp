@@ -76,12 +76,30 @@ Response MCPServer::onPing(Id id) {
 }
 
 Response MCPServer::onToolsList(Id id) {
+    // ADR-004 §2 + Milestone 1.5b: every remote (editor-scoped) tool gets an
+    // optional `_editor` property injected at list-time. Source tools.cpp files
+    // don't have to repeat the property; routing is uniform across the surface.
     nlohmann::json arr = nlohmann::json::array();
     for (const auto& tool : registry_->list()) {
+        nlohmann::json schema = tool.inputSchema;
+        if (tool.remote && schema.is_object()) {
+            if (!schema.contains("properties") || !schema["properties"].is_object()) {
+                schema["properties"] = nlohmann::json::object();
+            }
+            if (!schema["properties"].contains("_editor")) {
+                schema["properties"]["_editor"] = {
+                    {"type", "string"},
+                    {"description",
+                        "Optional target editor: session_id, label, or instance_id. "
+                        "If omitted, the active editor (or the only connected one) is used. "
+                        "Use list_editors to discover available editors."},
+                };
+            }
+        }
         arr.push_back({
             {"name",        tool.name},
             {"description", tool.description},
-            {"inputSchema", tool.inputSchema},
+            {"inputSchema", std::move(schema)},
         });
     }
     nlohmann::json result = {{"tools", std::move(arr)}};
@@ -97,7 +115,17 @@ Response MCPServer::onToolsCall(Id id, const nlohmann::json& params) {
     const auto toolName  = params["name"].get<std::string>();
     nlohmann::json args  = params.value("arguments", nlohmann::json::object());
 
-    auto outcome = registry_->dispatch(toolName, args);
+    // Pull `_editor` out of the args before forwarding — it's transport-level
+    // routing metadata, not part of the tool's domain payload (ADR-004 §2).
+    std::string targetEditor;
+    if (args.is_object() && args.contains("_editor")) {
+        if (args["_editor"].is_string()) {
+            targetEditor = args["_editor"].get<std::string>();
+        }
+        args.erase("_editor");
+    }
+
+    auto outcome = registry_->dispatch(toolName, args, targetEditor);
     if (!outcome.has_value()) {
         return Response::failure(std::move(id), outcome.error());
     }

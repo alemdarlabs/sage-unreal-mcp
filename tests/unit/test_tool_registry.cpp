@@ -136,7 +136,8 @@ TEST_CASE("ToolRegistry routes remote tool via dispatcher", "[mcp][registry]") {
 
     bool called = false;
     reg.setRemoteDispatcher(
-        [&called](std::string_view tool, const nlohmann::json& args) -> ToolResult {
+        [&called](std::string_view tool, const nlohmann::json& args,
+                  std::string_view /*targetEditor*/) -> ToolResult {
             called = true;
             REQUIRE(tool == "editor.ping");
             return nlohmann::json{{"echoed", args}};
@@ -178,7 +179,7 @@ TEST_CASE("ToolRegistry remote dispatcher exception → InternalError",
     };
     REQUIRE(reg.registerTool(std::move(remote)).has_value());
     reg.setRemoteDispatcher(
-        [](std::string_view, const nlohmann::json&) -> ToolResult {
+        [](std::string_view, const nlohmann::json&, std::string_view) -> ToolResult {
             throw std::runtime_error("dispatcher boom");
         });
 

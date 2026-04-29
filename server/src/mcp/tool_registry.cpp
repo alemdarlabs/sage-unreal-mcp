@@ -55,7 +55,8 @@ std::vector<Tool> ToolRegistry::list() const {
 }
 
 ToolResult ToolRegistry::dispatch(std::string_view name,
-                                   const nlohmann::json& params) const {
+                                   const nlohmann::json& params,
+                                   std::string_view targetEditor) const {
     const Tool* tool = find(name);
     if (tool == nullptr) {
         return std::unexpected(ErrorObject::fromCode(
@@ -68,7 +69,7 @@ ToolResult ToolRegistry::dispatch(std::string_view name,
                 ErrorCode::InternalError, "remote dispatcher not configured"));
         }
         try {
-            return remoteDispatcher_(name, params);
+            return remoteDispatcher_(name, params, targetEditor);
         } catch (const std::exception& ex) {
             spdlog::error("Remote dispatcher threw for '{}': {}", name, ex.what());
             return std::unexpected(ErrorObject::fromCode(

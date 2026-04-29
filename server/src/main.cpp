@@ -101,9 +101,14 @@ int main() {
     g_runningBridge.store(&bridge, std::memory_order_release);
 
     // ---- Wire bridge into tool registry (remote tools route via WS) -----
+    // ADR-004 §2 + Milestone 1.5b: dispatcher forwards `_editor` (extracted by
+    // MCPServer::onToolsCall) so each call can target a specific editor.
     registry->setRemoteDispatcher(
-        [&bridge](std::string_view tool, const nlohmann::json& args) {
-            return bridge.dispatchTool(tool, args);
+        [&bridge](std::string_view tool, const nlohmann::json& args,
+                  std::string_view targetEditor) {
+            return bridge.dispatchTool(tool, args,
+                                       bridge.config().defaultDispatchTimeout,
+                                       targetEditor);
         });
 
     // ---- Knowledge layer (Phase 2) --------------------------------------

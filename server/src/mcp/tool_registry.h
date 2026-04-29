@@ -24,9 +24,13 @@ public:
 
     // Routes a remote-tagged tool to the bridge layer (sync, blocking until
     // plugin response or timeout). Injected by main.cpp to keep sage-mcp
-    // independent of sage-bridge.
+    // independent of sage-bridge. `targetEditor` is the optional `_editor`
+    // value extracted by MCPServer::onToolsCall — empty means "use active
+    // session" (ADR-004 §2 + Milestone 1.5b).
     using RemoteDispatcher =
-        std::function<ToolResult(std::string_view tool, const nlohmann::json& args)>;
+        std::function<ToolResult(std::string_view tool,
+                                 const nlohmann::json& args,
+                                 std::string_view targetEditor)>;
 
     ToolRegistry() = default;
     ToolRegistry(const ToolRegistry&) = delete;
@@ -43,8 +47,10 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return tools_.size(); }
 
     // `tools/call` semantics. Returns ErrorObject if tool absent or handler throws.
+    // `targetEditor` is forwarded to the remote dispatcher; ignored for local tools.
     [[nodiscard]] ToolResult dispatch(std::string_view name,
-                                      const nlohmann::json& params) const;
+                                      const nlohmann::json& params,
+                                      std::string_view targetEditor = {}) const;
 
     void setRemoteDispatcher(RemoteDispatcher fn);
     [[nodiscard]] bool hasRemoteDispatcher() const noexcept;
