@@ -688,3 +688,39 @@ first ask: can the registry/response layer add it once, conditional
 on a tool predicate? If yes, do that. Source-side per-tool
 repetition is allowed only when the value differs per-tool (which
 schema-routing metadata never does).
+
+## C++ proje plugin install: dylib + Source/ ikisi birden gerek
+
+**Symptom**: SuperheroFlightAnimations bootstrap_module ile C++ projesine
+yükseltildikten sonra editor "could not compile plugin SageBridge" hatası
+verdi ve açılmadı. BP-only Kale'de aynı plugin (sadece dylib + uplugin) iyi
+çalışıyordu.
+
+**Root**: UE'nin "shipped plugin = sadece Binaries yeter" optimizasyonu
+yalnız BP-only projeler için çalışır. Proje C++ olunca (`.uproject` Modules
+array'i dolduğunda) UBT proje target'ı oluştururken bağlı plugin'leri de
+target ağacına alır ve onları **source'tan** rebuild eder. Plugin
+`.uplugin`'inde `Installed: true` olsa bile bu kural değişmez — Installed
+flag yalnız "Marketplace store" senaryosunu işaretler, UBT host-target
+build'ini etkilemez.
+
+**Rule**: Per-project plugin install'ında her projeye **3 şey kopyalanmalı**:
+1. `<Project>/Plugins/SageBridge/SageBridge.uplugin`
+2. `<Project>/Plugins/SageBridge/Binaries/<Platform>/UnrealEditor-SageBridge.dylib` + `UnrealEditor.modules` (BP-only proje için yeter)
+3. `<Project>/Plugins/SageBridge/Source/` (C++ proje için + sürdürülebilir editor build için)
+
+Source size ~1MB, ihmal edilebilir. BP-only projede Source/ olması zarar
+vermez (UE precompiled binary'i hâlâ görür ve kullanır), C++ projede
+mecburi. **Default: hep ikisini birden kopyala.**
+
+**Apply**: `sage init` (npm-pkg phase) bu üçünü birden kopyalar; Mac/Linux
+için `cp -R Source` + `cp Binaries/Mac/*`. Dev döngüsünde dylib swap
+yaparken Source mismatch'i olmasın diye Source da güncel tutulmalı (rev
+mismatch UE compile fail eder).
+
+**Engine plugin alternatifi**: `<UE>/Engine/Plugins/Marketplace/SageBridge/`
+altına engine-level kurulum hâlinde Source dahil her şey bir kez kurulur,
+tüm projeler paylaşır. Ama bu engine version başına ayrı kurulum gerektirir
+(5.4/5.5/5.6/5.7) — `sage init` per-project install'ı default tuttuğumuz
+için (ADR-016) Engine kurulumu opsiyonel "advanced install" path'i olarak
+ileride eklenir.
