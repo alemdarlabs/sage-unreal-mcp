@@ -1489,12 +1489,19 @@ FSageToolDispatch::FOutcome BpExportNodesT3DImpl(const TSharedPtr<FJsonObject>& 
 
     // ExportNodesToText only writes nodes flagged CanDuplicateNode (UE editor's
     // Copy filter — entry/return nodes are excluded). Pre-filter so the count
-    // matches reality.
+    // matches reality. include_all_nodes=true bypasses the filter for
+    // archival/recreate use cases (bp.full_dump): entry+return nodes are
+    // serialized too — paste-back into a fresh graph still works because UE's
+    // import path skips those duplicates.
+    bool bIncludeAllNodes = false;
+    Args->TryGetBoolField(TEXT("include_all_nodes"), bIncludeAllNodes);
+
     TSet<UObject*> NodeSet;
     int32 Skipped = 0;
     for (UEdGraphNode* N : Selected)
     {
-        if (N && N->CanDuplicateNode())
+        if (!N) continue;
+        if (bIncludeAllNodes || N->CanDuplicateNode())
         {
             N->PrepareForCopying();
             NodeSet.Add(N);
@@ -1507,7 +1514,10 @@ FSageToolDispatch::FOutcome BpExportNodesT3DImpl(const TSharedPtr<FJsonObject>& 
     if (NodeSet.Num() == 0)
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602,
-            TEXT("no duplicatable nodes (entry/return nodes can't be exported)"));
+            bIncludeAllNodes
+                ? TEXT("graph has no nodes")
+                : TEXT("no duplicatable nodes (entry/return nodes can't be exported; "
+                       "pass include_all_nodes=true for archival dumps)"));
     }
 
     FString Exported;
@@ -3262,15 +3272,35 @@ FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
                                 Obj->SetObjectField(TEXT("graph"), G.Result);
                             }
                         }
-                        // T3D node export (per-function, can be huge)
+                        // T3D node export (per-function, can be huge). Pass
+                        // include_all_nodes=true so entry/return + custom-event
+                        // nodes survive into the archival dump — recreation
+                        // needs them, even though UE's interactive Copy
+                        // filters them out.
                         if (bIncludeT3d)
                         {
+                            FA->SetBoolField(TEXT("include_all_nodes"), true);
                             auto T = BpExportNodesT3DImpl(FA);
+                            FA->RemoveField(TEXT("include_all_nodes"));
                             if (T.bSuccess && T.Result.IsValid())
                             {
                                 FString T3dStr;
                                 if (T.Result->TryGetStringField(TEXT("t3d"), T3dStr))
+                                {
                                     Obj->SetStringField(TEXT("t3d"), T3dStr);
+                                    int32 NodeCount = 0;
+                                    if (T.Result->TryGetNumberField(TEXT("count"), NodeCount))
+                                        Obj->SetNumberField(TEXT("t3d_node_count"), NodeCount);
+                                }
+                            }
+                            else if (T.Error.IsValid())
+                            {
+                                // Surface the reason rather than swallowing it
+                                // (Gap #11: empty graph / unresolved fn etc.).
+                                FString ErrMsg;
+                                T.Error->TryGetStringField(TEXT("message"), ErrMsg);
+                                Obj->SetStringField(TEXT("t3d_skip_reason"),
+                                    ErrMsg.IsEmpty() ? FString(TEXT("unknown")) : ErrMsg);
                             }
                         }
                     }
