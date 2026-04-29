@@ -27,14 +27,17 @@ namespace fs = std::filesystem;
 constexpr const char* kPlatformDir = "Mac";
 constexpr const char* kPluginDylib = "UnrealEditor-SageBridge.dylib";
 constexpr const char* kPluginModules = "UnrealEditor.modules";
+constexpr const char* kUbtBuildScript = "Engine/Build/BatchFiles/Mac/Build.sh";
 #elif defined(__linux__)
 constexpr const char* kPlatformDir = "Linux";
 constexpr const char* kPluginDylib = "libUnrealEditor-SageBridge.so";
 constexpr const char* kPluginModules = "UnrealEditor.modules";
+constexpr const char* kUbtBuildScript = "Engine/Build/BatchFiles/Linux/Build.sh";
 #elif defined(_WIN32)
 constexpr const char* kPlatformDir = "Win64";
 constexpr const char* kPluginDylib = "UnrealEditor-SageBridge.dll";
 constexpr const char* kPluginModules = "UnrealEditor.modules";
+constexpr const char* kUbtBuildScript = "Engine/Build/BatchFiles/Build.bat";
 #else
 #  error "unsupported platform for restart_orchestrator"
 #endif
@@ -149,13 +152,22 @@ mcp::Tool buildRestartEditorTool(bridge::BridgeServer& bridge, RestartConfig cfg
     const auto schema = nlohmann::json{
         {"type", "object"},
         {"properties", {
-            {"confirmed",          {{"type", "boolean"},
-                                    {"description", "MUST be true. Safety guard."}}},
-            {"build_plugin",       {{"type", "boolean"}}},
-            {"save_dirty",         {{"type", "boolean"}}},
-            {"wait_handshake_sec", {{"type", "integer"},
-                                    {"minimum", 0}, {"maximum", 300}}},
-            {"slot_id",            {{"type", "string"}}},
+            {"confirmed",                {{"type", "boolean"},
+                                          {"description", "MUST be true. Safety guard."}}},
+            {"build_plugin",             {{"type", "boolean"}}},
+            {"save_dirty",               {{"type", "boolean"}}},
+            {"rebuild_project_modules",  {{"type", "boolean"},
+                                          {"description",
+                                              "Mac/Linux substitute for Live Coding: "
+                                              "between editor kill and relaunch, run "
+                                              "UBT to rebuild <Project>Editor target. "
+                                              "Required after editing project C++ "
+                                              "sources (added classes, modified UCLASS "
+                                              "members, etc) — UE editor relaunch "
+                                              "alone does NOT recompile project modules."}}},
+            {"wait_handshake_sec",       {{"type", "integer"},
+                                          {"minimum", 0}, {"maximum", 300}}},
+            {"slot_id",                  {{"type", "string"}}},
         }},
         {"required", nlohmann::json::array({"confirmed"})},
         {"additionalProperties", false},
@@ -169,6 +181,7 @@ mcp::Tool buildRestartEditorTool(bridge::BridgeServer& bridge, RestartConfig cfg
         }
         const bool buildPlugin     = params.value("build_plugin", true);
         const bool saveDirty       = params.value("save_dirty",   true);
+        const bool rebuildProject  = params.value("rebuild_project_modules", false);
         const int  waitHandshakeS  = params.value("wait_handshake_sec", 90);
 
         // ---- Resolve target session ------------------------------------
@@ -295,6 +308,55 @@ mcp::Tool buildRestartEditorTool(bridge::BridgeServer& bridge, RestartConfig cfg
             result["dylib_swapped"] = true;
         }
 
+        // ---- Step 4b: rebuild project modules (UBT) -------------------
+        // Mac/Linux substitute for Live Coding. Editor MUST be killed first
+        // (Step 3) so module .dylib's aren't memory-mapped. UE 5.7 macOS
+        // doesn't ship Live Coding; without this step a freshly-added
+        // project C++ class never registers in reflection and bp_reparent /
+        // bp_get_cdo_properties on /Script/<Project>.<Class> fail with
+        // "class not found".
+        if (rebuildProject) {
+            if (cfg.ueRoot.empty()) {
+                return std::unexpected(mcp::ErrorObject::fromCode(
+                    mcp::ErrorCode::InternalError,
+                    "rebuild_project_modules requires SAGE_UE_ROOT or "
+                    "RestartConfig::ueRoot to be set"));
+            }
+            const auto buildScript = cfg.ueRoot / kUbtBuildScript;
+            if (!fs::exists(buildScript)) {
+                return std::unexpected(mcp::ErrorObject::fromCode(
+                    mcp::ErrorCode::InternalError,
+                    "UBT build script not found: " + buildScript.string()));
+            }
+
+            const auto projectName  = fs::path{projectPath}.stem().string();
+            const auto editorTarget = projectName + "Editor";
+
+            std::string cmd = "'" + buildScript.string() + "' "
+                            + editorTarget + " " + std::string{kPlatformDir}
+                            + " Development -Project='" + projectPath + "' "
+                            + "-WaitMutex -NoHotReload";
+
+            spdlog::info("restart_editor: rebuilding project module: {}", cmd);
+            const auto t1 = std::chrono::steady_clock::now();
+            const auto pr = runShell(cmd);
+            const auto rebuildMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t1).count();
+            result["rebuild_project_ms"]   = rebuildMs;
+            result["rebuild_project_exit"] = pr.exitCode;
+            result["rebuild_project_target"] = editorTarget;
+            if (pr.exitCode != 0) {
+                const auto tail = pr.lastOutput.size() > 3000
+                    ? pr.lastOutput.substr(pr.lastOutput.size() - 3000)
+                    : pr.lastOutput;
+                return std::unexpected(mcp::ErrorObject::fromCode(
+                    mcp::ErrorCode::InternalError,
+                    "project rebuild failed (exit=" + std::to_string(pr.exitCode)
+                    + " target=" + editorTarget + "); tail:\n" + tail));
+            }
+            result["rebuild_project"] = true;
+        }
+
         // ---- Step 5: relaunch ----------------------------------------
         if (!relaunchEditor(projectPath)) {
             return std::unexpected(mcp::ErrorObject::fromCode(
@@ -324,11 +386,16 @@ mcp::Tool buildRestartEditorTool(bridge::BridgeServer& bridge, RestartConfig cfg
 
     return mcp::Tool{
         .name        = "restart_editor",
-        .description = "Save dirty assets → terminate editor → (optionally) "
-                       "rebuild plugin via UAT → swap dylib → relaunch → wait "
-                       "for handshake. Mac/Linux's stand-in for Live Coding. "
+        .description = "Save dirty assets → (optionally) build plugin via UAT "
+                       "→ terminate editor → swap plugin dylib → (optionally) "
+                       "rebuild project modules via UBT → relaunch → wait for "
+                       "handshake. Mac/Linux's stand-in for Live Coding. "
                        "REQUIRES confirmed=true. Aborts before kill if plugin "
-                       "build fails. Returns the new session_id on success.",
+                       "build fails. Pass rebuild_project_modules=true after "
+                       "editing project C++ sources (added classes / modified "
+                       "UCLASS) — UE editor relaunch alone does NOT recompile "
+                       "project modules on Mac. Returns the new session_id on "
+                       "success along with build/rebuild durations.",
         .inputSchema = schema,
         .handler     = std::move(handler),
         .remote      = false,
