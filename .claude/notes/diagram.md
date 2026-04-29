@@ -41,7 +41,7 @@ flowchart TB
   M17 ==Demo 1 ✓==> M21a
 
   %% Şu an
-  M25 ==> NOW(["ŞİMDİ BURADA<br/>━━━━━━━━━━━━━━━<br/>79 commit · 200 MCP tool · index_slot 30s→4s (7.5x)<br/>Phase 1+2+3+4.0/4.1/4.2(r1+r2)/4.3/4.4/4.5-r1+r2-b1..b9/4.6(r1+r2+r3-b1..b6)/4.7/4.11-r1+r2 CANLI<br/>SageTest UE 5.7 — 8K asset · 16K dep · 8337 class · 8336 inherit · 492 engine module<br/>Phase 4.6-r3-b6: seq.create + list_tracks + add_track (CameraCut verified)<br/>UE-MCP 448 action audit → Phase 4 yol haritası %83 done"]):::now
+  M25 ==> NOW(["ŞİMDİ BURADA (2026-04-29)<br/>━━━━━━━━━━━━━━━<br/>90 commit · 443 plugin tool · 456 schema (444 _editor-aware)<br/>Phase 1+2+3+4 + Milestone 1.5b CANLI<br/>Multi-editor per-call routing (ADR-017): _editor opsiyonel paramı + active fallback + ambiguity error<br/>İlk dogfooding loop (Kale): 235 schema bug fix + asset.search/list gap fix + multi-editor routing<br/>UE-MCP 448 action audit %99.3 (445/448) · ADR sayısı 17"]):::now
 
   %% Phase 1'den ertelenenler
   subgraph DEF["Storage / out-of-process gerektirenler"]

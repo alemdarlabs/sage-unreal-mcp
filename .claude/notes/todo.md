@@ -1,8 +1,49 @@
-# Milestone Kayıt Defteri (Phase 1-4 TAMAMLANDI)
+# Milestone Kayıt Defteri (Phase 1-4 + Milestone 1.5b TAMAMLANDI)
 
-> Bu dosya Phase 1 Milestone 1.1'den Phase 4 sonuna kadar tüm tamamlanan işleri kayıt altına alır.
-> **Mevcut durum: 85 commit · 443 plugin tool · 456 server şema · Phase 4 complete (2026-04-28)**
-> Referans: `.claude/docs/mvp-roadmap.md` · `.claude/notes/ue-mcp-tasks.md`
+> Bu dosya Phase 1 Milestone 1.1'den itibaren tamamlanan tüm işleri kayıt altına alır.
+> **Mevcut durum: 90 commit · 443 plugin tool · 456 server şema (444 _editor-aware) · Multi-editor per-call routing CANLI (ADR-017, 2026-04-29)**
+> Referans: `.claude/docs/mvp-roadmap.md` · `.claude/notes/ue-mcp-tasks.md` · `.claude/decisions/adr-017-multi-editor-routing-impl.md`
+
+---
+
+## Milestone 1.5b — Multi-editor per-call routing ✓ (commit 76ef244, 2026-04-29)
+
+İlk dogfooding loop'unda Kale projesinde test eden ikinci Claude tespit etti: tüm 200+ remote tool implicit "active editor"'a gidiyor; per-call session targeting yok. Bonus mevcut bug: `BridgeServer::dispatchTool` `getClients()[0]` alıyordu, `activeSessionId_`'yi hiç kullanmıyordu.
+
+Çözüm — orta katman injection (DRY):
+- `EditorSession.ws` raw pointer (handleHello'da kayıt)
+- `BridgeServer::dispatchTool(tool, args, timeout, targetIdOrLabel)` — target resolution + ws lookup
+- `ToolRegistry::RemoteDispatcher` signature genişlet (targetEditor)
+- `MCPServer::onToolsCall` `_editor` extract (args'tan sil, dispatcher'a forward)
+- `MCPServer::onToolsList` runtime schema injection — 444 remote tool otomatik kazandı
+
+Routing önceliği: explicit `_editor` > active pointer > tek editor implicit > ambiguity error.
+
+ADR-017 yazıldı; ADR-004 §2'yi tamamlar.
+
+---
+
+## Phase 4 sonrası bug + gap fix turu (2026-04-29)
+
+### Schema generator bug fix (commit a83fa00)
+
+İlk gerçek MCP client testi (Claude Code Zod validator): 234/456 tool inputSchema invalid. 4 kalıp:
+1. `required: {"a":"b"}` (75 tool) — nlohmann brace-init `{{"a","b"}}` two-strings → object
+2. `required: [["a"]]` (136 tool) — `{{"a"}}` single-string → nested array
+3. `properties: null` (22 tool) — `obj({})` → JSON null
+4. `properties.value: null` (1 tool) — `widget.set_property` `{"value", {}}`
+
+Fix: `obj()` helper'ı `std::initializer_list<const char*>` alacak şekilde yeniden yazıldı (nlohmann brace-init disambiguate edildi). 211 çağrı sed ile flatten. main.cpp'de iki manuel düzeltme.
+
+### Asset enumeration gaps (commit c837969)
+
+Diğer Claude raporladı:
+- Gap #1: `asset.search` schema'da `query` required değil ama runtime zorunlu. Class-only sorgu yapılamıyor.
+- Gap #2: `asset.list` 3132 asset'lik projede 557KB JSON → token limit aşıyor.
+
+Fix:
+- `asset.search`: query optional, class+directory ile fallback. `query VEYA class` zorunlu.
+- `asset.list`: yeni opsiyonel `class` (FTopLevelAssetPath), `kind` (string array), `offset`, `fields` (output projection).
 
 ---
 

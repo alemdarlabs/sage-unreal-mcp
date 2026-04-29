@@ -630,3 +630,61 @@ must add:
 
 Until then, Claude Code works in stateless mode but with reduced
 capability awareness; that's fine for dev, not for shipping.
+
+## BridgeServer routing — `getClients()[0]` was a deferred TODO that became a real bug
+
+**Symptom**: Pre-Milestone-1.5b dispatchTool used
+`server_->getClients()[0]` — i.e. picked a non-deterministic "first
+client" from an `std::set<std::shared_ptr<WebSocket>>`. The
+`activeSessionId_` pointer set by `set_active_editor` was *never read*
+by the dispatcher. Multi-editor scenarios silently behaved like
+"random editor wins."
+
+**Root**: In Phase 1.3a's bridge scaffolding, the comment
+`// today dispatchTool() targets the first active session` was a TODO
+flag for Milestone 1.5b. But getClients() returns a std::set — there's
+no "first" in a set, ordering is hash-bucket-dependent. Worked fine
+with one editor (only one element); broke silently with two.
+
+**Rule**:
+- Never write `getClients()[0]` or `*set.begin()` for routing — sets
+  have no deterministic ordering. If you must pick "any one element"
+  for a single-editor convenience path, document the assumption
+  explicitly *and* fall through to error on multiple.
+- TODO comments like "lands in Milestone X" must be wired to a
+  failing test or an explicit error path before merge — silent
+  deferred TODOs rot for months.
+- Multi-target routing belongs at the **dispatcher** layer
+  (`BridgeServer::dispatchTool`), not at each tool's handler. The
+  handler is single-session by definition (it's running inside one
+  plugin); routing is the bridge's job.
+
+**Apply**: In Sage, EditorSession now carries an `ix::WebSocket* ws`
+field; `dispatchTool(target_id_or_label)` resolves explicit > active >
+single-implicit > ambiguity-error and uses
+`sessions_[targetSessionId].ws` for send().
+
+## DRY middleware injection beats per-tool repetition
+
+**Story**: Adding a uniform parameter (`_editor`) to 200+ tool schemas
+had two paths: (a) edit every tool definition source-side; (b) inject
+once at the response layer. Path (a) is what the schema validation
+disaster (235 invalid schemas, lessons.md "nlohmann brace-init
+silently corrupts") was made of — repetition begets typos.
+
+**Rule**: Cross-cutting schema concerns (auth, routing, sessioning,
+rate-limit hints) should be applied at the **registry** or
+**response** layer, never per-tool. For Sage:
+- `MCPServer::onToolsList` injects `_editor` for every
+  `tool.remote == true`, skipping tools that already declare it.
+- 12 server-side tools (knowledge graph queries, ping, list_editors,
+  ...) automatically excluded by the `remote == true` predicate —
+  no explicit allowlist needed.
+- New remote tools added later inherit `_editor` for free; no
+  source-side opt-in.
+
+**Apply**: When tempted to add a parameter to "every tool that ...",
+first ask: can the registry/response layer add it once, conditional
+on a tool predicate? If yes, do that. Source-side per-tool
+repetition is allowed only when the value differs per-tool (which
+schema-routing metadata never does).

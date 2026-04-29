@@ -73,17 +73,20 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Şu Anki Durum (Snapshot)
 
-> Tek satırda durum: **85 commit · 443 plugin tool · 456 server schema · Phase 1+2+3+4 TAMAM · 10 yeni domain (Level/Gameplay/Animation/Niagara/PCG/Landscape/Foliage/Audio/Networking/GAS) · BUILD SUCCESSFUL**.
+> Tek satırda durum: **90 commit · 443 plugin tool · 456 server schema (444 _editor-aware) · Phase 1+2+3+4 + Milestone 1.5b TAMAM · multi-editor per-call routing CANLI · BUILD SUCCESSFUL**.
 
-- **Test ortamı**: `/Users/mahmutalemdar/Developer/alemdarlabs/SageTest/SageTest.uproject` (UE 5.7.4 Third Person + Blueprint).
+- **Test ortamı**: `/Users/mahmutalemdar/Developer/alemdarlabs/Kale/Kale.uproject` (canlı dogfooding) + `/Users/mahmutalemdar/Developer/alemdarlabs/SageTest/SageTest.uproject` (eski test).
 - **Knowledge graph (canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Real-time delta + query_graph + class_hierarchy çalışıyor.
+- **Multi-editor (ADR-017)**: Tüm 444 editor-scoped tool opsiyonel `_editor` parametresi alıyor (session_id / label / instance_id). Routing önceliği: explicit > active pointer > tek editor implicit > ambiguity error. 12 server-side tool (knowledge graph + ping + editor mgmt) `_editor` almaz.
+- **İlk dogfooding loop'u sonuçları**: (1) Schema generator bug fix — 235 invalid schema (`required` brace-init pitfall + `obj({})` null props) düzeltildi; (2) `asset.search` query optional + `asset.list` class/kind/offset/fields ile genişletildi; (3) per-call routing canlıya geçti.
 - **Skills**: `/unreal-close` ve `/unreal-open` ile editor restart loop otonom — agent BuildPlugin → dylib swap → relaunch yapabiliyor (ayrıca tek MCP tool olarak `restart_editor`).
 - **Dokümantasyon**:
   - [`.claude/notes/diagram.md`](.claude/notes/diagram.md) — Phase 1-4 milestone akışı + tool dağılımı pie chart + knowledge graph şeması (v4)
   - [`.claude/notes/ue-mcp-integration-plan.md`](.claude/notes/ue-mcp-integration-plan.md) — UE-MCP'nin 562 action'ına karşı Sage'ın yol haritası (Phase 4.0–4.20)
-  - [`.claude/notes/ue-mcp-tasks.md`](.claude/notes/ue-mcp-tasks.md) — eksik action'lar için per-tool task listesi (yeni)
-  - [`.claude/notes/lessons.md`](.claude/notes/lessons.md) — kabul edilen kuralların kayıtlı olduğu dosya (en kritik: "MVP scope-cut yapma", BP/Material write GameThread'de marshal et)
-- **Yeni session devraldığında ilk bakılacak**: bu dosya → `.claude/notes/diagram.md` → `.claude/notes/ue-mcp-tasks.md` → son commit `git log --oneline | head -10`.
+  - [`.claude/notes/ue-mcp-tasks.md`](.claude/notes/ue-mcp-tasks.md) — eksik action'lar için per-tool task listesi
+  - [`.claude/notes/lessons.md`](.claude/notes/lessons.md) — kabul edilen kuralların kayıtlı olduğu dosya (en kritik: MVP scope-cut yasak, BP/Material write GameThread'de marshal, nlohmann brace-init pitfall, MCP Streamable HTTP partial-impl)
+- **Açık iş (Phase 5 öncesi)**: `asset.migrate` tool (`FAssetToolsModule::MigratePackages` wrapper, source/dest editor session ile cross-project transfer). MCP transport polish (Mcp-Session-Id + GET /mcp + OAuth stub) paketleme öncesi şart.
+- **Yeni session devraldığında ilk bakılacak**: bu dosya → `.claude/notes/diagram.md` → `.claude/decisions/adr-017-multi-editor-routing-impl.md` → `.claude/notes/ue-mcp-tasks.md` → son commit `git log --oneline | head -10`.
 
 ## Tool Tablosu (özet — 200 toplam)
 
