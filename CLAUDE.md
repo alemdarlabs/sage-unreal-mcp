@@ -32,7 +32,19 @@ Bu projede `.claude/agents/` altında 13 uzman agent tanımlıdır. **Her konuş
 
 `sage-unreal-mcp` is the Unreal Engine implementation, the first of the family. Planned siblings: `sage-unity-mcp`, `sage-godot-mcp`.
 
-The project is in **architecture design phase** — no code written yet. Design decisions are tracked in [`.claude/decisions/`](.claude/decisions/), system documentation in [`.claude/docs/`](.claude/docs/).
+**Status (2026-04-30): production code aktif** — Phase 1+2+3+4 + Milestone 1.5b tamamlandı, ilk gerçek dogfooding turu (11 gap fix tek oturumda) bitti, Mac→Windows production transition başlıyor. Mimari kararlar [`.claude/decisions/`](.claude/decisions/) (17 ADR), sistem dokümantasyonu [`.claude/docs/`](.claude/docs/), kabul edilen davranış kuralları [`.claude/notes/lessons.md`](.claude/notes/lessons.md).
+
+## Ticari Bağlam (KRİTİK)
+
+**Sage ticari satılacak ürün.** Bu, license + dağıtım + güvenlik kararlarını doğrudan etkiler:
+
+- **Permissive open-source license (Apache-2.0, MIT, BSD) YASAK** — rakipler aynı kodu alıp ürünü yeniden satabilir, moat çürür. Erken ADR-016'da Apache-2.0 önerim **iptal edildi**.
+- **Repo private** (`git@github.com:alemdarlabs/sage-unreal-mcp.git`); LICENSE dosyası yok, README'de proprietary copyright notice.
+- **Dağıtım modeli iki katmanlı**:
+  - *Binary*: npm public — `npm install -g @alemdarlabs/sage-mcp` herkese açık (Claude Code/Codex pattern). Postinstall GitHub Releases'tan native binary indirir.
+  - *Runtime*: auth-gated — sage-server başladığında **login zorunlu**, sadece authenticate olmuş kullanıcılar tool çağırabilir. Auth detayı (OAuth / license key / hibrit) Phase 5+ Mahmut kararına bırakıldı; kod tarafında auth hooks **henüz yok**.
+- **Distribution channel detayı**: ADR-016 (npm-first) kararı binary kanalı için geçerli; runtime auth ayrı katman olarak gelecek.
+- **License/dağıtım önerisi yaparken** "ücretsiz public, rakip kullanım serbest" varsayımı YAPMA — daima commercial-protective lens.
 
 ## Tech Stack
 
@@ -151,35 +163,105 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Build & Run Commands
 
+### Mac (test ortamı, dogfooding)
+
 ```bash
-# Server build:
+# Server build
 VCPKG_ROOT=$HOME/vcpkg cmake --build --preset debug --target sage-server
 
-# Server start (with knowledge graph + restart orchestrator wiring):
+# Server start
 SAGE_REPO_ROOT=/Users/mahmutalemdar/Developer/alemdarlabs/sage-unreal-mcp \
+SAGE_UE_ROOT="/Users/Shared/Epic Games/UE_5.7" \
 SAGE_LOG_LEVEL=info \
 ./build/debug/bin/sage-server >/tmp/sage-server.log 2>&1 &
 
-# Plugin build (UAT BuildPlugin, ~50s):
+# Plugin build (UAT BuildPlugin, ~70s)
 ./scripts/build-plugin.sh
 
-# Plugin swap into SageTest:
-cp build/plugin/Binaries/Mac/UnrealEditor-SageBridge.{dylib,modules} \
-   /Users/mahmutalemdar/Developer/alemdarlabs/SageTest/Plugins/SageBridge/Binaries/Mac/
+# Plugin install (her UE projesi için 3 şey kopyala — lessons.md'deki kural)
+PROJ=/path/to/Project
+mkdir -p "$PROJ/Plugins/SageBridge/Binaries/Mac"
+cp build/plugin/SageBridge.uplugin "$PROJ/Plugins/SageBridge/"
+cp build/plugin/Binaries/Mac/* "$PROJ/Plugins/SageBridge/Binaries/Mac/"
+rm -rf "$PROJ/Plugins/SageBridge/Source"
+cp -R build/plugin/Source "$PROJ/Plugins/SageBridge/Source"  # C++ projelerde şart
 
-# Editor restart loop (autonomous via MCP tool):
+# Editor restart loop (otonom MCP tool)
 curl -s -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"restart_editor","arguments":{"confirmed":true}}}' \
   http://127.0.0.1:7777/mcp
-
-# Server start (eski/legacy command):
-# cmake -B build -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
-
-# Plugin: Unreal Editor üzerinden veya UnrealBuildTool plugin compile
-
-# Server start (planlanan):
-# ./build/sage-server --config sage.toml
 ```
+
+### Windows (production hedefi — 2026-04-30 itibarıyla)
+
+```powershell
+# Server build
+$env:VCPKG_ROOT = "$HOME\vcpkg"
+cmake --build --preset debug --target sage-server
+
+# Server start
+$env:SAGE_REPO_ROOT = "C:\path\to\sage-unreal-mcp"
+$env:SAGE_UE_ROOT   = "C:\Program Files\Epic Games\UE_5.7"
+$env:SAGE_LOG_LEVEL = "info"
+.\build\debug\bin\sage-server.exe
+
+# Plugin build
+.\scripts\build-plugin.ps1
+
+# Plugin install (3 şey, Win64 platform)
+$proj = "C:\path\to\Project"
+New-Item -Type Directory "$proj\Plugins\SageBridge\Binaries\Win64" -Force
+Copy-Item build\plugin\SageBridge.uplugin "$proj\Plugins\SageBridge\"
+Copy-Item build\plugin\Binaries\Win64\* "$proj\Plugins\SageBridge\Binaries\Win64\"
+Remove-Item -Recurse "$proj\Plugins\SageBridge\Source" -ErrorAction SilentlyContinue
+Copy-Item -Recurse build\plugin\Source "$proj\Plugins\SageBridge\Source"  # C++ projelerde şart
+```
+
+### Mac vs Windows — Önemli Farklar
+
+| Konu | Mac | Windows |
+|---|---|---|
+| **Live Coding** | YOK (UE 5.7 macOS desteklemiyor) → `restart_editor({rebuild_project_modules:true})` ile UBT compile | VAR — `compile_and_reload` çalışır, hot reload mümkün |
+| **Plugin binary** | `UnrealEditor-SageBridge.dylib` | `UnrealEditor-SageBridge.dll` |
+| **UBT script** | `<UE>/Engine/Build/BatchFiles/Mac/Build.sh` | `<UE>/Engine/Build/BatchFiles/Build.bat` |
+| **kPlatformDir** | `Mac` | `Win64` |
+| **UE install path** | `/Users/Shared/Epic Games/UE_5.7/` | `C:\Program Files\Epic Games\UE_5.7\` |
+| **Modül lock** | `.dylib` memory-mapped → editor close şart swap için | `.dll` Live Coding ile hot-swap mümkün |
+
+Sage codebase Windows-aware (`restart_orchestrator.cpp` per-platform `kPluginDylib`/`kUbtBuildScript`, plugin `.uplugin` `PlatformAllowList: [Win64, Mac, Linux]`). Ama tüm flow'un Windows'ta sıfırdan denemesi henüz yapılmadı — ilk Windows session'da UBT path normalization + plugin packaging UAT'ın Windows davranışı doğrulanmalı.
+
+## Production Project Disiplini (KRİTİK)
+
+Mac'te dogfooding sırasında SageTest + SuperheroFlightAnimations gibi **throwaway sample project'ler** kullandık; "Source/'u sileyim, fresh state'e dönüyorum" gibi destructive eylemler serbestti. **Windows'a geçtikten sonra Mahmut gerçek production project'lerde Sage kullanıyor** (yıllarca emek, takım/source-control, geri dönüşü olmayan kayıp riski). Sıkı disiplin:
+
+1. **Destructive op öncesi `bp.full_dump` ZORUNLU** — Blueprint'i C++'a çevirmeden, silmeden, reparent etmeden önce mutlaka `output_path: "Saved/SageDumps/<name>.PRE_<op>.dump.json"` ile dump al; `include_t3d=true` paste-back için. Bu safety net olmadan continue etme.
+2. **`confirmed:true` flag'lerini agent otomatik onaylamaz** — `restart_editor`, `delete_actor`, `delete_asset`, `asset.delete_batch`, `discard_changes` gibi tool'lar her seferinde explicit kullanıcı onayı ister.
+3. **Manuel filesystem manipulation (`rm -rf`, uproject Modules silme, Source/ wipe) production'da yasak** — önce kullanıcıya sor.
+4. **Multi-editor isim çakışması** — production project + Sage geliştirme repo'su aynı anda açıkken `_editor` parametresi her tool çağrısında explicit. Implicit fallback (tek editor) production senaryosunda riskli.
+5. **`SAGE_UE_ROOT` + `SAGE_REPO_ROOT` env var ile server başlat** — paths tutmak için; production project SAGE_REPO_ROOT'a karışmasın.
+6. **Major mutation öncesi source control kontrol** (`git status` veya equivalent) — clean working tree yoksa kullanıcıdan onay iste.
+7. **Knowledge layer'dan yararlan** — körü körüne mutate etmek yerine `index_slot` + `references_to(...)` ile etki çıkar. `bp.full_dump` ile kombinlenince double safety net.
+
+## İlk Dogfooding Turu Çıktıları (2026-04-29)
+
+Mac'te ikinci Claude Code session'ı (Kale projesi) gerçek MCP-client testi yaptı; 11 gerçek gap raporu, hepsi tek oturumda fix edildi:
+
+| Gap | Konu | Commit |
+|---|---|---|
+| pre | 234 invalid schema (nlohmann brace-init pitfall, `obj()` helper rewrite) | `a83fa00` |
+| #1+#2 | `asset.search` query optional + `asset.list` class/kind/offset/fields | `c837969` |
+| #3 | Multi-editor per-call routing (ADR-017) + silent `getClients()[0]` bug | `76ef244` + `930e46e` |
+| #4 | `project.create_cpp_class` `bootstrap_module` (BP-only → C++) | `3f87ce5` |
+| #5 | UHT prefix + parent header registry (~30 base class) | `6082c5e` |
+| (V5→V6) | `BuildSettingsVersion.V6` (UE 5.7 default) | `5def2b5` |
+| #6 | `bp.full_dump` atomic Blueprint snapshot (10+ helper orchestrate) | `c79bbe8` |
+| #7 | `bp.full_dump` CDO + cosmetic cleanup | `aadf0bc` |
+| #8 | `bp.full_dump` response collapse when output_path set | `c0b5269` |
+| #9 | `project.add_module_dependency` Build.cs array-literal-aware + private flag | `409a48b` |
+| #10 | `restart_editor` `rebuild_project_modules` (Mac UBT compile, Live Coding muadili) | `d3859df` |
+| #11 | `bp.full_dump` `include_t3d` gerçekten T3D üretiyor (`include_all_nodes`) | `690318a` |
+
+**Pattern (yeni dogfooding'lerde tekrar)**: Test eden Claude `Gap #N` formatıyla rapor — *Hedef* + *Denenen tool(lar)* + *Args* + *Sonuç/hata* + *Eksik* + *Öneri (A/B/C öncelikli)* + *Workaround*. Geliştirici Claude fix + commit + bildirim. Bu format çok değerliydi, korunmalı.
 
 ## Environment Variables
 
@@ -237,6 +319,21 @@ curl -s -X POST -H 'Content-Type: application/json' \
 - Point at logs, errors, failing tests — then resolve them
 - Zero context switching required from the user
 
+### 7. Türkçe Yanıt Zorunlu
+- Mahmut türkçe konuşur; yanıtlar türkçe olmalı (orthografik tam — diakritik şart, "fur" yerine "için", "loeschen" yerine "sil" yazma)
+- Teknik terimler ve kod identifier'ları orijinal hâlinde kalır
+- Commit mesajları teknik diline uygun (genelde İngilizce + Türkçe açıklama mix), README/docs İngilizce — bunlar dış-yüzlü
+
+### 8. MVP Scope-Cut Yasak
+- "1-week MVP'ye sığsın" diye feature'ı read+write parçalara bölme — read+write hep birlikte ship
+- "v1 minimum", "first cut" framing'i kullanma; bir feature dark corner'larıyla beraber teslim
+- Time estimate ≠ scope deletion gerekçesi
+- Mahmut'un sözü: *"bir daha bir MVP'ye sığdırmak için bir şey yapma, sana ne amk? Sen işini yap!"*
+
+### 9. Production Project Destructive Guard
+- Yukarıdaki "Production Project Disiplini" bölümü içeriği (özet): destructive op öncesi `bp.full_dump` zorunlu, `confirmed:true` flag'leri otomatik onaylanmaz, manuel `rm -rf` veya uproject Modules silme yasak (önce kullanıcıya sor), multi-editor ortamında `_editor` parametresi explicit
+- Mac sample'larda yaptığımız "deneyip görelim" davranışı production'da geçersiz
+
 ## Task Management
 
 1. **Plan First**: Write plan to `.claude/notes/todo.md` with checkable items
@@ -265,3 +362,34 @@ curl -s -X POST -H 'Content-Type: application/json' \
 - [Compile Coordination](.claude/docs/compile-coordination.md) — Live Coding vs full restart
 - [MVP Roadmap](.claude/docs/mvp-roadmap.md) — Phase 1 + Phase 2 milestone breakdown, risk register
 - [Decisions (ADR)](.claude/decisions/) — Architectural Decision Records (17 ADRs · son: ADR-017 multi-editor-routing-impl)
+
+## Kritik Dersler Özeti (lessons.md'den)
+
+Tam liste [`.claude/notes/lessons.md`](.claude/notes/lessons.md) — schema/transport/build/UE-API touch eden değişiklikten önce zorunlu okuma. En kritik 8 madde:
+
+1. **BP/Material mutation GameThread'e marshal** — UE editor mutation API'leri (FBlueprintEditorUtils, UObject Modify, FScopedTransaction, SCS edits) WS worker thread'inden çağrılırsa editor anında crash eder. Plugin handler'ları `detail::RunOnGameThread([]() { ... })` ile sarmalı (zaten `GT(...)` register wrapper'ı bunu yapıyor).
+2. **macOS .dylib swap → editor restart şart** — UE 5.7 macOS'ta plugin .dylib memory-mapped; fresh build/copy editor process exit etmedikçe etkili olmaz. `restart_editor` MCP tool veya `/unreal-close + /unreal-open` skill ikilisi otonom.
+3. **C++ proje plugin install: 3 şey** — `*.uplugin` + `Binaries/<Platform>/*.dylib(.modules)` + **`Source/`** (C++ projelerde mecbur, BP-only'da opsiyonel). UBT proje target'ında plugin'i source'tan rebuild ediyor; sadece binary swap C++ proje açılışında "could not compile plugin" verir.
+4. **nlohmann brace-init pitfall** — `{{"a","b"}}` two strings → `{"a":"b"}` object (NOT `["a","b"]` array). String-array required field'larda `std::initializer_list<const char*>` parametresi kullan, `obj({})` argümanı JSON null'a init eder (empty object DEĞİL). `tools/list` output Zod-validate edilmeli; smoke `tools/call` direct invoke schema'yı atlar.
+5. **MCP Streamable HTTP partial-impl (paketleme blocker)** — sage-server şu an `Mcp-Session-Id` response header, GET `/mcp` SSE endpoint, OAuth metadata stub, `Mcp-Protocol-Version` header üretmiyor. Schema validation bittiğinde Claude Code stateless mode'da çalışıyor ama paketleme öncesi tamamlanmalı.
+6. **PC_Real subcategory zorunlu** — UE 5.0+ pin type'lara `PC_Real + (PC_Float | PC_Double)` set etmek zorunlu. `PinCategory = FName(*UserStr)` direct assignment KismetCompiler crash + corrupt asset + crash loop. `MakePinType()` helper kullan.
+7. **DRY middleware injection > per-tool repetition** — Cross-cutting param (`_editor`, auth header, vs.) registry/response layer'da bir kez uygulan. Per-tool source repetition lessons.md'deki "234 invalid schema" felaketinin kaynağı.
+8. **Silent fail anti-pattern** — `bp.full_dump`'ın CDO + T3D çağrıları sessizce yutuluyordu (Gap #7, #11). Hata durumunda en az `_skip_reason` field'ı set et ki kullanıcı sebebi görsün. TODO'lar (`getClients()[0]`-tier) failing test veya error path'a wire'lı olmalı.
+
+## Yeni Session Devraldığında
+
+İlk 5 dakikada bakılacaklar (sıralı):
+
+1. **Bu dosya** (CLAUDE.md) — full snapshot + ticari bağlam + production disiplini + Windows/Mac build + dogfooding turu çıktıları
+2. **`.claude/notes/lessons.md`** — kabul edilmiş kurallar (yukarıdaki 8 madde + onlarca daha)
+3. **`.claude/decisions/adr-017-multi-editor-routing-impl.md`** — son büyük mimari karar
+4. **`.claude/decisions/adr-016-distribution-channel-npm.md`** — dağıtım stratejisi (binary kanalı)
+5. **Son commit'ler**: `git log --oneline -12`
+6. **Server canlı mı**: `curl -sS -X POST -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","method":"tools/list","id":1}' http://127.0.0.1:7777/mcp | python3 -c "import json,sys; print(len(json.load(sys.stdin)['result']['tools']))"` → 457 olmalı
+7. **Bağlı editor'ler**: `list_editors` MCP tool çağrısı
+
+Yeni gap raporu / feature isteği geldiğinde:
+- Test eden Claude `Gap #N` formatında raporluyorsa → fix + commit + bildirim pattern'i
+- Yeni feature → ADR taslağı önce, sonra implement
+- Schema değişikliği → `tools/list` Zod-validate kontrol şart
+- Plugin handler değişikliği → BuildPlugin + dylib+Source swap + editor restart loop
