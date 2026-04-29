@@ -3329,14 +3329,18 @@ FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
         }
     }
 
-    // 9. output_path → write file
+    // 9. output_path → write file. When set, the response collapses to a
+    //    summary (meta + source header + counts) — full payload lives in the
+    //    file. Without output_path the full dump is returned inline.
+    //    Pattern: same as asset.list "capped" — avoid duplicating ~MB-sized
+    //    payloads through the MCP response when the file is the source of
+    //    truth (Gap #8: large BPs were eating the harness token budget).
     if (!OutputPath.IsEmpty())
     {
         FString JsonStr;
         TSharedRef<TJsonWriter<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>> Writer =
             TJsonWriterFactory<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>::Create(&JsonStr);
         FJsonSerializer::Serialize(Dump.ToSharedRef(), Writer);
-        // Dump is TSharedPtr; ToSharedRef() OK after IsValid check above.
 
         FString AbsPath = OutputPath;
         if (FPaths::IsRelative(AbsPath))
@@ -3351,8 +3355,60 @@ FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
             return FSageToolDispatch::FOutcome::MakeError(-32000,
                 FString::Printf(TEXT("could not write: %s"), *AbsPath));
 
-        Dump->SetStringField(TEXT("output_path"), AbsPath);
-        Dump->SetNumberField(TEXT("bytes_written"), JsonStr.Len());
+        // Build summary response: meta + source header + counts. Caller
+        // reads the file for full detail.
+        auto CountArray = [&](const TCHAR* Field) -> int32
+        {
+            const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+            return (Dump->TryGetArrayField(Field, Arr) && Arr) ? Arr->Num() : 0;
+        };
+        auto CountObjectFields = [&](const TCHAR* Field) -> int32
+        {
+            const TSharedPtr<FJsonObject>* Obj = nullptr;
+            return (Dump->TryGetObjectField(Field, Obj) && Obj && Obj->IsValid())
+                   ? (*Obj)->Values.Num() : 0;
+        };
+
+        auto Counts = MakeShared<FJsonObject>();
+        Counts->SetNumberField(TEXT("variables"),         CountArray(TEXT("variables")));
+        Counts->SetNumberField(TEXT("components"),        CountArray(TEXT("components")));
+        Counts->SetNumberField(TEXT("functions"),         CountArray(TEXT("functions")));
+        Counts->SetNumberField(TEXT("event_dispatchers"), CountArray(TEXT("event_dispatchers")));
+        Counts->SetNumberField(TEXT("cdo_properties"),    CountObjectFields(TEXT("cdo_properties")));
+
+        // Dependencies object has nested asset / referenced_classes arrays.
+        const TSharedPtr<FJsonObject>* DepsObj = nullptr;
+        if (Dump->TryGetObjectField(TEXT("dependencies"), DepsObj) && DepsObj && DepsObj->IsValid())
+        {
+            const TArray<TSharedPtr<FJsonValue>>* Sub = nullptr;
+            if ((*DepsObj)->TryGetArrayField(TEXT("assets"), Sub) && Sub)
+                Counts->SetNumberField(TEXT("dependencies"), Sub->Num());
+            if ((*DepsObj)->TryGetArrayField(TEXT("referenced_classes"), Sub) && Sub)
+                Counts->SetNumberField(TEXT("referenced_classes"), Sub->Num());
+        }
+
+        auto Summary = MakeShared<FJsonObject>();
+        Summary->SetStringField(TEXT("schema_version"), TEXT("1"));
+        FString CapturedAt;
+        Dump->TryGetStringField(TEXT("captured_at"), CapturedAt);
+        Summary->SetStringField(TEXT("captured_at"),  CapturedAt);
+        Summary->SetStringField(TEXT("path"),         Path);
+        Summary->SetStringField(TEXT("output_path"),  AbsPath);
+        Summary->SetNumberField(TEXT("bytes_written"),JsonStr.Len());
+
+        // Inline header keeps the basic shape visible without re-reading.
+        const TSharedPtr<FJsonObject>* SourceObj = nullptr;
+        if (Dump->TryGetObjectField(TEXT("source"), SourceObj) && SourceObj && SourceObj->IsValid())
+            Summary->SetObjectField(TEXT("source"), *SourceObj);
+
+        Summary->SetObjectField(TEXT("counts"), Counts);
+        Summary->SetStringField(TEXT("note"),
+            TEXT("Full payload in 'output_path'; this response collapsed to "
+                 "header + counts to spare the MCP response budget. Read the "
+                 "file for variables/components/functions/cdo_properties/"
+                 "dependencies detail."));
+
+        return FSageToolDispatch::FOutcome::MakeSuccess(Summary);
     }
 
     return FSageToolDispatch::FOutcome::MakeSuccess(Dump);
