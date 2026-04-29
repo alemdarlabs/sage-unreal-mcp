@@ -1349,6 +1349,31 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .inputSchema=obj({{"path",str()},{"dest",str()}},{"path","dest"}),
         .handler=nullptr,.remote=true});
 
+    reg(registry, Tool{.name="bp.full_dump",
+        .description="Atomic snapshot of a Blueprint's full state in one call: "
+                     "header (parent, generated class, BP type), variables (name, "
+                     "type, default, flags, category), components (SCS hierarchy "
+                     "+ optional defaults), functions (params, locals, optional "
+                     "graph node detail, optional T3D), event_dispatchers, "
+                     "interfaces, cdo_properties, dependencies (assets + class "
+                     "refs). Required: path. Optional: output_path (project-"
+                     "relative or absolute; pretty-prints JSON to file and "
+                     "returns the absolute path). Defaults: "
+                     "include_function_graphs=true, include_referenced_assets=true, "
+                     "include_component_defaults=true, include_t3d=false. "
+                     "Designed as a destructive-change safety net — capture "
+                     "before BP→C++ conversion / delete / restructure, diff or "
+                     "audit afterward. Cevap schema_version='1' + captured_at "
+                     "(ISO8601) içerir.",
+        .inputSchema=obj({{"path",str()},
+                          {"output_path",str()},
+                          {"include_function_graphs",bln()},
+                          {"include_t3d",bln()},
+                          {"include_referenced_assets",bln()},
+                          {"include_component_defaults",bln()}},
+                         {"path"}),
+        .handler=nullptr,.remote=true});
+
     // ========================================================================
     // asset.* extensions (missing tools)
     // ========================================================================

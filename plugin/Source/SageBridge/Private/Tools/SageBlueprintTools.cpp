@@ -3102,6 +3102,242 @@ FSageToolDispatch::FOutcome BpSetActorTickSettingsImpl(const TSharedPtr<FJsonObj
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- bp.full_dump  (Phase 5 / Gap #6) ----------------------------------------
+//
+// Atomik snapshot: BP'nin tüm state'ini tek çağrıda toplar (header, variables,
+// components+defaults, functions+graphs+params+locals, event_dispatchers,
+// interfaces, cdo_properties, dependencies, optional T3D). Conversion-öncesi
+// audit/restore reference için. Çağrı zaten game thread'de (GT wrapper),
+// alt-impl'lere direct çağrı yapılır — double-marshalling yok.
+//
+// output_path verilirse JSON dosyaya yazılır; project-relative kabul edilir
+// (FPaths::ProjectDir() altında resolve), absolute path da kabul edilir.
+
+FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    bool bIncludeGraphs            = true;
+    bool bIncludeT3d               = false;
+    bool bIncludeDeps              = true;
+    bool bIncludeComponentDefaults = true;
+    Args->TryGetBoolField(TEXT("include_function_graphs"),  bIncludeGraphs);
+    Args->TryGetBoolField(TEXT("include_t3d"),              bIncludeT3d);
+    Args->TryGetBoolField(TEXT("include_referenced_assets"),bIncludeDeps);
+    Args->TryGetBoolField(TEXT("include_component_defaults"),bIncludeComponentDefaults);
+
+    FString OutputPath;
+    Args->TryGetStringField(TEXT("output_path"), OutputPath);
+
+    auto MakePathArgs = [&]() -> TSharedPtr<FJsonObject>
+    {
+        auto A = MakeShared<FJsonObject>();
+        A->SetStringField(TEXT("path"), Path);
+        return A;
+    };
+
+    // Helper: pull an array sub-field out of a sub-handler's Result, attach
+    // under a (possibly-renamed) field on Dump. No-op if missing.
+    auto AttachArray = [](TSharedPtr<FJsonObject> Dump,
+                          const TSharedPtr<FJsonObject>& Result,
+                          const TCHAR* SrcField,
+                          const TCHAR* DstField)
+    {
+        if (!Dump.IsValid() || !Result.IsValid()) return;
+        const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+        if (Result->TryGetArrayField(SrcField, Arr))
+            Dump->SetArrayField(DstField, *Arr);
+    };
+
+    TSharedPtr<FJsonObject> Dump = MakeShared<FJsonObject>();
+    Dump->SetStringField(TEXT("schema_version"), TEXT("1"));
+    Dump->SetStringField(TEXT("captured_at"),    FDateTime::UtcNow().ToIso8601());
+    Dump->SetStringField(TEXT("path"),           Path);
+
+    // 1. source (header: parent class, generated class, BP type, ...)
+    {
+        auto Out = BpReadImpl(MakePathArgs());
+        if (!Out.bSuccess) return Out;
+        if (Out.Result.IsValid())
+            Dump->SetObjectField(TEXT("source"), Out.Result);
+    }
+
+    // 2. variables
+    {
+        auto Out = BpListVariablesImpl(MakePathArgs());
+        AttachArray(Dump, Out.Result, TEXT("variables"), TEXT("variables"));
+    }
+
+    // 3. components (+ optional per-component defaults)
+    {
+        auto Out = BpReadComponentsImpl(MakePathArgs());
+        if (Out.bSuccess && Out.Result.IsValid())
+        {
+            const TArray<TSharedPtr<FJsonValue>>* Comps = nullptr;
+            if (Out.Result->TryGetArrayField(TEXT("components"), Comps) && Comps)
+            {
+                if (bIncludeComponentDefaults)
+                {
+                    TArray<TSharedPtr<FJsonValue>> Enriched;
+                    for (const auto& V : *Comps)
+                    {
+                        auto Obj = V.IsValid() ? V->AsObject() : nullptr;
+                        if (!Obj.IsValid()) { Enriched.Add(V); continue; }
+                        FString CompName;
+                        Obj->TryGetStringField(TEXT("name"), CompName);
+                        if (!CompName.IsEmpty())
+                        {
+                            auto PA = MakeShared<FJsonObject>();
+                            PA->SetStringField(TEXT("path"),      Path);
+                            PA->SetStringField(TEXT("component"), CompName);
+                            auto P = BpReadComponentPropertiesImpl(PA);
+                            if (P.bSuccess && P.Result.IsValid())
+                                Obj->SetObjectField(TEXT("defaults"), P.Result);
+                        }
+                        Enriched.Add(MakeShared<FJsonValueObject>(Obj));
+                    }
+                    Dump->SetArrayField(TEXT("components"), Enriched);
+                }
+                else
+                {
+                    Dump->SetArrayField(TEXT("components"), *Comps);
+                }
+            }
+        }
+    }
+
+    // 4. functions / graphs (+ optional graph detail, T3D, params, locals)
+    {
+        auto Out = BpListGraphsImpl(MakePathArgs());
+        if (Out.bSuccess && Out.Result.IsValid())
+        {
+            const TArray<TSharedPtr<FJsonValue>>* Graphs = nullptr;
+            if (Out.Result->TryGetArrayField(TEXT("graphs"), Graphs) && Graphs)
+            {
+                TArray<TSharedPtr<FJsonValue>> Funcs;
+                for (const auto& V : *Graphs)
+                {
+                    auto Obj = V.IsValid() ? V->AsObject() : nullptr;
+                    if (!Obj.IsValid()) { Funcs.Add(V); continue; }
+                    FString FuncName;
+                    Obj->TryGetStringField(TEXT("name"), FuncName);
+                    if (!FuncName.IsEmpty())
+                    {
+                        auto FA = MakeShared<FJsonObject>();
+                        FA->SetStringField(TEXT("path"),          Path);
+                        FA->SetStringField(TEXT("function"),      FuncName);
+                        FA->SetStringField(TEXT("function_name"), FuncName);
+                        // params
+                        {
+                            auto P = BpListFunctionParametersImpl(FA);
+                            if (P.bSuccess && P.Result.IsValid())
+                            {
+                                const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+                                if (P.Result->TryGetArrayField(TEXT("parameters"), Arr) && Arr)
+                                    Obj->SetArrayField(TEXT("params"), *Arr);
+                            }
+                        }
+                        // local vars
+                        {
+                            auto L = BpListLocalVariablesImpl(FA);
+                            if (L.bSuccess && L.Result.IsValid())
+                            {
+                                const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+                                if (L.Result->TryGetArrayField(TEXT("local_variables"), Arr) && Arr)
+                                    Obj->SetArrayField(TEXT("local_vars"), *Arr);
+                            }
+                        }
+                        // graph detail (nodes + pins + connections)
+                        if (bIncludeGraphs)
+                        {
+                            auto G = BpReadGraphImpl(FA);
+                            if (G.bSuccess && G.Result.IsValid())
+                                Obj->SetObjectField(TEXT("graph"), G.Result);
+                        }
+                        // T3D node export (per-function, can be huge)
+                        if (bIncludeT3d)
+                        {
+                            auto T = BpExportNodesT3DImpl(FA);
+                            if (T.bSuccess && T.Result.IsValid())
+                            {
+                                FString T3dStr;
+                                if (T.Result->TryGetStringField(TEXT("t3d"), T3dStr))
+                                    Obj->SetStringField(TEXT("t3d"), T3dStr);
+                            }
+                        }
+                    }
+                    Funcs.Add(MakeShared<FJsonValueObject>(Obj));
+                }
+                Dump->SetArrayField(TEXT("functions"), Funcs);
+            }
+        }
+    }
+
+    // 5. event_dispatchers
+    {
+        auto Out = BpListEventDispatchersImpl(MakePathArgs());
+        AttachArray(Dump, Out.Result, TEXT("dispatchers"),       TEXT("event_dispatchers"));
+        AttachArray(Dump, Out.Result, TEXT("event_dispatchers"), TEXT("event_dispatchers"));
+    }
+
+    // 6. interfaces
+    {
+        auto Out = BpListInterfacesImpl(MakePathArgs());
+        AttachArray(Dump, Out.Result, TEXT("interfaces"), TEXT("interfaces"));
+    }
+
+    // 7. cdo_properties
+    {
+        auto Out = BpGetCdoPropertiesImpl(MakePathArgs());
+        if (Out.bSuccess && Out.Result.IsValid())
+        {
+            const TSharedPtr<FJsonObject>* Sub = nullptr;
+            if (Out.Result->TryGetObjectField(TEXT("properties"), Sub) && Sub && Sub->IsValid())
+                Dump->SetObjectField(TEXT("cdo_properties"), *Sub);
+            else
+                Dump->SetObjectField(TEXT("cdo_properties"), Out.Result);
+        }
+    }
+
+    // 8. dependencies (asset + class refs)
+    if (bIncludeDeps)
+    {
+        auto Out = BpGetDependenciesImpl(MakePathArgs());
+        if (Out.bSuccess && Out.Result.IsValid())
+            Dump->SetObjectField(TEXT("dependencies"), Out.Result);
+    }
+
+    // 9. output_path → write file
+    if (!OutputPath.IsEmpty())
+    {
+        FString JsonStr;
+        TSharedRef<TJsonWriter<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>::Create(&JsonStr);
+        FJsonSerializer::Serialize(Dump.ToSharedRef(), Writer);
+        // Dump is TSharedPtr; ToSharedRef() OK after IsValid check above.
+
+        FString AbsPath = OutputPath;
+        if (FPaths::IsRelative(AbsPath))
+            AbsPath = FPaths::ProjectDir() / AbsPath;
+        FPaths::NormalizeFilename(AbsPath);
+
+        const FString ParentDir = FPaths::GetPath(AbsPath);
+        if (!ParentDir.IsEmpty() && !IFileManager::Get().DirectoryExists(*ParentDir))
+            IFileManager::Get().MakeDirectory(*ParentDir, /*Tree*/ true);
+
+        if (!FFileHelper::SaveStringToFile(JsonStr, *AbsPath))
+            return FSageToolDispatch::FOutcome::MakeError(-32000,
+                FString::Printf(TEXT("could not write: %s"), *AbsPath));
+
+        Dump->SetStringField(TEXT("output_path"), AbsPath);
+        Dump->SetNumberField(TEXT("bytes_written"), JsonStr.Len());
+    }
+
+    return FSageToolDispatch::FOutcome::MakeSuccess(Dump);
+}
+
 }  // namespace (anonymous)
 
 void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
@@ -3208,6 +3444,9 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
 
     // Compile
     Dispatch.RegisterHandler(TEXT("bp.compile"),             GT(&BpCompileImpl));
+
+    // Read — atomic full snapshot (Gap #6)
+    Dispatch.RegisterHandler(TEXT("bp.full_dump"),           GT(&BpFullDumpImpl));
 }
 
 #undef LOCTEXT_NAMESPACE
