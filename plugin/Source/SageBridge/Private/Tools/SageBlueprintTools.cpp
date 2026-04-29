@@ -3249,12 +3249,18 @@ FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
                                     Obj->SetArrayField(TEXT("local_vars"), *Arr);
                             }
                         }
-                        // graph detail (nodes + pins + connections)
+                        // graph detail (nodes + pins + connections).
+                        // Strip redundant inner fields — outer object already
+                        // carries the function name + nodes array length.
                         if (bIncludeGraphs)
                         {
                             auto G = BpReadGraphImpl(FA);
                             if (G.bSuccess && G.Result.IsValid())
+                            {
+                                G.Result->RemoveField(TEXT("graph"));
+                                G.Result->RemoveField(TEXT("count"));
                                 Obj->SetObjectField(TEXT("graph"), G.Result);
+                            }
                         }
                         // T3D node export (per-function, can be huge)
                         if (bIncludeT3d)
@@ -3282,22 +3288,30 @@ FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
         AttachArray(Dump, Out.Result, TEXT("event_dispatchers"), TEXT("event_dispatchers"));
     }
 
-    // 6. interfaces
-    {
-        auto Out = BpListInterfacesImpl(MakePathArgs());
-        AttachArray(Dump, Out.Result, TEXT("interfaces"), TEXT("interfaces"));
-    }
+    // 6. interfaces — already surfaced under source.interfaces by BpReadImpl;
+    //    skipping the top-level duplicate to keep the dump compact.
 
-    // 7. cdo_properties
+    // 7. cdo_properties — BpGetCdoPropertiesImpl needs the generated UClass
+    //    path under arg key 'class', NOT the Blueprint asset path. Resolve
+    //    BP→GeneratedClass first, otherwise the call returns -32602
+    //    "missing 'class'" and the dump silently loses CDO state — the
+    //    most important field for pure-CDO BPs (CameraShake, DataAsset
+    //    descendants, simple settings BPs).
     {
-        auto Out = BpGetCdoPropertiesImpl(MakePathArgs());
-        if (Out.bSuccess && Out.Result.IsValid())
+        UBlueprint* BP = ResolveBlueprint(Path);
+        if (BP && BP->GeneratedClass)
         {
-            const TSharedPtr<FJsonObject>* Sub = nullptr;
-            if (Out.Result->TryGetObjectField(TEXT("properties"), Sub) && Sub && Sub->IsValid())
-                Dump->SetObjectField(TEXT("cdo_properties"), *Sub);
-            else
-                Dump->SetObjectField(TEXT("cdo_properties"), Out.Result);
+            auto CdoArgs = MakeShared<FJsonObject>();
+            CdoArgs->SetStringField(TEXT("class"), BP->GeneratedClass->GetPathName());
+            auto Out = BpGetCdoPropertiesImpl(CdoArgs);
+            if (Out.bSuccess && Out.Result.IsValid())
+            {
+                const TSharedPtr<FJsonObject>* Sub = nullptr;
+                if (Out.Result->TryGetObjectField(TEXT("properties"), Sub) && Sub && Sub->IsValid())
+                    Dump->SetObjectField(TEXT("cdo_properties"), *Sub);
+                else
+                    Dump->SetObjectField(TEXT("cdo_properties"), Out.Result);
+            }
         }
     }
 
@@ -3306,7 +3320,13 @@ FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
     {
         auto Out = BpGetDependenciesImpl(MakePathArgs());
         if (Out.bSuccess && Out.Result.IsValid())
+        {
+            // Strip echo fields — the dump's BP path is on the top-level,
+            // and full_dump always wants forward-deps, never reverse.
+            Out.Result->RemoveField(TEXT("blueprint"));
+            Out.Result->RemoveField(TEXT("reverse"));
             Dump->SetObjectField(TEXT("dependencies"), Out.Result);
+        }
     }
 
     // 9. output_path → write file
