@@ -1674,24 +1674,60 @@ FSageToolDispatch::FOutcome ProjectAddModuleDependencyImpl(const TSharedPtr<FJso
         return FSageToolDispatch::FOutcome::MakeSuccess(R);
     }
 
-    // Insert into PublicDependencyModuleNames or PrivateDependencyModuleNames
-    FString InsertTarget = TEXT("PublicDependencyModuleNames.AddRange");
+    // Insert into PublicDependencyModuleNames (default) or
+    // PrivateDependencyModuleNames (when private=true).
+    bool bPrivate = false;
+    Args->TryGetBoolField(TEXT("private"), bPrivate);
+    const FString TargetArrayName = bPrivate
+        ? TEXT("PrivateDependencyModuleNames")
+        : TEXT("PublicDependencyModuleNames");
+
+    FString InsertTarget = TargetArrayName + TEXT(".AddRange");
     int32 Idx = Content.Find(InsertTarget);
     if (Idx == INDEX_NONE)
     {
-        InsertTarget = TEXT("PublicDependencyModuleNames.Add");
+        InsertTarget = TargetArrayName + TEXT(".Add");
         Idx = Content.Find(InsertTarget);
     }
 
     bool bPatched = false;
     if (Idx != INDEX_NONE)
     {
-        // Find the closing paren/bracket of this call
-        int32 End = Content.Find(TEXT(");"), ESearchCase::IgnoreCase, ESearchDir::FromStart, Idx);
-        if (End != INDEX_NONE)
+        // Locate the array literal:  AddRange(new string[] { ... });
+        // The previous impl injected at `);` which falls between `}` and `)`,
+        // producing  ..."InputCore"\n}\n   "EngineCameras",); — C# syntax error.
+        // Correct insertion is just before the closing `}` of the array
+        // literal, after the last existing element (handling trailing comma
+        // both ways).
+        const int32 OpenBrace = Content.Find(TEXT("{"), ESearchCase::IgnoreCase,
+                                              ESearchDir::FromStart, Idx);
+        const int32 CloseBrace = (OpenBrace != INDEX_NONE)
+            ? Content.Find(TEXT("}"), ESearchCase::IgnoreCase,
+                           ESearchDir::FromStart, OpenBrace + 1)
+            : INDEX_NONE;
+        if (OpenBrace != INDEX_NONE && CloseBrace != INDEX_NONE)
         {
-            FString Insert = FString::Printf(TEXT("\n            \"%s\","), *Dependency);
-            Content.InsertAt(End, Insert);
+            // Walk back from `}` to the last non-whitespace char to learn
+            // whether the array already has a trailing comma.
+            int32 LastChar = CloseBrace - 1;
+            while (LastChar > OpenBrace && FChar::IsWhitespace(Content[LastChar]))
+                --LastChar;
+
+            FString Insert;
+            const TCHAR LastCh = (LastChar > OpenBrace) ? Content[LastChar] : TEXT('{');
+            if (LastCh == TEXT(',') || LastCh == TEXT('{'))
+            {
+                // Trailing comma (or empty array) — append a fresh entry.
+                Insert = FString::Printf(TEXT("\n            \"%s\","), *Dependency);
+                Content.InsertAt(LastChar + 1, Insert);
+            }
+            else
+            {
+                // Last char is `"` (closing quote of last existing string).
+                // Add a leading comma to separate, then our entry.
+                Insert = FString::Printf(TEXT(",\n            \"%s\""), *Dependency);
+                Content.InsertAt(LastChar + 1, Insert);
+            }
             bPatched = true;
         }
     }
@@ -1701,7 +1737,7 @@ FSageToolDispatch::FOutcome ProjectAddModuleDependencyImpl(const TSharedPtr<FJso
         auto R = MakeShared<FJsonObject>();
         R->SetStringField(TEXT("note"),
             FString::Printf(TEXT("could not auto-patch Build.cs; add \"%s\" manually to "
-                "PublicDependencyModuleNames in %s"), *Dependency, *BuildCsPath));
+                "%s in %s"), *Dependency, *TargetArrayName, *BuildCsPath));
         return FSageToolDispatch::FOutcome::MakeSuccess(R);
     }
 

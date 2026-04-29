@@ -1262,8 +1262,16 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="project.add_module_dependency",
-        .description="Append a module name to PublicDependencyModuleNames in a Build.cs file.",
-        .inputSchema=obj({{"module",str()},{"dependency",str()}},{"module","dependency"}),
+        .description="Append a module name to PublicDependencyModuleNames "
+                     "(default) or PrivateDependencyModuleNames (private=true) "
+                     "in a module's Build.cs file. Idempotent — returns "
+                     "{already_present:true} if the dependency string is "
+                     "already in the file. Insertion is array-literal-aware: "
+                     "places the new entry before the closing `}` of the "
+                     "AddRange/Add invocation, with comma handling for both "
+                     "trailing-comma and no-trailing-comma styles.",
+        .inputSchema=obj({{"module",str()},{"dependency",str()},{"private",bln()}},
+                         {"module","dependency"}),
         .handler=nullptr,.remote=true});
 
     // ========================================================================
