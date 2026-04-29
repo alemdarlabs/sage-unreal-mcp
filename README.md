@@ -1,5 +1,11 @@
 # Sage Unreal MCP
 
+> **Copyright (c) 2026 alemdarlabs. All rights reserved.**
+> Proprietary commercial software. Source code is private. The published
+> binary will be distributed via npm (`@alemdarlabs/sage-mcp`) with
+> authenticated runtime access — see ADR-016 (distribution) and the
+> separate End User License Agreement (forthcoming) for terms.
+
 AI agent integration for **Unreal Engine** via the Model Context Protocol.
 
 Part of the **Sage** family of engine MCP servers:
