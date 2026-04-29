@@ -478,7 +478,7 @@ int main() {
                        "(in-memory edits not yet saved to disk). Read-only.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
-            {"properties", {}},
+            {"properties", nlohmann::json::object()},
             {"additionalProperties", false},
         },
         .handler = nullptr,
@@ -3018,7 +3018,7 @@ int main() {
                 {"blueprint", {{"type", "string"}}},
                 {"name",      {{"type", "string"}}},
                 {"property",  {{"type", "string"}}},
-                {"value",     {}},
+                {"value",     {{"description", "any JSON value (primitive, struct, array, ...)"}}},
             }},
             {"required", nlohmann::json::array({"blueprint", "name", "property", "value"})},
             {"additionalProperties", false},

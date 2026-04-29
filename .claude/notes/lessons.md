@@ -536,3 +536,97 @@ handler, read the impl's first 10–15 lines to capture required field
 names + plugin-gated `NotAvailable()` paths, (c) wrap plugin-gated
 calls in try/except so the smoke can pass when the plugin isn't loaded
 in SageTest (PCG, GAS, SmartObjects, PoseSearch are common gaps).
+
+## nlohmann::json brace-init silently corrupts MCP `required` arrays
+
+**Symptom**: First real test against Claude Code MCP client failed with
+234/456 tools rejected by Zod validator. Three patterns:
+1. `{"path":"name"}` where `["path","name"]` was intended (75 tools)
+2. `[["path"]]` where `["path"]` was intended (136 tools)
+3. `properties: null` where `properties: {}` was intended (22 tools)
+
+**Root**: nlohmann::json's brace-init constructor disambiguates poorly.
+- `{{"a","b"}}` — two strings inside outer brace: nlohmann interprets
+  the inner pair as a key:value entry → `{"a":"b"}` object, NOT
+  `["a","b"]` array.
+- `{{"a"}}` — single string inside outer brace: outer wraps inner array
+  → `[["a"]]`, NOT `["a"]`.
+- `{}` passed as a `nlohmann::json` argument → constructs as JSON null
+  (default-constructed value), NOT empty object. `is_null()` returns
+  true; `is_object()` false.
+
+The bug was latent in `phase4_schemas.cpp`'s `obj()` helper. Smoke
+tests passed because they invoked `tools/call` directly (which doesn't
+re-validate input schemas) — only a strict MCP client (Claude Code
+uses Zod) caught it on `tools/list`.
+
+**Rule**:
+- For string-array fields like `required`, use
+  `std::initializer_list<const char*>` parameters in helpers, then
+  build a `nlohmann::json::array()` explicitly inside. This forbids
+  the ambiguous brace-init at call sites:
+  ```cpp
+  static nlohmann::json obj(nlohmann::json props,
+                            std::initializer_list<const char*> required = {}) {
+      auto req = nlohmann::json::array();
+      for (const char* k : required) req.push_back(k);
+      ...
+  }
+  // Call: obj(props, {"path"}) — flat single-brace, unambiguous.
+  ```
+- For "no properties" object schemas, write
+  `nlohmann::json::object()` explicitly, not `{}`.
+- For "any JSON value" schema, write
+  `{{"description","any JSON value"}}` (real one-key object), not
+  `{}` (which is null).
+
+**How to verify before merge**: After any `tools/list`-affecting
+change, fetch the JSON and Zod-validate it from the client side, OR run:
+```python
+import json
+data = json.loads(...)
+for i,t in enumerate(data['result']['tools']):
+    s = t['inputSchema']
+    assert s.get('properties') is not None, f"[{i}] {t['name']} props=null"
+    r = s.get('required')
+    if r is not None:
+        assert isinstance(r, list), f"[{i}] {t['name']} required not array"
+        for x in r: assert isinstance(x, str), f"[{i}] {t['name']} required[*] not string"
+```
+
+**Apply**: This is a paketleme-blocker. ANY MCP server's `tools/list`
+output MUST validate against the JSON-Schema-of-JSON-Schema before
+shipping; smoke that only exercises `tools/call` is insufficient.
+
+## MCP Streamable HTTP — partial spec implementation surfaces as "Capabilities: none"
+
+**Symptom**: Claude Code MCP panel showed
+`Status: ✔ connected · Auth: ✘ not authenticated · Capabilities: none`
+plus an OAuth 404. Logs revealed "Failed to open SSE stream: Not Found"
+followed by the schema validation errors (the actual blocker).
+
+**Root**: Sage server only implements POST `/mcp` for the JSON-RPC
+envelope. The MCP "Streamable HTTP" transport spec also requires:
+- `Mcp-Session-Id` response header on initialize (for stateful sessions)
+- `Mcp-Protocol-Version` header (negotiation)
+- GET `/mcp` SSE long-poll endpoint (for server-pushed notifications)
+- DELETE `/mcp` for session termination
+- An OAuth metadata discovery endpoint (`.well-known/oauth-authorization-server`)
+  — server returns 404, Claude treats as "no auth" (warning, non-blocking)
+
+The schema validation errors blocked tool registration *before* the
+SSE stream warning would have mattered. Once schemas are valid, Claude
+proceeds even without SSE (stateless fallback).
+
+**Rule**: For paketleme-readiness, sage-server's `http_sse_server.cpp`
+must add:
+1. `Mcp-Session-Id` (random UUID) on initialize response, echoed by
+   subsequent client requests
+2. `Mcp-Protocol-Version: 2025-03-26` response header
+3. GET `/mcp` endpoint that returns `text/event-stream` (can be empty
+   stream — server-pushed notifications are optional capability)
+4. (Lower priority) OAuth metadata stub returning `{}` instead of 404
+   to silence the discovery warning
+
+Until then, Claude Code works in stateless mode but with reduced
+capability awareness; that's fine for dev, not for shipping.
