@@ -1131,6 +1131,112 @@ FSageToolDispatch::FOutcome ProjectGenerateProjectFilesImpl(const TSharedPtr<FJs
 
 // ---- project.create_cpp_class ----------------------------------------------
 
+// Parent class registry: bilinen UE base class'ları için (a) UHT prefix
+// ('A' for AActor descendants, 'U' for UObject descendants) ve (b) include
+// header path. UCLASS reflection prefix'lere bağlı; UHT eksik prefix'i
+// "Class deriving from 'AActor' must be prefixed with 'A'" ile reddeder.
+struct FParentClassInfo {
+    const TCHAR* Prefix;          // "A", "U", ...
+    const TCHAR* HeaderInclude;   // "GameFramework/Character.h"
+};
+
+static const TMap<FString, FParentClassInfo>& GetParentClassRegistry()
+{
+    // Static once-init; ~30 entry covers the %95-use-case of game C++ classes.
+    static const TMap<FString, FParentClassInfo> R = {
+        // AActor descendants
+        { TEXT("AActor"),                    { TEXT("A"), TEXT("GameFramework/Actor.h") } },
+        { TEXT("APawn"),                     { TEXT("A"), TEXT("GameFramework/Pawn.h") } },
+        { TEXT("ACharacter"),                { TEXT("A"), TEXT("GameFramework/Character.h") } },
+        { TEXT("APlayerController"),         { TEXT("A"), TEXT("GameFramework/PlayerController.h") } },
+        { TEXT("APlayerState"),              { TEXT("A"), TEXT("GameFramework/PlayerState.h") } },
+        { TEXT("AGameModeBase"),             { TEXT("A"), TEXT("GameFramework/GameModeBase.h") } },
+        { TEXT("AGameMode"),                 { TEXT("A"), TEXT("GameFramework/GameMode.h") } },
+        { TEXT("AGameStateBase"),            { TEXT("A"), TEXT("GameFramework/GameStateBase.h") } },
+        { TEXT("AGameState"),                { TEXT("A"), TEXT("GameFramework/GameState.h") } },
+        { TEXT("AHUD"),                      { TEXT("A"), TEXT("GameFramework/HUD.h") } },
+        { TEXT("AInfo"),                     { TEXT("A"), TEXT("GameFramework/Info.h") } },
+        { TEXT("AVolume"),                   { TEXT("A"), TEXT("GameFramework/Volume.h") } },
+        { TEXT("AStaticMeshActor"),          { TEXT("A"), TEXT("Engine/StaticMeshActor.h") } },
+        { TEXT("ATriggerVolume"),            { TEXT("A"), TEXT("Engine/TriggerVolume.h") } },
+        { TEXT("AWorldSettings"),            { TEXT("A"), TEXT("GameFramework/WorldSettings.h") } },
+
+        // UObject descendants
+        { TEXT("UObject"),                       { TEXT("U"), TEXT("UObject/Object.h") } },
+        { TEXT("UActorComponent"),               { TEXT("U"), TEXT("Components/ActorComponent.h") } },
+        { TEXT("USceneComponent"),               { TEXT("U"), TEXT("Components/SceneComponent.h") } },
+        { TEXT("UPrimitiveComponent"),           { TEXT("U"), TEXT("Components/PrimitiveComponent.h") } },
+        { TEXT("UStaticMeshComponent"),          { TEXT("U"), TEXT("Components/StaticMeshComponent.h") } },
+        { TEXT("USkeletalMeshComponent"),        { TEXT("U"), TEXT("Components/SkeletalMeshComponent.h") } },
+        { TEXT("UCameraComponent"),              { TEXT("U"), TEXT("Camera/CameraComponent.h") } },
+        { TEXT("USpringArmComponent"),           { TEXT("U"), TEXT("GameFramework/SpringArmComponent.h") } },
+        { TEXT("UMovementComponent"),            { TEXT("U"), TEXT("GameFramework/MovementComponent.h") } },
+        { TEXT("UPawnMovementComponent"),        { TEXT("U"), TEXT("GameFramework/PawnMovementComponent.h") } },
+        { TEXT("UCharacterMovementComponent"),   { TEXT("U"), TEXT("GameFramework/CharacterMovementComponent.h") } },
+        { TEXT("UFloatingPawnMovement"),         { TEXT("U"), TEXT("GameFramework/FloatingPawnMovement.h") } },
+        { TEXT("UUserWidget"),                   { TEXT("U"), TEXT("Blueprint/UserWidget.h") } },
+        { TEXT("UDataAsset"),                    { TEXT("U"), TEXT("Engine/DataAsset.h") } },
+        { TEXT("UPrimaryDataAsset"),             { TEXT("U"), TEXT("Engine/DataAsset.h") } },
+        { TEXT("UAnimInstance"),                 { TEXT("U"), TEXT("Animation/AnimInstance.h") } },
+        { TEXT("UAnimNotify"),                   { TEXT("U"), TEXT("Animation/AnimNotifies/AnimNotify.h") } },
+        { TEXT("UAnimNotifyState"),              { TEXT("U"), TEXT("Animation/AnimNotifies/AnimNotifyState.h") } },
+        { TEXT("UBlueprintFunctionLibrary"),     { TEXT("U"), TEXT("Kismet/BlueprintFunctionLibrary.h") } },
+        { TEXT("UDeveloperSettings"),            { TEXT("U"), TEXT("Engine/DeveloperSettings.h") } },
+        { TEXT("USaveGame"),                     { TEXT("U"), TEXT("GameFramework/SaveGame.h") } },
+        { TEXT("UGameInstance"),                 { TEXT("U"), TEXT("Engine/GameInstance.h") } },
+        { TEXT("UGameViewportClient"),           { TEXT("U"), TEXT("Engine/GameViewportClient.h") } },
+    };
+    return R;
+}
+
+// Resolve the conventional UHT prefix for a parent class. Falls back to the
+// parent's first character if it follows the UE convention; empty string
+// means "couldn't infer — leave class name untouched."
+static FString DerivePrefixFromParent(const FString& ParentClass)
+{
+    if (auto* Info = GetParentClassRegistry().Find(ParentClass))
+        return FString(Info->Prefix);
+    // Heuristic fallback: AActor convention is a single uppercase prefix
+    // (A/U/F/T/I/E). If parent looks like one of those, reuse the same
+    // prefix for the child.
+    if (!ParentClass.IsEmpty())
+    {
+        const TCHAR Ch0 = ParentClass[0];
+        if (Ch0 == TEXT('A') || Ch0 == TEXT('U'))
+        {
+            // Confirm second char is uppercase to avoid matching e.g. "Actor"
+            // (already prefix-stripped; not common but be defensive).
+            if (ParentClass.Len() > 1 && FChar::IsUpper(ParentClass[1]))
+                return ParentClass.Left(1);
+        }
+    }
+    return FString();
+}
+
+// Look up the conventional include header for a parent class. Empty if
+// unknown — caller may fall back to user-supplied parent_header arg.
+static FString DeriveHeaderFromParent(const FString& ParentClass)
+{
+    if (auto* Info = GetParentClassRegistry().Find(ParentClass))
+        return FString(Info->HeaderInclude);
+    return FString();
+}
+
+// Apply the UHT prefix to a user-provided class name if missing. Returns the
+// (possibly-transformed) name and reports whether a prefix was prepended.
+static FString ApplyPrefix(const FString& UserName, const FString& Prefix, bool& bOutPrepended)
+{
+    bOutPrepended = false;
+    if (Prefix.IsEmpty() || UserName.IsEmpty()) return UserName;
+    if (UserName.StartsWith(Prefix) && UserName.Len() > Prefix.Len()
+        && FChar::IsUpper(UserName[Prefix.Len()]))
+    {
+        return UserName;  // already prefixed
+    }
+    bOutPrepended = true;
+    return Prefix + UserName;
+}
+
 // ---- bootstrap helpers (BP-only project → C++ project upgrade) -------------
 
 // Default Build.cs content for a freshly-bootstrapped Game module.
@@ -1375,21 +1481,45 @@ FSageToolDispatch::FOutcome ProjectCreateCppClassImpl(const TSharedPtr<FJsonObje
             IFileManager::Get().MakeDirectory(*TargetDir, /*Tree*/ true);
     }
 
-    const FString HeaderPath = TargetDir / ClassName + TEXT(".h");
-    const FString SourcePath = TargetDir / ClassName + TEXT(".cpp");
+    // UHT compliance:
+    //   1. Apply conventional prefix (AActor descendants → 'A', UObject → 'U').
+    //   2. Include the parent class's header (CoreMinimal.h alone doesn't bring
+    //      ACharacter/UActorComponent/...).
+    // Falls back to user-supplied `parent_header` arg if registry doesn't know
+    // the parent (custom base class scenario).
+    const FString DerivedPrefix = DerivePrefixFromParent(ParentClass);
+    bool bPrefixApplied = false;
+    const FString FinalClassName = ApplyPrefix(ClassName, DerivedPrefix, bPrefixApplied);
+
+    FString ParentHeader;
+    Args->TryGetStringField(TEXT("parent_header"), ParentHeader);
+    if (ParentHeader.IsEmpty())
+        ParentHeader = DeriveHeaderFromParent(ParentClass);
+    // Normalize: drop a leading slash if present.
+    if (ParentHeader.StartsWith(TEXT("/"))) ParentHeader.RemoveAt(0);
+
+    const FString HeaderPath = TargetDir / FinalClassName + TEXT(".h");
+    const FString SourcePath = TargetDir / FinalClassName + TEXT(".cpp");
 
     if (FPaths::FileExists(HeaderPath))
         return FSageToolDispatch::FOutcome::MakeError(-32602,
             FString::Printf(TEXT("file already exists: %s"), *HeaderPath));
 
+    // Compose includes block: CoreMinimal + parent header (if known) + the
+    // generated.h sentinel must be LAST (UHT requirement).
+    FString IncludeBlock = TEXT("#include \"CoreMinimal.h\"\n");
+    if (!ParentHeader.IsEmpty())
+        IncludeBlock += FString::Printf(TEXT("#include \"%s\"\n"), *ParentHeader);
+    IncludeBlock += FString::Printf(TEXT("#include \"%s.generated.h\"\n"), *FinalClassName);
+
     const FString ModuleUpper = ModuleName.ToUpper();
     const FString Header = FString::Printf(
-        TEXT("#pragma once\n#include \"CoreMinimal.h\"\n#include \"%s.generated.h\"\n\n"
+        TEXT("#pragma once\n%s\n"
              "UCLASS()\nclass %s_API %s : public %s\n{\n    GENERATED_BODY()\n};\n"),
-        *ClassName, *ModuleUpper, *ClassName, *ParentClass);
+        *IncludeBlock, *ModuleUpper, *FinalClassName, *ParentClass);
 
     const FString Source = FString::Printf(
-        TEXT("#include \"%s.h\"\n"), *ClassName);
+        TEXT("#include \"%s.h\"\n"), *FinalClassName);
 
     if (!FFileHelper::SaveStringToFile(Header, *HeaderPath))
         return FSageToolDispatch::FOutcome::MakeError(-32000,
@@ -1399,12 +1529,23 @@ FSageToolDispatch::FOutcome ProjectCreateCppClassImpl(const TSharedPtr<FJsonObje
             FString::Printf(TEXT("could not write: %s"), *SourcePath));
 
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("class_name"),   ClassName);
-    R->SetStringField(TEXT("header_path"),  HeaderPath);
-    R->SetStringField(TEXT("source_path"),  SourcePath);
-    R->SetStringField(TEXT("parent_class"), ParentClass);
-    R->SetStringField(TEXT("module"),       ModuleName);
-    R->SetBoolField  (TEXT("bootstrapped"), bDidBootstrap);
+    R->SetStringField(TEXT("class_name"),     FinalClassName);
+    R->SetStringField(TEXT("header_path"),    HeaderPath);
+    R->SetStringField(TEXT("source_path"),    SourcePath);
+    R->SetStringField(TEXT("parent_class"),   ParentClass);
+    R->SetStringField(TEXT("module"),         ModuleName);
+    R->SetBoolField  (TEXT("prefix_applied"), bPrefixApplied);
+    if (bPrefixApplied)
+        R->SetStringField(TEXT("prefix"), DerivedPrefix);
+    if (!ParentHeader.IsEmpty())
+        R->SetStringField(TEXT("parent_header"), ParentHeader);
+    else
+        R->SetStringField(TEXT("warning"),
+            FString::Printf(TEXT("parent_class '%s' not in registry; no header "
+                                 "auto-included. Pass parent_header=\"...\" or "
+                                 "edit the .h to add the include manually."),
+                            *ParentClass));
+    R->SetBoolField(TEXT("bootstrapped"), bDidBootstrap);
     if (bDidBootstrap)
     {
         TArray<TSharedPtr<FJsonValue>> ScaffoldArr;
