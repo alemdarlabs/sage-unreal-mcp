@@ -41,7 +41,7 @@ flowchart TB
   M17 ==Demo 1 ✓==> M21a
 
   %% Şu an
-  M25 ==> NOW(["ŞİMDİ BURADA (2026-04-29)<br/>━━━━━━━━━━━━━━━<br/>90 commit · 443 plugin tool · 456 schema (444 _editor-aware)<br/>Phase 1+2+3+4 + Milestone 1.5b CANLI<br/>Multi-editor per-call routing (ADR-017): _editor opsiyonel paramı + active fallback + ambiguity error<br/>İlk dogfooding loop (Kale): 235 schema bug fix + asset.search/list gap fix + multi-editor routing<br/>UE-MCP 448 action audit %99.3 (445/448) · ADR sayısı 17"]):::now
+  M25 ==> NOW(["ŞİMDİ BURADA (2026-04-30)<br/>━━━━━━━━━━━━━━━<br/>102 commit · 443 plugin tool · 457 schema (444 _editor-aware) · 17 ADR<br/>Phase 1+2+3+4 + Milestone 1.5b TAMAM<br/>İlk dogfooding turu (Kale + SuperheroFlight, Mac, 11 gap fix tek oturumda)<br/>Multi-editor + bp.full_dump + bootstrap_module + UBT rebuild + UHT prefix registry CANLI<br/>Mac→Windows production transition başlıyor — gerçek project'ler, dikkat disiplini"]):::now
 
   %% Phase 1'den ertelenenler
   subgraph DEF["Storage / out-of-process gerektirenler"]

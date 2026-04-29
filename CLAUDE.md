@@ -73,22 +73,37 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Şu Anki Durum (Snapshot)
 
-> Tek satırda durum: **90 commit · 443 plugin tool · 456 server schema (444 _editor-aware) · Phase 1+2+3+4 + Milestone 1.5b TAMAM · multi-editor per-call routing CANLI · BUILD SUCCESSFUL**.
+> Tek satırda durum: **102 commit · 443 plugin tool · 457 server schema (444 _editor-aware) · 17 ADR · Phase 1+2+3+4 + Milestone 1.5b TAMAM · multi-editor per-call routing + bp.full_dump + bootstrap_module + UBT rebuild CANLI · ilk dogfooding turu (11 gap fix) bitti · Mac→Windows transition (2026-04-30)**.
 
-- **Test ortamı**: `/Users/mahmutalemdar/Developer/alemdarlabs/Kale/Kale.uproject` (canlı dogfooding) + `/Users/mahmutalemdar/Developer/alemdarlabs/SageTest/SageTest.uproject` (eski test).
-- **Knowledge graph (canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Real-time delta + query_graph + class_hierarchy çalışıyor.
-- **Multi-editor (ADR-017)**: Tüm 444 editor-scoped tool opsiyonel `_editor` parametresi alıyor (session_id / label / instance_id). Routing önceliği: explicit > active pointer > tek editor implicit > ambiguity error. 12 server-side tool (knowledge graph + ping + editor mgmt) `_editor` almaz.
-- **İlk dogfooding loop'u sonuçları**: (1) Schema generator bug fix — 235 invalid schema (`required` brace-init pitfall + `obj({})` null props) düzeltildi; (2) `asset.search` query optional + `asset.list` class/kind/offset/fields ile genişletildi; (3) per-call routing canlıya geçti.
-- **Skills**: `/unreal-close` ve `/unreal-open` ile editor restart loop otonom — agent BuildPlugin → dylib swap → relaunch yapabiliyor (ayrıca tek MCP tool olarak `restart_editor`).
+- **Önceki test ortamı (Mac, dogfooding)**: `~/Developer/alemdarlabs/Kale/Kale.uproject` (Game Animation Sample, Motion Matching) + `~/Developer/alemdarlabs/SuperheroFlightAnimations/SuperheroFlightAnimations.uproject` (state machine + ActorComponent flight, dogfooding sırasında C++'a yükseltildi) + `~/Developer/alemdarlabs/SageTest/SageTest.uproject` (eski Third Person + Blueprint).
+- **Şimdi (2026-04-30)**: Mahmut Windows tarafına geçti, **gerçek production project'lerde** Sage'i kullanmaya başlıyor. Bkz. auto-memory `feedback_real_projects_caution.md` (destructive op disiplini) ve `project_windows_transition.md` (platform farkları).
+- **Knowledge graph (Mac SageTest slot'unda canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Diğer slot'lar (Kale, SuperheroFlight, Windows projeleri) henüz indexlenmedi — `index_slot` çağrısı ile aktive olur.
+- **Multi-editor (ADR-017)**: Tüm 444 editor-scoped tool opsiyonel `_editor` parametresi alıyor (session_id / label / instance_id / project-name prefix). Routing önceliği: explicit > active pointer > tek editor implicit > ambiguity error. 12 server-side tool (knowledge graph + ping + editor mgmt) `_editor` almaz.
+- **İlk dogfooding turu sonuçları (2026-04-29, 11 gap, hepsi tek oturumda fix)**:
+  - Pre: 235 invalid schema fix (nlohmann brace-init pitfall, `obj()` helper rewrite)
+  - Gap #1+#2: `asset.search` query optional + `asset.list` class/kind/offset/fields filter+pagination+projection
+  - Gap #3: multi-editor per-call routing (ADR-017) + silent `getClients()[0]` bug fix
+  - Gap #4 + #5 + V5→V6: `project.create_cpp_class` `bootstrap_module` (BP-only → C++) + UHT prefix/header registry (~30 base class) + `BuildSettingsVersion.V6`
+  - Gap #6+#7+#8+#11: `bp.full_dump` atomic snapshot + CDO fix + response collapse + T3D `include_all_nodes`
+  - Gap #9: `project.add_module_dependency` Build.cs array-literal-aware insertion + `private` flag
+  - Gap #10: `restart_editor` `rebuild_project_modules` (Mac UBT compile, Live Coding muadili)
+- **Açık iş (Phase 5 / paketleme öncesi)**:
+  - `asset.migrate` tool (`FAssetToolsModule::MigratePackages` wrapper)
+  - MCP transport polish (`Mcp-Session-Id` header + GET /mcp SSE + OAuth metadata stub + `Mcp-Protocol-Version`)
+  - License kararı (ADR-016 Apache-2.0 önerim — onay bekliyor)
+  - Public docs/getting-started + README rakam sync (eski 82/443/454 → 102/443/457)
+  - `project.get_info` disconnected mode
+  - Repo public push (`git@github.com:alemdarlabs/sage-unreal-mcp.git` boş repo, henüz push edilmedi)
+- **Skills**: `/unreal-close` + `/unreal-open` editor restart loop autonomous (Mac); MCP tool olarak `restart_editor` (Mac+Win, yeni `rebuild_project_modules` flag).
 - **Dokümantasyon**:
-  - [`.claude/notes/diagram.md`](.claude/notes/diagram.md) — Phase 1-4 milestone akışı + tool dağılımı pie chart + knowledge graph şeması (v4)
-  - [`.claude/notes/ue-mcp-integration-plan.md`](.claude/notes/ue-mcp-integration-plan.md) — UE-MCP'nin 562 action'ına karşı Sage'ın yol haritası (Phase 4.0–4.20)
-  - [`.claude/notes/ue-mcp-tasks.md`](.claude/notes/ue-mcp-tasks.md) — eksik action'lar için per-tool task listesi
-  - [`.claude/notes/lessons.md`](.claude/notes/lessons.md) — kabul edilen kuralların kayıtlı olduğu dosya (en kritik: MVP scope-cut yasak, BP/Material write GameThread'de marshal, nlohmann brace-init pitfall, MCP Streamable HTTP partial-impl)
-- **Açık iş (Phase 5 öncesi)**: `asset.migrate` tool (`FAssetToolsModule::MigratePackages` wrapper, source/dest editor session ile cross-project transfer). MCP transport polish (Mcp-Session-Id + GET /mcp + OAuth stub) paketleme öncesi şart.
-- **Yeni session devraldığında ilk bakılacak**: bu dosya → `.claude/notes/diagram.md` → `.claude/decisions/adr-017-multi-editor-routing-impl.md` → `.claude/notes/ue-mcp-tasks.md` → son commit `git log --oneline | head -10`.
+  - [`.claude/notes/diagram.md`](.claude/notes/diagram.md) — milestone akışı + tool dağılımı + knowledge graph şeması
+  - [`.claude/notes/ue-mcp-integration-plan.md`](.claude/notes/ue-mcp-integration-plan.md) — UE-MCP 562 action'a karşı Sage yol haritası
+  - [`.claude/notes/ue-mcp-tasks.md`](.claude/notes/ue-mcp-tasks.md) — per-tool task listesi
+  - [`.claude/notes/lessons.md`](.claude/notes/lessons.md) — kabul edilen kurallar (en kritik: MVP scope-cut yasak, BP/Material GameThread marshal, nlohmann brace-init pitfall, MCP Streamable HTTP partial-impl, BridgeServer routing TODO trap, DRY middleware injection, C++ proje plugin install Source+Binaries)
+  - [`.claude/decisions/`](.claude/decisions/) — 17 ADR (son: ADR-017 multi-editor-routing-impl, ADR-016 distribution-channel-npm)
+- **Yeni session devraldığında ilk bakılacak**: bu dosya → auto-memory (`sage_current_state.md` + `project_windows_transition.md` + `feedback_real_projects_caution.md`) → `.claude/notes/diagram.md` → `.claude/decisions/adr-017-multi-editor-routing-impl.md` → son commit `git log --oneline -12`.
 
-## Tool Tablosu (özet — 200 toplam)
+## Tool Tablosu (özet — 457 toplam, 444 _editor-aware + 13 server-only)
 
 | Phase | Domain | Tool sayısı |
 |---|---|---|

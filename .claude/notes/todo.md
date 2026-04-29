@@ -1,8 +1,35 @@
-# Milestone Kayıt Defteri (Phase 1-4 + Milestone 1.5b TAMAMLANDI)
+# Milestone Kayıt Defteri (Phase 1-4 + Milestone 1.5b TAMAMLANDI · İlk dogfooding turu bitti)
 
 > Bu dosya Phase 1 Milestone 1.1'den itibaren tamamlanan tüm işleri kayıt altına alır.
-> **Mevcut durum: 90 commit · 443 plugin tool · 456 server şema (444 _editor-aware) · Multi-editor per-call routing CANLI (ADR-017, 2026-04-29)**
-> Referans: `.claude/docs/mvp-roadmap.md` · `.claude/notes/ue-mcp-tasks.md` · `.claude/decisions/adr-017-multi-editor-routing-impl.md`
+> **Mevcut durum (2026-04-30): 102 commit · 443 plugin tool · 457 server şema (444 _editor-aware) · 17 ADR · 11-gap dogfooding turu fix · Mac→Windows transition**
+> Referans: `.claude/docs/mvp-roadmap.md` · `.claude/notes/ue-mcp-tasks.md` · `.claude/decisions/adr-017-multi-editor-routing-impl.md` · auto-memory `project_dogfooding_loop_2026_04_29.md` + `project_windows_transition.md`
+
+---
+
+## İlk Dogfooding Turu — 11 gap fix tek oturumda (2026-04-29)
+
+Mahmut Mac'te ikinci bir Claude Code session'ı (Kale projesi) ile gerçek MCP-client testi başlattı. Test eden Claude kullanıcı/tester rolünde, bu (sage repo) Claude geliştirici rolünde, Mahmut köprü. 11 gerçek gap raporu çıktı, hepsi aynı oturumda fix edildi.
+
+| Gap | Konu | Commit |
+|---|---|---|
+| pre | 234 invalid schema (nlohmann brace-init pitfall) | `a83fa00` |
+| #1+#2 | asset.search query optional + asset.list class/kind/offset/fields | `c837969` |
+| #3 | multi-editor per-call routing (ADR-017) + getClients()[0] bug | `76ef244` + `930e46e` |
+| #4 | project.create_cpp_class bootstrap_module (BP→C++ scaffold) | `3f87ce5` |
+| #5 | UHT prefix + parent header registry (~30 base class) | `6082c5e` |
+| (V5→V6) | BuildSettingsVersion.V6 (UE 5.7 default) | `5def2b5` |
+| #6 | bp.full_dump atomic Blueprint snapshot | `c79bbe8` |
+| #7 | bp.full_dump CDO + cosmetic | `aadf0bc` |
+| #8 | bp.full_dump response collapse when output_path set | `c0b5269` |
+| #9 | project.add_module_dependency Build.cs array-literal-aware + private flag | `409a48b` |
+| #10 | restart_editor rebuild_project_modules (Mac UBT compile) | `d3859df` |
+| #11 | bp.full_dump include_t3d gerçekten T3D üretiyor (include_all_nodes) | `690318a` |
+
+**Pattern (yeni dogfooding'lerde tekrar)**: Test eden Claude `Gap #N` formatıyla rapor — hedef, denenen tool/args, sonuç/hata, eksik, öneri (A/B/C öncelikli), workaround. Geliştirici Claude fix + commit + bildirim.
+
+**Detay**: auto-memory `project_dogfooding_loop_2026_04_29.md`.
+
+---
 
 ---
 

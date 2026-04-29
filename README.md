@@ -10,14 +10,17 @@ Part of the **Sage** family of engine MCP servers:
 
 ## Status
 
-**Phase 1–4 Complete** (as of 2026-04-28 · 82 commits)
+**Phase 1–4 + Milestone 1.5b Complete** (as of 2026-04-30 · 102 commits)
 
 - **443 MCP tool handlers** in the Unreal plugin (SageBridgeSubsystem)
-- **454 tool schemas** in the C++23 server (`tools/list` fully populated)
+- **457 tool schemas** in the C++23 server (`tools/list` fully populated; **444 of them carry an optional `_editor` parameter** for multi-editor per-call routing — see ADR-017)
 - **UE-MCP parity:** 445 / 448 actions covered (99.3%) — 3 N/A (feedback + demo categories)
-- Knowledge graph live: 8 359 assets · 16 093 DEPENDS_ON edges · 8 337 UClass nodes
-- Tested on UE 5.7.4 (SageTest — Third Person + Blueprint project)
-- Both binaries build clean: `build-plugin.sh` (UAT) + `cmake --build --preset debug`
+- **Knowledge graph live** on test slot: 8 359 assets · 16 093 DEPENDS_ON edges · 8 337 UClass nodes
+- **Multi-editor per-call routing**: tool calls can target a specific connected editor by `_editor: "<session_id|label|instance_id|project-name>"`; falls back to active pointer or single-editor implicit; ambiguity errors when neither set
+- **First real-MCP-client dogfooding loop**: 11 gaps reported and fixed in a single session (2026-04-29) — `bp.full_dump` (atomic Blueprint snapshot), `project.create_cpp_class` `bootstrap_module` (BP→C++ scaffold), `restart_editor` `rebuild_project_modules` (Mac UBT compile), schema-generator brace-init bug fix (235 schemas), and more
+- Tested on UE 5.7.4 (Mac); Windows port present in code paths, first real run pending
+- Both binaries build clean: `scripts/build-plugin.sh` (UAT) / `scripts/build-plugin.ps1` (Windows) + `cmake --build --preset debug`
+- 17 Architectural Decision Records under [`.claude/decisions/`](.claude/decisions/)
 
 ## What this is
 
