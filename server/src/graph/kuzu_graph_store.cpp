@@ -76,8 +76,32 @@ KuzuGraphStore::KuzuGraphStore(const std::filesystem::path& dbPath)
     if (dbPath_.has_parent_path()) {
         std::filesystem::create_directories(dbPath_.parent_path(), ec);
     }
-    db_   = std::make_unique<kuzu::main::Database>(dbPath_.string());
-    conn_ = std::make_unique<kuzu::main::Connection>(db_.get());
+    // Stage logs are deliberately verbose. Without them we cannot tell from
+    // a post-crash log file whether kuzu's Database ctor (B-tree init / WAL
+    // replay / system catalog load) or its Connection ctor was the one
+    // that aborted. Both are native dll calls that can raise SEH.
+    spdlog::info("KuzuGraphStore: creating Database at {}", dbPath_.string());
+    try {
+        db_ = std::make_unique<kuzu::main::Database>(dbPath_.string());
+    } catch (const std::exception& ex) {
+        spdlog::error("KuzuGraphStore: Database ctor threw: {}", ex.what());
+        throw;
+    } catch (...) {
+        spdlog::error("KuzuGraphStore: Database ctor threw unknown exception");
+        throw;
+    }
+    spdlog::info("KuzuGraphStore: Database created");
+
+    try {
+        conn_ = std::make_unique<kuzu::main::Connection>(db_.get());
+    } catch (const std::exception& ex) {
+        spdlog::error("KuzuGraphStore: Connection ctor threw: {}", ex.what());
+        throw;
+    } catch (...) {
+        spdlog::error("KuzuGraphStore: Connection ctor threw unknown exception");
+        throw;
+    }
+    spdlog::info("KuzuGraphStore: Connection created");
     spdlog::info("KuzuGraphStore: opened {}", dbPath_.string());
 }
 
@@ -95,8 +119,36 @@ GraphResult KuzuGraphStore::execute(std::string_view cypher) {
     if (conn_ == nullptr) {
         return GraphError{"store not open", 0};
     }
-    auto result = conn_->query(std::string{cypher});
-    return buildResult(*result);
+    // Pre-call log is the breadcrumb that survives a hard crash inside
+    // Connection::query (e.g. kuzu binder/parser AV). Truncate to keep
+    // the log readable for COPY FROM CSV statements with long paths.
+    spdlog::info("KuzuGraphStore::execute: {}",
+                 cypher.size() > 200 ? std::string{cypher.substr(0, 200)} + "..." : std::string{cypher});
+    // Kuzu's Connection::query is documented to return a valid QueryResult
+    // even on failure (caller checks isSuccess()), but defensively guard:
+    // (1) nullptr return → would segfault on `*result` and the prior crash
+    //     pattern (no error log, abrupt WebSocket 1006 close) matches an
+    //     unguarded null deref. (2) Native exception (std::bad_alloc,
+    //     kuzu-internal throw) → caller chain has no catch and the process
+    //     would std::terminate without flushing logs. Both paths must
+    //     surface as a recoverable GraphError.
+    try {
+        auto result = conn_->query(std::string{cypher});
+        if (!result) {
+            spdlog::error("KuzuGraphStore::execute: kuzu query returned nullptr; cypher='{}'",
+                          cypher);
+            return GraphError{"kuzu query returned nullptr", 0};
+        }
+        return buildResult(*result);
+    } catch (const std::exception& ex) {
+        spdlog::error("KuzuGraphStore::execute: native exception '{}'; cypher='{}'",
+                      ex.what(), cypher);
+        return GraphError{std::string{"kuzu query threw: "} + ex.what(), 0};
+    } catch (...) {
+        spdlog::error("KuzuGraphStore::execute: unknown native exception; cypher='{}'",
+                      cypher);
+        return GraphError{"kuzu query threw unknown exception", 0};
+    }
 }
 
 GraphResult KuzuGraphStore::execute(std::string_view cypher, const Json& /*params*/) {

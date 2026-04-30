@@ -54,7 +54,21 @@ GraphStore& GraphStoreManager::acquireSlot(std::string_view slotId) {
     auto path = slotDbPath(slotId);
     spdlog::info("GraphStoreManager: opening slot '{}' at {}", key, path.string());
 
-    auto store = std::make_unique<KuzuGraphStore>(path);
+    std::unique_ptr<KuzuGraphStore> store;
+    try {
+        store = std::make_unique<KuzuGraphStore>(path);
+    } catch (const std::exception& ex) {
+        spdlog::error("GraphStoreManager: KuzuGraphStore ctor for slot '{}' threw: {}",
+                      key, ex.what());
+        throw;
+    } catch (...) {
+        spdlog::error("GraphStoreManager: KuzuGraphStore ctor for slot '{}' threw unknown",
+                      key);
+        throw;
+    }
+    spdlog::info("GraphStoreManager: KuzuGraphStore for slot '{}' constructed, beginning migration",
+                 key);
+
     auto migrate = migrateToCurrent(*store);
     if (is_error(migrate)) {
         throw std::runtime_error("GraphStoreManager: schema migration for slot '"
