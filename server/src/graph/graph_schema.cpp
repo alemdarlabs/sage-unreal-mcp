@@ -87,24 +87,22 @@ std::vector<std::string> splitStatements(std::string_view blob) {
 }
 
 GraphResult readCurrentVersion(GraphStore& store) {
-    // Probe whether _SchemaVersion exists — pre-v1 stores won't have it.
-    // We rely on the registry-table query (kuzu CALL show_tables) being
-    // cheap and stable across kuzu 0.11.x.
-    auto probe = store.execute("CALL show_tables() RETURN name;");
-    if (is_error(probe)) {
-        return error_of(probe);
-    }
-    bool hasVersionTable = false;
-    for (const auto& row : value_of(probe)["rows"]) {
-        if (row.contains("name") && row["name"].is_string()
-            && row["name"].get<std::string>() == "_SchemaVersion") {
-            hasVersionTable = true;
-            break;
-        }
-    }
-    if (!hasVersionTable) {
-        return Json(0);
-    }
+    // The original probe used `CALL show_tables() RETURN name;` to detect
+    // pre-v1 stores. On Windows kuzu 0.11.x that built-in segfaults inside
+    // the dll on a freshly-opened database (verified 2026-05-01: server
+    // log shows the cypher reaching execute() then a silent SEH abort with
+    // no `applying migration v1` follow-up). The crash happens before any
+    // C++ exception is raised, so try/catch can't trap it.
+    //
+    // The fix sidesteps show_tables entirely: create the _SchemaVersion
+    // table with CREATE IF NOT EXISTS (idempotent — v1 migration repeats
+    // the same statement, no-op'ing on already-present tables), then read
+    // the row. A pre-v1 store now produces "table just created, no rows"
+    // → version 0, identical to the old probe semantics. Same shape, no
+    // dependency on the broken built-in.
+    auto ensure = store.execute(
+        "CREATE NODE TABLE IF NOT EXISTS _SchemaVersion(id INT64 PRIMARY KEY, value INT64);");
+    if (is_error(ensure)) return error_of(ensure);
 
     auto r = store.execute(
         "MATCH (v:_SchemaVersion {id: 1}) RETURN v.value AS value;");
