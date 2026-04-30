@@ -169,6 +169,16 @@ std::filesystem::path makeTempCsvPath(std::string_view tag) {
         ("sage_" + std::string{tag} + "_" + std::to_string(gen()) + ".csv");
 }
 
+// Cypher single-quoted string literals interpret `\` as an escape introducer
+// (\n, \t, \uXXXX, …). On Windows std::filesystem::path::string() returns
+// `C:\Users\...` which the kuzu parser then chokes on with "Invalid input"
+// at the first `\U`/`\A`/`\T`. Forward slashes are accepted everywhere by
+// kuzu's COPY FROM, so emit the path with generic_string() (POSIX-style)
+// regardless of host. No-op on macOS/Linux.
+std::string cypherPathLiteral(const std::filesystem::path& p) {
+    return p.generic_string();
+}
+
 // Bulk-insert Asset nodes via COPY FROM CSV. ~4x faster than CREATE
 // batch (1.9s → ~0.4s on 8K assets).
 GraphResult insertAssetsViaCopy(GraphStore& store, const Json& assets) {
@@ -185,7 +195,7 @@ GraphResult insertAssetsViaCopy(GraphStore& store, const Json& assets) {
             out.put('\n');
         }
     }
-    const std::string q = "COPY Asset FROM '" + csv.string() + "' (HEADER=true);";
+    const std::string q = "COPY Asset FROM '" + cypherPathLiteral(csv) + "' (HEADER=true);";
     auto r = store.execute(q);
     std::error_code ec;
     fs::remove(csv, ec);
@@ -213,7 +223,7 @@ GraphResult insertClassesViaCopy(GraphStore& store, const Json& classes) {
             out.put('\n');
         }
     }
-    const std::string q = "COPY Class FROM '" + csv.string() + "' (HEADER=true);";
+    const std::string q = "COPY Class FROM '" + cypherPathLiteral(csv) + "' (HEADER=true);";
     auto r = store.execute(q);
     std::error_code ec;
     fs::remove(csv, ec);
@@ -247,7 +257,7 @@ GraphResult insertInheritsFromViaCopy(GraphStore& store, const Json& classes,
         fs::remove(csv, ec);
         return Json(int64_t{0});
     }
-    const std::string q = "COPY INHERITS_FROM FROM '" + csv.string() + "' (HEADER=true);";
+    const std::string q = "COPY INHERITS_FROM FROM '" + cypherPathLiteral(csv) + "' (HEADER=true);";
     auto r = store.execute(q);
     std::error_code ec;
     fs::remove(csv, ec);
@@ -287,7 +297,7 @@ GraphResult insertDepsViaCopy(GraphStore& store, const Json& deps,
         return Json(int64_t{0});
     }
 
-    const std::string q = "COPY DEPENDS_ON FROM '" + csv.string() + "' (HEADER=true);";
+    const std::string q = "COPY DEPENDS_ON FROM '" + cypherPathLiteral(csv) + "' (HEADER=true);";
     auto r = store.execute(q);
     std::error_code ec;
     fs::remove(csv, ec);  // best-effort
