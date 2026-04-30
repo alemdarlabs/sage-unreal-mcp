@@ -5,6 +5,7 @@
   "description": "Sage MCP server for Unreal Engine — execution + intelligence layer",
   "homepage": "https://github.com/alemdarlabs/sage-unreal-mcp",
   "supports": "(windows | osx | linux) & (x64 | arm64)",
+  "builtin-baseline": "80f9bcfa455e875d9c1bf7a7c6692d7e1e481061",
   "dependencies": [
     "nlohmann-json",
     "spdlog",
