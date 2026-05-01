@@ -3,6 +3,110 @@
 > Per CLAUDE.md §Self-Improvement Loop. Patterns observed during implementation
 > that should change future behavior.
 
+## BP→C++ pipeline: empty the BP before reparenting it
+
+**Symptom**: 2026-05-01 HeroFlight ABP_Player conversion. Reparent →
+`bp.refresh_nodes` → save sequence produced 30 orphan pins, then 17
+disconnected `Target` pins after orphan removal, then 60+ "Can't connect
+pins" errors after the link-migration pass found types had silently
+degraded under a Component reparent. Recovery via Autosave restore +
+explicit variable retype + a fresh full conversion took ~4 hours.
+
+**Root**: Two correct mental models had not been wired together —
+*"the BP must be a shell after conversion (0 graphs/0 vars/0 fns)"* and
+*"reparent only walks FName equality."* The naive ordering was
+`reparent → refresh-and-pray`. With graphs still present, every stale
+pin became an orphan; orphan removal then severed the link the next
+node depended on; and meanwhile a Component reparent had silently
+retyped a downstream variable from the BP child class to the C++
+parent, so the surviving links would have been type-incompatible
+anyway. Each individual step was defensible, but their composition
+was a trap.
+
+**Rule**: One BP, ten gates. The pipeline is documented in
+`docs/bp-cpp-conversion-pipeline.md`. Step 6 (EMPTY) runs *before*
+step 7 (REPARENT), not after — so pin orphans are structurally
+unreachable when the reparent fires. Step 3 (DEPS READY) verifies
+that any class hierarchy the BP touches is fully migrated; this is the
+gate that catches the variable-type-silent-degrade case.
+
+**How to apply**:
+- New BP→C++ conversion task: read
+  `docs/bp-cpp-conversion-pipeline.md` first, every time, even if you
+  think you remember the order. The order is the whole point.
+- New gate failure mode discovered: add a step to that document, don't
+  silently work around it.
+- Tool added that makes a gate mechanically reachable (for example
+  `bp.clear_graphs` enabling step 6, `bp.set_variable_type` enabling the
+  step-3 fix path): document it in the tools section of that file with
+  the specific failure mode it addresses.
+
+---
+
+## BP variable FNames are not C++ identifiers
+
+**Symptom**: `BP_ConversionTest` accepts `Variable 01 Black`, `100Damage`,
+`Hız`, `class`, `🚀Rocket`, `auto`, `Damage(per sec)` etc. as variable
+FNames and compiles cleanly. The BP saves, the variable is settable from
+the editor, the value flows. None of those FNames are valid C++
+identifiers.
+
+**Root**: UE's BP variable name validation is far looser than C++ —
+spaces, non-ASCII characters, leading digits, reserved keywords, control
+characters, all permitted by the engine. The conversion target (a
+generated C++ UPROPERTY) is much stricter. FName equality is what makes
+reparent merge BP variables onto the parent C++ UPROPERTY, so the BP-side
+FName must already be the C++ identifier *before* reparent — not a
+translation produced at C++-write time.
+
+**Rule**:
+- Sanitise the BP first. `bp.sanitize_variable_names dry_run=true`
+  surfaces the mapping; `dry_run=false` applies it. The algorithm is
+  built into the tool — Turkish transliteration, non-ASCII strip, run
+  collapse, leading-digit fix, C++ keyword suffix, 128-char cap, and
+  collision resolution by `_2`/`_3` suffixes.
+- Both `bp.rename_variable` and `bp.sanitize_variable_names` enforce
+  the same 128-char cap and the same identifier rules — they round-trip
+  losslessly.
+- The C++ header writes the sanitised name, never the BP display name.
+  Display continuity, if the designer wants the original visible in the
+  editor, lives in `meta=(DisplayName="…")`.
+
+**How to apply**: When sketching a header from a BP dump, run the
+sanitizer (dry-run is fine) first and write the C++ to the new names.
+The reparent in step 7 will then match without `_0` orphan suffixes.
+
+---
+
+## UE Python `replace_variable_references` is not a rename
+
+**Symptom**: `BlueprintEditorLibrary.replace_variable_references(bp,
+old, new)` returned without error, the editor logged
+`"X rename: Y → Z"`-shaped messages, but
+`bp.list_variables` showed the variable still under its original name.
+Subsequent compile reported the variable as missing on the new pins.
+
+**Root**: The Python API's name says it all — *references*. It walks
+`K2Node_VariableGet`/`Set` nodes and rewrites their
+`VariableReference` to point at the new name. It does NOT touch
+`FBPVariableDescription::VarName`. The variable's definition is
+unchanged; the references now point at a non-existent variable. UE
+Python's BP authoring surface omits a member-variable-rename function
+entirely.
+
+**Rule**: Use `bp.rename_variable` (sage), which wraps the C++
+`FBlueprintEditorUtils::RenameMemberVariable` — that one updates the
+description AND walks the references AND renames `OnRep_<X>` for
+replicated variables.
+
+**How to apply**: If the project is BP-authoring-heavy, the sage tool
+surface is the right layer for these operations. Don't reach for
+`editor.run_python` as a fallback for write-side BP work — its
+`BlueprintEditorLibrary` is read-leaning and quietly omits exactly the
+write paths you'd need most.
+
+---
+
 ## Don't scope-cut for "MVP" reasons
 
 **Symptom**: Proposed Tier B as Blueprint-read-only "to fit a 1-week MVP",

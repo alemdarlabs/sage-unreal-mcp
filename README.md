@@ -47,6 +47,7 @@ Codebase instructions and design docs live under `.claude/`:
 - [`.claude/docs/knowledge-graph.md`](.claude/docs/knowledge-graph.md) — 3-tier indexing strategy
 - [`.claude/docs/transactions.md`](.claude/docs/transactions.md) — transaction layer detail
 - [`.claude/docs/compile-coordination.md`](.claude/docs/compile-coordination.md) — Live Coding vs full restart
+- [`.claude/docs/bp-cpp-conversion-pipeline.md`](.claude/docs/bp-cpp-conversion-pipeline.md) — 10-gate BP→C++ migration playbook + tool reference
 - [`.claude/decisions/`](.claude/decisions/) — Architectural Decision Records (ADRs)
 
 ## Brand

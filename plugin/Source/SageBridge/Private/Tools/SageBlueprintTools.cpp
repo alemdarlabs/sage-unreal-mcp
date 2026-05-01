@@ -29,6 +29,7 @@
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
 #include "K2Node_IfThenElse.h"
+#include "K2Node_Tunnel.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
 #include "Kismet2/BlueprintEditorUtils.h"
@@ -707,6 +708,762 @@ FSageToolDispatch::FOutcome BpDeleteVariableImpl(const TSharedPtr<FJsonObject>& 
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- bp.rename_variable ---------------------------------------------------
+//
+// Renames a BP-defined member variable in place. Wraps
+// FBlueprintEditorUtils::RenameMemberVariable, which (a) updates
+// FBPVariableDescription::VarName, (b) walks every K2Node_Variable[Get|Set]
+// in every graph and rewrites the VariableReference, (c) renames the
+// generated RepNotify function (OnRep_<Name>) when the variable is
+// replicated. UE Python's BlueprintEditorLibrary.replace_variable_references
+// only does step (b) — it leaves the variable's definition unchanged, so the
+// rename appears to silently no-op. That's the gap this tool fills.
+//
+// Validation rejects the bad inputs that would otherwise get accepted by the
+// engine and produce broken state: name collision, inherited variable,
+// non-identifier characters, C++ reserved keywords. UE will happily store a
+// variable named "🚀Rocket" or "auto" — but the Phase 2 reparent into a C++
+// parent class needs FName equality with the C++ UPROPERTY, so the BP-side
+// FName must already be a valid C++ identifier.
+
+namespace
+{
+    // C++17 + UE-namespaced reserved words. Lower-cased for case-insensitive
+    // comparison; anything that would shadow a keyword when emitted into a
+    // header gets rejected.
+    static const TSet<FString>& GetCppReservedWords()
+    {
+        static const TSet<FString> Set = {
+            TEXT("auto"), TEXT("class"), TEXT("register"), TEXT("template"),
+            TEXT("operator"), TEXT("int"), TEXT("float"), TEXT("double"),
+            TEXT("bool"), TEXT("void"), TEXT("const"), TEXT("static"),
+            TEXT("virtual"), TEXT("override"), TEXT("public"), TEXT("private"),
+            TEXT("protected"), TEXT("struct"), TEXT("union"), TEXT("enum"),
+            TEXT("typedef"), TEXT("typename"), TEXT("namespace"), TEXT("using"),
+            TEXT("new"), TEXT("delete"), TEXT("this"), TEXT("try"), TEXT("catch"),
+            TEXT("throw"), TEXT("return"), TEXT("if"), TEXT("else"), TEXT("for"),
+            TEXT("while"), TEXT("do"), TEXT("switch"), TEXT("case"),
+            TEXT("default"), TEXT("break"), TEXT("continue"), TEXT("goto"),
+            TEXT("sizeof"), TEXT("true"), TEXT("false"), TEXT("nullptr"),
+            TEXT("char"), TEXT("short"), TEXT("long"), TEXT("unsigned"),
+            TEXT("signed"), TEXT("mutable"), TEXT("explicit"), TEXT("friend"),
+            TEXT("inline"), TEXT("volatile"), TEXT("extern"), TEXT("constexpr"),
+            TEXT("static_cast"), TEXT("dynamic_cast"), TEXT("const_cast"),
+            TEXT("reinterpret_cast"), TEXT("decltype"), TEXT("noexcept"),
+            TEXT("thread_local"), TEXT("alignas"), TEXT("alignof"), TEXT("asm"),
+            TEXT("char8_t"), TEXT("char16_t"), TEXT("char32_t"), TEXT("concept"),
+            TEXT("co_await"), TEXT("co_return"), TEXT("co_yield"),
+            TEXT("requires"), TEXT("wchar_t")
+        };
+        return Set;
+    }
+
+    bool IsValidCppIdentifier(const FString& In)
+    {
+        if (In.IsEmpty()) return false;
+        const TCHAR First = In[0];
+        const bool bFirstOk = (First == TEXT('_'))
+            || (First >= TEXT('a') && First <= TEXT('z'))
+            || (First >= TEXT('A') && First <= TEXT('Z'));
+        if (!bFirstOk) return false;
+        for (int32 i = 1; i < In.Len(); ++i)
+        {
+            const TCHAR C = In[i];
+            const bool bOk = (C == TEXT('_'))
+                || (C >= TEXT('a') && C <= TEXT('z'))
+                || (C >= TEXT('A') && C <= TEXT('Z'))
+                || (C >= TEXT('0') && C <= TEXT('9'));
+            if (!bOk) return false;
+        }
+        return true;
+    }
+
+    bool IsCppKeyword(const FString& In)
+    {
+        return GetCppReservedWords().Contains(In.ToLower());
+    }
+
+    // Walk every graph (recursing into sub-graphs) and tally how many
+    // K2Node_VariableGet/Set nodes reference the named variable. Used to
+    // report references_updated AFTER RenameMemberVariable has rewritten them.
+    int32 CountVariableReferences(const UBlueprint* BP, const FName& VarName)
+    {
+        if (!BP) return 0;
+        int32 Count = 0;
+
+        // UBlueprint::GetAllGraphs takes an out-array; need a non-const BP*
+        // because the overload is non-const even though it doesn't mutate.
+        TArray<UEdGraph*> AllGraphs;
+        const_cast<UBlueprint*>(BP)->GetAllGraphs(AllGraphs);
+
+        TSet<UEdGraph*> Seen;
+        TArray<UEdGraph*> Stack = AllGraphs;
+        while (Stack.Num() > 0)
+        {
+            UEdGraph* G = Stack.Pop();
+            if (!G || Seen.Contains(G)) continue;
+            Seen.Add(G);
+            for (UEdGraphNode* N : G->Nodes)
+            {
+                if (auto* Get = Cast<UK2Node_VariableGet>(N))
+                {
+                    if (Get->GetVarName() == VarName) ++Count;
+                }
+                else if (auto* Set = Cast<UK2Node_VariableSet>(N))
+                {
+                    if (Set->GetVarName() == VarName) ++Count;
+                }
+                if (N)
+                {
+                    for (UEdGraph* Sub : N->GetSubGraphs()) Stack.Add(Sub);
+                }
+            }
+        }
+        return Count;
+    }
+} // namespace (rename helpers)
+
+FSageToolDispatch::FOutcome BpRenameVariableImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, OldNameStr, NewNameStr;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("old_name"), OldNameStr)
+        || !Args->TryGetStringField(TEXT("new_name"), NewNameStr))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'old_name', or 'new_name'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    const FName OldName(*OldNameStr);
+    const FName NewName(*NewNameStr);
+
+    // Idempotent: same in/out → no-op success.
+    if (OldName == NewName)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("blueprint"), BP->GetName());
+        R->SetStringField(TEXT("old_name"), OldNameStr);
+        R->SetStringField(TEXT("new_name"), NewNameStr);
+        R->SetBoolField(TEXT("already"), true);
+        R->SetNumberField(TEXT("references_updated"), 0);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    // Old must be a BP-defined NewVariable (not inherited).
+    const int32 OldIdx = FBlueprintEditorUtils::FindNewVariableIndex(BP, OldName);
+    if (OldIdx == INDEX_NONE)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("variable '%s' not found (or inherited from parent)"), *OldNameStr));
+    }
+    // New must not collide with an existing BP-defined variable.
+    if (FBlueprintEditorUtils::FindNewVariableIndex(BP, NewName) != INDEX_NONE)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("name collision: '%s' already exists in this BP"), *NewNameStr));
+    }
+    // Identifier + keyword gates.
+    if (!IsValidCppIdentifier(NewNameStr))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("new_name is not a valid C++ identifier: '%s'"), *NewNameStr));
+    }
+    if (IsCppKeyword(NewNameStr))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("new_name is a C++ reserved keyword: '%s'"), *NewNameStr));
+    }
+    // Length cap — same 128-char limit the sanitiser uses, so the two tools
+    // can round-trip without one accepting names the other would truncate.
+    // MSVC link mangling tolerates more, but UHT-generated symbols paired
+    // with FName hashing get pathological past this point.
+    if (NewNameStr.Len() > 128)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("new_name exceeds 128-char cap (got %d): '%s...'"),
+                            NewNameStr.Len(), *NewNameStr.Left(40)));
+    }
+    // FName invalid character check (control chars, etc).
+    if (!FName::IsValidXName(NewNameStr, INVALID_OBJECTNAME_CHARACTERS))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("new_name fails FName::IsValidXName: '%s'"), *NewNameStr));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("BpRenameVar", "Sage: Rename BP Variable"));
+    BP->Modify();
+    FBlueprintEditorUtils::RenameMemberVariable(BP, OldName, NewName);
+
+    // Reference count is most useful AFTER the rename, when graphs have been
+    // rewritten — we report how many node uses now point at NewName.
+    const int32 RefCount = CountVariableReferences(BP, NewName);
+
+    FKismetEditorUtilities::CompileBlueprint(BP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetStringField(TEXT("old_name"), OldNameStr);
+    R->SetStringField(TEXT("new_name"), NewNameStr);
+    R->SetNumberField(TEXT("references_updated"), RefCount);
+    R->SetBoolField(TEXT("compiled"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- bp.sanitize_variable_names -------------------------------------------
+//
+// Bulk pass: walk BP->NewVariables, derive a C++-safe FName for each, and
+// (unless dry_run=true) rename them via FBlueprintEditorUtils::RenameMemberVariable.
+// The sanitiser is deliberately conservative — Turkish transliteration first
+// (so identifiers stay readable for tr_TR users), then strip every non-ASCII
+// alnum/underscore, collapse runs, fix leading-digit and reserved-word cases,
+// then collision-resolve with `_2`, `_3`... suffixes.
+//
+// Dry-run is the default because the rename cascade is destructive on
+// in-progress BPs (graph references rewrite, RepNotify functions rename); the
+// caller should review the mapping first.
+
+namespace
+{
+    // Map upper+lower Turkish letters to their ASCII fold. We deliberately do
+    // not map 'ı' to 'I' (that would collide Turkish dotless-i with English I)
+    // — instead 'ı'/'İ' both fold to 'i'/'I' and the originals are visually
+    // marked in the meta DisplayName.
+    static const TMap<TCHAR, TCHAR>& GetTurkishFold()
+    {
+        static TMap<TCHAR, TCHAR> M;
+        if (M.Num() == 0)
+        {
+            M.Add(TEXT('ç'), TEXT('c')); M.Add(TEXT('Ç'), TEXT('C'));
+            M.Add(TEXT('ğ'), TEXT('g')); M.Add(TEXT('Ğ'), TEXT('G'));
+            M.Add(TEXT('ı'), TEXT('i')); M.Add(TEXT('İ'), TEXT('I'));
+            M.Add(TEXT('ö'), TEXT('o')); M.Add(TEXT('Ö'), TEXT('O'));
+            M.Add(TEXT('ş'), TEXT('s')); M.Add(TEXT('Ş'), TEXT('S'));
+            M.Add(TEXT('ü'), TEXT('u')); M.Add(TEXT('Ü'), TEXT('U'));
+        }
+        return M;
+    }
+
+    // Sanitize and tag the reasons we changed the name — useful for telling
+    // the caller WHY each variable needed rewriting. Multiple reasons can
+    // accumulate (a Turkish-with-spaces name hits two).
+    FString SanitizeVariableName(const FString& In, TArray<FString>& OutReasons)
+    {
+        if (In.IsEmpty()) { OutReasons.Add(TEXT("empty")); return TEXT("UnnamedVar"); }
+
+        FString S;
+        S.Reserve(In.Len() + 4);
+
+        // 1. Turkish transliteration.
+        bool bTransliterated = false;
+        const TMap<TCHAR, TCHAR>& Fold = GetTurkishFold();
+        for (TCHAR C : In)
+        {
+            if (const TCHAR* Mapped = Fold.Find(C))
+            {
+                S.AppendChar(*Mapped);
+                bTransliterated = true;
+            }
+            else
+            {
+                S.AppendChar(C);
+            }
+        }
+        if (bTransliterated) OutReasons.Add(TEXT("transliteration"));
+
+        // 2. Replace any non-[A-Za-z0-9_] with underscore.
+        bool bSpaces = false, bSpecial = false, bNonAscii = false;
+        FString Cleaned;
+        Cleaned.Reserve(S.Len());
+        for (TCHAR C : S)
+        {
+            const bool bAlnum = (C >= TEXT('a') && C <= TEXT('z'))
+                || (C >= TEXT('A') && C <= TEXT('Z'))
+                || (C >= TEXT('0') && C <= TEXT('9'))
+                || C == TEXT('_');
+            if (bAlnum) { Cleaned.AppendChar(C); continue; }
+            // categorise the offending char for the reason field
+            if (C == TEXT(' ')) bSpaces = true;
+            else if ((int32)C > 127) bNonAscii = true;
+            else bSpecial = true;
+            Cleaned.AppendChar(TEXT('_'));
+        }
+        if (bSpaces)   OutReasons.Add(TEXT("spaces"));
+        if (bSpecial)  OutReasons.Add(TEXT("special_chars"));
+        if (bNonAscii) OutReasons.Add(TEXT("non_ascii"));
+
+        // 3. Collapse runs of underscores.
+        FString Collapsed;
+        Collapsed.Reserve(Cleaned.Len());
+        bool bPrevUnderscore = false;
+        for (TCHAR C : Cleaned)
+        {
+            if (C == TEXT('_'))
+            {
+                if (!bPrevUnderscore) Collapsed.AppendChar(C);
+                bPrevUnderscore = true;
+            }
+            else
+            {
+                Collapsed.AppendChar(C);
+                bPrevUnderscore = false;
+            }
+        }
+
+        // 4. Trim leading/trailing underscores.
+        FString Trimmed = Collapsed;
+        while (Trimmed.StartsWith(TEXT("_"))) Trimmed.RightChopInline(1);
+        while (Trimmed.EndsWith(TEXT("_"))) Trimmed.LeftChopInline(1);
+
+        // 5. Empty post-clean → fallback.
+        if (Trimmed.IsEmpty()) { OutReasons.Add(TEXT("empty_after_sanitize")); return TEXT("UnnamedVar"); }
+
+        // 6. Leading digit → prefix underscore.
+        if (Trimmed[0] >= TEXT('0') && Trimmed[0] <= TEXT('9'))
+        {
+            Trimmed = FString(TEXT("_")) + Trimmed;
+            OutReasons.Add(TEXT("number_prefix"));
+        }
+
+        // 7. C++ keyword → suffix _Var.
+        if (IsCppKeyword(Trimmed))
+        {
+            Trimmed += TEXT("_Var");
+            OutReasons.Add(TEXT("cpp_keyword"));
+        }
+
+        // 8. Length cap (UHT-safe; MSVC mangles huge symbols pathologically).
+        if (Trimmed.Len() > 128)
+        {
+            Trimmed.LeftInline(128);
+            OutReasons.Add(TEXT("truncated"));
+        }
+
+        return Trimmed;
+    }
+}
+
+FSageToolDispatch::FOutcome BpSanitizeVariableNamesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    bool DryRun = true;
+    Args->TryGetBoolField(TEXT("dry_run"), DryRun);
+
+    TSet<FString> Exclude;
+    {
+        const TArray<TSharedPtr<FJsonValue>>* ExArr = nullptr;
+        if (Args->TryGetArrayField(TEXT("exclude"), ExArr) && ExArr)
+        {
+            for (const TSharedPtr<FJsonValue>& V : *ExArr)
+            {
+                if (V.IsValid() && V->Type == EJson::String) Exclude.Add(V->AsString());
+            }
+        }
+    }
+
+    // Plan the renames first; collect skips alongside.
+    struct FPlanned
+    {
+        FString OldName;
+        FString NewName;
+        TArray<FString> Reasons;
+    };
+    TArray<FPlanned> Plan;
+    TArray<FString> SkippedExcluded, SkippedClean;
+
+    // Track final names (existing untouched variables + newly assigned ones)
+    // so the conflict resolver can suffix `_2`, `_3`, ... deterministically.
+    TSet<FString> Reserved;
+    for (const FBPVariableDescription& V : BP->NewVariables)
+    {
+        Reserved.Add(V.VarName.ToString());
+    }
+
+    int32 ConflictsResolved = 0;
+
+    for (const FBPVariableDescription& V : BP->NewVariables)
+    {
+        const FString OldStr = V.VarName.ToString();
+        if (Exclude.Contains(OldStr)) { SkippedExcluded.Add(OldStr); continue; }
+
+        TArray<FString> Reasons;
+        FString NewStr = SanitizeVariableName(OldStr, Reasons);
+        if (NewStr == OldStr) { SkippedClean.Add(OldStr); continue; }
+
+        // Conflict resolution: NewStr must be unique vs. (existing names ∪ already-planned new names).
+        // We DO want NewStr to "shadow" OldStr (the rename will free OldStr), so remove OldStr from
+        // Reserved before checking — otherwise every rename would self-collide.
+        Reserved.Remove(OldStr);
+
+        FString Final = NewStr;
+        int32 Suffix = 2;
+        while (Reserved.Contains(Final))
+        {
+            Final = FString::Printf(TEXT("%s_%d"), *NewStr, Suffix++);
+            ++ConflictsResolved;
+        }
+        Reserved.Add(Final);
+
+        Plan.Add({OldStr, Final, Reasons});
+    }
+
+    // Build mapping array regardless of dry_run for transparency.
+    TArray<TSharedPtr<FJsonValue>> MappingJson;
+    for (const FPlanned& P : Plan)
+    {
+        auto Entry = MakeShared<FJsonObject>();
+        Entry->SetStringField(TEXT("old"), P.OldName);
+        Entry->SetStringField(TEXT("new"), P.NewName);
+        Entry->SetStringField(TEXT("reason"), FString::Join(P.Reasons, TEXT(",")));
+        MappingJson.Add(MakeShared<FJsonValueObject>(Entry));
+    }
+
+    bool bCompiled = false;
+    if (!DryRun && Plan.Num() > 0)
+    {
+        FScopedTransaction Tx(LOCTEXT("BpSanitizeVars", "Sage: Sanitize BP Variable Names"));
+        BP->Modify();
+        for (const FPlanned& P : Plan)
+        {
+            FBlueprintEditorUtils::RenameMemberVariable(BP, FName(*P.OldName), FName(*P.NewName));
+        }
+        FKismetEditorUtilities::CompileBlueprint(BP);
+        bCompiled = true;
+    }
+
+    auto Skipped = MakeShared<FJsonObject>();
+    {
+        TArray<TSharedPtr<FJsonValue>> ExArr;
+        for (const FString& S : SkippedExcluded) ExArr.Add(MakeShared<FJsonValueString>(S));
+        TArray<TSharedPtr<FJsonValue>> CleanArr;
+        for (const FString& S : SkippedClean) CleanArr.Add(MakeShared<FJsonValueString>(S));
+        Skipped->SetArrayField(TEXT("excluded"), ExArr);
+        Skipped->SetArrayField(TEXT("already_clean"), CleanArr);
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetBoolField(TEXT("dry_run"), DryRun);
+    R->SetNumberField(TEXT("total_variables"), BP->NewVariables.Num());
+    R->SetNumberField(TEXT("rename_needed"), Plan.Num());
+    R->SetNumberField(TEXT("conflicts_resolved"), ConflictsResolved);
+    R->SetObjectField(TEXT("skipped"), Skipped);
+    R->SetArrayField(TEXT("mapping"), MappingJson);
+    R->SetBoolField(TEXT("compiled"), bCompiled);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- bp.set_variable_type -------------------------------------------------
+//
+// Re-types an existing BP variable. Wraps
+// FBlueprintEditorUtils::ChangeMemberVariableType, which (a) updates
+// FBPVariableDescription::VarType, (b) recomputes the underlying UProperty
+// during the next CompileBlueprint, (c) refreshes K2Node_Variable[Get|Set]
+// pin types via RefreshAllNodes. Default values that survive the type
+// conversion are kept; otherwise the engine resets them silently.
+//
+// Conceived for the ABP_Player incident (2026-05-01): when a Component
+// reparented from a BP class to its C++ parent, BP->NewVariables[X].VarType
+// silently degraded from the BP child class to the C++ parent class, leaving
+// every K2Node_CallFunction targeting BP-side functions with an incompatible
+// Target pin. This tool is the explicit fix path.
+
+FSageToolDispatch::FOutcome BpSetVariableTypeImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, Name, TypeStr;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("name"), Name)
+        || !Args->TryGetStringField(TEXT("type"), TypeStr))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'name', or 'type'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    FString TypeObj;
+    Args->TryGetStringField(TEXT("type_object"), TypeObj);
+    bool bArr = false;
+    Args->TryGetBoolField(TEXT("is_array"), bArr);
+
+    // Build the new pin type via the shared MakePinType helper — same path
+    // bp.add_variable uses, so any bug in PC_Real subcategory handling etc.
+    // is fixed in one place.
+    const FEdGraphPinType NewPinType = MakePinType(TypeStr, TypeObj, bArr);
+
+    const FName VName(*Name);
+    const int32 Idx = FBlueprintEditorUtils::FindNewVariableIndex(BP, VName);
+    if (Idx == INDEX_NONE)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("variable '%s' not found (or inherited)"), *Name));
+    }
+
+    // Stringify both sides BEFORE the mutation for the {old_type, new_type} report.
+    auto PinTypeToHuman = [](const FEdGraphPinType& T) -> FString
+    {
+        FString Cat = T.PinCategory.ToString();
+        if (T.PinSubCategoryObject.IsValid())
+        {
+            return FString::Printf(TEXT("%s:%s"), *Cat, *T.PinSubCategoryObject->GetName());
+        }
+        if (!T.PinSubCategory.IsNone())
+        {
+            return FString::Printf(TEXT("%s:%s"), *Cat, *T.PinSubCategory.ToString());
+        }
+        return Cat;
+    };
+
+    const FEdGraphPinType OldPinType = BP->NewVariables[Idx].VarType;
+    const FString OldHuman = PinTypeToHuman(OldPinType);
+    const FString NewHuman = PinTypeToHuman(NewPinType);
+
+    // Idempotent: same pin type → no-op.
+    if (OldPinType == NewPinType)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("blueprint"), BP->GetName());
+        R->SetStringField(TEXT("variable"), Name);
+        R->SetStringField(TEXT("old_type"), OldHuman);
+        R->SetStringField(TEXT("new_type"), NewHuman);
+        R->SetBoolField(TEXT("already"), true);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("BpSetVarType", "Sage: Change BP Variable Type"));
+    BP->Modify();
+    FBlueprintEditorUtils::ChangeMemberVariableType(BP, VName, NewPinType);
+
+    // Engine flushes default value if the conversion is lossy. We can't
+    // recover it; just report whether anything is left in the slot.
+    const bool bDefaultPreserved = !BP->NewVariables[Idx].DefaultValue.IsEmpty();
+
+    const int32 RefCount = CountVariableReferences(BP, VName);
+    FKismetEditorUtilities::CompileBlueprint(BP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetStringField(TEXT("variable"), Name);
+    R->SetStringField(TEXT("old_type"), OldHuman);
+    R->SetStringField(TEXT("new_type"), NewHuman);
+    R->SetBoolField(TEXT("default_value_preserved"), bDefaultPreserved);
+    R->SetNumberField(TEXT("references_refreshed"), RefCount);
+    R->SetBoolField(TEXT("compiled"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- bp.clear_graphs ------------------------------------------------------
+//
+// Empties out every node a Blueprint owns inside its event/function/macro
+// graphs while keeping the graph SHELLS (FunctionEntry/Result/Tunnel) so the
+// generated UClass still exposes the function signatures. This is Step 6 of
+// the conversion playbook: once the C++ parent class implements the same
+// behaviour, the BP graphs become redundant and the only correct thing to
+// do is remove every K2Node so the BP can't drift from the C++ source. Pin
+// orphan errors during reparent (Step 7) become impossible — there are no
+// nodes left to hold stale references.
+//
+// scope: "all" | "event_graph" | "functions" | "macros"
+// keep_entry_nodes: preserve UFunctionEntry/UFunctionResult/UTunnel (default true)
+// keep_event_entries: preserve UK2Node_Event placeholders (default false)
+
+FSageToolDispatch::FOutcome BpClearGraphsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    FString Scope = TEXT("all");
+    Args->TryGetStringField(TEXT("scope"), Scope);
+    if (Scope != TEXT("all") && Scope != TEXT("event_graph")
+        && Scope != TEXT("functions") && Scope != TEXT("macros"))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("scope must be one of: all, event_graph, functions, macros"));
+    }
+
+    bool bKeepEntries = true, bKeepEventEntries = false;
+    Args->TryGetBoolField(TEXT("keep_entry_nodes"), bKeepEntries);
+    Args->TryGetBoolField(TEXT("keep_event_entries"), bKeepEventEntries);
+
+    // Roll up the target graph set per scope. Each list maps to the
+    // corresponding UBlueprint::*Graphs array; we keep them separate for the
+    // per-bucket counts in the response.
+    TArray<UEdGraph*> FunctionTargets, MacroTargets, EventTargets;
+    if (Scope == TEXT("all") || Scope == TEXT("functions"))   FunctionTargets.Append(BP->FunctionGraphs);
+    if (Scope == TEXT("all") || Scope == TEXT("macros"))      MacroTargets.Append(BP->MacroGraphs);
+    if (Scope == TEXT("all") || Scope == TEXT("event_graph")) EventTargets.Append(BP->UbergraphPages);
+
+    int32 NodesRemoved = 0, EntriesKept = 0, GraphsVisited = 0;
+    int32 FuncCount = 0, MacroCount = 0, UberCount = 0;
+
+    auto ProcessGraph = [&](UEdGraph* Graph, int32* Bucket)
+    {
+        if (!Graph) return;
+        TSet<UEdGraph*> Seen;
+        TArray<UEdGraph*> Stack;
+        Stack.Add(Graph);
+        while (Stack.Num() > 0)
+        {
+            UEdGraph* G = Stack.Pop();
+            if (!G || Seen.Contains(G)) continue;
+            Seen.Add(G);
+            G->Modify();
+            ++GraphsVisited;
+
+            TArray<UEdGraphNode*> Snap = G->Nodes;
+            for (UEdGraphNode* N : Snap)
+            {
+                if (!N) continue;
+                const bool bIsEntry = N->IsA<UK2Node_FunctionEntry>()
+                                   || N->IsA<UK2Node_FunctionResult>()
+                                   || N->IsA<UK2Node_Tunnel>();
+                const bool bIsEvent = N->IsA<UK2Node_Event>();
+
+                if (bIsEntry && bKeepEntries) { ++EntriesKept; continue; }
+                if (bIsEvent && bKeepEventEntries) { ++EntriesKept; continue; }
+
+                // Snapshot sub-graphs so we still recurse into a node's
+                // sub-graphs even when the node itself is about to be removed.
+                for (UEdGraph* Sub : N->GetSubGraphs()) Stack.Add(Sub);
+
+                G->RemoveNode(N);
+                ++NodesRemoved;
+                if (Bucket) ++(*Bucket);
+            }
+
+            // The graph itself can hold sub-graphs (e.g. composite graphs
+            // nest under SubGraphs). Walk those too even if all nodes were kept.
+            for (UEdGraph* Sub : G->SubGraphs) Stack.Add(Sub);
+        }
+    };
+
+    FScopedTransaction Tx(LOCTEXT("BpClearGraphs", "Sage: Clear BP Graphs"));
+    BP->Modify();
+    for (UEdGraph* G : FunctionTargets) ProcessGraph(G, &FuncCount);
+    for (UEdGraph* G : MacroTargets)    ProcessGraph(G, &MacroCount);
+    for (UEdGraph* G : EventTargets)    ProcessGraph(G, &UberCount);
+    FKismetEditorUtilities::CompileBlueprint(BP);
+
+    auto Summary = MakeShared<FJsonObject>();
+    Summary->SetNumberField(TEXT("function_graphs"), FuncCount);
+    Summary->SetNumberField(TEXT("macro_graphs"), MacroCount);
+    Summary->SetNumberField(TEXT("ubergraph_pages"), UberCount);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetNumberField(TEXT("graphs_visited"), GraphsVisited);
+    R->SetNumberField(TEXT("nodes_removed"), NodesRemoved);
+    R->SetNumberField(TEXT("entry_nodes_kept"), EntriesKept);
+    R->SetStringField(TEXT("scope"), Scope);
+    R->SetObjectField(TEXT("summary"), Summary);
+    R->SetBoolField(TEXT("compiled"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---- bp.delete_all_variables ----------------------------------------------
+//
+// Bulk RemoveMemberVariable across BP->NewVariables. Inherited variables and
+// SCS-generated component variables are not in NewVariables and remain
+// untouched. The `except` array names variables to keep — useful when a
+// handful of designer-overridable knobs should outlive the C++ migration.
+
+FSageToolDispatch::FOutcome BpDeleteAllVariablesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    TSet<FString> Except;
+    {
+        const TArray<TSharedPtr<FJsonValue>>* ExArr = nullptr;
+        if (Args->TryGetArrayField(TEXT("except"), ExArr) && ExArr)
+        {
+            for (const TSharedPtr<FJsonValue>& V : *ExArr)
+            {
+                if (V.IsValid() && V->Type == EJson::String) Except.Add(V->AsString());
+            }
+        }
+    }
+    bool DryRun = false;
+    Args->TryGetBoolField(TEXT("dry_run"), DryRun);
+
+    // Snapshot — RemoveMemberVariable mutates NewVariables, so we collect first.
+    TArray<FName> ToDelete;
+    TArray<FString> Kept;
+    for (const FBPVariableDescription& V : BP->NewVariables)
+    {
+        const FString Name = V.VarName.ToString();
+        if (Except.Contains(Name)) { Kept.Add(Name); continue; }
+        ToDelete.Add(V.VarName);
+    }
+
+    TArray<FString> Deleted;
+    if (!DryRun && ToDelete.Num() > 0)
+    {
+        FScopedTransaction Tx(LOCTEXT("BpDelAllVars", "Sage: Delete All BP Variables"));
+        BP->Modify();
+        for (const FName& VName : ToDelete)
+        {
+            FBlueprintEditorUtils::RemoveMemberVariable(BP, VName);
+            Deleted.Add(VName.ToString());
+        }
+        FKismetEditorUtilities::CompileBlueprint(BP);
+    }
+    else
+    {
+        // Dry-run — surface what WOULD be deleted as the same string list shape.
+        for (const FName& VName : ToDelete) Deleted.Add(VName.ToString());
+    }
+
+    auto KeptObj = MakeShared<FJsonObject>();
+    {
+        TArray<TSharedPtr<FJsonValue>> KeptArr;
+        for (const FString& S : Kept) KeptArr.Add(MakeShared<FJsonValueString>(S));
+        KeptObj->SetArrayField(TEXT("excepted"), KeptArr);
+        KeptObj->SetArrayField(TEXT("inherited"), TArray<TSharedPtr<FJsonValue>>{});
+        KeptObj->SetArrayField(TEXT("scs_generated"), TArray<TSharedPtr<FJsonValue>>{});
+    }
+    TArray<TSharedPtr<FJsonValue>> DeletedArr;
+    for (const FString& S : Deleted) DeletedArr.Add(MakeShared<FJsonValueString>(S));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetBoolField(TEXT("dry_run"), DryRun);
+    R->SetArrayField(TEXT("deleted"), DeletedArr);
+    R->SetObjectField(TEXT("kept"), KeptObj);
+    R->SetBoolField(TEXT("compiled"), !DryRun && ToDelete.Num() > 0);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---- bp.set_variable_default ---------------------------------------------
 
 FSageToolDispatch::FOutcome BpSetVariableDefaultImpl(const TSharedPtr<FJsonObject>& Args)
@@ -724,8 +1481,6 @@ FSageToolDispatch::FOutcome BpSetVariableDefaultImpl(const TSharedPtr<FJsonObjec
     UBlueprint* BP = ResolveBlueprint(Path);
     if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
 
-    const TSharedPtr<FJsonValue>* ValueField = nullptr;
-    Args->Values.Find(TEXT("value"));
     auto It = Args->Values.Find(TEXT("value"));
     if (!It) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'value'"));
 
@@ -2887,6 +3642,185 @@ FSageToolDispatch::FOutcome BpReparentImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- bp.refresh_nodes -----------------------------------------------------
+//
+// Engine's `RefreshAllNodes` (called from `bp.reparent`) only revisits a
+// subset of K2 nodes; specifically, AnimGraph nodes and certain UMG
+// `Get<Var>` getters keep their pin descriptors cached against the *old*
+// parent's variable layout. Reparent → variable migrates up to the new C++
+// class → BP graph still references the now-departed local property by an
+// invalid pin id → next compile errors with "In use pin <Name> no longer
+// exists on node Get."
+//
+// The fix is per-node `Node->ReconstructNode()`: each node rebuilds its own
+// pin set from its current source-of-truth (variable resolution, function
+// signature, anim node socket binding, etc.). Then a final RefreshAllNodes
+// + StructurallyModified + Compile rebuilds the bytecode against the fresh
+// pins. Used after a class-layout-changing reparent to clear "broken pin"
+// errors.
+//
+// `BP->GetAllGraphs` returns the top-level graphs (UbergraphPages,
+// FunctionGraphs, MacroGraphs, IntermediateGenerated, Delegate signature
+// graphs). It does NOT descend into nested sub-graphs that K2 nodes own —
+// most importantly, AnimGraph state machines hide their state pose graphs
+// and transition rule graphs behind UEdGraphNode::GetSubGraphs(). Without
+// recursing into those, a state-machine BP that references a renamed
+// (or reparented-into-C++) variable inside any transition rule will keep
+// reporting "In use pin no longer exists" forever. So we walk every node,
+// pull its sub-graphs, and recurse — covers state machines, sub-state
+// machines, and any future K2 node that exposes nested graphs.
+namespace
+{
+    // Strip whitespace + underscores, lowercase. Used to reconcile cached
+    // pin display-names ("Superhero Flight Component") against fresh schema
+    // FNames ("SuperheroFlightComponent") that point at the same property.
+    FString NormalizePinIdent(const FString& In)
+    {
+        FString S = In;
+        S.ReplaceInline(TEXT(" "), TEXT(""));
+        S.ReplaceInline(TEXT("_"), TEXT(""));
+        return S.ToLower();
+    }
+
+    // After ReconstructNode, walk the orphan pins and try to migrate their
+    // links to the freshly-allocated schema pin that semantically replaces
+    // them. UE editor's manual "Refresh Nodes" menu item does this; engine's
+    // K2 RestorePins only matches by exact FName + direction + type, which
+    // misses cases where the saved pin name had display-style spacing
+    // ("Superhero Flight Component") and the new schema pin is the camelCase
+    // variable FName ("SuperheroFlightComponent"). We do a normalized match
+    // (whitespace/underscore-insensitive, case-insensitive) and use
+    // UEdGraphSchema::MovePinLinks so sub-pin/default-value semantics ride
+    // along correctly. Falls back to remove-with-broken-links when no match.
+    void ReconcileOrphanPins(UEdGraphNode* Node, int32& Migrated, int32& Removed)
+    {
+        if (!Node) return;
+
+        TArray<UEdGraphPin*> Orphans;
+        TArray<UEdGraphPin*> Live;
+        for (UEdGraphPin* P : Node->Pins)
+        {
+            if (!P) continue;
+            (P->bOrphanedPin ? Orphans : Live).Add(P);
+        }
+        if (Orphans.Num() == 0) return;
+
+        for (UEdGraphPin* OrphanPin : Orphans)
+        {
+            const FString OrphanNorm = NormalizePinIdent(OrphanPin->PinName.ToString());
+            UEdGraphPin* Match = nullptr;
+            for (UEdGraphPin* LivePin : Live)
+            {
+                if (LivePin->Direction != OrphanPin->Direction) continue;
+                if (NormalizePinIdent(LivePin->PinName.ToString()) != OrphanNorm) continue;
+                Match = LivePin;
+                break;
+            }
+
+            if (Match)
+            {
+                // Direct bidirectional link transfer via UEdGraphPin::MakeLinkTo
+                // (bypasses K2 schema's TryCreateConnection type check, which
+                // rejects perfectly valid migrations when the saved-pin's stale
+                // type metadata mismatches the new pin's fresh type — even
+                // though both terminals already agreed on the link beforehand).
+                // Snapshot LinkedTo because MakeLinkTo mutates source array.
+                TArray<UEdGraphPin*> LinkedSnap = OrphanPin->LinkedTo;
+                for (UEdGraphPin* L : LinkedSnap)
+                {
+                    if (L) Match->MakeLinkTo(L);
+                }
+                // Carry default value forward when the match has no incoming
+                // links (the orphan was used as a literal feed).
+                if (Match->LinkedTo.Num() == 0 && !OrphanPin->DefaultValue.IsEmpty())
+                {
+                    Match->DefaultValue = OrphanPin->DefaultValue;
+                }
+                ++Migrated;
+            }
+            OrphanPin->BreakAllPinLinks();
+            Node->RemovePin(OrphanPin);
+            if (!Match) ++Removed;
+        }
+    }
+
+    void RefreshGraphRecursive(UEdGraph* Graph,
+                               TSet<UEdGraph*>& Visited,
+                               int32& NodesReconstructed,
+                               int32& GraphsVisited,
+                               int32& OrphanPinsMigrated,
+                               int32& OrphanPinsRemoved)
+    {
+        if (!Graph || Visited.Contains(Graph)) return;
+        Visited.Add(Graph);
+        ++GraphsVisited;
+
+        // Snapshot the array — ReconstructNode is allowed to add/remove pins
+        // but should not reshape the node list itself; copy is belt-and-braces.
+        TArray<UEdGraphNode*> NodeSnapshot = Graph->Nodes;
+        for (UEdGraphNode* Node : NodeSnapshot)
+        {
+            if (!Node) continue;
+            Node->ReconstructNode();
+            ++NodesReconstructed;
+
+            // After reconstruct, the engine flags pins that the new schema
+            // doesn't produce as bOrphanedPin=true. Try to migrate links to
+            // a normalized-name match before removing — see ReconcileOrphanPins.
+            ReconcileOrphanPins(Node, OrphanPinsMigrated, OrphanPinsRemoved);
+
+            // Recurse into any sub-graphs the node owns. UEdGraphNode's
+            // virtual GetSubGraphs covers state-machine bound graphs
+            // (UAnimStateNode, UAnimStateTransitionNode), composite graph
+            // wrappers, etc., without us hard-linking against AnimGraph.
+            // Note: UE5 signature returns the array (no out-parameter).
+            for (UEdGraph* Sub : Node->GetSubGraphs())
+            {
+                RefreshGraphRecursive(Sub, Visited, NodesReconstructed, GraphsVisited, OrphanPinsMigrated, OrphanPinsRemoved);
+            }
+        }
+    }
+}
+FSageToolDispatch::FOutcome BpRefreshNodesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+
+    FScopedTransaction Tx(LOCTEXT("BpRefresh", "Sage: Refresh BP Nodes"));
+    BP->Modify();
+
+    int32 ReconstructedCount = 0;
+    int32 GraphsVisited = 0;
+    int32 OrphanPinsMigrated = 0;
+    int32 OrphanPinsRemoved = 0;
+    TSet<UEdGraph*> Visited;
+    TArray<UEdGraph*> AllGraphs;
+    BP->GetAllGraphs(AllGraphs);
+    for (UEdGraph* Graph : AllGraphs)
+    {
+        RefreshGraphRecursive(Graph, Visited, ReconstructedCount, GraphsVisited, OrphanPinsMigrated, OrphanPinsRemoved);
+    }
+
+    FBlueprintEditorUtils::RefreshAllNodes(BP);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+    FKismetEditorUtilities::CompileBlueprint(BP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetNumberField(TEXT("nodes_reconstructed"), ReconstructedCount);
+    R->SetNumberField(TEXT("graphs_visited"), GraphsVisited);
+    R->SetNumberField(TEXT("orphan_pins_migrated"), OrphanPinsMigrated);
+    R->SetNumberField(TEXT("orphan_pins_removed"), OrphanPinsRemoved);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---- bp.create_function  (new user-defined function in a Blueprint) --------
 
 FSageToolDispatch::FOutcome BpCreateFunctionImpl(const TSharedPtr<FJsonObject>& Args)
@@ -3476,6 +4410,11 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
     // Write — variables (member + local)
     Dispatch.RegisterHandler(TEXT("bp.add_variable"),         GT(&BpAddVariableImpl));
     Dispatch.RegisterHandler(TEXT("bp.delete_variable"),      GT(&BpDeleteVariableImpl));
+    Dispatch.RegisterHandler(TEXT("bp.rename_variable"),      GT(&BpRenameVariableImpl));
+    Dispatch.RegisterHandler(TEXT("bp.sanitize_variable_names"), GT(&BpSanitizeVariableNamesImpl));
+    Dispatch.RegisterHandler(TEXT("bp.set_variable_type"),    GT(&BpSetVariableTypeImpl));
+    Dispatch.RegisterHandler(TEXT("bp.clear_graphs"),         GT(&BpClearGraphsImpl));
+    Dispatch.RegisterHandler(TEXT("bp.delete_all_variables"), GT(&BpDeleteAllVariablesImpl));
     Dispatch.RegisterHandler(TEXT("bp.set_variable_default"), GT(&BpSetVariableDefaultImpl));
     Dispatch.RegisterHandler(TEXT("bp.list_local_variables"), GT(&BpListLocalVariablesImpl));
     Dispatch.RegisterHandler(TEXT("bp.add_local_variable"),   GT(&BpAddLocalVariableImpl));
@@ -3537,6 +4476,7 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
     // Write — class shape
     Dispatch.RegisterHandler(TEXT("bp.set_cdo_property"),    GT(&BpSetCdoPropertyImpl));
     Dispatch.RegisterHandler(TEXT("bp.reparent"),            GT(&BpReparentImpl));
+    Dispatch.RegisterHandler(TEXT("bp.refresh_nodes"),       GT(&BpRefreshNodesImpl));
 
     // Write — function creation + actor tick
     Dispatch.RegisterHandler(TEXT("bp.create_function"),           GT(&BpCreateFunctionImpl));

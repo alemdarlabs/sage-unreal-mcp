@@ -1160,6 +1160,129 @@ int main(int argc, char* argv[]) {
         .handler = nullptr, .remote = true,
     });
     registerRemote(sage::mcp::Tool{
+        .name = "bp.rename_variable",
+        .description = "Rename a BP-defined member variable in place. Wraps "
+                       "FBlueprintEditorUtils::RenameMemberVariable — updates "
+                       "the FBPVariableDescription, rewrites every "
+                       "K2Node_VariableGet/Set reference, renames the "
+                       "OnRep_<Name> RepNotify function. Validation rejects: "
+                       "name collision, inherited variable, non-C++-identifier, "
+                       "C++ reserved keywords. Idempotent (returns already=true "
+                       "when old==new). Returns {old_name, new_name, "
+                       "references_updated, compiled}. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"old_name", {{"type", "string"}}},
+                {"new_name", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "old_name", "new_name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.sanitize_variable_names",
+        .description = "Bulk-rename every BP member variable whose FName is not "
+                       "a valid C++ identifier into a sanitized form. Algorithm: "
+                       "Turkish transliteration → strip non-[A-Za-z0-9_] → "
+                       "collapse underscores → leading-digit fix (_) → "
+                       "C++-keyword fix (_Var suffix) → 128-char cap. "
+                       "Sanitised collisions resolve with _2, _3... suffixes. "
+                       "dry_run defaults to true (preview only). Each mapping "
+                       "entry carries a comma-separated reason "
+                       "(spaces/special_chars/non_ascii/cpp_keyword/number_prefix/"
+                       "transliteration/truncated). PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",    {{"type", "string"}}},
+                {"dry_run", {{"type", "boolean"}}},
+                {"exclude", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+            }},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.set_variable_type",
+        .description = "Re-type an existing BP member variable. Wraps "
+                       "FBlueprintEditorUtils::ChangeMemberVariableType. type "
+                       "values match bp.add_variable (bool/int/real/string/"
+                       "object/class/struct/byte/name/text). type_object "
+                       "resolves UClass/UStruct path for reference types. "
+                       "is_array=true for TArray. Idempotent on same type "
+                       "(already=true). Use this to fix the variable-type "
+                       "degrade that follows a Component reparent (BP child "
+                       "class → C++ parent class). Returns {old_type, new_type, "
+                       "default_value_preserved, references_refreshed, "
+                       "compiled}. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",        {{"type", "string"}}},
+                {"name",        {{"type", "string"}}},
+                {"type",        {{"type", "string"}}},
+                {"type_object", {{"type", "string"}}},
+                {"is_array",    {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "name", "type"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.clear_graphs",
+        .description = "Empty every K2Node out of a Blueprint's event/function/"
+                       "macro graphs while preserving graph shells. Step 6 of "
+                       "the BP→C++ conversion playbook: once C++ implements the "
+                       "behaviour, clearing the BP graphs prevents drift and "
+                       "makes the subsequent reparent's pin-orphan errors "
+                       "impossible (no nodes left to hold stale references). "
+                       "scope ∈ {all, event_graph, functions, macros}. "
+                       "keep_entry_nodes (default true) preserves "
+                       "UFunctionEntry/Result/Tunnel so function signatures "
+                       "survive. keep_event_entries (default false) preserves "
+                       "UK2Node_Event placeholders. Recurses into composite "
+                       "sub-graphs. PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",               {{"type", "string"}}},
+                {"scope",              {{"type", "string"},
+                                        {"enum", nlohmann::json::array({"all", "event_graph", "functions", "macros"})}}},
+                {"keep_entry_nodes",   {{"type", "boolean"}}},
+                {"keep_event_entries", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.delete_all_variables",
+        .description = "Bulk RemoveMemberVariable across BP->NewVariables. "
+                       "Inherited and SCS-component variables are not in "
+                       "NewVariables and remain untouched. except[] preserves "
+                       "named variables. dry_run lists what would be deleted "
+                       "without writing. Returns {deleted[], "
+                       "kept{excepted, inherited, scs_generated}, compiled}. "
+                       "PIE rejected.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",    {{"type", "string"}}},
+                {"except",  {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"dry_run", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"path"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
         .name = "bp.set_variable_default",
         .description = "Set a member variable's default value (string-coerced). "
                        "PIE rejected.",
@@ -1901,6 +2024,22 @@ int main(int argc, char* argv[]) {
         .name = "bp.compile",
         .description = "Trigger full BP compile. Returns {success, errors, "
                        "warnings, notes}. PIE rejected.",
+        .inputSchema = bpPathSchema, .handler = nullptr, .remote = true,
+    });
+
+    // -- refresh nodes (post-reparent pin cleanup) --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.refresh_nodes",
+        .description = "Reconstruct every node in every graph of the Blueprint "
+                       "(per-node Node->ReconstructNode + final RefreshAllNodes "
+                       "+ Compile). Engine's bp.reparent path only refreshes a "
+                       "subset; AnimGraph nodes and UMG variable getters keep "
+                       "pin descriptors cached against the old parent's "
+                       "layout, leaving 'In use pin no longer exists' errors "
+                       "after a class-layout change. Use this after reparent "
+                       "if compile reports broken-pin errors. Returns "
+                       "{blueprint, nodes_reconstructed, graphs_visited}. "
+                       "PIE rejected.",
         .inputSchema = bpPathSchema, .handler = nullptr, .remote = true,
     });
 
