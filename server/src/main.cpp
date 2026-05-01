@@ -18,8 +18,10 @@
 #include "tools/phase4_schemas.h"
 #include "tools/restart_orchestrator.h"
 #include "transport/http_sse_server.h"
+#include "transport/stdio_mcp.h"
 
 #include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -31,11 +33,19 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 
 namespace {
 
 std::atomic<sage::transport::HttpSseServer*> g_runningHttp{nullptr};
 std::atomic<sage::bridge::BridgeServer*>     g_runningBridge{nullptr};
+
+[[nodiscard]] bool hasFlag(int argc, char* argv[], std::string_view flag) {
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i] && std::string_view{argv[i]} == flag) return true;
+    }
+    return false;
+}
 
 extern "C" void signalHandler(int signal) {
     // Async-signal-safe surface: only atomics + library stop() functions
@@ -67,15 +77,48 @@ extern "C" void signalHandler(int signal) {
 
 }  // namespace
 
-int main() {
-    auto logger = spdlog::stdout_color_mt("sage");
+int main(int argc, char* argv[]) {
+    // Transport selection — stdio is default (Anthropic SDK native, OAuth-free).
+    // HTTP+SSE (port 7777) opt-in via `--http` for multi-client / debugging.
+    const bool useHttp = hasFlag(argc, argv, "--http");
+
+    // Stdio reserves stdout for the JSON-RPC protocol stream; logs MUST go to
+    // stderr (which Claude Code subprocess parent drains). HTTP mode is free
+    // to use stdout. Stdio mode also tees logs to a file (%TEMP%/sage-stdio.log
+    // on Windows, /tmp/sage-stdio.log elsewhere) for debugging spawn issues
+    // when stderr is hard to capture from the MCP client side.
+    std::shared_ptr<spdlog::logger> logger;
+    if (useHttp) {
+        logger = spdlog::stdout_color_mt("sage");
+    } else {
+        try {
+            const std::string tmp = std::getenv("TEMP") ? std::getenv("TEMP")
+                                  : std::getenv("TMPDIR") ? std::getenv("TMPDIR")
+                                  : "/tmp";
+            const std::string logPath = tmp + "/sage-stdio.log";
+            auto stderrSink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
+            auto fileSink   = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logPath, /*truncate=*/true);
+            logger = std::make_shared<spdlog::logger>("sage",
+                spdlog::sinks_init_list{stderrSink, fileSink});
+        } catch (const std::exception&) {
+            // File sink failed (path issue, permissions); fall back to stderr-only.
+            logger = spdlog::stderr_color_mt("sage");
+        }
+    }
     spdlog::set_default_logger(logger);
     spdlog::set_pattern("[%H:%M:%S.%e] [%^%l%$] [%n] %v");
 
     const auto levelStr = envOr("SAGE_LOG_LEVEL", "info");
     spdlog::set_level(spdlog::level::from_str(levelStr));
 
-    spdlog::info("sage-server starting (version 0.1.0, log_level={})", levelStr);
+    // Flush every info+ record immediately. Without this, a native crash
+    // (e.g. kuzu access violation, std::terminate) leaves the last several
+    // log lines buffered and we lose the breadcrumb trail. Cost is one extra
+    // file write per log line, negligible at info volume.
+    spdlog::flush_on(spdlog::level::info);
+
+    spdlog::info("sage-server starting (version 0.1.0, transport={}, log_level={})",
+                 useHttp ? "http+sse" : "stdio", levelStr);
 
     auto registry = std::make_shared<sage::mcp::ToolRegistry>();
     sage::tools::registerBuiltins(*registry);
@@ -4057,30 +4100,46 @@ int main() {
             }
         });
 
-    // ---- HTTP+SSE transport (Claude ↔ server) ---------------------------
-    sage::transport::HttpSseConfig httpCfg{
-        .host            = envOr("SAGE_HTTP_HOST", "127.0.0.1"),
-        .port            = envIntOr("SAGE_HTTP_PORT", 7777),
-        .mcpEndpoint     = "/mcp",
-        .readTimeoutSec  = 30,
-        .writeTimeoutSec = 30,
-    };
-    sage::transport::HttpSseServer transport(mcpServer, httpCfg);
-    g_runningHttp.store(&transport, std::memory_order_release);
+    // ---- MCP Transport ---------------------------------------------------
+    if (useHttp) {
+        sage::transport::HttpSseConfig httpCfg{
+            .host            = envOr("SAGE_HTTP_HOST", "127.0.0.1"),
+            .port            = envIntOr("SAGE_HTTP_PORT", 7777),
+            .mcpEndpoint     = "/mcp",
+            .readTimeoutSec  = 30,
+            .writeTimeoutSec = 30,
+        };
+        sage::transport::HttpSseServer transport(mcpServer, httpCfg);
+        g_runningHttp.store(&transport, std::memory_order_release);
 
-    std::signal(SIGINT,  &signalHandler);
-    std::signal(SIGTERM, &signalHandler);
+        std::signal(SIGINT,  &signalHandler);
+        std::signal(SIGTERM, &signalHandler);
 
-    const bool ok = transport.listen();
+        const bool ok = transport.listen();
 
-    g_runningHttp.store(nullptr, std::memory_order_release);
-    bridge.stop();
-    g_runningBridge.store(nullptr, std::memory_order_release);
+        g_runningHttp.store(nullptr, std::memory_order_release);
+        bridge.stop();
+        g_runningBridge.store(nullptr, std::memory_order_release);
 
-    if (!ok) {
-        spdlog::error("HTTP server failed to bind {}:{}", httpCfg.host, httpCfg.port);
-        return 1;
+        if (!ok) {
+            spdlog::error("HTTP server failed to bind {}:{}", httpCfg.host, httpCfg.port);
+            return 1;
+        }
+    } else {
+        // stdio: parent (Claude Code) closes stdin to end the session.
+        // Minimal SIGINT handler so Ctrl+C from a manual shell still cleans
+        // the bridge before terminating.
+        std::signal(SIGINT, [](int) {
+            if (auto* b = g_runningBridge.load(std::memory_order_acquire)) b->stop();
+        });
+
+        sage::transport::StdioMcp stdio(mcpServer);
+        stdio.run();
+
+        bridge.stop();
+        g_runningBridge.store(nullptr, std::memory_order_release);
     }
+
     spdlog::info("Bye");
     return 0;
 }

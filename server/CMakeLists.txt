@@ -22,6 +22,7 @@ target_link_libraries(sage-mcp
 # ---- transport library ----
 add_library(sage-transport STATIC
     src/transport/http_sse_server.cpp
+    src/transport/stdio_mcp.cpp
 )
 target_include_directories(sage-transport
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
