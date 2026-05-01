@@ -21,7 +21,7 @@
 #include "transport/stdio_mcp.h"
 
 #include <spdlog/sinks/stdout_color_sinks.h>
-#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -84,9 +84,11 @@ int main(int argc, char* argv[]) {
 
     // Stdio reserves stdout for the JSON-RPC protocol stream; logs MUST go to
     // stderr (which Claude Code subprocess parent drains). HTTP mode is free
-    // to use stdout. Stdio mode also tees logs to a file (%TEMP%/sage-stdio.log
-    // on Windows, /tmp/sage-stdio.log elsewhere) for debugging spawn issues
-    // when stderr is hard to capture from the MCP client side.
+    // to use stdout. Stdio mode also tees logs to a rotating file (%TEMP%/
+    // sage-stdio.log on Windows, /tmp/sage-stdio.log elsewhere) — rotating
+    // (5MB × 3 backups) instead of truncate-on-start so a crash log survives
+    // the next launch by the MCP client. Without rotation, the post-crash
+    // restart wipes exactly the breadcrumb you wanted to read.
     std::shared_ptr<spdlog::logger> logger;
     if (useHttp) {
         logger = spdlog::stdout_color_mt("sage");
@@ -97,7 +99,8 @@ int main(int argc, char* argv[]) {
                                   : "/tmp";
             const std::string logPath = tmp + "/sage-stdio.log";
             auto stderrSink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
-            auto fileSink   = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logPath, /*truncate=*/true);
+            auto fileSink   = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+                logPath, /*max_size=*/5 * 1024 * 1024, /*max_files=*/3);
             logger = std::make_shared<spdlog::logger>("sage",
                 spdlog::sinks_init_list{stderrSink, fileSink});
         } catch (const std::exception&) {
@@ -4179,6 +4182,108 @@ int main(int argc, char* argv[]) {
         spdlog::warn("Failed to register 'restart_editor'");
     }
 
+    // ---- wait_for_editor (Milestone 1.6c) ------------------------------
+    // Replaces the polling+fixed-wait pattern callers used after restart_editor:
+    // block until the plugin handshake completes (or matching slot_id arrives),
+    // up to a timeout. Returns immediately when a matching session is already
+    // present. Backed by BridgeServer::waitForSession (cv signaled on hello).
+    {
+        sage::mcp::Tool waitForEditorTool{
+            .name        = "wait_for_editor",
+            .description = "Block until an editor's plugin handshake completes (or the named "
+                           "slot_id arrives) and return its session info. Replaces "
+                           "list_editors polling + fixed sleeps after restart_editor. "
+                           "If a matching editor is already connected, returns immediately "
+                           "with already_connected=true. Timeout returns "
+                           "EditorNotConnected (-32001).",
+            .inputSchema = nlohmann::json{
+                {"type", "object"},
+                {"properties", {
+                    {"slot_id",    {{"type", "string"},
+                                    {"description", "Optional: only count editors with this slot_id"}}},
+                    {"timeout_ms", {{"type", "integer"},
+                                    {"minimum", 100}, {"maximum", 600000},
+                                    {"description", "Default 120000 (2 min); max 600000 (10 min)"}}},
+                }},
+                {"additionalProperties", false},
+            },
+            .handler = [&bridge](const nlohmann::json& params) -> sage::mcp::ToolResult {
+                std::optional<std::string> slotFilter;
+                if (params.is_object() && params.contains("slot_id")
+                    && params["slot_id"].is_string()) {
+                    auto s = params["slot_id"].get<std::string>();
+                    if (!s.empty()) slotFilter = std::move(s);
+                }
+                const int timeoutMs = std::clamp(
+                    params.value("timeout_ms", 120000), 100, 600000);
+
+                auto sessionToJson = [](const sage::bridge::EditorSession& s,
+                                        bool already) -> nlohmann::json {
+                    return {
+                        {"already_connected", already},
+                        {"session_id",        s.session_id},
+                        {"slot_id",           s.slot_id},
+                        {"instance_id",       s.instance_id},
+                        {"label",             s.label},
+                        {"project_id",        s.project_id},
+                        {"project_path",      s.project_path},
+                        {"engine_version",    s.engine_version},
+                        {"pid",               s.pid},
+                    };
+                };
+
+                // Fast path: matching editor already in sessions_.
+                for (const auto& s : bridge.snapshotSessions()) {
+                    if (!slotFilter || s.slot_id == *slotFilter) {
+                        return sessionToJson(s, /*already=*/true);
+                    }
+                }
+
+                // Slow path: park on the cv until handleHello signals or timeout.
+                auto session = bridge.waitForSession(
+                    slotFilter, std::chrono::milliseconds(timeoutMs));
+                if (!session) {
+                    return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                        sage::mcp::ErrorCode::EditorNotConnected,
+                        slotFilter
+                            ? "no editor with matching slot_id connected within timeout"
+                            : "no editor connected within timeout"));
+                }
+                return sessionToJson(*session, /*already=*/false);
+            },
+            .remote = false,
+        };
+        if (auto r = registry->registerTool(std::move(waitForEditorTool));
+            !r.has_value()) {
+            spdlog::warn("Failed to register 'wait_for_editor'");
+        }
+    }
+
+    // ---- Editor lifecycle notifications (Milestone 1.6c) ---------------
+    // Bridge fires connected/disconnected callbacks; we relay them as MCP
+    // `notifications/message` envelopes (spec-canonical, so MCP clients
+    // with default logging UIs surface them without custom handlers).
+    bridge.setSessionEventCallback(
+        [&mcpServer](std::string_view kind,
+                     const sage::bridge::EditorSession& s) {
+            nlohmann::json data = {
+                {"event",          std::string{kind}},  // "connected" / "disconnected"
+                {"session_id",     s.session_id},
+                {"slot_id",        s.slot_id},
+                {"instance_id",    s.instance_id},
+                {"label",          s.label},
+                {"project_path",   s.project_path},
+                {"project_id",     s.project_id},
+                {"engine_version", s.engine_version},
+                {"pid",            s.pid},
+            };
+            mcpServer.publishNotification("notifications/message", nlohmann::json{
+                {"level",  "info"},
+                {"logger", "sage.editor"},
+                {"data",   std::move(data)},
+            });
+        });
+
     // ---- Real-time delta (Milestone 2.3b) -------------------------------
     // Plugin emits AssetRegistry deltas as `event` envelopes; we patch the
     // per-slot graph in place so the snapshot stays current without a full
@@ -4273,7 +4378,20 @@ int main(int argc, char* argv[]) {
         });
 
         sage::transport::StdioMcp stdio(mcpServer);
+
+        // Wire server-pushed notifications (editor connect/disconnect) to the
+        // stdio writer. The writer is mutex-serialized internally so concurrent
+        // emissions from the bridge worker thread can't tear a JSON-RPC line.
+        mcpServer.setNotificationSink(
+            [&stdio](const nlohmann::json& envelope) {
+                stdio.writeJson(envelope);
+            });
+
         stdio.run();
+
+        // Detach the sink before stdio leaves scope — late notifications from
+        // the bridge worker would dereference a dangling reference.
+        mcpServer.setNotificationSink(nullptr);
 
         bridge.stop();
         g_runningBridge.store(nullptr, std::memory_order_release);

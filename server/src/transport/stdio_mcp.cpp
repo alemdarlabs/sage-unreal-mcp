@@ -13,6 +13,14 @@ namespace sage::transport {
 
 StdioMcp::StdioMcp(mcp::MCPServer& server) : server_(server) {}
 
+void StdioMcp::writeJson(const nlohmann::json& envelope) {
+    // Stringify outside the lock so a slow dump() doesn't block the reader
+    // when a notification publisher fires concurrently.
+    const std::string serialized = envelope.dump();
+    std::lock_guard lk(stdoutMu_);
+    std::cout << serialized << '\n' << std::flush;
+}
+
 void StdioMcp::run() {
     running_.store(true);
     spdlog::info("MCP stdio transport: reading JSON-RPC from stdin "
@@ -30,25 +38,22 @@ void StdioMcp::run() {
         try {
             payload = nlohmann::json::parse(line);
         } catch (const std::exception& ex) {
-            const nlohmann::json errResp = {
+            writeJson(nlohmann::json{
                 {"jsonrpc", "2.0"},
                 {"id",      nullptr},
                 {"error", {
                     {"code",    static_cast<int>(mcp::ErrorCode::ParseError)},
                     {"message", std::string{"Parse error: "} + ex.what()},
                 }},
-            };
-            std::cout << errResp.dump() << '\n' << std::flush;
+            });
             continue;
         }
 
         auto response = server_.handleRaw(payload);
         if (response) {
-            // Single line; explicit flush so Claude Code receives the response
-            // immediately rather than buffering until next line.
-            std::cout << response->dump() << '\n' << std::flush;
+            writeJson(*response);
         }
-        // Notification: no response per JSON-RPC 2.0.
+        // Notification (no id): no response per JSON-RPC 2.0.
     }
 
     running_.store(false);

@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <future>
 #include <memory>
@@ -109,6 +110,25 @@ public:
                                              const EventMessage& ev)>;
     void setEventHandler(EventHandler handler);
 
+    // Session lifecycle hook — invoked off the bridge worker thread on each
+    // hello-completed (kind="connected") and connection-close (kind="disconnected").
+    // For "disconnected" the session struct is the snapshot taken just before
+    // erase so callers see the final identity. main.cpp wires this to the
+    // MCP notification publisher.
+    using SessionEventCallback = std::function<void(std::string_view kind,
+                                                     const EditorSession& session)>;
+    void setSessionEventCallback(SessionEventCallback cb);
+
+    // Block until a matching editor session exists, or timeout. If
+    // `slot_id_filter` is set, waits for that specific slot; otherwise wakes
+    // on the first session that arrives. Returns nullopt on timeout.
+    //
+    // Caller-side fast path (already-connected) is NOT done here — the tool
+    // handler checks snapshotSessions() first to avoid a lock + cv round-trip.
+    [[nodiscard]] std::optional<EditorSession> waitForSession(
+        std::optional<std::string> slot_id_filter,
+        std::chrono::milliseconds timeout);
+
 private:
     void onClientMessage(const std::shared_ptr<ix::ConnectionState>& state,
                          ix::WebSocket& ws,
@@ -123,6 +143,10 @@ private:
 
     struct PendingRpc {
         std::promise<mcp::ToolResult> promise;
+        // Originating session id — set on dispatch, read on close to fail-fast
+        // pending RPCs whose target editor disconnected before the result
+        // arrived (otherwise they'd time out at the configured deadline).
+        std::string                   session_id;
     };
 
     BridgeConfig                                      cfg_;
@@ -131,7 +155,8 @@ private:
     std::atomic<std::uint64_t>                        txCounter_{0};
 
     mutable std::mutex                                sessionsMu_;
-    std::unordered_map<std::string, EditorSession>    sessions_;  // keyed by ConnectionState id
+    std::condition_variable                           sessionsCv_;  // signals on hello + close
+    std::unordered_map<std::string, EditorSession>    sessions_;    // keyed by ConnectionState id
 
     mutable std::mutex                                pendingMu_;
     std::unordered_map<std::string, PendingRpc>       pending_;   // keyed by tx_id
@@ -141,6 +166,9 @@ private:
 
     mutable std::mutex                                eventHandlerMu_;
     EventHandler                                      eventHandler_;
+
+    mutable std::mutex                                sessionEventMu_;
+    SessionEventCallback                              sessionEventCb_;
 };
 
 }  // namespace sage::bridge

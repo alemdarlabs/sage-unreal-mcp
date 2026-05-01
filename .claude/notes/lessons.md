@@ -3,6 +3,97 @@
 > Per CLAUDE.md §Self-Improvement Loop. Patterns observed during implementation
 > that should change future behavior.
 
+## Polling on the agent side is a server-side missing-tool problem
+
+**Symptom**: Post-`restart_editor`, the agent had no way to know when the
+plugin handshake completed. Workaround in HeroFlight (and earlier sessions):
+`ScheduleWakeup 90s → list_editors → if count==0 wait again`. Editor
+opens in 30s → 60s wasted; opens in 200s → premature retry, restart of
+the wait loop. Every cycle felt sluggish for no good reason.
+
+**Root**: the right shape for "block until X" is a **server-side blocking
+tool**, not agent-side polling. The server already has a `condition_variable`
+candidate (sessions map). Polling existed because the corresponding tool
+didn't.
+
+**Rule**: When you catch yourself building a polling loop on the agent side,
+ask first: *can the server expose a blocking tool that returns the instant
+the condition is true?* For sage that's `wait_for_editor(slot_id?,
+timeout_ms?)` — `BridgeServer::waitForSession` parks on a cv that
+`handleHello` signals. The agent does one tool call instead of N polls;
+the server sleeps efficiently on the cv instead of replying to N tools/list
+spam.
+
+**How to apply**:
+- New "wait until X" need? Add a server tool, not an agent loop.
+- The cv MUST also be signaled on shutdown / failure paths (`stop()`),
+  otherwise the tool blocks past the timeout and the parent process can't
+  exit cleanly.
+- Always include a fast path: if the condition is already satisfied at
+  call time, return immediately without ever locking the cv. Keeps the
+  hot path cheap.
+- Pair the blocking tool with a best-effort `notifications/message`
+  publisher (spec-canonical envelope) so MCP clients that DO surface
+  notifications get an even faster path. The blocking tool is the
+  deterministic floor; the notification is the optional ceiling.
+
+## Bridge socket close must fail-fast pending RPCs, not let them time out
+
+**Symptom**: HeroFlight reported "4 paralel tool call → user reject ×4".
+The actual sequence: bridge WebSocket closed (1006 abnormal closure from the
+plugin side), `BridgeServer::onClientMessage` Close branch erased the session
+but **left the 4 pending RPCs sitting on their 30s timeout**. After 30s each
+dispatch returned a generic "tool dispatch timeout"; the MCP harness rendered
+that as "user reject" — the misleading symptom.
+
+**Root**: The Close case used to do `sessions_.erase(session_id)` and stop —
+no walk over `pending_` to fail-fast outstanding promises whose target session
+just disappeared. PendingRpc didn't even carry a `session_id` field, so the
+walk wasn't expressible. The dispatcher and the close handler shared no
+correlation key.
+
+**Rule**:
+- Every pending RPC structure carries the originating session id (`PendingRpc::session_id`).
+- The close branch walks `pending_` and resolves matching entries with
+  `EditorNotConnected (-32001)` immediately — no 30s wait, no misleading
+  timeout error code. The actual cause (editor disconnected mid-call)
+  surfaces directly.
+- Same applies on `stop()`: every pending must be resolved (already covered;
+  this is the analogous discipline at shutdown).
+
+**How to apply**: When adding any in-flight tracker keyed by transaction
+id, include the *resource* it depends on (session, file lock, pipe). On
+resource teardown, walk the tracker and fail-fast — never rely on timeouts
+to clean up, they hide the actual cause and look like generic flakiness.
+
+## Stdio transport: stdout has TWO producers, mutex it
+
+**Symptom**: Adding a notification publisher (bridge worker thread → MCP
+notification → stdout) on top of an existing stdio reader (main thread →
+response → stdout) created an unsynchronized two-writer setup. Without a
+mutex, two `std::cout << json << '\n' << flush` calls from different threads
+can interleave at any character — a single torn line breaks JSON-RPC framing
+in the client, which then drops the connection or pollutes its parse buffer.
+
+**Rule**: All stdout writes go through `StdioMcp::writeJson(envelope)`,
+which:
+1. Serializes the json with `dump()` outside the mutex (don't hold the lock
+   during a potentially slow stringification).
+2. Acquires the stdout mutex.
+3. Writes the serialized form + `'\n'` + `flush` atomically.
+
+There is exactly **one** legal route to stdout from inside the server.
+`std::cout <<` from any other site is a bug.
+
+**How to apply**: When wiring a second producer to a stream that already has
+a producer, the answer is always a mutex (or a single-writer queue). Don't
+assume "stdout is a stream, that handles it" — `std::ostream` is not
+thread-safe; only individual `<<` operations on certain types are atomic at
+the OS level for pipes ≤ PIPE_BUF, which is much smaller than a real
+JSON-RPC envelope. Treat shared stdout exactly like shared mutable state.
+
+
+
 ## BP→C++ pipeline: empty the BP before reparenting it
 
 **Symptom**: 2026-05-01 HeroFlight ABP_Player conversion. Reparent →

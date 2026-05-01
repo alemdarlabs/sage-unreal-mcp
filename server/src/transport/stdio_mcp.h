@@ -1,6 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
+
+#include <nlohmann/json_fwd.hpp>
 
 namespace sage::mcp {
 class MCPServer;
@@ -17,6 +20,11 @@ namespace sage::transport {
 // IMPORTANT: stdout is reserved for the JSON-RPC protocol stream — the caller
 // (main()) MUST configure spdlog to write to stderr before run() is invoked,
 // otherwise log lines will corrupt the protocol stream and break the client.
+//
+// Thread-safety: the reader loop runs on a single thread (stdin getline), but
+// server-pushed notifications (editor connect/disconnect) are published from
+// the bridge worker thread. writeJson() serializes both producers behind a
+// mutex; a half-written line would break JSON-RPC framing.
 //
 // This is the canonical Anthropic-SDK-compatible MCP transport (no OAuth,
 // session-id, protocol-version, or SSE notification handshake — stdio handles
@@ -42,9 +50,16 @@ public:
 
     [[nodiscard]] bool running() const noexcept { return running_.load(); }
 
+    // Thread-safe writer: emits one JSON-RPC envelope on stdout followed by
+    // '\n', flushed. Used by run() for responses AND by the MCPServer
+    // notification sink for server-pushed events. Must be the ONLY route to
+    // stdout from inside the server process.
+    void writeJson(const nlohmann::json& envelope);
+
 private:
-    mcp::MCPServer& server_;
-    std::atomic<bool> running_{false};
+    mcp::MCPServer&    server_;
+    std::atomic<bool>  running_{false};
+    std::mutex         stdoutMu_;
 };
 
 }  // namespace sage::transport

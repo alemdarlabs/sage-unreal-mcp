@@ -48,17 +48,23 @@ void BridgeServer::stop() {
         server_->stop();
 
         // Resolve any in-flight RPCs so awaiting threads don't hang on shutdown.
-        std::lock_guard lk(pendingMu_);
-        for (auto& [tx_id, rpc] : pending_) {
-            try {
-                rpc.promise.set_value(std::unexpected(
-                    mcp::ErrorObject::fromCode(mcp::ErrorCode::InternalError,
-                                                "bridge stopped")));
-            } catch (const std::future_error&) {
-                // promise already satisfied — ignore
+        {
+            std::lock_guard lk(pendingMu_);
+            for (auto& [tx_id, rpc] : pending_) {
+                try {
+                    rpc.promise.set_value(std::unexpected(
+                        mcp::ErrorObject::fromCode(mcp::ErrorCode::InternalError,
+                                                    "bridge stopped")));
+                } catch (const std::future_error&) {
+                    // promise already satisfied — ignore
+                }
             }
+            pending_.clear();
         }
-        pending_.clear();
+
+        // Wake any waitForSession() callers so they fall through to nullopt
+        // instead of waiting out their timeout.
+        sessionsCv_.notify_all();
     }
 }
 
@@ -196,7 +202,9 @@ mcp::ToolResult BridgeServer::dispatchTool(std::string_view tool,
     std::future<mcp::ToolResult> future;
     {
         std::lock_guard lk(pendingMu_);
-        future = pending_[txId].promise.get_future();
+        auto& rpc      = pending_[txId];
+        rpc.session_id = targetSessionId;
+        future         = rpc.promise.get_future();
     }
 
     const auto envelope = toolCallMessage(txId, std::string{tool}, args);
@@ -226,14 +234,66 @@ void BridgeServer::onClientMessage(const std::shared_ptr<ix::ConnectionState>& s
         spdlog::info("Bridge: connection opened from {} (id={})", remote, session_id);
         break;
 
-    case ix::WebSocketMessageType::Close:
+    case ix::WebSocketMessageType::Close: {
         spdlog::info("Bridge: connection closed (id={}, code={}, reason='{}')",
                      session_id, msg->closeInfo.code, msg->closeInfo.reason);
+
+        // Snapshot the session struct before erasing so the disconnect
+        // callback sees the final identity (slot_id, label, instance_id).
+        std::optional<EditorSession> snapshot;
         {
             std::lock_guard lk(sessionsMu_);
-            sessions_.erase(session_id);
+            if (auto it = sessions_.find(session_id); it != sessions_.end()) {
+                snapshot = it->second;
+                sessions_.erase(it);
+            }
+        }
+        sessionsCv_.notify_all();
+
+        // Fail-fast every pending RPC targeted at this session — otherwise
+        // each one would sit on its 30s timeout, surfacing to the MCP client
+        // as a generic "tool dispatch timeout" (Claude harness then renders
+        // those as 'user reject', which is what HeroFlight saw).
+        std::size_t failed = 0;
+        {
+            std::lock_guard lk(pendingMu_);
+            for (auto it = pending_.begin(); it != pending_.end(); ) {
+                if (it->second.session_id == session_id) {
+                    try {
+                        it->second.promise.set_value(std::unexpected(
+                            mcp::ErrorObject::fromCode(mcp::ErrorCode::EditorNotConnected,
+                                "editor disconnected before tool result")));
+                    } catch (const std::future_error&) {
+                        // Already satisfied — ignore.
+                    }
+                    it = pending_.erase(it);
+                    ++failed;
+                } else {
+                    ++it;
+                }
+            }
+        }
+        if (failed > 0) {
+            spdlog::info("Bridge: failed-fast {} pending RPC(s) on session {} close",
+                         failed, session_id);
+        }
+
+        if (snapshot) {
+            SessionEventCallback cb;
+            {
+                std::lock_guard lk(sessionEventMu_);
+                cb = sessionEventCb_;
+            }
+            if (cb) {
+                try { cb("disconnected", *snapshot); }
+                catch (const std::exception& ex) {
+                    spdlog::warn(
+                        "Bridge: session event callback threw on disconnected: {}", ex.what());
+                }
+            }
         }
         break;
+    }
 
     case ix::WebSocketMessageType::Error:
         spdlog::warn("Bridge: connection error (id={}): {}",
@@ -309,12 +369,27 @@ void BridgeServer::handleHello(ix::WebSocket& ws,
         std::lock_guard lk(sessionsMu_);
         sessions_[session_id] = s;
     }
+    sessionsCv_.notify_all();  // wake wait_for_editor
 
     spdlog::info(
         "Bridge handshake: slot={}, label='{}', project='{}', instance='{}', engine={}",
         s.slot_id, s.label, s.project_path, s.instance_id, s.engine_version);
 
     ws.send(welcomeMessage(session_id, "0.1.0").dump());
+
+    // Fire connected callback (e.g. MCP notification publisher) AFTER welcome
+    // is on the wire — the publisher must not block the handshake.
+    SessionEventCallback cb;
+    {
+        std::lock_guard lk(sessionEventMu_);
+        cb = sessionEventCb_;
+    }
+    if (cb) {
+        try { cb("connected", s); }
+        catch (const std::exception& ex) {
+            spdlog::warn("Bridge: session event callback threw on connected: {}", ex.what());
+        }
+    }
 }
 
 void BridgeServer::handleHeartbeat(ix::WebSocket& ws,
@@ -413,6 +488,38 @@ void BridgeServer::handleEvent(const std::string& session_id, const Json& payloa
 void BridgeServer::setEventHandler(EventHandler handler) {
     std::lock_guard lk(eventHandlerMu_);
     eventHandler_ = std::move(handler);
+}
+
+void BridgeServer::setSessionEventCallback(SessionEventCallback cb) {
+    std::lock_guard lk(sessionEventMu_);
+    sessionEventCb_ = std::move(cb);
+}
+
+std::optional<EditorSession> BridgeServer::waitForSession(
+    std::optional<std::string> slot_id_filter,
+    std::chrono::milliseconds timeout) {
+
+    auto matches = [&](const EditorSession& s) {
+        return !slot_id_filter || s.slot_id == *slot_id_filter;
+    };
+
+    std::unique_lock lk(sessionsMu_);
+    // Predicate also covers the already-connected case: cv.wait_for returns
+    // true immediately if matches() is already satisfied. Caller can still
+    // do a snapshot fast path before getting here to avoid the lock churn.
+    const bool ok = sessionsCv_.wait_for(lk, timeout, [&] {
+        if (!running_.load()) return true;  // shutdown — break out
+        for (const auto& [_, s] : sessions_) {
+            if (matches(s)) return true;
+        }
+        return false;
+    });
+    if (!ok) return std::nullopt;
+    if (!running_.load()) return std::nullopt;
+    for (const auto& [_, s] : sessions_) {
+        if (matches(s)) return s;
+    }
+    return std::nullopt;  // race: matched session disconnected before we re-checked
 }
 
 std::string BridgeServer::nextTxId() {

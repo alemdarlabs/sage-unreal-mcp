@@ -106,6 +106,36 @@ Response MCPServer::onToolsList(Id id) {
     return Response::success(std::move(id), std::move(result));
 }
 
+void MCPServer::setNotificationSink(NotificationSink sink) {
+    std::lock_guard lk(sinkMu_);
+    sink_ = std::move(sink);
+}
+
+void MCPServer::publishNotification(std::string method, nlohmann::json params) {
+    NotificationSink local;
+    {
+        std::lock_guard lk(sinkMu_);
+        local = sink_;
+    }
+    if (!local) {
+        // No transport sink installed — drop. Common during early init or
+        // HTTP-only mode without an SSE channel; not an error.
+        spdlog::trace("publishNotification dropped (no sink): {}", method);
+        return;
+    }
+
+    nlohmann::json envelope = {
+        {"jsonrpc", "2.0"},
+        {"method",  std::move(method)},
+        {"params",  std::move(params)},
+    };
+    try {
+        local(envelope);
+    } catch (const std::exception& ex) {
+        spdlog::warn("Notification sink threw: {}", ex.what());
+    }
+}
+
 Response MCPServer::onToolsCall(Id id, const nlohmann::json& params) {
     if (!params.is_object() || !params.contains("name") || !params["name"].is_string()) {
         return Response::failure(std::move(id),

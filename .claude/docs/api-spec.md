@@ -12,6 +12,52 @@ MCP tool catalog, transport protocols, and token-optimization principles.
 - **Multi-client**: Yes — server holds multiple concurrent client sessions
 - **Streaming**: Tools that generate progressive output (compile, indexing, bulk) stream via SSE chunks
 
+### Server-pushed notifications (Claude ← Server)
+
+Server emits JSON-RPC 2.0 notifications (no `id`) so the agent observes
+lifecycle events without polling. Channel:
+
+- **stdio mode**: written to stdout interleaved with responses; `StdioMcp::writeJson`
+  serializes both producers behind a mutex so no JSON-RPC line tears.
+- **HTTP+SSE mode**: routed over the GET `/mcp` SSE stream (TODO; tracked
+  alongside the `Mcp-Session-Id` / `Mcp-Protocol-Version` paketleme blocker).
+
+All sage events use the spec-canonical `notifications/message` envelope so MCP
+clients with default logging UIs surface them without custom handlers:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method":  "notifications/message",
+  "params": {
+    "level":  "info",
+    "logger": "sage.editor",
+    "data": {
+      "event":          "connected",
+      "session_id":     "1",
+      "slot_id":        "9780bcd7c32e...",
+      "instance_id":    "HeroFlight@8ca84e8c",
+      "label":          "",
+      "project_path":   "D:/Steamworks/HeroFlight/HeroFlight.uproject",
+      "project_id":     "...",
+      "engine_version": "5.7.4",
+      "pid":            12345
+    }
+  }
+}
+```
+
+Current event kinds (`data.event`):
+
+- `connected` — plugin handshake completed; full identity available.
+- `disconnected` — bridge socket closed (snapshot taken just before erase).
+
+Future kinds: `indexing_progress`, `editor_log_spike`, `bp_compile_complete`.
+
+Notifications are best-effort: if the MCP harness doesn't surface them as
+system reminders, the agent should fall back to `wait_for_editor` (see below)
+which is the deterministic blocking-tool path.
+
 ### Server ↔ Plugin: WebSocket (localhost)
 
 - **Endpoint**: `ws://localhost:<port>/bridge`
@@ -52,6 +98,7 @@ Non-exhaustive list. Items grouped by domain.
 | `get_editor(id_or_label)` | Editor details |
 | `get_active_editor()` | Currently active editor for this session |
 | `set_active_editor(id_or_label)` | Switch active editor |
+| `wait_for_editor(slot_id?, timeout_ms?)` | Block until plugin handshake completes (or matching slot_id arrives). Replaces post-`restart_editor` polling: condition_variable signaled on `hello`, returns the instant the editor connects. Already-connected editors return immediately with `already_connected=true`. Timeout returns `EditorNotConnected` (-32001). Default 120000ms, max 600000ms. |
 
 ### Indexing
 
