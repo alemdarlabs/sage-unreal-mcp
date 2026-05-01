@@ -248,7 +248,26 @@ void BridgeServer::onClientMessage(const std::shared_ptr<ix::ConnectionState>& s
                 sessions_.erase(it);
             }
         }
-        sessionsCv_.notify_all();
+
+        // Mirror the connect ordering: publish "disconnected" BEFORE
+        // resolving pending RPCs and notifying the cv. Pending RPC
+        // resolution will write tool-error responses to stdout; if we did
+        // those first the agent would see error responses before the
+        // disconnected notification that explains them.
+        if (snapshot) {
+            SessionEventCallback cb;
+            {
+                std::lock_guard lk(sessionEventMu_);
+                cb = sessionEventCb_;
+            }
+            if (cb) {
+                try { cb("disconnected", *snapshot); }
+                catch (const std::exception& ex) {
+                    spdlog::warn(
+                        "Bridge: session event callback threw on disconnected: {}", ex.what());
+                }
+            }
+        }
 
         // Fail-fast every pending RPC targeted at this session — otherwise
         // each one would sit on its 30s timeout, surfacing to the MCP client
@@ -278,20 +297,7 @@ void BridgeServer::onClientMessage(const std::shared_ptr<ix::ConnectionState>& s
                          failed, session_id);
         }
 
-        if (snapshot) {
-            SessionEventCallback cb;
-            {
-                std::lock_guard lk(sessionEventMu_);
-                cb = sessionEventCb_;
-            }
-            if (cb) {
-                try { cb("disconnected", *snapshot); }
-                catch (const std::exception& ex) {
-                    spdlog::warn(
-                        "Bridge: session event callback threw on disconnected: {}", ex.what());
-                }
-            }
-        }
+        sessionsCv_.notify_all();
         break;
     }
 
@@ -369,16 +375,19 @@ void BridgeServer::handleHello(ix::WebSocket& ws,
         std::lock_guard lk(sessionsMu_);
         sessions_[session_id] = s;
     }
-    sessionsCv_.notify_all();  // wake wait_for_editor
 
     spdlog::info(
         "Bridge handshake: slot={}, label='{}', project='{}', instance='{}', engine={}",
         s.slot_id, s.label, s.project_path, s.instance_id, s.engine_version);
 
-    ws.send(welcomeMessage(session_id, "0.1.0").dump());
-
-    // Fire connected callback (e.g. MCP notification publisher) AFTER welcome
-    // is on the wire — the publisher must not block the handshake.
+    // Fire the "connected" callback BEFORE signaling the cv. The callback
+    // typically publishes a notifications/message envelope on stdout; if we
+    // notified first, the wait_for_editor waiter could wake, build a tool
+    // response, and write that response to stdout before the notification
+    // arrived — leaving observed order as response⇒notification, which makes
+    // the notification useless for "agent learns the editor is up" UX. The
+    // callback returns quickly (lock-free queue write into the stdio mutex);
+    // this small reordering is safe.
     SessionEventCallback cb;
     {
         std::lock_guard lk(sessionEventMu_);
@@ -390,6 +399,10 @@ void BridgeServer::handleHello(ix::WebSocket& ws,
             spdlog::warn("Bridge: session event callback threw on connected: {}", ex.what());
         }
     }
+
+    sessionsCv_.notify_all();  // wake wait_for_editor — AFTER notification published
+
+    ws.send(welcomeMessage(session_id, "0.1.0").dump());
 }
 
 void BridgeServer::handleHeartbeat(ix::WebSocket& ws,
