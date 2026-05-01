@@ -141,17 +141,26 @@ def main() -> int:
     #    server-side (list_editors). All in flight at once.
     slot_id = editor.get("slot_id")
     calls = [
-        ("editor.ping",   {"message":"a"}),
-        ("editor.ping",   {"message":"b"}),
-        ("list_editors",  {}),
-        ("asset.list",    {"max_results": 50}),
-        ("asset.list",    {"kind": "Blueprint", "max_results": 50}),
-        ("asset.list",    {"kind": "WidgetBlueprint", "max_results": 50}),
-        ("asset.search",  {"query": "BP_", "max_results": 25}),
-        ("asset.search",  {"query": "Widget", "max_results": 25}),
+        ("editor.ping",       {"message":"a"}),
+        ("editor.ping",       {"message":"b"}),
+        ("editor.ping",       {"message":"c"}),
+        ("editor.ping",       {"message":"d"}),
+        ("list_editors",      {}),
         ("get_active_editor", {}),
-        ("class_hierarchy",  {"class_name": "AActor", "direction": "ancestors",
-                              "max_depth": 5, "slot_id": slot_id}),
+        ("get_editor",        {"id_or_label": editor.get("instance_id", "")}),
+        ("asset.list",        {"max_results": 30}),
+        ("asset.list",        {"kind": "Blueprint",        "max_results": 30}),
+        ("asset.list",        {"kind": "WidgetBlueprint",  "max_results": 30}),
+        ("asset.list",        {"kind": "Material",         "max_results": 30}),
+        ("asset.list",        {"kind": "Texture2D",        "max_results": 30}),
+        ("asset.list",        {"kind": "DataTable",        "max_results": 30}),
+        ("asset.search",      {"query": "BP_",       "max_results": 20}),
+        ("asset.search",      {"query": "Widget",    "max_results": 20}),
+        ("asset.search",      {"query": "Mat_",      "max_results": 20}),
+        ("asset.search",      {"query": "T_",        "max_results": 20}),
+        ("asset.search",      {"query": "DT_",       "max_results": 20}),
+        ("asset.search",      {"query": "BP_Conv",   "max_results": 20}),
+        ("asset.search",      {"query": "Anim",      "max_results": 20}),
     ]
     N = len(calls)
     print(f"\n[stress] {N} parallel mixed tool/calls "

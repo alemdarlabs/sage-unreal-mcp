@@ -27,8 +27,9 @@ UE_ROOT  = Path(os.environ.get(
 UE_EXE   = UE_ROOT / "Engine" / "Binaries" / "Win64" / "UnrealEditor.exe"
 UPROJECT = Path(r"D:\Steamworks\HeroFlight\HeroFlight.uproject")
 
-PARALLEL = 50
-ROUNDS   = 3
+PARALLEL = int(os.environ.get("STRESS_PARALLEL", "50"))
+ROUNDS   = int(os.environ.get("STRESS_ROUNDS",   "3"))
+SKIP_EDITOR_CYCLE = os.environ.get("STRESS_SKIP_CYCLE", "0") == "1"
 
 
 def ps(cmd: str) -> str:
@@ -62,16 +63,18 @@ def post(req: dict, timeout=30.0) -> tuple[float, dict | str]:
 
 
 def main() -> int:
-    # Cycle the editor to guarantee a clean reconnect (avoids the >30s backoff
-    # that any prior failed-attempt session has accumulated).
-    pid = find_pid()
-    if pid:
-        print(f"[kill] HeroFlight pid={pid}")
-        ps(f"Stop-Process -Id {pid} -Force")
-        for _ in range(30):
-            if find_pid() is None: break
-            time.sleep(0.5)
-        time.sleep(1.0)
+    # Optionally cycle the editor to guarantee a clean reconnect (default ON
+    # — when SKIP_EDITOR_CYCLE=1 we just restart the server and reuse the
+    # already-running editor).
+    if not SKIP_EDITOR_CYCLE:
+        pid = find_pid()
+        if pid:
+            print(f"[kill] HeroFlight pid={pid}")
+            ps(f"Stop-Process -Id {pid} -Force")
+            for _ in range(30):
+                if find_pid() is None: break
+                time.sleep(0.5)
+            time.sleep(1.0)
 
     env = os.environ.copy()
     env["SAGE_REPO_ROOT"] = str(REPO)
@@ -88,17 +91,22 @@ def main() -> int:
         print(f"  init failed: {init}"); proc.kill(); return 2
     post({"jsonrpc":"2.0","method":"notifications/initialized"})
 
-    # spawn editor fresh
-    print(f"[editor] spawn")
-    subprocess.Popen(
-        [str(UE_EXE), str(UPROJECT)],
-        creationflags=subprocess.DETACHED_PROCESS
-                    | subprocess.CREATE_NEW_PROCESS_GROUP)
+    if not SKIP_EDITOR_CYCLE:
+        # spawn editor fresh
+        print(f"[editor] spawn")
+        subprocess.Popen(
+            [str(UE_EXE), str(UPROJECT)],
+            creationflags=subprocess.DETACHED_PROCESS
+                        | subprocess.CREATE_NEW_PROCESS_GROUP)
+        wait_seconds = 45
+    else:
+        print(f"[editor] reusing already-running editor (plugin should reconnect)")
+        wait_seconds = 60  # plugin backoff might be at the 30s cap
 
     # wait for plugin
-    print("[wait] plugin handshake (up to 45s)...")
+    print(f"[wait] plugin handshake (up to {wait_seconds}s)...")
     plugin = None
-    deadline = time.monotonic() + 45
+    deadline = time.monotonic() + wait_seconds
     while time.monotonic() < deadline:
         _, r = post({"jsonrpc":"2.0","method":"tools/call","id":99,
                      "params":{"name":"list_editors","arguments":{}}})
