@@ -172,12 +172,12 @@ FSageToolDispatch::FOutcome ReadLogImpl(const TSharedPtr<FJsonObject>& Args)
     }
     MaxLines = FMath::Clamp(MaxLines, 1, 5000);
 
-    const FString LogPath = FPlatformOutputDevices::GetAbsoluteLogFilename();
+    const FString AbsoluteLogPath = FPlatformOutputDevices::GetAbsoluteLogFilename();
     FString Contents;
-    if (!FFileHelper::LoadFileToString(Contents, *LogPath))
+    if (!FFileHelper::LoadFileToString(Contents, *AbsoluteLogPath))
     {
         return FSageToolDispatch::FOutcome::MakeError(-32603,
-            FString::Printf(TEXT("could not read log file: %s"), *LogPath));
+            FString::Printf(TEXT("could not read log file: %s"), *AbsoluteLogPath));
     }
 
     TArray<FString> Lines;
@@ -192,7 +192,7 @@ FSageToolDispatch::FOutcome ReadLogImpl(const TSharedPtr<FJsonObject>& Args)
     }
 
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("log_path"),  LogPath);
+    R->SetStringField(TEXT("log_path"),  AbsoluteLogPath);
     R->SetArrayField (TEXT("lines"),     Out);
     R->SetNumberField(TEXT("count"),     Out.Num());
     R->SetNumberField(TEXT("total_lines"), Lines.Num());
@@ -346,12 +346,12 @@ FSageToolDispatch::FOutcome SearchLogImpl(const TSharedPtr<FJsonObject>& Args)
         MaxLines = FMath::Clamp(static_cast<int32>(Num), 1, 5000);
     }
 
-    const FString LogPath = FPlatformOutputDevices::GetAbsoluteLogFilename();
+    const FString AbsoluteLogPath = FPlatformOutputDevices::GetAbsoluteLogFilename();
     FString Contents;
-    if (!FFileHelper::LoadFileToString(Contents, *LogPath))
+    if (!FFileHelper::LoadFileToString(Contents, *AbsoluteLogPath))
     {
         return FSageToolDispatch::FOutcome::MakeError(-32603,
-            FString::Printf(TEXT("could not read log: %s"), *LogPath));
+            FString::Printf(TEXT("could not read log: %s"), *AbsoluteLogPath));
     }
     TArray<FString> Lines;
     Contents.ParseIntoArrayLines(Lines, /*bCullEmpty*/ false);
@@ -369,7 +369,7 @@ FSageToolDispatch::FOutcome SearchLogImpl(const TSharedPtr<FJsonObject>& Args)
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("query"),       Query);
-    R->SetStringField(TEXT("log_path"),    LogPath);
+    R->SetStringField(TEXT("log_path"),    AbsoluteLogPath);
     R->SetArrayField (TEXT("hits"),        Hits);
     R->SetNumberField(TEXT("count"),       Hits.Num());
     R->SetNumberField(TEXT("total_lines"), Lines.Num());
@@ -907,9 +907,9 @@ FSageToolDispatch::FOutcome GetMessageLogImpl(const TSharedPtr<FJsonObject>& Arg
 
     // Message log is Slate-based; we surface recent log lines from the output log
     // that match the category prefix as a proxy.
-    FString LogPath = FPlatformOutputDevices::GetAbsoluteLogFilename();
+    FString AbsoluteLogPath = FPlatformOutputDevices::GetAbsoluteLogFilename();
     TArray<FString> Lines;
-    FFileHelper::LoadFileToStringArray(Lines, *LogPath);
+    FFileHelper::LoadFileToStringArray(Lines, *AbsoluteLogPath);
 
     TArray<TSharedPtr<FJsonValue>> Messages;
     for (int32 I = Lines.Num() - 1; I >= 0 && Messages.Num() < 50; --I)

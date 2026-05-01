@@ -4,17 +4,27 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <expected>
 #include <thread>
 
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#include <signal.h>
+#if defined(_WIN32)
+#  include <io.h>
+#  include <windows.h>
+#  define popen  _popen
+#  define pclose _pclose
+using pid_t = int;
+#else
+#  include <sys/types.h>
+#  include <sys/wait.h>
+#  include <unistd.h>
+#  include <signal.h>
+#endif
 
 namespace sage::tools {
 
@@ -70,6 +80,10 @@ ScriptResult runShell(const std::string& cmd) {
     }
     const int rc = ::pclose(pipe);
     out.lastOutput = std::move(buf);
+#if defined(_WIN32)
+    // _pclose returns the spawned program's exit code directly.
+    out.exitCode = rc;
+#else
     if (rc == -1) {
         out.exitCode = -1;
     } else if (WIFEXITED(rc)) {
@@ -77,20 +91,60 @@ ScriptResult runShell(const std::string& cmd) {
     } else {
         out.exitCode = -1;
     }
+#endif
     return out;
 }
 
 bool processAlive(pid_t pid) {
+    if (pid <= 0) return false;
+#if defined(_WIN32)
+    // OpenProcess + GetExitCodeProcess. STILL_ACTIVE (259) means the process
+    // is running; any other value is its exit code.
+    HANDLE h = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                             static_cast<DWORD>(pid));
+    if (h == nullptr) return false;
+    DWORD code = 0;
+    bool alive = false;
+    if (::GetExitCodeProcess(h, &code)) {
+        alive = (code == STILL_ACTIVE);
+    }
+    ::CloseHandle(h);
+    return alive;
+#else
     // ::kill(pid, 0) returns 0 if signalable; ESRCH means gone, EPERM means
     // it's there but not ours (still 'alive' for our purposes).
-    if (pid <= 0) return false;
     if (::kill(pid, 0) == 0) return true;
     return errno == EPERM;
+#endif
 }
 
 bool killEditor(pid_t pid, std::chrono::seconds graceWindow) {
     if (!processAlive(pid)) return true;
 
+#if defined(_WIN32)
+    // Windows has no clean SIGTERM analog for a Slate window. Live Coding is
+    // available on Windows so restart_editor is rarely the right tool here;
+    // when it IS invoked the caller already passed confirmed=true and
+    // save_dirty has run. Go straight to TerminateProcess and wait for the
+    // OS to release the kernel object before the next-step plugin .dll swap.
+    HANDLE h = ::OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE,
+                             static_cast<DWORD>(pid));
+    if (h == nullptr) {
+        spdlog::warn("restart_editor: OpenProcess failed pid={} err={}",
+                     pid, ::GetLastError());
+        return false;
+    }
+    if (!::TerminateProcess(h, 1)) {
+        spdlog::error("restart_editor: TerminateProcess failed pid={} err={}",
+                      pid, ::GetLastError());
+        ::CloseHandle(h);
+        return false;
+    }
+    ::WaitForSingleObject(h, static_cast<DWORD>(graceWindow.count() * 1000));
+    ::CloseHandle(h);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    return !processAlive(pid);
+#else
     if (::kill(pid, SIGTERM) != 0 && errno != ESRCH) {
         spdlog::warn("restart_editor: SIGTERM failed pid={}: {}", pid, std::strerror(errno));
     }
@@ -108,6 +162,7 @@ bool killEditor(pid_t pid, std::chrono::seconds graceWindow) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     return !processAlive(pid);
+#endif
 }
 
 bool relaunchEditor(const std::string& projectPath) {

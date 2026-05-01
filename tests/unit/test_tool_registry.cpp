@@ -167,7 +167,7 @@ TEST_CASE("ToolRegistry remote without dispatcher yields InternalError",
     REQUIRE(outcome.error().code == ErrorCode::InternalError);
 }
 
-TEST_CASE("ToolRegistry remote dispatcher exception → InternalError",
+TEST_CASE("ToolRegistry remote dispatcher exception -> InternalError",
           "[mcp][registry]") {
     ToolRegistry reg;
     Tool remote{

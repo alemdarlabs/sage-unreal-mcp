@@ -46,6 +46,15 @@ add_library(sage-warnings INTERFACE)
 if(MSVC)
     target_compile_options(sage-warnings INTERFACE
         /W4 /permissive- /Zc:__cplusplus /Zc:preprocessor)
+    # MSVC promotes POSIX/CRT names like getenv, strncpy, sprintf to C4996
+    # "deprecated"; we treat warnings as errors so suppress the noise here
+    # rather than wrapping every call site. Same convention CMake's own
+    # internal projects use.
+    target_compile_definitions(sage-warnings INTERFACE
+        _CRT_SECURE_NO_WARNINGS
+        _CRT_NONSTDC_NO_WARNINGS
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN)
     if(SAGE_WARNINGS_AS_ERRORS)
         target_compile_options(sage-warnings INTERFACE /WX)
     endif()
@@ -83,6 +92,14 @@ find_package(spdlog        CONFIG REQUIRED)
 find_package(httplib       CONFIG REQUIRED)
 find_package(ixwebsocket   CONFIG REQUIRED)
 
+# vcpkg's ixwebsocket port doesn't propagate Windows system libraries
+# pulled in by mbedcrypto's entropy_poll (BCryptGenRandom -> bcrypt.lib).
+# Patch the imported target so every consumer links bcrypt transparently.
+if(WIN32 AND TARGET ixwebsocket::ixwebsocket)
+    set_property(TARGET ixwebsocket::ixwebsocket APPEND PROPERTY
+                 INTERFACE_LINK_LIBRARIES bcrypt)
+endif()
+
 # ---- KuzuDB (prebuilt via scripts/fetch-kuzu.sh) ----------------------------
 # vcpkg has no kuzu port; we use the upstream prebuilt release archive.
 set(KUZU_DIR "${CMAKE_SOURCE_DIR}/third_party/kuzu")
@@ -96,7 +113,7 @@ if(APPLE)
 elseif(UNIX)
     set(KUZU_LIB_NAME "libkuzu.so")
 elseif(WIN32)
-    set(KUZU_LIB_NAME "kuzu.dll")
+    set(KUZU_LIB_NAME "kuzu_shared.dll")
 endif()
 add_library(kuzu::kuzu SHARED IMPORTED GLOBAL)
 set_target_properties(kuzu::kuzu PROPERTIES
