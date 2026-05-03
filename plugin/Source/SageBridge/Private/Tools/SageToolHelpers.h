@@ -64,9 +64,26 @@ bool SetUPropertyFromJson(UObject* Container,
                           FProperty* Property,
                           const TSharedPtr<FJsonValue>& Value);
 
-// Public: read a UProperty into a JSON value. Symmetric inverse.
+// Recursion context for instanced subobject expansion. When a non-null
+// pointer is threaded through GetPropertyValueAtPtr / GetUPropertyAsJson,
+// FObjectProperty values are emitted as embedded `{_class, _path, _props}`
+// objects whenever the property carries CPF_InstancedReference (or the
+// target's class is CLASS_DefaultToInstanced / CPF_PersistentInstance is
+// set). Cycles short-circuit via Visited; CurrentDepth is bumped on each
+// descent and clamped against MaxDepth (excess refs fall back to bare
+// path strings, matching the no-context behaviour).
+struct FInstancedRecurseCtx
+{
+    int32 MaxDepth = 4;
+    int32 CurrentDepth = 0;
+    TSet<const UObject*> Visited;
+};
+
+// Public: read a UProperty into a JSON value. Symmetric inverse. Pass a
+// non-null Ctx to enable instanced-subobject recursion.
 [[nodiscard]] TSharedPtr<FJsonValue> GetUPropertyAsJson(const UObject* Container,
-                                                        const FProperty* Property);
+                                                        const FProperty* Property,
+                                                        FInstancedRecurseCtx* Ctx = nullptr);
 
 // Lower-level: write into a raw memory location given a property descriptor.
 // Used by both the public form (after ContainerPtrToValuePtr) and the
@@ -74,9 +91,11 @@ bool SetUPropertyFromJson(UObject* Container,
 bool SetPropertyValueAtPtr(FProperty* Property, void* ValuePtr,
                            const TSharedPtr<FJsonValue>& Value);
 
-// Symmetric read from raw pointer.
+// Symmetric read from raw pointer. Optional Ctx enables recursive expansion
+// of instanced UObject refs; containers thread it through to elements.
 [[nodiscard]] TSharedPtr<FJsonValue> GetPropertyValueAtPtr(const FProperty* Property,
-                                                            const void* ValuePtr);
+                                                            const void* ValuePtr,
+                                                            FInstancedRecurseCtx* Ctx = nullptr);
 
 // Type-aware JSON value equality for the primitive set we round-trip.
 // Numbers compared with FMath::IsNearlyEqual; arrays/objects fall back to false.

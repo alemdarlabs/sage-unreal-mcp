@@ -513,7 +513,8 @@ bool SetPropertyValueAtPtr(FProperty* Property, void* ValuePtr,
 }
 
 TSharedPtr<FJsonValue> GetPropertyValueAtPtr(const FProperty* Property,
-                                               const void* ValuePtr)
+                                               const void* ValuePtr,
+                                               FInstancedRecurseCtx* Ctx)
 {
     if (Property == nullptr || ValuePtr == nullptr) return nullptr;
 
@@ -564,6 +565,52 @@ TSharedPtr<FJsonValue> GetPropertyValueAtPtr(const FProperty* Property,
     {
         UObject* Obj = P->GetObjectPropertyValue(ValuePtr);
         if (!Obj) return MakeShared<FJsonValueNull>();
+
+        // Instanced subobject recursion (CommonAIExport-style): when the
+        // property is marked CPF_InstancedReference (UPROPERTY(Instanced))
+        // or its declared class is CLASS_DefaultToInstanced (e.g. UObject
+        // subclasses authored as inline GameFeatureActions), expand the
+        // sub-object's reflected properties inline instead of emitting a
+        // bare path string. Bounded by Ctx->MaxDepth and a Visited set so
+        // cycles short-circuit cleanly.
+        const bool bClassInstanced = P->PropertyClass != nullptr
+            && P->PropertyClass->HasAnyClassFlags(CLASS_DefaultToInstanced);
+        const bool bInstanced = Property->HasAnyPropertyFlags(
+                                    CPF_InstancedReference | CPF_PersistentInstance)
+                              || bClassInstanced;
+        if (Ctx != nullptr && bInstanced
+            && Ctx->CurrentDepth < Ctx->MaxDepth
+            && !Ctx->Visited.Contains(Obj))
+        {
+            Ctx->Visited.Add(Obj);
+            ++Ctx->CurrentDepth;
+
+            auto Sub  = MakeShared<FJsonObject>();
+            Sub->SetStringField(TEXT("_class"), Obj->GetClass()->GetPathName());
+            Sub->SetStringField(TEXT("_path"),  FSoftObjectPath(Obj).ToString());
+
+            auto Props = MakeShared<FJsonObject>();
+            int32 Count = 0;
+            for (TFieldIterator<FProperty> It(Obj->GetClass()); It; ++It)
+            {
+                FProperty* SubP = *It;
+                if (!SubP) continue;
+                if (SubP->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient))
+                    continue;
+                auto V = GetPropertyValueAtPtr(SubP,
+                    SubP->ContainerPtrToValuePtr<void>(Obj), Ctx);
+                if (V.IsValid())
+                {
+                    Props->SetField(SubP->GetName(), V);
+                    ++Count;
+                }
+            }
+            Sub->SetObjectField(TEXT("_props"), Props);
+            Sub->SetNumberField(TEXT("_count"), Count);
+
+            --Ctx->CurrentDepth;
+            return MakeShared<FJsonValueObject>(Sub);
+        }
         return MakeShared<FJsonValueString>(FSoftObjectPath(Obj).ToString());
     }
     if (const FSoftObjectProperty* P = CastField<FSoftObjectProperty>(Property))
@@ -591,7 +638,7 @@ TSharedPtr<FJsonValue> GetPropertyValueAtPtr(const FProperty* Property,
         Arr.Reserve(Helper.Num());
         for (int32 i = 0; i < Helper.Num(); ++i)
         {
-            auto V = GetPropertyValueAtPtr(P->Inner, Helper.GetRawPtr(i));
+            auto V = GetPropertyValueAtPtr(P->Inner, Helper.GetRawPtr(i), Ctx);
             Arr.Add(V.IsValid() ? V : MakeShared<FJsonValueNull>());
         }
         return MakeShared<FJsonValueArray>(Arr);
@@ -604,7 +651,7 @@ TSharedPtr<FJsonValue> GetPropertyValueAtPtr(const FProperty* Property,
         for (int32 i = 0; i < Helper.GetMaxIndex(); ++i)
         {
             if (!Helper.IsValidIndex(i)) continue;
-            auto V = GetPropertyValueAtPtr(P->ElementProp, Helper.GetElementPtr(i));
+            auto V = GetPropertyValueAtPtr(P->ElementProp, Helper.GetElementPtr(i), Ctx);
             Arr.Add(V.IsValid() ? V : MakeShared<FJsonValueNull>());
         }
         return MakeShared<FJsonValueArray>(Arr);
@@ -617,8 +664,8 @@ TSharedPtr<FJsonValue> GetPropertyValueAtPtr(const FProperty* Property,
         for (int32 i = 0; i < Helper.GetMaxIndex(); ++i)
         {
             if (!Helper.IsValidIndex(i)) continue;
-            auto KeyV = GetPropertyValueAtPtr(P->KeyProp, Helper.GetKeyPtr(i));
-            auto ValV = GetPropertyValueAtPtr(P->ValueProp, Helper.GetValuePtr(i));
+            auto KeyV = GetPropertyValueAtPtr(P->KeyProp, Helper.GetKeyPtr(i), Ctx);
+            auto ValV = GetPropertyValueAtPtr(P->ValueProp, Helper.GetValuePtr(i), Ctx);
             const FString Key = KeyV.IsValid() ? KeyV->AsString() : FString::FromInt(i);
             Obj->SetField(Key, ValV.IsValid() ? ValV : MakeShared<FJsonValueNull>());
         }
@@ -638,11 +685,12 @@ bool SetUPropertyFromJson(UObject* Container,
 }
 
 TSharedPtr<FJsonValue> GetUPropertyAsJson(const UObject* Container,
-                                           const FProperty* Property)
+                                           const FProperty* Property,
+                                           FInstancedRecurseCtx* Ctx)
 {
     if (Property == nullptr || Container == nullptr) return nullptr;
     return GetPropertyValueAtPtr(Property,
-        Property->ContainerPtrToValuePtr<void>(Container));
+        Property->ContainerPtrToValuePtr<void>(Container), Ctx);
 }
 
 bool JsonValuesEqual(const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)

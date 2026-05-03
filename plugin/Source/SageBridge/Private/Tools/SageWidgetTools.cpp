@@ -22,6 +22,18 @@
 #include "WidgetBlueprint.h"
 #include "WidgetBlueprintFactory.h"
 
+// Widget animation authoring (Phase 4.11-r3 — CommonAIExport parity).
+// Storage: UWidgetBlueprint::Animations is a TArray<UWidgetAnimation*>. Each
+// UWidgetAnimation owns a UMovieScene + a TArray<FWidgetAnimationBinding>
+// mapping widget names to MovieScene possessables.
+#include "Animation/WidgetAnimation.h"
+#include "Animation/WidgetAnimationBinding.h"
+#include "MovieScene.h"
+#include "Tracks/MovieSceneFloatTrack.h"
+#include "Sections/MovieSceneFloatSection.h"
+#include "Channels/MovieSceneFloatChannel.h"
+#include "Channels/MovieSceneChannelProxy.h"
+
 #define LOCTEXT_NAMESPACE "SageWidget"
 
 namespace sage::tools
@@ -872,6 +884,326 @@ FSageToolDispatch::FOutcome GetRuntimeDelegatesImpl(const TSharedPtr<FJsonObject
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- widget.anim.* (Phase 4.11-r3) -----------------------------------------
+//
+// CommonAIExport parity: 4 authoring tools for UMG animations. Storage is
+// UWidgetBlueprint::Animations (TArray<UWidgetAnimation*>). Each animation
+// owns a UMovieScene + a TArray<FWidgetAnimationBinding> mapping widget
+// names → MovieScene possessable GUIDs.
+
+UWidgetAnimation* FindWidgetAnimation(UWidgetBlueprint* WB, const FString& AnimName)
+{
+    if (!WB) return nullptr;
+    for (UWidgetAnimation* A : WB->Animations)
+    {
+        if (A && A->GetName() == AnimName) return A;
+    }
+    return nullptr;
+}
+
+FSageToolDispatch::FOutcome AnimCreateImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, AnimName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("name"), AnimName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path' or 'name'"));
+    }
+    UWidgetBlueprint* WB = ResolveWidgetBlueprint(Path);
+    if (!WB) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("WidgetBlueprint not found: %s"), *Path));
+    if (FindWidgetAnimation(WB, AnimName) != nullptr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("animation '%s' already exists on %s"),
+                            *AnimName, *Path));
+    }
+
+    int32 FrameRate = 60;
+    double Duration = 5.0;
+    if (Args.IsValid())
+    {
+        double N = 0;
+        if (Args->TryGetNumberField(TEXT("frame_rate"), N))
+            FrameRate = FMath::Clamp(static_cast<int32>(N), 1, 480);
+        if (Args->TryGetNumberField(TEXT("duration_seconds"), N))
+            Duration = FMath::Clamp(N, 0.001, 3600.0);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("WidgetAnimCreate", "Create Widget Animation"));
+    WB->Modify();
+
+    const FName UniqueName(*AnimName);
+    UWidgetAnimation* Anim = NewObject<UWidgetAnimation>(WB, UniqueName,
+        RF_Public | RF_Transactional);
+    Anim->MovieScene = NewObject<UMovieScene>(Anim, UniqueName,
+        RF_Public | RF_Transactional);
+
+    Anim->MovieScene->SetDisplayRate(FFrameRate(FrameRate, 1));
+    const FFrameRate Tick = Anim->MovieScene->GetTickResolution();
+    const FFrameNumber EndFrame = Tick.AsFrameTime(Duration).RoundToFrame();
+    Anim->MovieScene->SetPlaybackRange(
+        TRange<FFrameNumber>(FFrameNumber(0), EndFrame));
+
+    WB->Animations.Add(Anim);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WB);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),             WB->GetPathName());
+    R->SetStringField(TEXT("name"),             Anim->GetName());
+    R->SetNumberField(TEXT("frame_rate"),       FrameRate);
+    R->SetNumberField(TEXT("duration_seconds"), Duration);
+    R->SetNumberField(TEXT("animation_count"),  WB->Animations.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AnimBindImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, AnimName, WidgetName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("anim_name"), AnimName)
+        || !Args->TryGetStringField(TEXT("widget_name"), WidgetName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'anim_name' or 'widget_name'"));
+    }
+    UWidgetBlueprint* WB = ResolveWidgetBlueprint(Path);
+    if (!WB) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("WidgetBlueprint not found: %s"), *Path));
+    UWidgetAnimation* Anim = FindWidgetAnimation(WB, AnimName);
+    if (!Anim) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("animation not found: %s"), *AnimName));
+
+    UWidget* Target = WB->WidgetTree
+        ? WB->WidgetTree->FindWidget(FName(*WidgetName))
+        : nullptr;
+    if (!Target) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("widget '%s' not found in WidgetTree"), *WidgetName));
+
+    // Skip if a binding already exists for this widget.
+    for (const FWidgetAnimationBinding& B : Anim->AnimationBindings)
+    {
+        if (B.WidgetName == FName(*WidgetName))
+        {
+            auto R = MakeShared<FJsonObject>();
+            R->SetStringField(TEXT("path"),         WB->GetPathName());
+            R->SetStringField(TEXT("anim_name"),    AnimName);
+            R->SetStringField(TEXT("widget_name"),  WidgetName);
+            R->SetStringField(TEXT("binding_guid"), B.AnimationGuid.ToString());
+            R->SetBoolField  (TEXT("already_bound"), true);
+            return FSageToolDispatch::FOutcome::MakeSuccess(R);
+        }
+    }
+
+    FScopedTransaction Tx(LOCTEXT("WidgetAnimBind", "Bind Widget Animation"));
+    WB->Modify();
+    Anim->Modify();
+
+    const FGuid Guid = Anim->MovieScene->AddPossessable(
+        Target->GetName(), Target->GetClass());
+
+    FWidgetAnimationBinding Binding;
+    Binding.WidgetName     = FName(*Target->GetName());
+    Binding.SlotWidgetName = NAME_None;
+    Binding.AnimationGuid  = Guid;
+    Binding.bIsRootWidget  = (WB->WidgetTree && Target == WB->WidgetTree->RootWidget);
+    Anim->AnimationBindings.Add(Binding);
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WB);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),         WB->GetPathName());
+    R->SetStringField(TEXT("anim_name"),    AnimName);
+    R->SetStringField(TEXT("widget_name"),  WidgetName);
+    R->SetStringField(TEXT("binding_guid"), Guid.ToString());
+    R->SetBoolField  (TEXT("is_root"),      Binding.bIsRootWidget);
+    R->SetNumberField(TEXT("binding_count"),Anim->AnimationBindings.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AnimAddTrackImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, AnimName, GuidStr, PropName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("anim_name"), AnimName)
+        || !Args->TryGetStringField(TEXT("binding_guid"), GuidStr)
+        || !Args->TryGetStringField(TEXT("property_name"), PropName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'anim_name', 'binding_guid' or 'property_name'"));
+    }
+    FString TrackType = TEXT("float");
+    Args->TryGetStringField(TEXT("track_type"), TrackType);
+    if (!TrackType.Equals(TEXT("float"), ESearchCase::IgnoreCase))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("track_type '%s' not supported (only 'float')"),
+                            *TrackType));
+    }
+
+    UWidgetBlueprint* WB = ResolveWidgetBlueprint(Path);
+    if (!WB) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("WidgetBlueprint not found: %s"), *Path));
+    UWidgetAnimation* Anim = FindWidgetAnimation(WB, AnimName);
+    if (!Anim || !Anim->MovieScene)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("animation not found: %s"), *AnimName));
+
+    FGuid Guid;
+    if (!FGuid::Parse(GuidStr, Guid))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid binding_guid: %s"), *GuidStr));
+
+    FScopedTransaction Tx(LOCTEXT("WidgetAnimAddTrack", "Add Widget Animation Track"));
+    Anim->MovieScene->Modify();
+
+    UMovieSceneFloatTrack* Track = Anim->MovieScene->AddTrack<UMovieSceneFloatTrack>(Guid);
+    if (!Track) return FSageToolDispatch::FOutcome::MakeError(-32000,
+        TEXT("AddTrack<UMovieSceneFloatTrack> returned null"));
+    Track->SetPropertyNameAndPath(FName(*PropName), PropName);
+
+    UMovieSceneSection* Section = Track->CreateNewSection();
+    if (Section)
+    {
+        Section->SetRange(TRange<FFrameNumber>::All());
+        Track->AddSection(*Section);
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WB);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),          WB->GetPathName());
+    R->SetStringField(TEXT("anim_name"),     AnimName);
+    R->SetStringField(TEXT("binding_guid"),  GuidStr);
+    R->SetStringField(TEXT("property_name"), PropName);
+    R->SetStringField(TEXT("track_type"),    TEXT("float"));
+    R->SetNumberField(TEXT("section_count"), Track->GetAllSections().Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AnimAddKeyframeImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, AnimName, GuidStr, PropName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("anim_name"), AnimName)
+        || !Args->TryGetStringField(TEXT("binding_guid"), GuidStr)
+        || !Args->TryGetStringField(TEXT("property_name"), PropName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'anim_name', 'binding_guid' or 'property_name'"));
+    }
+    double TimeSeconds = 0.0;
+    double Value = 0.0;
+    if (!Args->TryGetNumberField(TEXT("time_seconds"), TimeSeconds))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'time_seconds'"));
+    }
+    if (!Args->TryGetNumberField(TEXT("value"), Value))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'value'"));
+    }
+
+    UWidgetBlueprint* WB = ResolveWidgetBlueprint(Path);
+    if (!WB) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("WidgetBlueprint not found: %s"), *Path));
+    UWidgetAnimation* Anim = FindWidgetAnimation(WB, AnimName);
+    if (!Anim || !Anim->MovieScene)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("animation not found: %s"), *AnimName));
+
+    FGuid Guid;
+    if (!FGuid::Parse(GuidStr, Guid))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid binding_guid: %s"), *GuidStr));
+
+    // Locate the float track on the binding matching property_name.
+    UMovieSceneFloatTrack* Track = nullptr;
+    for (UMovieSceneTrack* T : Anim->MovieScene->FindTracks(
+            UMovieSceneFloatTrack::StaticClass(), Guid))
+    {
+        UMovieSceneFloatTrack* FT = Cast<UMovieSceneFloatTrack>(T);
+        if (FT && FT->GetPropertyName() == FName(*PropName))
+        {
+            Track = FT;
+            break;
+        }
+    }
+    if (!Track) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("no float track for property '%s' on binding %s"),
+                        *PropName, *GuidStr));
+
+    UMovieSceneFloatSection* Section = nullptr;
+    for (UMovieSceneSection* S : Track->GetAllSections())
+    {
+        if (UMovieSceneFloatSection* FS = Cast<UMovieSceneFloatSection>(S))
+        {
+            Section = FS;
+            break;
+        }
+    }
+    if (!Section)
+    {
+        Section = Cast<UMovieSceneFloatSection>(Track->CreateNewSection());
+        if (!Section) return FSageToolDispatch::FOutcome::MakeError(-32000,
+            TEXT("CreateNewSection returned null"));
+        Section->SetRange(TRange<FFrameNumber>::All());
+        Track->AddSection(*Section);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("WidgetAnimAddKey", "Add Widget Animation Keyframe"));
+    Section->Modify();
+
+    const FFrameRate Tick = Anim->MovieScene->GetTickResolution();
+    const FFrameNumber Frame = Tick.AsFrameTime(TimeSeconds).RoundToFrame();
+
+    TArrayView<FMovieSceneFloatChannel*> Channels =
+        Section->GetChannelProxy().GetChannels<FMovieSceneFloatChannel>();
+    if (Channels.Num() == 0)
+        return FSageToolDispatch::FOutcome::MakeError(-32000,
+            TEXT("section has no float channels"));
+    Channels[0]->AddCubicKey(Frame, static_cast<float>(Value));
+    int32 KeyCount = Channels[0]->GetData().GetTimes().Num();
+
+    // Expand playback range if the new key is past the current end.
+    TRange<FFrameNumber> Range = Anim->MovieScene->GetPlaybackRange();
+    if (Range.HasUpperBound() && Frame > Range.GetUpperBoundValue())
+    {
+        Anim->MovieScene->SetPlaybackRange(
+            TRange<FFrameNumber>(Range.GetLowerBoundValue(), Frame));
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WB);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),          WB->GetPathName());
+    R->SetStringField(TEXT("anim_name"),     AnimName);
+    R->SetStringField(TEXT("binding_guid"),  GuidStr);
+    R->SetStringField(TEXT("property_name"), PropName);
+    R->SetNumberField(TEXT("time_seconds"),  TimeSeconds);
+    R->SetNumberField(TEXT("value"),         Value);
+    R->SetNumberField(TEXT("key_count"),     KeyCount);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 }  // namespace (anonymous)
 
 void RegisterWidgetTools(FSageToolDispatch& Dispatch)
@@ -906,6 +1238,12 @@ void RegisterWidgetTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("widget.list_runtime"),           GT(&ListRuntimeWidgetsImpl));
     Dispatch.RegisterHandler(TEXT("widget.get_runtime"),            GT(&GetRuntimeWidgetImpl));
     Dispatch.RegisterHandler(TEXT("widget.get_runtime_delegates"),  GT(&GetRuntimeDelegatesImpl));
+
+    // Widget animation authoring (Phase 4.11-r3 — CommonAIExport parity)
+    Dispatch.RegisterHandler(TEXT("widget.anim.create"),       GT(&AnimCreateImpl));
+    Dispatch.RegisterHandler(TEXT("widget.anim.bind"),         GT(&AnimBindImpl));
+    Dispatch.RegisterHandler(TEXT("widget.anim.add_track"),    GT(&AnimAddTrackImpl));
+    Dispatch.RegisterHandler(TEXT("widget.anim.add_keyframe"), GT(&AnimAddKeyframeImpl));
 }
 
 #undef LOCTEXT_NAMESPACE

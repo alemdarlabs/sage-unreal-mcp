@@ -545,6 +545,26 @@ FSageToolDispatch::FOutcome ReadAssetPropertiesImpl(const TSharedPtr<FJsonObject
             FString::Printf(TEXT("asset not found: %s"), *Path));
     }
 
+    // Optional: instanced-subobject recursion. When `recurse_instanced` is
+    // true the property reader expands UPROPERTY(Instanced) refs (e.g.
+    // GameFeatureActions, ComponentList) into embedded `{_class, _path,
+    // _props}` objects; otherwise they round-trip as bare path strings.
+    bool bRecurseInstanced = false;
+    int32 MaxDepth = 4;
+    if (Args.IsValid())
+    {
+        Args->TryGetBoolField(TEXT("recurse_instanced"), bRecurseInstanced);
+        double N = 0;
+        if (Args->TryGetNumberField(TEXT("max_depth"), N))
+        {
+            MaxDepth = FMath::Clamp(static_cast<int32>(N), 1, 16);
+        }
+    }
+    detail::FInstancedRecurseCtx Ctx;
+    Ctx.MaxDepth = MaxDepth;
+    Ctx.Visited.Add(Obj);  // root: never re-emit the asset itself
+    detail::FInstancedRecurseCtx* CtxPtr = bRecurseInstanced ? &Ctx : nullptr;
+
     auto Props = MakeShared<FJsonObject>();
     int32 Count = 0;
     for (TFieldIterator<FProperty> It(Obj->GetClass()); It; ++It)
@@ -553,7 +573,7 @@ FSageToolDispatch::FOutcome ReadAssetPropertiesImpl(const TSharedPtr<FJsonObject
         if (!P) continue;
         if (P->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient)) continue;
         const FString PropName = P->GetName();
-        TSharedPtr<FJsonValue> V = detail::GetUPropertyAsJson(Obj, P);
+        TSharedPtr<FJsonValue> V = detail::GetUPropertyAsJson(Obj, P, CtxPtr);
         if (V.IsValid())
         {
             Props->SetField(PropName, V);
@@ -566,6 +586,11 @@ FSageToolDispatch::FOutcome ReadAssetPropertiesImpl(const TSharedPtr<FJsonObject
     R->SetStringField(TEXT("class"),      Obj->GetClass()->GetName());
     R->SetObjectField(TEXT("properties"), Props);
     R->SetNumberField(TEXT("count"),      Count);
+    if (bRecurseInstanced)
+    {
+        R->SetBoolField  (TEXT("recurse_instanced"), true);
+        R->SetNumberField(TEXT("max_depth"),         MaxDepth);
+    }
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 

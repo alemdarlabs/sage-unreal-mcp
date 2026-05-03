@@ -1334,6 +1334,183 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     // ========================================================================
+    // widget.anim.* — UMG Widget Animation authoring (Phase 4.11-r3)
+    // CommonAIExport parity: 4 tools that author UWidgetBlueprint::Animations
+    // (TArray<UWidgetAnimation*>). Each animation owns a UMovieScene and a
+    // TArray<FWidgetAnimationBinding> mapping widget names → possessable GUIDs.
+    // ========================================================================
+
+    reg(registry, Tool{.name="widget.anim.create",
+        .description="Create a new UWidgetAnimation on a WidgetBlueprint. "
+                     "Allocates a UMovieScene with `frame_rate` (default 60 FPS) "
+                     "display rate and `duration_seconds` (default 5s) playback "
+                     "range. Returns {path, name, frame_rate, duration_seconds, "
+                     "animation_count}. -32602 if the blueprint is missing or "
+                     "the animation name already exists.",
+        .inputSchema=obj({
+            {"path",str()},
+            {"name",str()},
+            {"frame_rate",i32()},
+            {"duration_seconds",num()},
+        },{"path","name"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="widget.anim.bind",
+        .description="Bind a widget from the WidgetTree to a UWidgetAnimation. "
+                     "Adds a possessable to the MovieScene and an "
+                     "FWidgetAnimationBinding entry. Idempotent — if the "
+                     "widget is already bound, returns the existing GUID with "
+                     "`already_bound: true`. Returns {path, anim_name, "
+                     "widget_name, binding_guid, is_root, binding_count}.",
+        .inputSchema=obj({
+            {"path",str()},
+            {"anim_name",str()},
+            {"widget_name",str()},
+        },{"path","anim_name","widget_name"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="widget.anim.add_track",
+        .description="Add a property track to a binding. Currently only "
+                     "`track_type: 'float'` is supported (UMovieSceneFloatTrack); "
+                     "more types follow once smoke-tested. Creates an empty "
+                     "section spanning the playback range. Returns {path, "
+                     "anim_name, binding_guid, property_name, track_type, "
+                     "section_count}.",
+        .inputSchema=obj({
+            {"path",str()},
+            {"anim_name",str()},
+            {"binding_guid",str()},
+            {"property_name",str()},
+            {"track_type",str()},
+        },{"path","anim_name","binding_guid","property_name"}),
+        .handler=nullptr,.remote=true});
+
+    // ========================================================================
+    // world.* — UWorld/Map structural exporter (Phase 4.6-r4)
+    // ========================================================================
+
+    reg(registry, Tool{.name="world.export",
+        .description="Export the currently-loaded editor world as a "
+                     "structured snapshot. Returns {world_path, world_name, "
+                     "actors:[{name,class,path,folder?,transform:{location,"
+                     "rotation,scale},tags?,components?,properties?,"
+                     "property_count?}], returned, total, truncated, "
+                     "is_world_partition, level_bounds:{min,max}, "
+                     "streaming_levels:[{name,class,loaded,visible,...}], "
+                     "streaming_count, world_settings?}. "
+                     "Optional `path` is a safety check — if supplied and "
+                     "doesn't match the current PersistentLevel, returns "
+                     "-32602 telling the caller to load the map first "
+                     "(production projects: never auto-switches maps). "
+                     "Optional `actor_class_filter` (top-level asset path) "
+                     "narrows enumeration. `include_components` lists "
+                     "{name,class}; `include_actor_props` runs the full "
+                     "instanced-recursion property reader (depth 2); "
+                     "`include_world_settings` adds the AWorldSettings "
+                     "reflected props (depth 3). `max_actors` defaults "
+                     "to 10000 (range 1..200000).",
+        .inputSchema=obj({
+            {"path",str()},
+            {"actor_class_filter",str()},
+            {"include_components",bln()},
+            {"include_actor_props",bln()},
+            {"include_world_settings",bln()},
+            {"max_actors",i32()},
+        }),
+        .handler=nullptr,.remote=true});
+
+    // ========================================================================
+    // audio.read_* — Audio asset structural dumpers (Phase 4.x)
+    // CommonAIExport parity: 7 read-only tools that resolve an audio asset,
+    // verify the expected class (dynamically — AudioModulation plugin may not
+    // be loaded), and emit reflected properties. SoundClass/SoundSubmix add
+    // a flat `children` path array for hierarchy traversal. All seven accept
+    // the same `recurse_instanced` + `max_depth` flags as asset.read_properties.
+    // ========================================================================
+
+    auto audioReadSchema = [&](){
+        return obj({
+            {"path",str()},
+            {"recurse_instanced",bln()},
+            {"max_depth",i32()},
+        },{"path"});
+    };
+
+    reg(registry, Tool{.name="audio.read_sound_class",
+        .description="Dump a USoundClass asset. Returns {path, class, "
+                     "properties:{Volume,Pitch,...}, count, children:[paths]}. "
+                     "`children` is the explicit ChildClasses array (parent "
+                     "→ child hierarchy). -32602 if path doesn't resolve to a "
+                     "USoundClass.",
+        .inputSchema=audioReadSchema(),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="audio.read_sound_submix",
+        .description="Dump a USoundSubmixBase asset (covers USoundSubmix, "
+                     "USoundfieldSubmix, UEndpointSubmix). Returns the same "
+                     "shape as read_sound_class with `children` reading "
+                     "ChildSubmixes — the routing tree. -32602 if path doesn't "
+                     "resolve.",
+        .inputSchema=audioReadSchema(),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="audio.read_sound_concurrency",
+        .description="Dump a USoundConcurrency asset (max active sounds, "
+                     "voice stealing rules). Returns {path, class, properties, "
+                     "count}.",
+        .inputSchema=audioReadSchema(),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="audio.read_sound_attenuation",
+        .description="Dump a USoundAttenuation asset (spatialisation, falloff "
+                     "curves, occlusion, focus, reverb). Returns {path, class, "
+                     "properties, count}. Curve points come through as "
+                     "structured property values via the FRichCurve struct "
+                     "shorthand.",
+        .inputSchema=audioReadSchema(),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="audio.read_control_bus",
+        .description="Dump a USoundControlBus asset (AudioModulation plugin). "
+                     "Returns {path, class, properties, count}. -32602 if the "
+                     "AudioModulation module/plugin isn't loaded.",
+        .inputSchema=audioReadSchema(),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="audio.read_control_bus_mix",
+        .description="Dump a USoundControlBusMix asset (AudioModulation "
+                     "plugin) — the bus → mix value mapping. Returns {path, "
+                     "class, properties, count}. -32602 if AudioModulation "
+                     "isn't loaded.",
+        .inputSchema=audioReadSchema(),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="audio.read_modulation_patch",
+        .description="Dump a USoundModulationPatch asset (AudioModulation "
+                     "plugin) — modulator wiring + curves. Returns {path, "
+                     "class, properties, count}. -32602 if AudioModulation "
+                     "isn't loaded.",
+        .inputSchema=audioReadSchema(),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="widget.anim.add_keyframe",
+        .description="Add a cubic-interpolated keyframe to a float track on "
+                     "a binding. Time is in seconds (converted via the "
+                     "MovieScene's tick resolution). If the keyframe is past "
+                     "the current playback end, the playback range expands "
+                     "to include it. Returns {path, anim_name, binding_guid, "
+                     "property_name, time_seconds, value, key_count}.",
+        .inputSchema=obj({
+            {"path",str()},
+            {"anim_name",str()},
+            {"binding_guid",str()},
+            {"property_name",str()},
+            {"time_seconds",num()},
+            {"value",num()},
+        },{"path","anim_name","binding_guid","property_name","time_seconds","value"}),
+        .handler=nullptr,.remote=true});
+
+    // ========================================================================
     // bp.* extensions (missing tools)
     // ========================================================================
 

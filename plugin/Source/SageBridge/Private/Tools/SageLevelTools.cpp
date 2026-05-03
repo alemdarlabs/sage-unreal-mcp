@@ -14,6 +14,7 @@
 #include "Editor.h"
 #include "Engine/ExponentialHeightFog.h"
 #include "Engine/Level.h"
+#include "Engine/LevelStreaming.h"
 #include "Engine/TriggerVolume.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -878,6 +879,239 @@ FSageToolDispatch::FOutcome LevelBuildLightingImpl(const TSharedPtr<FJsonObject>
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- world.export (Phase 4.6-r4 — CommonAIExport parity) -------------------
+//
+// Read-only structural snapshot of the currently-loaded editor world. To
+// keep destructive risk near zero on production projects this tool refuses
+// to switch maps: if `path` is provided and doesn't match the current
+// PersistentLevel, returns -32602 telling the caller to load the map first
+// (via editor UI or `level.load`).
+
+FSageToolDispatch::FOutcome WorldExportImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World) return FSageToolDispatch::FOutcome::MakeError(-32603,
+        TEXT("no editor world"));
+
+    bool bIncludeComponents = false;
+    bool bIncludeActorProps = false;
+    bool bIncludeWorldSettings = false;
+    int32 MaxActors = 10000;
+    FString PathArg, ClassFilter;
+    if (Args.IsValid())
+    {
+        Args->TryGetStringField(TEXT("path"),               PathArg);
+        Args->TryGetStringField(TEXT("actor_class_filter"), ClassFilter);
+        Args->TryGetBoolField  (TEXT("include_components"), bIncludeComponents);
+        Args->TryGetBoolField  (TEXT("include_actor_props"),bIncludeActorProps);
+        Args->TryGetBoolField  (TEXT("include_world_settings"), bIncludeWorldSettings);
+        double N = 0;
+        if (Args->TryGetNumberField(TEXT("max_actors"), N))
+            MaxActors = FMath::Clamp(static_cast<int32>(N), 1, 200000);
+    }
+
+    const FString CurrentMapPath = World->GetOutermost()->GetName();
+    if (!PathArg.IsEmpty() && !PathArg.Equals(CurrentMapPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("current world is '%s'; refuses to switch maps. "
+                                 "Load the requested map (editor UI or "
+                                 "level.load) and re-run."),
+                            *CurrentMapPath));
+    }
+
+    UClass* Filter = nullptr;
+    if (!ClassFilter.IsEmpty())
+    {
+        Filter = FindObject<UClass>(nullptr, *ClassFilter);
+        if (!Filter)
+        {
+            Filter = LoadObject<UClass>(nullptr, *ClassFilter);
+        }
+        if (!Filter)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("actor_class_filter not found: %s"),
+                                *ClassFilter));
+        }
+    }
+
+    detail::FInstancedRecurseCtx ActorCtx;
+    ActorCtx.MaxDepth = 2;  // shallow — components hold their own refs
+
+    TArray<TSharedPtr<FJsonValue>> Actors;
+    int32 Total = 0;
+    int32 Truncated = 0;
+    FBox WorldBounds(ForceInit);
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        AActor* A = *It;
+        if (!A) continue;
+        if (A->IsA(AWorldSettings::StaticClass())) continue;
+        if (Filter && !A->IsA(Filter)) continue;
+        ++Total;
+        if (Actors.Num() >= MaxActors) { ++Truncated; continue; }
+
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("name"),  A->GetActorLabel());
+        J->SetStringField(TEXT("class"), A->GetClass()->GetPathName());
+        J->SetStringField(TEXT("path"),  A->GetPathName());
+        const FName Folder = A->GetFolderPath();
+        if (!Folder.IsNone()) J->SetStringField(TEXT("folder"), Folder.ToString());
+
+        const FTransform Tx = A->GetActorTransform();
+        const FVector Loc = Tx.GetLocation();
+        const FRotator Rot = Tx.Rotator();
+        const FVector Scale = Tx.GetScale3D();
+        TArray<TSharedPtr<FJsonValue>> LocArr = {
+            MakeShared<FJsonValueNumber>(Loc.X),
+            MakeShared<FJsonValueNumber>(Loc.Y),
+            MakeShared<FJsonValueNumber>(Loc.Z),
+        };
+        TArray<TSharedPtr<FJsonValue>> RotArr = {
+            MakeShared<FJsonValueNumber>(Rot.Pitch),
+            MakeShared<FJsonValueNumber>(Rot.Yaw),
+            MakeShared<FJsonValueNumber>(Rot.Roll),
+        };
+        TArray<TSharedPtr<FJsonValue>> ScaleArr = {
+            MakeShared<FJsonValueNumber>(Scale.X),
+            MakeShared<FJsonValueNumber>(Scale.Y),
+            MakeShared<FJsonValueNumber>(Scale.Z),
+        };
+        auto TxJ = MakeShared<FJsonObject>();
+        TxJ->SetArrayField(TEXT("location"), LocArr);
+        TxJ->SetArrayField(TEXT("rotation"), RotArr);
+        TxJ->SetArrayField(TEXT("scale"),    ScaleArr);
+        J->SetObjectField(TEXT("transform"), TxJ);
+
+        if (A->Tags.Num() > 0)
+        {
+            TArray<TSharedPtr<FJsonValue>> TagArr;
+            for (FName T : A->Tags)
+                TagArr.Add(MakeShared<FJsonValueString>(T.ToString()));
+            J->SetArrayField(TEXT("tags"), TagArr);
+        }
+
+        if (bIncludeComponents)
+        {
+            TArray<TSharedPtr<FJsonValue>> Comps;
+            TArray<UActorComponent*> ComponentList;
+            A->GetComponents(ComponentList);
+            for (UActorComponent* C : ComponentList)
+            {
+                if (!C) continue;
+                auto CJ = MakeShared<FJsonObject>();
+                CJ->SetStringField(TEXT("name"),  C->GetName());
+                CJ->SetStringField(TEXT("class"), C->GetClass()->GetPathName());
+                Comps.Add(MakeShared<FJsonValueObject>(CJ));
+            }
+            J->SetArrayField(TEXT("components"), Comps);
+        }
+
+        if (bIncludeActorProps)
+        {
+            // Reset visited per actor — actor instances are independent roots.
+            ActorCtx.Visited.Reset();
+            ActorCtx.Visited.Add(A);
+            ActorCtx.CurrentDepth = 0;
+            auto Props = MakeShared<FJsonObject>();
+            int32 Count = 0;
+            for (TFieldIterator<FProperty> It2(A->GetClass()); It2; ++It2)
+            {
+                FProperty* P = *It2;
+                if (!P) continue;
+                if (P->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient))
+                    continue;
+                auto V = detail::GetUPropertyAsJson(A, P, &ActorCtx);
+                if (V.IsValid()) { Props->SetField(P->GetName(), V); ++Count; }
+            }
+            J->SetObjectField(TEXT("properties"), Props);
+            J->SetNumberField(TEXT("property_count"), Count);
+        }
+
+        // Track world bounds across kept actors only — quicker, still useful.
+        FBox B = A->GetComponentsBoundingBox(/*bNonColliding=*/true);
+        if (B.IsValid) WorldBounds += B;
+
+        Actors.Add(MakeShared<FJsonValueObject>(J));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("world_path"),  CurrentMapPath);
+    R->SetStringField(TEXT("world_name"),  World->GetName());
+    R->SetArrayField (TEXT("actors"),      Actors);
+    R->SetNumberField(TEXT("returned"),    Actors.Num());
+    R->SetNumberField(TEXT("total"),       Total);
+    R->SetBoolField  (TEXT("truncated"),   Truncated > 0);
+    R->SetBoolField  (TEXT("is_world_partition"),
+        World->GetWorldPartition() != nullptr);
+
+    if (WorldBounds.IsValid)
+    {
+        TArray<TSharedPtr<FJsonValue>> MinArr = {
+            MakeShared<FJsonValueNumber>(WorldBounds.Min.X),
+            MakeShared<FJsonValueNumber>(WorldBounds.Min.Y),
+            MakeShared<FJsonValueNumber>(WorldBounds.Min.Z),
+        };
+        TArray<TSharedPtr<FJsonValue>> MaxArr = {
+            MakeShared<FJsonValueNumber>(WorldBounds.Max.X),
+            MakeShared<FJsonValueNumber>(WorldBounds.Max.Y),
+            MakeShared<FJsonValueNumber>(WorldBounds.Max.Z),
+        };
+        auto BJ = MakeShared<FJsonObject>();
+        BJ->SetArrayField(TEXT("min"), MinArr);
+        BJ->SetArrayField(TEXT("max"), MaxArr);
+        R->SetObjectField(TEXT("level_bounds"), BJ);
+    }
+
+    // Streaming levels (top-level only — nested LevelInstance/WP unhandled).
+    TArray<TSharedPtr<FJsonValue>> Streams;
+    for (ULevelStreaming* SL : World->GetStreamingLevels())
+    {
+        if (!SL) continue;
+        auto SJ = MakeShared<FJsonObject>();
+        SJ->SetStringField(TEXT("name"),
+            SL->GetWorldAssetPackageFName().ToString());
+        SJ->SetStringField(TEXT("class"), SL->GetClass()->GetName());
+        SJ->SetBoolField  (TEXT("loaded"),       SL->IsLevelLoaded());
+        SJ->SetBoolField  (TEXT("visible"),      SL->IsLevelVisible());
+        SJ->SetBoolField  (TEXT("should_be_loaded"),  SL->ShouldBeLoaded());
+        SJ->SetBoolField  (TEXT("should_be_visible"), SL->ShouldBeVisible());
+        Streams.Add(MakeShared<FJsonValueObject>(SJ));
+    }
+    R->SetArrayField (TEXT("streaming_levels"), Streams);
+    R->SetNumberField(TEXT("streaming_count"),  Streams.Num());
+
+    if (bIncludeWorldSettings)
+    {
+        AWorldSettings* WS = World->GetWorldSettings();
+        if (WS)
+        {
+            detail::FInstancedRecurseCtx WsCtx;
+            WsCtx.MaxDepth = 3;
+            WsCtx.Visited.Add(WS);
+            auto Props = MakeShared<FJsonObject>();
+            int32 Count = 0;
+            for (TFieldIterator<FProperty> It2(WS->GetClass()); It2; ++It2)
+            {
+                FProperty* P = *It2;
+                if (!P) continue;
+                if (P->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient))
+                    continue;
+                auto V = detail::GetUPropertyAsJson(WS, P, &WsCtx);
+                if (V.IsValid()) { Props->SetField(P->GetName(), V); ++Count; }
+            }
+            auto WSJ = MakeShared<FJsonObject>();
+            WSJ->SetStringField(TEXT("class"), WS->GetClass()->GetPathName());
+            WSJ->SetObjectField(TEXT("properties"), Props);
+            WSJ->SetNumberField(TEXT("property_count"), Count);
+            R->SetObjectField(TEXT("world_settings"), WSJ);
+        }
+    }
+
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 }  // namespace (anonymous)
 
 void RegisterLevelTools(FSageToolDispatch& Dispatch)
@@ -918,6 +1152,9 @@ void RegisterLevelTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("level.set_world_settings"),   GT(&LevelSetWorldSettingsImpl));
     Dispatch.RegisterHandler(TEXT("level.set_water_body_property"), GT(&LevelSetWaterBodyPropertyImpl));
     Dispatch.RegisterHandler(TEXT("level.build_lighting"),       GT(&LevelBuildLightingImpl));
+
+    // World/Map structural exporter (Phase 4.6-r4 — CommonAIExport parity)
+    Dispatch.RegisterHandler(TEXT("world.export"),               GT(&WorldExportImpl));
 }
 
 #undef LOCTEXT_NAMESPACE

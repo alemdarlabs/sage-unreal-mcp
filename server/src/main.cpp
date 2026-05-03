@@ -19,6 +19,7 @@
 #include "tools/restart_orchestrator.h"
 #include "transport/http_sse_server.h"
 #include "transport/stdio_mcp.h"
+#include "util/crash_handler.h"
 
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/sinks/rotating_file_sink.h>
@@ -78,6 +79,12 @@ extern "C" void signalHandler(int signal) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    // Install crash handlers BEFORE any other init. A CRT precondition
+    // failure during static/dynamic library init (kuzu DLL load, spdlog
+    // sink ctor, etc.) must still produce a minidump and never block on
+    // a modal MessageBox (cf. xmemory:209 incident, 2026-05-02).
+    sage::installCrashHandlers();
+
     // Transport selection — stdio is default (Anthropic SDK native, OAuth-free).
     // HTTP+SSE (port 7777) opt-in via `--http` for multi-client / debugging.
     const bool useHttp = hasFlag(argc, argv, "--http");
@@ -2629,12 +2636,23 @@ int main(int argc, char* argv[]) {
                        "UObject. Skips CPF_Transient + DuplicateTransient. "
                        "Goes through Sage's GetUPropertyAsJson — structs "
                        "(Vector/Rotator/Transform/Color), TArray/TMap/"
-                       "TSet, enums, soft refs all round-tripped. Returns "
-                       "{class, properties: {...}, count}. -32602 if path "
+                       "TSet, enums, soft refs all round-tripped. "
+                       "Optional `recurse_instanced` (default false) "
+                       "expands UPROPERTY(Instanced) refs (e.g. "
+                       "GameFeatureActions, ComponentList) into embedded "
+                       "{_class, _path, _props, _count} objects bounded "
+                       "by `max_depth` (default 4, range 1..16). Cycles "
+                       "short-circuit via a visited set. Returns "
+                       "{class, properties: {...}, count, "
+                       "recurse_instanced?, max_depth?}. -32602 if path "
                        "doesn't resolve.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
-            {"properties", {{"path", {{"type", "string"}}}}},
+            {"properties", {
+                {"path", {{"type", "string"}}},
+                {"recurse_instanced", {{"type", "boolean"}}},
+                {"max_depth", {{"type", "integer"}, {"minimum", 1}, {"maximum", 16}}},
+            }},
             {"required", nlohmann::json::array({"path"})},
             {"additionalProperties", false},
         },

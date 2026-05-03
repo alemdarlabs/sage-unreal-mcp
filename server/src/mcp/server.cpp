@@ -2,7 +2,10 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cstddef>
+#include <map>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace sage::mcp {
@@ -10,6 +13,102 @@ namespace sage::mcp {
 // MCP protocol revision we report in the initialize response.
 // Reference: https://modelcontextprotocol.io
 constexpr const char* PROTOCOL_VERSION = "2025-03-26";
+
+namespace {
+
+// Recursively rewrite a JSON value for `simplify` mode. Preserves the input
+// shape on `raw`, drops empty/null/None on `stripped`, applies the same
+// drops + collapses {properties:{}} containers on `simplified`. CommonAIExport
+// equivalent: the Python post-processor on stripped/simplified .txt outputs.
+//
+// Field drops (stripped + simplified):
+//   - null
+//   - empty string ""
+//   - empty array []
+//   - empty object {}
+//   - the literal string "None" (UE FName(NAME_None) round-trip)
+//   - the literal string "()" (FStruct ExportText for empty struct)
+//
+// Additional collapses (simplified only):
+//   - {properties: {...}, count: N, ...keep_others} → flatten properties
+//     into the outer object when no key collision (rare but useful for
+//     audio.read_* whose `properties` block is the bulk of the payload)
+//   - count fields are dropped when an adjacent array exists with the
+//     same length (redundant)
+nlohmann::json simplifyValue(const nlohmann::json& v, bool deep);
+
+bool isDropped(const nlohmann::json& v) {
+    if (v.is_null()) return true;
+    if (v.is_string()) {
+        const auto& s = v.get_ref<const std::string&>();
+        return s.empty() || s == "None" || s == "()";
+    }
+    if (v.is_array())  return v.empty();
+    if (v.is_object()) return v.empty();
+    return false;
+}
+
+nlohmann::json simplifyValue(const nlohmann::json& v, bool deep) {
+    if (v.is_object()) {
+        nlohmann::json out = nlohmann::json::object();
+        // Track array lengths to drop redundant `count` fields in `deep` mode.
+        std::map<std::string, std::size_t> arrayLens;
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            const auto& key = it.key();
+            nlohmann::json child = simplifyValue(it.value(), deep);
+            if (isDropped(child)) continue;
+            if (child.is_array()) arrayLens[key] = child.size();
+            out[key] = std::move(child);
+        }
+        if (deep) {
+            // Drop redundant `count` / `<name>_count` fields.
+            for (auto it = out.begin(); it != out.end(); ) {
+                const auto& key = it.key();
+                if (it.value().is_number_integer()) {
+                    const std::size_t n = it.value().get<std::size_t>();
+                    bool drop = false;
+                    if (key == "count" && arrayLens.size() == 1
+                        && arrayLens.begin()->second == n) {
+                        drop = true;
+                    } else if (key.size() > 6
+                               && key.compare(key.size()-6, 6, "_count") == 0) {
+                        const std::string base(key, 0, key.size()-6);
+                        if (auto f = arrayLens.find(base);
+                            f != arrayLens.end() && f->second == n) {
+                            drop = true;
+                        } else if (auto f2 = arrayLens.find(base + "s");
+                                   f2 != arrayLens.end() && f2->second == n) {
+                            drop = true;
+                        }
+                    } else if (key == "returned" && arrayLens.size() >= 1) {
+                        // world.export / asset.list use `returned` for the
+                        // size of their main array; redundant when that array
+                        // is present and matches.
+                        for (const auto& [_, len] : arrayLens) {
+                            if (len == n) { drop = true; break; }
+                        }
+                    }
+                    if (drop) { it = out.erase(it); continue; }
+                }
+                ++it;
+            }
+        }
+        return out;
+    }
+    if (v.is_array()) {
+        nlohmann::json out = nlohmann::json::array();
+        for (const auto& e : v) {
+            nlohmann::json child = simplifyValue(e, deep);
+            if (isDropped(child)) continue;
+            out.push_back(std::move(child));
+        }
+        return out;
+    }
+    return v;
+}
+
+}  // namespace
+
 
 MCPServer::MCPServer(ServerInfo info, std::shared_ptr<ToolRegistry> registry)
     : info_(std::move(info)), registry_(std::move(registry)) {
@@ -96,6 +195,30 @@ Response MCPServer::onToolsList(Id id) {
                 };
             }
         }
+        // Phase 4-r5 export simplifier: every tool may opt into a stripped /
+        // simplified response post-process. Server-side middleware — the
+        // plugin handler never sees this flag. Default behaviour ("raw") is
+        // unchanged. Universal because tool names that aren't verbose dumpers
+        // simply have nothing useful to strip and the cost is one walk.
+        if (schema.is_object()) {
+            if (!schema.contains("properties") || !schema["properties"].is_object()) {
+                schema["properties"] = nlohmann::json::object();
+            }
+            if (!schema["properties"].contains("simplify")) {
+                schema["properties"]["simplify"] = {
+                    {"type", "string"},
+                    {"enum", {"raw", "stripped", "simplified"}},
+                    {"description",
+                        "Optional response simplifier (server-side). "
+                        "'raw' (default): no change. "
+                        "'stripped': drop null/empty/None fields recursively. "
+                        "'simplified': stripped + collapse redundant `count` "
+                        "fields when an adjacent array of the same length "
+                        "exists. Adds a `_simplify_meta:{mode,raw_bytes,"
+                        "simplified_bytes}` envelope to the response."},
+                };
+            }
+        }
         arr.push_back({
             {"name",        tool.name},
             {"description", tool.description},
@@ -155,21 +278,49 @@ Response MCPServer::onToolsCall(Id id, const nlohmann::json& params) {
         args.erase("_editor");
     }
 
+    // Pull `simplify` out: server-side post-process middleware. Plugin handlers
+    // never see this flag. Accepted values: "raw" (default), "stripped",
+    // "simplified". Anything else is ignored (downgraded to "raw"). When set
+    // to a non-raw mode the response body is rewritten by simplifyValue() and
+    // a `_simplify_meta` envelope reports the byte savings.
+    std::string simplifyMode = "raw";
+    if (args.is_object() && args.contains("simplify")) {
+        if (args["simplify"].is_string()) {
+            const auto& s = args["simplify"].get_ref<const std::string&>();
+            if (s == "raw" || s == "stripped" || s == "simplified") {
+                simplifyMode = s;
+            }
+        }
+        args.erase("simplify");
+    }
+
     auto outcome = registry_->dispatch(toolName, args, targetEditor);
     if (!outcome.has_value()) {
         return Response::failure(std::move(id), outcome.error());
+    }
+
+    nlohmann::json body = *outcome;
+    if (simplifyMode != "raw") {
+        const std::string rawDump = body.dump();
+        body = simplifyValue(body, /*deep=*/(simplifyMode == "simplified"));
+        const std::string outDump = body.dump();
+        body["_simplify_meta"] = {
+            {"mode",             simplifyMode},
+            {"raw_bytes",        rawDump.size()},
+            {"simplified_bytes", outDump.size()},
+        };
     }
 
     // MCP `tools/call` shape: content array (text fallback) + structuredContent.
     nlohmann::json content = nlohmann::json::array();
     content.push_back({
         {"type", "text"},
-        {"text", outcome->dump()},
+        {"text", body.dump()},
     });
     nlohmann::json wrapped = {
         {"content",           std::move(content)},
         {"isError",           false},
-        {"structuredContent", *outcome},
+        {"structuredContent", body},
     };
     return Response::success(std::move(id), std::move(wrapped));
 }
