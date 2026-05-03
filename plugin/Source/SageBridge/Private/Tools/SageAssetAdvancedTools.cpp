@@ -2118,6 +2118,149 @@ FSageToolDispatch::FOutcome ReindexFtsImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- asset.add_array_element (Lyra Sage Gap #11 — append to TArray<T>) ------
+//
+// Increment-append a single element to a UPROPERTY TArray on an asset's
+// CDO. Pairs with the now-recursive FStructProperty writer so struct array
+// authoring (FLyraInputAction[], FLyraAbilitySet_GameplayAbility[], etc.)
+// works without nuking + rebuilding the entire array. CommonAIExport
+// add_cdo_array_element parity.
+//
+// Args:
+//   asset_path        (string)  — asset path
+//   array_property    (string)  — top-level UPROPERTY name on the asset
+//   element_value     (any)     — JSON value matching the inner property
+//                                 type. Strings for object/path refs,
+//                                 objects for structs, scalars for prims.
+//   class_name        (string?) — only for instanced UObject inners; if
+//                                 set, NewObject<class>() before applying
+//                                 element_value as instanced subobject
+//                                 properties.
+// Returns: {asset_path, array_property, index, length}.
+
+FSageToolDispatch::FOutcome AddArrayElementImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    if (!Args.IsValid())
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing args"));
+    FString AssetPath, ArrayProp;
+    if (!Args->TryGetStringField(TEXT("asset_path"), AssetPath) || AssetPath.IsEmpty())
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'asset_path'"));
+    if (!Args->TryGetStringField(TEXT("array_property"), ArrayProp) || ArrayProp.IsEmpty())
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'array_property'"));
+    const TSharedPtr<FJsonValue> ElemField =
+        Args->Values.FindRef(TEXT("element_value"));
+    if (!ElemField.IsValid())
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'element_value'"));
+    FString ClassName;
+    Args->TryGetStringField(TEXT("class_name"), ClassName);
+
+    UObject* Asset = nullptr;
+    {
+        FSoftObjectPath Soft(AssetPath);
+        Asset = Soft.ResolveObject();
+        if (!Asset) Asset = Soft.TryLoad();
+    }
+    if (!Asset)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("asset not found: %s"), *AssetPath));
+
+    FArrayProperty* Array = CastField<FArrayProperty>(
+        Asset->GetClass()->FindPropertyByName(*ArrayProp));
+    if (!Array)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("'%s' is not a TArray on %s"),
+                            *ArrayProp, *Asset->GetClass()->GetName()));
+
+    FScopedTransaction Tx(LOCTEXT("AddArrayElement", "Sage: Add Array Element"));
+    Asset->Modify();
+    Asset->PreEditChange(Array);
+
+    FScriptArrayHelper Helper(Array, Array->ContainerPtrToValuePtr<void>(Asset));
+    const int32 NewIndex = Helper.AddValue();
+    void* ElemPtr = Helper.GetRawPtr(NewIndex);
+
+    bool bOk = false;
+    if (!ClassName.IsEmpty())
+    {
+        // Instanced UObject branch: synthesize a subobject of class_name and
+        // apply element_value as its property dict.
+        FObjectProperty* InnerObj = CastField<FObjectProperty>(Array->Inner);
+        if (!InnerObj)
+        {
+            Helper.Resize(NewIndex);
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("'class_name' supplied but inner property isn't FObjectProperty"));
+        }
+        UClass* Cls = FindObject<UClass>(nullptr, *ClassName);
+        if (!Cls) Cls = LoadObject<UClass>(nullptr, *ClassName);
+        if (!Cls)
+        {
+            Helper.Resize(NewIndex);
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("class not found: %s"), *ClassName));
+        }
+        if (InnerObj->PropertyClass && !Cls->IsChildOf(InnerObj->PropertyClass))
+        {
+            Helper.Resize(NewIndex);
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("class %s isn't a subclass of %s"),
+                                *Cls->GetName(),
+                                *InnerObj->PropertyClass->GetName()));
+        }
+        UObject* Inst = NewObject<UObject>(Asset, Cls,
+            NAME_None, RF_Public | RF_Transactional);
+        InnerObj->SetObjectPropertyValue(ElemPtr, Inst);
+        // Apply element_value (object dict) as Inst's properties.
+        if (ElemField->Type == EJson::Object)
+        {
+            const auto& EO = ElemField->AsObject();
+            for (TFieldIterator<FProperty> It(Inst->GetClass()); It && EO.IsValid(); ++It)
+            {
+                FProperty* SubP = *It;
+                if (!SubP) continue;
+                const TSharedPtr<FJsonValue>* Field = EO->Values.Find(SubP->GetName());
+                if (!Field || !Field->IsValid()) continue;
+                detail::SetUPropertyFromJson(Inst, SubP, *Field);
+            }
+        }
+        bOk = true;
+    }
+    else
+    {
+        bOk = detail::SetPropertyValueAtPtr(Array->Inner, ElemPtr, ElemField);
+    }
+
+    if (!bOk)
+    {
+        Helper.Resize(NewIndex);
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("failed to set element on inner type %s"),
+                            Array->Inner ? *Array->Inner->GetClass()->GetName()
+                                         : TEXT("<null>")));
+    }
+
+    FPropertyChangedEvent ChangeEvent(Array, EPropertyChangeType::ArrayAdd);
+    Asset->PostEditChangeProperty(ChangeEvent);
+    Asset->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("asset_path"),     Asset->GetPathName());
+    R->SetStringField(TEXT("array_property"), ArrayProp);
+    R->SetNumberField(TEXT("index"),          NewIndex);
+    R->SetNumberField(TEXT("length"),         Helper.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 }  // namespace (anonymous)
 
 void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
@@ -2143,6 +2286,10 @@ void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("asset.list"),               GT(&ListAssetsImpl));
     Dispatch.RegisterHandler(TEXT("asset.search"),             GT(&SearchAssetsImpl));
     Dispatch.RegisterHandler(TEXT("asset.read_properties"),    GT(&ReadAssetPropertiesImpl));
+    // Lyra Sage Gap #11: TArray append helper, pairs with the FStructProperty
+    // recursive JSON-object writer so DataAsset CDO struct arrays can be
+    // authored without nuking the array.
+    Dispatch.RegisterHandler(TEXT("asset.add_array_element"),  GT(&AddArrayElementImpl));
 
     // Phase 4.5-r2 batch 2: socket management
     Dispatch.RegisterHandler(TEXT("asset.list_sockets"),       GT(&ListSocketsImpl));

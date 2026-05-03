@@ -435,6 +435,38 @@ bool SetPropertyValueAtPtr(FProperty* Property, void* ValuePtr,
     if (FStructProperty* P = CastField<FStructProperty>(Property))
     {
         if (JsonToStructShorthand(P->Struct, ValuePtr, Value)) return true;
+        // Custom USTRUCTs (Lyra: FLyraInputAction, FLyraAbilitySet_*, etc.)
+        // arrive as JSON objects {field: value, ...}. Walk the struct's
+        // properties and recursively dispatch each field through the same
+        // SetPropertyValueAtPtr — gives us full struct write support
+        // (covers FStruct → FArray → FStruct → FObjectProperty chains).
+        // Lyra Sage Gap #11 fix.
+        if (Value->Type == EJson::Object)
+        {
+            const auto& Obj = Value->AsObject();
+            if (!Obj.IsValid()) return false;
+            bool bAny = false;
+            for (TFieldIterator<FProperty> It(P->Struct); It; ++It)
+            {
+                FProperty* Inner = *It;
+                if (!Inner) continue;
+                const TSharedPtr<FJsonValue>* Field = Obj->Values.Find(Inner->GetName());
+                if (!Field || !Field->IsValid()) continue;
+                if (!SetPropertyValueAtPtr(Inner,
+                        Inner->ContainerPtrToValuePtr<void>(ValuePtr), *Field))
+                {
+                    UE_LOG(LogSageBridge, Verbose,
+                           TEXT("[SageProp] struct %s field '%s' set failed"),
+                           *P->Struct->GetName(), *Inner->GetName());
+                    return false;
+                }
+                bAny = true;
+            }
+            // Empty objects ({}) are valid — they leave the struct at its
+            // default-constructed state, which is the natural identity for
+            // "set to empty struct". Treat as success.
+            return true;
+        }
         // Fallback: serialize JSON to a string and use ImportText. Lossy
         // for nested asset refs but works for arbitrary plain USTRUCTs.
         if (Value->Type == EJson::String)

@@ -66,6 +66,10 @@ public class SageBridge : ModuleRules
             "Blutility",
             // GameplayTags — GConfig-based tag list / create operations
             "GameplayTags",
+            // Enhanced Input — UInputMappingContext::MapKey + Trigger/Modifier
+            // UClass set (Lyra Sage Gap #10). EnabledByDefault on every UE 5.7
+            // project, so the hard dep is safe.
+            "EnhancedInput",
         });
         // Note: Niagara, PCG, Landscape, Foliage, GAS, MetaSound are loaded via
         // FindObject<UClass> at runtime — no hard Build.cs dep needed.

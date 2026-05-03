@@ -360,28 +360,74 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="gameplay.add_imc_mapping",
-        .description="Add a key mapping to an InputMappingContext.",
-        .inputSchema=obj({{"path",str()},{"action",str()},{"key",str()}},{"path","action","key"}),
+        .description="Append a (key→action) binding to an InputMappingContext "
+                     "asset via UInputMappingContext::MapKey. `key` is an "
+                     "FKey name like 'SpaceBar', 'LeftMouseButton', "
+                     "'Gamepad_FaceButton_Bottom', 'C', 'One'. Optional "
+                     "`triggers` and `modifiers` are string arrays — short "
+                     "names (e.g. 'Pressed', 'Hold', 'Tap', 'Pulse', "
+                     "'HoldAndRelease', 'ChordAction', 'ChordBlocker', "
+                     "'Combo' for triggers; 'Negate', 'DeadZone', 'Scalar', "
+                     "'ScaleByDeltaTime', 'FOVScaling', 'ResponseCurve', "
+                     "'Smooth', 'SwizzleAxis', 'ToWorldSpace' for modifiers) "
+                     "or fully-qualified class paths "
+                     "('/Script/EnhancedInput.InputTriggerPressed'). Unknown "
+                     "names are dropped silently and reported in "
+                     "`skipped_triggers`/`skipped_modifiers`. Returns "
+                     "{asset_path, action, key, trigger_count, "
+                     "modifier_count, mapping_count, skipped_*?}. -32602 if "
+                     "asset/action/key is invalid. (Lyra Sage Gap #10 fix.)",
+        .inputSchema=obj({
+            {"path",str()},{"action",str()},{"key",str()},
+            {"triggers",arr()},{"modifiers",arr()},
+        },{"path","action","key"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="gameplay.set_mapping_modifiers",
-        .description="Set modifier and trigger chains on an IMC key mapping.",
-        .inputSchema=obj({{"path",str()},{"action",str()},{"key",str()},{"modifiers",arr()},{"triggers",arr()}},{"path","action","key"}),
+        .description="Replace (NOT append) the trigger and modifier chains "
+                     "on an existing IMC mapping identified by (action, key). "
+                     "Same `triggers`/`modifiers` short-name vocabulary as "
+                     "gameplay.add_imc_mapping. Returns {asset_path, action, "
+                     "key, index, trigger_count, modifier_count, "
+                     "skipped_*?}. -32602 if no mapping matches. (Lyra "
+                     "Sage Gap #10 fix.)",
+        .inputSchema=obj({
+            {"path",str()},{"action",str()},{"key",str()},
+            {"triggers",arr()},{"modifiers",arr()},
+        },{"path","action","key"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="gameplay.remove_imc_mapping",
-        .description="Remove a key mapping from an InputMappingContext by action+key.",
-        .inputSchema=obj({{"path",str()},{"action",str()},{"key",str()}},{"path","action","key"}),
+        .description="Remove a key mapping from an InputMappingContext by "
+                     "(action, key) via UInputMappingContext::UnmapKey. "
+                     "Returns {asset_path, action, key, removed_index, "
+                     "mapping_count}. -32602 if no mapping matches. (Lyra "
+                     "Sage Gap #10 fix.)",
+        .inputSchema=obj({{"path",str()},{"action",str()},{"key",str()}},
+                          {"path","action","key"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="gameplay.set_imc_mapping_key",
-        .description="Rebind an existing IMC mapping to a new key.",
-        .inputSchema=obj({{"path",str()},{"action",str()},{"old_key",str()},{"new_key",str()}},{"path","action","old_key","new_key"}),
+        .description="Rebind an existing IMC mapping (matched by action + "
+                     "old_key) to new_key. Triggers/modifiers preserved. "
+                     "Returns {asset_path, action, old_key, new_key, index}. "
+                     "-32602 if no mapping matches old_key. (Lyra Sage Gap "
+                     "#10 fix.)",
+        .inputSchema=obj({
+            {"path",str()},{"action",str()},
+            {"old_key",str()},{"new_key",str()},
+        },{"path","action","old_key","new_key"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="gameplay.set_imc_mapping_action",
-        .description="Retarget an IMC mapping to a different InputAction asset.",
-        .inputSchema=obj({{"path",str()},{"old_action",str()},{"new_action",str()},{"key",str()}},{"path","old_action","new_action","key"}),
+        .description="Retarget an existing IMC mapping (matched by old_action "
+                     "+ key) to new_action. Triggers/modifiers preserved. "
+                     "Returns {asset_path, old_action, new_action, key, "
+                     "index}. -32602 if no mapping matches. (Lyra Sage Gap "
+                     "#10 fix.)",
+        .inputSchema=obj({
+            {"path",str()},{"old_action",str()},{"new_action",str()},{"key",str()},
+        },{"path","old_action","new_action","key"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="gameplay.list_behavior_trees",
@@ -1383,6 +1429,63 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
             {"property_name",str()},
             {"track_type",str()},
         },{"path","anim_name","binding_guid","property_name"}),
+        .handler=nullptr,.remote=true});
+
+    // ========================================================================
+    // bp.override_inherited_component_class — Lyra Sage Gap #12
+    // ========================================================================
+
+    reg(registry, Tool{.name="bp.override_inherited_component_class",
+        .description="Override the *class* of a SCS component inherited from "
+                     "a parent Blueprint. Storage: UBlueprint::"
+                     "ComponentClassOverrides (TArray<FBPComponentClassOverride>"
+                     "{ComponentName,ComponentClass}). On compile the BP "
+                     "regenerates the component template using the override "
+                     "class. TopDownArena B_Hero_Arena → CharMoveComp class "
+                     "swap is the canonical UE pattern. `component` is the "
+                     "FName matching the parent's SCS node; `new_class` must "
+                     "be a TopLevelAssetPath to a UClass derived from the "
+                     "parent's SCS component class. `recompile` (default "
+                     "true) drives FKismetEditorUtilities::CompileBlueprint "
+                     "after the edit. Idempotent: re-running with the same "
+                     "args updates the existing entry instead of duplicating. "
+                     "Returns {blueprint, component, old_class, new_class, "
+                     "recompiled, created}. -32602 if the BP/parent SCS node/"
+                     "class doesn't resolve or the new class isn't a subclass "
+                     "of the parent's. (Lyra Sage Gap #12 fix.)",
+        .inputSchema=obj({
+            {"path",str()},
+            {"component",str()},
+            {"new_class",str()},
+            {"recompile",bln()},
+        },{"path","component","new_class"}),
+        .handler=nullptr,.remote=true});
+
+    // ========================================================================
+    // asset.add_array_element — Lyra Sage Gap #11
+    // ========================================================================
+
+    reg(registry, Tool{.name="asset.add_array_element",
+        .description="Append a single element to a UPROPERTY TArray on an "
+                     "asset's CDO. Pairs with Sage's recursive FStructProperty "
+                     "writer so DataAsset struct arrays (FLyraInputAction[], "
+                     "FLyraAbilitySet_GameplayAbility[], etc.) can be authored "
+                     "incrementally. `element_value` shape matches the inner "
+                     "property — string for object/path refs, JSON object "
+                     "{field:value,...} for structs, scalars for primitives. "
+                     "Optional `class_name` switches to the instanced "
+                     "UObject branch: NewObject<class>() then applies "
+                     "element_value as the subobject's property dict (covers "
+                     "TArray<UGameFeatureAction*> and similar instanced "
+                     "patterns). Returns {asset_path, array_property, index, "
+                     "length}. -32602 if asset/property is missing or the "
+                     "inner type rejects the value.",
+        .inputSchema=obj({
+            {"asset_path",str()},
+            {"array_property",str()},
+            {"element_value",{}},
+            {"class_name",str()},
+        },{"asset_path","array_property","element_value"}),
         .handler=nullptr,.remote=true});
 
     // ========================================================================

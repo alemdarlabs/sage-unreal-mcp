@@ -25,6 +25,13 @@
 #include "Kismet/GameplayStatics.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "ScopedTransaction.h"
+
+// Enhanced Input — Lyra Sage Gap #10 IMC mapping CRUD.
+#include "EnhancedActionKeyMapping.h"
+#include "InputAction.h"
+#include "InputMappingContext.h"
+#include "InputTriggers.h"
+#include "InputModifiers.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectIterator.h"
 
@@ -469,31 +476,409 @@ FSageToolDispatch::FOutcome ListInputMappingsImpl(const TSharedPtr<FJsonObject>&
     return ReadImcImpl(Args);
 }
 
+// Lyra Sage Gap #10 fix — IMC mapping CRUD (replaces previous stub batch).
+// Uses the typed UInputMappingContext API directly (EnhancedInput is a hard
+// Build.cs dep; ships EnabledByDefault on every UE 5.7 project).
+
+UInputMappingContext* ResolveImc(const FString& Path, FString& OutErr)
+{
+    FSoftObjectPath Soft(Path);
+    UObject* Obj = Soft.ResolveObject();
+    if (!Obj) Obj = Soft.TryLoad();
+    if (!Obj)
+    {
+        OutErr = FString::Printf(TEXT("IMC asset not found: %s"), *Path);
+        return nullptr;
+    }
+    UInputMappingContext* IMC = Cast<UInputMappingContext>(Obj);
+    if (!IMC)
+    {
+        OutErr = FString::Printf(TEXT("'%s' is %s, not UInputMappingContext"),
+                                  *Path, *Obj->GetClass()->GetName());
+        return nullptr;
+    }
+    return IMC;
+}
+
+UInputAction* ResolveInputAction(const FString& Path, FString& OutErr)
+{
+    FSoftObjectPath Soft(Path);
+    UObject* Obj = Soft.ResolveObject();
+    if (!Obj) Obj = Soft.TryLoad();
+    if (!Obj)
+    {
+        OutErr = FString::Printf(TEXT("InputAction not found: %s"), *Path);
+        return nullptr;
+    }
+    UInputAction* IA = Cast<UInputAction>(Obj);
+    if (!IA)
+    {
+        OutErr = FString::Printf(TEXT("'%s' is %s, not UInputAction"),
+                                  *Path, *Obj->GetClass()->GetName());
+        return nullptr;
+    }
+    return IA;
+}
+
+// Resolve a short-name (e.g. "Pressed") OR a full class path
+// ("/Script/EnhancedInput.InputTriggerPressed") into a UClass derived from
+// `Base`. Short-names use the convention "<Base>{Name}" — UInputTriggerPressed,
+// UInputModifierNegate, etc.
+UClass* ResolveInputClass(const FString& Name, UClass* Base, const TCHAR* Prefix)
+{
+    if (Name.IsEmpty()) return nullptr;
+    // Full path?
+    if (Name.Contains(TEXT("/")) || Name.Contains(TEXT(".")))
+    {
+        UClass* Cls = FindObject<UClass>(nullptr, *Name);
+        if (!Cls) Cls = LoadObject<UClass>(nullptr, *Name);
+        if (Cls && Base && Cls->IsChildOf(Base)) return Cls;
+        return nullptr;
+    }
+    // Short-name → /Script/EnhancedInput.<Prefix><Name>
+    const FString FullPath = FString::Printf(
+        TEXT("/Script/EnhancedInput.%s%s"), Prefix, *Name);
+    UClass* Cls = FindObject<UClass>(nullptr, *FullPath);
+    if (!Cls) Cls = LoadObject<UClass>(nullptr, *FullPath);
+    if (Cls && Base && Cls->IsChildOf(Base)) return Cls;
+    return nullptr;
+}
+
+// Pull "Pressed", "Hold", etc. from a JSON string array argument and resolve
+// each into a UClass. Unknown names are silently dropped (caller can verify
+// via length comparison).
+TArray<UClass*> ResolveInputClassArray(const TSharedPtr<FJsonObject>& Args,
+                                        const TCHAR* Field,
+                                        UClass* Base, const TCHAR* Prefix,
+                                        TArray<FString>& OutSkipped)
+{
+    TArray<UClass*> Out;
+    const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+    if (!Args.IsValid() || !Args->TryGetArrayField(Field, Arr) || !Arr) return Out;
+    for (const TSharedPtr<FJsonValue>& V : *Arr)
+    {
+        if (!V.IsValid() || V->Type != EJson::String) continue;
+        const FString Name = V->AsString();
+        UClass* Cls = ResolveInputClass(Name, Base, Prefix);
+        if (Cls) Out.Add(Cls);
+        else     OutSkipped.Add(Name);
+    }
+    return Out;
+}
+
 FSageToolDispatch::FOutcome AddImcMappingImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FSageToolDispatch::FOutcome Reject;
     if (detail::RejectIfPie(Reject)) return Reject;
 
-    FString Path;
-    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    FString Path, ActionPath, KeyName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("action"), ActionPath)
+        || !Args->TryGetStringField(TEXT("key"), KeyName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'action' or 'key'"));
+    }
+
+    FString Err;
+    UInputMappingContext* IMC = ResolveImc(Path, Err);
+    if (!IMC) return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+    UInputAction* IA = ResolveInputAction(ActionPath, Err);
+    if (!IA)  return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+
+    const FKey K(*KeyName);
+    if (!K.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid FKey name: %s (try 'SpaceBar', "
+                                 "'Gamepad_FaceButton_Bottom', 'LeftMouseButton')"),
+                            *KeyName));
+    }
+
+    TArray<FString> SkippedTriggers, SkippedModifiers;
+    TArray<UClass*> TriggerClasses = ResolveInputClassArray(Args, TEXT("triggers"),
+        UInputTrigger::StaticClass(),  TEXT("InputTrigger"),  SkippedTriggers);
+    TArray<UClass*> ModifierClasses = ResolveInputClassArray(Args, TEXT("modifiers"),
+        UInputModifier::StaticClass(), TEXT("InputModifier"), SkippedModifiers);
+
+    FScopedTransaction Tx(LOCTEXT("AddImcMapping", "Sage: Add IMC Mapping"));
+    IMC->Modify();
+
+    FEnhancedActionKeyMapping& NewMapping = IMC->MapKey(IA, K);
+    for (UClass* TC : TriggerClasses)
+    {
+        UInputTrigger* T = NewObject<UInputTrigger>(IMC, TC, NAME_None,
+            RF_Public | RF_Transactional);
+        NewMapping.Triggers.Add(T);
+    }
+    for (UClass* MC : ModifierClasses)
+    {
+        UInputModifier* M = NewObject<UInputModifier>(IMC, MC, NAME_None,
+            RF_Public | RF_Transactional);
+        NewMapping.Modifiers.Add(M);
+    }
+    IMC->MarkPackageDirty();
 
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("path"), Path);
-    R->SetStringField(TEXT("note"),
-        TEXT("IMC mapping mutation requires direct FEnhancedActionKeyMapping access; "
-             "use Blueprint IMC editor API for full mapping CRUD"));
+    R->SetStringField(TEXT("asset_path"), IMC->GetPathName());
+    R->SetStringField(TEXT("action"),     IA->GetPathName());
+    R->SetStringField(TEXT("key"),        KeyName);
+    R->SetNumberField(TEXT("trigger_count"),  TriggerClasses.Num());
+    R->SetNumberField(TEXT("modifier_count"), ModifierClasses.Num());
+    R->SetNumberField(TEXT("mapping_count"),  IMC->GetMappings().Num());
+    if (SkippedTriggers.Num() > 0 || SkippedModifiers.Num() > 0)
+    {
+        TArray<TSharedPtr<FJsonValue>> S1, S2;
+        for (const FString& s : SkippedTriggers)  S1.Add(MakeShared<FJsonValueString>(s));
+        for (const FString& s : SkippedModifiers) S2.Add(MakeShared<FJsonValueString>(s));
+        if (S1.Num() > 0) R->SetArrayField(TEXT("skipped_triggers"),  S1);
+        if (S2.Num() > 0) R->SetArrayField(TEXT("skipped_modifiers"), S2);
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// Helper: walk Mappings, return the index of the entry matching {Action,Key}
+// or -1 if none. Both filters optional — null Action / invalid Key skips
+// that constraint.
+int32 FindMappingIndex(const UInputMappingContext* IMC,
+                       const UInputAction* WantAction, FKey WantKey)
+{
+    const TArray<FEnhancedActionKeyMapping>& Mappings = IMC->GetMappings();
+    for (int32 i = 0; i < Mappings.Num(); ++i)
+    {
+        const FEnhancedActionKeyMapping& M = Mappings[i];
+        if (WantAction && M.Action != WantAction) continue;
+        if (WantKey.IsValid() && M.Key != WantKey) continue;
+        return i;
+    }
+    return -1;
+}
+
+FSageToolDispatch::FOutcome RemoveImcMappingImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, ActionPath, KeyName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("action"), ActionPath)
+        || !Args->TryGetStringField(TEXT("key"), KeyName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'action' or 'key'"));
+    }
+
+    FString Err;
+    UInputMappingContext* IMC = ResolveImc(Path, Err);
+    if (!IMC) return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+    UInputAction* IA = ResolveInputAction(ActionPath, Err);
+    if (!IA)  return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+    const FKey K(*KeyName);
+
+    const int32 Idx = FindMappingIndex(IMC, IA, K);
+    if (Idx < 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("no mapping for action=%s key=%s on %s"),
+                            *IA->GetName(), *KeyName, *IMC->GetName()));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("RemoveImcMapping", "Sage: Remove IMC Mapping"));
+    IMC->Modify();
+    IMC->UnmapKey(IA, K);
+    IMC->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("asset_path"),    IMC->GetPathName());
+    R->SetStringField(TEXT("action"),        IA->GetPathName());
+    R->SetStringField(TEXT("key"),           KeyName);
+    R->SetNumberField(TEXT("removed_index"), Idx);
+    R->SetNumberField(TEXT("mapping_count"), IMC->GetMappings().Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// Mappings is read-only via GetMappings() — for in-place mutation we need
+// the property pointer.
+TArray<FEnhancedActionKeyMapping>* MutableMappings(UInputMappingContext* IMC)
+{
+    FProperty* Prop = IMC->GetClass()->FindPropertyByName(TEXT("Mappings"));
+    FArrayProperty* Arr = CastField<FArrayProperty>(Prop);
+    if (!Arr) return nullptr;
+    return reinterpret_cast<TArray<FEnhancedActionKeyMapping>*>(
+        Arr->ContainerPtrToValuePtr<void>(IMC));
+}
+
+FSageToolDispatch::FOutcome SetImcMappingKeyImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, ActionPath, OldKeyName, NewKeyName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("action"), ActionPath)
+        || !Args->TryGetStringField(TEXT("old_key"), OldKeyName)
+        || !Args->TryGetStringField(TEXT("new_key"), NewKeyName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'action', 'old_key' or 'new_key'"));
+    }
+
+    FString Err;
+    UInputMappingContext* IMC = ResolveImc(Path, Err);
+    if (!IMC) return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+    UInputAction* IA = ResolveInputAction(ActionPath, Err);
+    if (!IA)  return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+
+    const FKey OldK(*OldKeyName), NewK(*NewKeyName);
+    if (!NewK.IsValid())
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid new FKey: %s"), *NewKeyName));
+
+    const int32 Idx = FindMappingIndex(IMC, IA, OldK);
+    if (Idx < 0)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("no mapping for action=%s old_key=%s"),
+                            *IA->GetName(), *OldKeyName));
+
+    auto* Mappings = MutableMappings(IMC);
+    if (!Mappings) return FSageToolDispatch::FOutcome::MakeError(-32603,
+        TEXT("Mappings property reflection failed"));
+
+    FScopedTransaction Tx(LOCTEXT("SetImcMappingKey", "Sage: Set IMC Mapping Key"));
+    IMC->Modify();
+    (*Mappings)[Idx].Key = NewK;
+    IMC->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("asset_path"), IMC->GetPathName());
+    R->SetStringField(TEXT("action"),     IA->GetPathName());
+    R->SetStringField(TEXT("old_key"),    OldKeyName);
+    R->SetStringField(TEXT("new_key"),    NewKeyName);
+    R->SetNumberField(TEXT("index"),      Idx);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetImcMappingActionImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, OldActionPath, NewActionPath, KeyName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("old_action"), OldActionPath)
+        || !Args->TryGetStringField(TEXT("new_action"), NewActionPath)
+        || !Args->TryGetStringField(TEXT("key"), KeyName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'old_action', 'new_action' or 'key'"));
+    }
+
+    FString Err;
+    UInputMappingContext* IMC = ResolveImc(Path, Err);
+    if (!IMC)         return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+    UInputAction* OldIA = ResolveInputAction(OldActionPath, Err);
+    if (!OldIA)       return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+    UInputAction* NewIA = ResolveInputAction(NewActionPath, Err);
+    if (!NewIA)       return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+
+    const FKey K(*KeyName);
+    const int32 Idx = FindMappingIndex(IMC, OldIA, K);
+    if (Idx < 0)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("no mapping for old_action=%s key=%s"),
+                            *OldIA->GetName(), *KeyName));
+
+    auto* Mappings = MutableMappings(IMC);
+    if (!Mappings) return FSageToolDispatch::FOutcome::MakeError(-32603,
+        TEXT("Mappings property reflection failed"));
+
+    FScopedTransaction Tx(LOCTEXT("SetImcMappingAction", "Sage: Set IMC Mapping Action"));
+    IMC->Modify();
+    (*Mappings)[Idx].Action = NewIA;
+    IMC->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("asset_path"), IMC->GetPathName());
+    R->SetStringField(TEXT("old_action"), OldIA->GetPathName());
+    R->SetStringField(TEXT("new_action"), NewIA->GetPathName());
+    R->SetStringField(TEXT("key"),        KeyName);
+    R->SetNumberField(TEXT("index"),      Idx);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 FSageToolDispatch::FOutcome SetMappingModifiersImpl(const TSharedPtr<FJsonObject>& Args)
-{ return AddImcMappingImpl(Args); }
-FSageToolDispatch::FOutcome RemoveImcMappingImpl(const TSharedPtr<FJsonObject>& Args)
-{ return AddImcMappingImpl(Args); }
-FSageToolDispatch::FOutcome SetImcMappingKeyImpl(const TSharedPtr<FJsonObject>& Args)
-{ return AddImcMappingImpl(Args); }
-FSageToolDispatch::FOutcome SetImcMappingActionImpl(const TSharedPtr<FJsonObject>& Args)
-{ return AddImcMappingImpl(Args); }
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, ActionPath, KeyName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("action"), ActionPath)
+        || !Args->TryGetStringField(TEXT("key"), KeyName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'action' or 'key'"));
+    }
+
+    FString Err;
+    UInputMappingContext* IMC = ResolveImc(Path, Err);
+    if (!IMC) return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+    UInputAction* IA = ResolveInputAction(ActionPath, Err);
+    if (!IA)  return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+    const FKey K(*KeyName);
+
+    const int32 Idx = FindMappingIndex(IMC, IA, K);
+    if (Idx < 0)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("no mapping for action=%s key=%s"),
+                            *IA->GetName(), *KeyName));
+
+    auto* Mappings = MutableMappings(IMC);
+    if (!Mappings) return FSageToolDispatch::FOutcome::MakeError(-32603,
+        TEXT("Mappings property reflection failed"));
+
+    TArray<FString> SkippedTriggers, SkippedModifiers;
+    TArray<UClass*> TriggerClasses = ResolveInputClassArray(Args, TEXT("triggers"),
+        UInputTrigger::StaticClass(),  TEXT("InputTrigger"),  SkippedTriggers);
+    TArray<UClass*> ModifierClasses = ResolveInputClassArray(Args, TEXT("modifiers"),
+        UInputModifier::StaticClass(), TEXT("InputModifier"), SkippedModifiers);
+
+    FScopedTransaction Tx(LOCTEXT("SetMappingModifiers", "Sage: Set IMC Mapping Modifiers"));
+    IMC->Modify();
+    FEnhancedActionKeyMapping& M = (*Mappings)[Idx];
+    // Replace, not append — semantics match `set_*`.
+    M.Triggers.Empty();
+    M.Modifiers.Empty();
+    for (UClass* TC : TriggerClasses)
+        M.Triggers.Add(NewObject<UInputTrigger>(IMC, TC, NAME_None,
+            RF_Public | RF_Transactional));
+    for (UClass* MC : ModifierClasses)
+        M.Modifiers.Add(NewObject<UInputModifier>(IMC, MC, NAME_None,
+            RF_Public | RF_Transactional));
+    IMC->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("asset_path"), IMC->GetPathName());
+    R->SetStringField(TEXT("action"),     IA->GetPathName());
+    R->SetStringField(TEXT("key"),        KeyName);
+    R->SetNumberField(TEXT("index"),      Idx);
+    R->SetNumberField(TEXT("trigger_count"),  TriggerClasses.Num());
+    R->SetNumberField(TEXT("modifier_count"), ModifierClasses.Num());
+    if (SkippedTriggers.Num() > 0 || SkippedModifiers.Num() > 0)
+    {
+        TArray<TSharedPtr<FJsonValue>> S1, S2;
+        for (const FString& s : SkippedTriggers)  S1.Add(MakeShared<FJsonValueString>(s));
+        for (const FString& s : SkippedModifiers) S2.Add(MakeShared<FJsonValueString>(s));
+        if (S1.Num() > 0) R->SetArrayField(TEXT("skipped_triggers"),  S1);
+        if (S2.Num() > 0) R->SetArrayField(TEXT("skipped_modifiers"), S2);
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
 
 // ---- gameplay.list_behavior_trees ------------------------------------------
 

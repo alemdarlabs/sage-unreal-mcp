@@ -4451,6 +4451,138 @@ FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(Dump);
 }
 
+// ---- bp.override_inherited_component_class (Lyra Sage Gap #12) -------------
+//
+// Override the *class* of a SCS component inherited from a parent Blueprint.
+// Engine storage: UBlueprint::ComponentClassOverrides — TArray of
+// FBPComponentClassOverride{ComponentName: FName, ComponentClass: UClass*}.
+// On compile, the BlueprintGeneratedClass walks parent SCS templates and
+// re-creates components whose name matches an entry in ComponentClassOverrides
+// using the override class. TopDownArena B_Hero_Arena.CharMoveComp →
+// UTopDownArenaMovementComponent uses exactly this mechanism.
+//
+// Args: path (BP), component (FName matching parent SCS node), new_class
+//       (path to a UClass derived from the parent's component class).
+// Returns: {blueprint, component, old_class, new_class, recompiled}.
+
+UClass* FindParentSCSComponentClass(UBlueprint* BP, const FName& Name,
+                                    USCS_Node** OutNode = nullptr)
+{
+    if (OutNode) *OutNode = nullptr;
+    UClass* SuperCls = BP->GetClass()->GetSuperClass();
+    // We need the parent's SimpleConstructionScript chain. Walk parent
+    // BlueprintGeneratedClasses upward.
+    UClass* C = BP->ParentClass;
+    while (C)
+    {
+        if (UBlueprintGeneratedClass* BGC = Cast<UBlueprintGeneratedClass>(C))
+        {
+            if (USimpleConstructionScript* SCS = BGC->SimpleConstructionScript)
+            {
+                for (USCS_Node* N : SCS->GetAllNodes())
+                {
+                    if (!N) continue;
+                    if (N->GetVariableName() == Name)
+                    {
+                        if (OutNode) *OutNode = N;
+                        return N->ComponentClass;
+                    }
+                }
+            }
+        }
+        // Native parents have UCS components via ObjectInitializer; we don't
+        // surface those here (override only applies to BP-side SCS).
+        C = C->GetSuperClass();
+    }
+    (void)SuperCls;
+    return nullptr;
+}
+
+FSageToolDispatch::FOutcome BpOverrideInheritedComponentClassImpl(
+    const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, CompName, NewClassPath;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("component"), CompName)
+        || !Args->TryGetStringField(TEXT("new_class"), NewClassPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'component' or 'new_class'"));
+    }
+    bool bRecompile = true;
+    Args->TryGetBoolField(TEXT("recompile"), bRecompile);
+
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("Blueprint not found: %s"), *Path));
+
+    UClass* NewClass = FindObject<UClass>(nullptr, *NewClassPath);
+    if (!NewClass) NewClass = LoadObject<UClass>(nullptr, *NewClassPath);
+    if (!NewClass)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("class not found: %s"), *NewClassPath));
+
+    // Verify the parent's SCS contains a component with this name and that
+    // NewClass is a subclass of the parent's declared component class.
+    USCS_Node* ParentNode = nullptr;
+    UClass* ParentCompClass = FindParentSCSComponentClass(
+        BP, FName(*CompName), &ParentNode);
+    if (!ParentNode)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("no SCS component '%s' on any parent BP of %s"),
+                            *CompName, *BP->GetName()));
+    if (ParentCompClass && !NewClass->IsChildOf(ParentCompClass))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("%s isn't a subclass of %s (parent SCS class)"),
+                            *NewClass->GetName(), *ParentCompClass->GetName()));
+
+    FScopedTransaction Tx(LOCTEXT("BpOverrideInherited",
+        "Sage: Override Inherited Component Class"));
+    BP->Modify();
+
+    FString OldClassName;
+    bool bUpdated = false;
+    for (FBPComponentClassOverride& Entry : BP->ComponentClassOverrides)
+    {
+        if (Entry.ComponentName == FName(*CompName))
+        {
+            OldClassName = Entry.ComponentClass
+                ? Entry.ComponentClass->GetPathName()
+                : ParentCompClass ? ParentCompClass->GetPathName() : FString();
+            Entry.ComponentClass = NewClass;
+            bUpdated = true;
+            break;
+        }
+    }
+    if (!bUpdated)
+    {
+        OldClassName = ParentCompClass ? ParentCompClass->GetPathName() : FString();
+        BP->ComponentClassOverrides.Add(
+            FBPComponentClassOverride(FName(*CompName), NewClass));
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+    bool bRecompiled = false;
+    if (bRecompile)
+    {
+        FKismetEditorUtilities::CompileBlueprint(BP);
+        bRecompiled = true;
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"),  BP->GetPathName());
+    R->SetStringField(TEXT("component"),  CompName);
+    R->SetStringField(TEXT("old_class"),  OldClassName);
+    R->SetStringField(TEXT("new_class"),  NewClass->GetPathName());
+    R->SetBoolField  (TEXT("recompiled"), bRecompiled);
+    R->SetBoolField  (TEXT("created"),    !bUpdated);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 }  // namespace (anonymous)
 
 void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
@@ -4566,6 +4698,10 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
 
     // Read — atomic full snapshot (Gap #6)
     Dispatch.RegisterHandler(TEXT("bp.full_dump"),           GT(&BpFullDumpImpl));
+
+    // Lyra Sage Gap #12 — inherited SCS component class override
+    Dispatch.RegisterHandler(TEXT("bp.override_inherited_component_class"),
+                             GT(&BpOverrideInheritedComponentClassImpl));
 }
 
 #undef LOCTEXT_NAMESPACE
