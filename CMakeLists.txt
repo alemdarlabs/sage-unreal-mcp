@@ -26,6 +26,25 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# ---- MSVC CRT: force /MD even in Debug --------------------------------------
+# kuzu prebuilt (third_party/kuzu/kuzu_shared.dll) is release-CRT linked
+# (MSVCP140.dll, ucrt). Linking Sage as /MDd causes STL container destructors
+# crossing the kuzu DLL boundary to trip _Big_allocation_sentinel (xmemory
+# line 209 debug assertion: "invalid argument"). Forcing /MD project-wide
+# fixes the ABI mismatch and implicitly sets _ITERATOR_DEBUG_LEVEL=0.
+# Verified via `dumpbin /imports` 2026-05-02; matches kuzu issue #5545.
+# CMP0091 (CMake >= 3.15) makes this a single set() instead of patching
+# every target's compile flags.
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:>DLL")
+    # Even in Debug, link the *release* variant of every imported target
+    # (vcpkg's spdlog/ixwebsocket/etc.). Without this, vcpkg's debug
+    # binaries are /MDd while Sage itself is /MD, re-introducing the
+    # LNK2038 _ITERATOR_DEBUG_LEVEL / RuntimeLibrary mismatch one DLL
+    # boundary further down the stack.
+    set(CMAKE_MAP_IMPORTED_CONFIG_DEBUG "Release;RelWithDebInfo;")
+endif()
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo)

@@ -87,10 +87,17 @@ target_link_libraries(sage-bridge
 add_executable(sage-server
     src/main.cpp
     src/tools/restart_orchestrator.cpp
+    src/util/crash_handler.cpp
 )
 target_link_libraries(sage-server
     PRIVATE sage-transport sage-tools sage-bridge sage-graph
             sage-warnings sage-sanitizers)
+if(WIN32)
+    # crash_handler.cpp uses MiniDumpWriteDump (dbghelp). #pragma comment
+    # already pulls dbghelp.lib in MSVC; keep an explicit link for clarity
+    # and so the dependency survives moves to clang-cl / lld-link.
+    target_link_libraries(sage-server PRIVATE dbghelp)
+endif()
 set_target_properties(sage-server PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     BUILD_RPATH   "${KUZU_DIR}"

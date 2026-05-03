@@ -23,6 +23,7 @@
 #include "IAssetTools.h"
 #include "K2Node.h"
 #include "K2Node_CallFunction.h"
+#include "K2Node_Composite.h"
 #include "K2Node_CustomEvent.h"
 #include "K2Node_EditablePinBase.h"
 #include "K2Node_Event.h"
@@ -68,6 +69,65 @@ UBlueprint* ResolveBlueprint(const FString& Path)
     return nullptr;
 }
 
+// ---- graph enumeration with composite descend ----------------------------
+//
+// K2Node_Composite ("Collapsed Graph") sub-graphs aren't exposed in any of
+// UBlueprint's top-level graph lists (FunctionGraphs / UbergraphPages /
+// MacroGraphs / DelegateSignatureGraphs). The composite node itself lives
+// inside its parent graph; its inner graph hangs off the node via
+// `K2Node_Composite::BoundGraph`. To address them with the same name-based
+// API the rest of bp.* tools use, walk every reachable graph and collect
+// composite BoundGraphs recursively.
+
+struct FBpGraphEntry
+{
+    UEdGraph* Graph        = nullptr;
+    FString   Kind;          // "ubergraph" / "function" / "macro" / "delegate" / "composite"
+    FString   ParentName;    // empty for top-level; immediate-parent graph name for composites
+};
+
+void WalkComposites(UEdGraph* Graph, const FString& ParentName, TArray<FBpGraphEntry>& Out)
+{
+    if (!Graph) return;
+    for (UEdGraphNode* N : Graph->Nodes)
+    {
+        UK2Node_Composite* Composite = Cast<UK2Node_Composite>(N);
+        if (!Composite || !Composite->BoundGraph) continue;
+        FBpGraphEntry E;
+        E.Graph      = Composite->BoundGraph;
+        E.Kind       = TEXT("composite");
+        E.ParentName = ParentName;
+        Out.Add(E);
+        // Composites can nest. Recurse.
+        WalkComposites(Composite->BoundGraph, Composite->BoundGraph->GetName(), Out);
+    }
+}
+
+TArray<FBpGraphEntry> CollectAllGraphs(UBlueprint* BP)
+{
+    TArray<FBpGraphEntry> Out;
+    if (!BP) return Out;
+
+    auto AppendRoot = [&](const TArray<TObjectPtr<UEdGraph>>& Graphs, const TCHAR* Kind)
+    {
+        for (UEdGraph* G : Graphs)
+        {
+            if (!G) continue;
+            FBpGraphEntry E;
+            E.Graph = G;
+            E.Kind  = Kind;
+            Out.Add(E);
+            WalkComposites(G, G->GetName(), Out);
+        }
+    };
+
+    AppendRoot(BP->UbergraphPages,          TEXT("ubergraph"));
+    AppendRoot(BP->FunctionGraphs,          TEXT("function"));
+    AppendRoot(BP->DelegateSignatureGraphs, TEXT("delegate"));
+    AppendRoot(BP->MacroGraphs,             TEXT("macro"));
+    return Out;
+}
+
 UEdGraph* FindFunctionGraph(UBlueprint* BP, const FString& FnName)
 {
     if (!BP) return nullptr;
@@ -87,6 +147,19 @@ UEdGraph* FindFunctionGraph(UBlueprint* BP, const FString& FnName)
     for (UEdGraph* G : BP->MacroGraphs)
     {
         if (G && G->GetName() == FnName) return G;
+    }
+    // Composite descend. Without this, K2Node_Composite collapsed sub-graphs
+    // are invisible to every reader tool — the symptom that triggered the
+    // 14-composite HeroFlight conversion stall (2026-05-02). Mutation tools
+    // (add/remove parameter, rename, etc.) still rely on a UFunction owner,
+    // which composite BoundGraphs don't have, so those code paths must keep
+    // their own validation; this fallback only opens the door for read /
+    // export tools (bp.read_function_graph, bp.export_nodes_t3d, bp.full_dump).
+    TArray<FBpGraphEntry> All = CollectAllGraphs(BP);
+    for (const FBpGraphEntry& E : All)
+    {
+        if (E.Kind == TEXT("composite") && E.Graph && E.Graph->GetName() == FnName)
+            return E.Graph;
     }
     return nullptr;
 }
@@ -2942,26 +3015,26 @@ FSageToolDispatch::FOutcome BpListGraphsImpl(const TSharedPtr<FJsonObject>& Args
     UBlueprint* BP = ResolveBlueprint(Path);
     if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
 
-    auto Append = [](TArray<TSharedPtr<FJsonValue>>& Out,
-                     const TArray<TObjectPtr<UEdGraph>>& Graphs,
-                     const TCHAR* Kind)
-    {
-        for (UEdGraph* G : Graphs)
-        {
-            if (!G) continue;
-            auto O = MakeShared<FJsonObject>();
-            O->SetStringField(TEXT("name"),       G->GetName());
-            O->SetStringField(TEXT("kind"),       Kind);
-            O->SetNumberField(TEXT("node_count"), G->Nodes.Num());
-            Out.Add(MakeShared<FJsonValueObject>(O));
-        }
-    };
+    // CollectAllGraphs walks the four top-level graph lists AND descends into
+    // every K2Node_Composite (collapsed sub-graph). Composite entries carry
+    // a "parent" field naming their immediate enclosing graph so callers can
+    // reconstruct the hierarchy and address them by name through the same
+    // bp.read_function_graph / bp.export_nodes_t3d surface as functions.
+    const TArray<FBpGraphEntry> All = CollectAllGraphs(BP);
 
     TArray<TSharedPtr<FJsonValue>> Out;
-    Append(Out, BP->UbergraphPages,          TEXT("ubergraph"));
-    Append(Out, BP->FunctionGraphs,          TEXT("function"));
-    Append(Out, BP->DelegateSignatureGraphs, TEXT("delegate"));
-    Append(Out, BP->MacroGraphs,             TEXT("macro"));
+    Out.Reserve(All.Num());
+    for (const FBpGraphEntry& E : All)
+    {
+        if (!E.Graph) continue;
+        auto O = MakeShared<FJsonObject>();
+        O->SetStringField(TEXT("name"),       E.Graph->GetName());
+        O->SetStringField(TEXT("kind"),       E.Kind);
+        O->SetNumberField(TEXT("node_count"), E.Graph->Nodes.Num());
+        if (!E.ParentName.IsEmpty())
+            O->SetStringField(TEXT("parent"), E.ParentName);
+        Out.Add(MakeShared<FJsonValueObject>(O));
+    }
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("blueprint"), BP->GetName());

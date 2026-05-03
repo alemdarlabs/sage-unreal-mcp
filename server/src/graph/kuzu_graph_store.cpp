@@ -80,9 +80,14 @@ KuzuGraphStore::KuzuGraphStore(const std::filesystem::path& dbPath)
     // a post-crash log file whether kuzu's Database ctor (B-tree init / WAL
     // replay / system catalog load) or its Connection ctor was the one
     // that aborted. Both are native dll calls that can raise SEH.
-    spdlog::info("KuzuGraphStore: creating Database at {}", dbPath_.string());
+    // generic_string() = forward-slash form on Windows. kuzu's Database
+    // ctor accepts both, but normalizing avoids any future Cypher-parser
+    // surprise (cf. commit 0b0e3ae for COPY FROM) and makes log lines
+    // identical across Win/macOS/Linux.
+    const auto pathStr = dbPath_.generic_string();
+    spdlog::info("KuzuGraphStore: creating Database at {}", pathStr);
     try {
-        db_ = std::make_unique<kuzu::main::Database>(dbPath_.string());
+        db_ = std::make_unique<kuzu::main::Database>(pathStr);
     } catch (const std::exception& ex) {
         spdlog::error("KuzuGraphStore: Database ctor threw: {}", ex.what());
         throw;
@@ -102,11 +107,18 @@ KuzuGraphStore::KuzuGraphStore(const std::filesystem::path& dbPath)
         throw;
     }
     spdlog::info("KuzuGraphStore: Connection created");
-    spdlog::info("KuzuGraphStore: opened {}", dbPath_.string());
+    spdlog::info("KuzuGraphStore: opened {}", pathStr);
 }
 
 KuzuGraphStore::~KuzuGraphStore() {
-    spdlog::info("KuzuGraphStore: closing {}", dbPath_.string());
+    // Strict closing order (kuzu issue #5316): Connection MUST be destroyed
+    // before Database. unique_ptr member declaration order in the header
+    // (db_ first, conn_ second) gives reverse-order destruction
+    // automatically — conn_.~unique_ptr() runs before db_.~unique_ptr().
+    // Don't reorder the header members or this contract breaks silently.
+    spdlog::info("KuzuGraphStore: closing {}", dbPath_.generic_string());
+    conn_.reset();
+    db_.reset();
 }
 
 bool KuzuGraphStore::isOpen() const {
