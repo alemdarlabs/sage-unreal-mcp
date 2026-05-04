@@ -229,6 +229,14 @@ FSageToolDispatch::FOutcome DeleteAssetOnGameThread(const TSharedPtr<FJsonObject
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'asset_path'"));
     }
 
+    bool bConfirmed = false;
+    Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    if (!bConfirmed)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("destructive operation; pass confirmed:true to proceed"));
+    }
+
     FSageToolDispatch::FOutcome PieErr;
     if (detail::RejectIfPie(PieErr)) return PieErr;
 

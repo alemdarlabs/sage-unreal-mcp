@@ -129,6 +129,23 @@ FSageToolDispatch::FOutcome LevelLoadImpl(const TSharedPtr<FJsonObject>& Args)
     if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), LevelPath))
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
 
+    // Dirty-state guard: refuse to swap maps if the current world has unsaved
+    // changes (mirrors the editor's "Save before opening?" dialog so we don't
+    // silently lose work). Callers can override with discard_unsaved:true.
+    bool bDiscardUnsaved = false;
+    if (Args.IsValid()) Args->TryGetBoolField(TEXT("discard_unsaved"), bDiscardUnsaved);
+    if (UWorld* CurrentWorld = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
+    {
+        UPackage* CurrentPkg = CurrentWorld->GetOutermost();
+        if (CurrentPkg && CurrentPkg->IsDirty() && !bDiscardUnsaved)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("current world '%s' has unsaved changes; "
+                                     "save first or pass 'discard_unsaved':true"),
+                                *CurrentPkg->GetName()));
+        }
+    }
+
     GEditor->Exec(GEditor->GetEditorWorldContext().World(),
         *FString::Printf(TEXT("open %s"), *LevelPath), *GLog);
 
@@ -187,6 +204,15 @@ FSageToolDispatch::FOutcome LevelCreateImpl(const TSharedPtr<FJsonObject>& Args)
     if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
 
+    bool bConfirmed = false;
+    if (Args.IsValid()) Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    if (!bConfirmed)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("destructive op: pass 'confirmed':true to proceed (level.create "
+                 "writes a new UWorld asset)"));
+    }
+
     FString PackagePath, AssetName;
     if (!Path.Split(TEXT("/"), &PackagePath, &AssetName, ESearchCase::IgnoreCase, ESearchDir::FromEnd))
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("path must be /Folder/Name form"));
@@ -199,8 +225,35 @@ FSageToolDispatch::FOutcome LevelCreateImpl(const TSharedPtr<FJsonObject>& Args)
     if (!Pkg) return FSageToolDispatch::FOutcome::MakeError(-32000, TEXT("CreatePackage failed"));
     Pkg->FullyLoad();
 
-    UWorld* NewWorld = NewObject<UWorld>(Pkg, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
-    if (!NewWorld) return FSageToolDispatch::FOutcome::MakeError(-32000, TEXT("NewObject<UWorld> failed"));
+    // Use UWorld::CreateWorld so the world is properly registered
+    // (FWorldDelegates fire, scene/physics init runs). The plain
+    // NewObject<UWorld>+MarkPackageDirty stub crashed at save time because
+    // FXSystem / Niagara world subsystems never spun up.
+    const UWorld::InitializationValues IVS = UWorld::InitializationValues()
+        .ShouldSimulatePhysics(false)
+        .EnableTraceCollision(true)
+        .CreateNavigation(true)
+        .CreateAISystem(true)
+        .CreateFXSystem(true);
+
+    UWorld* NewWorld = UWorld::CreateWorld(
+        EWorldType::Editor,
+        /*bInformEngineOfWorld=*/true,
+        FName(*AssetName),
+        Pkg,
+        /*bAddToRoot=*/true,
+        ERHIFeatureLevel::Num,
+        &IVS);
+    if (!NewWorld)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("UWorld::CreateWorld returned null"));
+    }
+    // CreateWorld set RF_Standalone+RF_Transactional already; ensure the
+    // outer-package flags are sane for asset registry.
+    NewWorld->SetFlags(RF_Public | RF_Standalone | RF_Transactional);
+    NewWorld->UpdateWorldComponents(/*bRerunConstructionScripts=*/true,
+                                    /*bCurrentLevelOnly=*/false);
 
     FAssetRegistryModule::AssetCreated(NewWorld);
     NewWorld->MarkPackageDirty();
@@ -208,6 +261,7 @@ FSageToolDispatch::FOutcome LevelCreateImpl(const TSharedPtr<FJsonObject>& Args)
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"), NewWorld->GetPathName());
     R->SetStringField(TEXT("name"), NewWorld->GetName());
+    R->SetBoolField  (TEXT("initialized"), true);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1043,6 +1097,14 @@ FSageToolDispatch::FOutcome WorldExportImpl(const TSharedPtr<FJsonObject>& Args)
     R->SetNumberField(TEXT("returned"),    Actors.Num());
     R->SetNumberField(TEXT("total"),       Total);
     R->SetBoolField  (TEXT("truncated"),   Truncated > 0);
+    if (bIncludeActorProps && Actors.Num() > 0)
+    {
+        R->SetStringField(TEXT("_perf_warning"),
+            FString::Printf(TEXT("depth-2 reflection on %d actors; pass "
+                                 "simplify=stripped or include_actor_props=false "
+                                 "to reduce payload"),
+                            Actors.Num()));
+    }
     R->SetBoolField  (TEXT("is_world_partition"),
         World->GetWorldPartition() != nullptr);
 

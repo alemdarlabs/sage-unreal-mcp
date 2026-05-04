@@ -627,6 +627,8 @@ FSageToolDispatch::FOutcome AddImcMappingImpl(const TSharedPtr<FJsonObject>& Arg
     R->SetNumberField(TEXT("trigger_count"),  TriggerClasses.Num());
     R->SetNumberField(TEXT("modifier_count"), ModifierClasses.Num());
     R->SetNumberField(TEXT("mapping_count"),  IMC->GetMappings().Num());
+    // Index of the mapping just appended (for subsequent remove/update calls).
+    R->SetNumberField(TEXT("mapping_index"),  IMC->GetMappings().Num() - 1);
     if (SkippedTriggers.Num() > 0 || SkippedModifiers.Num() > 0)
     {
         TArray<TSharedPtr<FJsonValue>> S1, S2;
@@ -1396,6 +1398,15 @@ FSageToolDispatch::FOutcome SetWorldGameModeImpl(const TSharedPtr<FJsonObject>& 
     if (!Args.IsValid() || !Args->TryGetStringField(TEXT("game_mode_class"), ClassPath))
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'game_mode_class'"));
 
+    bool bConfirmed = false;
+    if (Args.IsValid()) Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    if (!bConfirmed)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("destructive op: pass 'confirmed':true to proceed "
+                 "(gameplay.set_world_game_mode mutates WorldSettings)"));
+    }
+
     UWorld* World = GetEditorWorld();
     if (!World) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no editor world"));
 
@@ -1408,7 +1419,19 @@ FSageToolDispatch::FOutcome SetWorldGameModeImpl(const TSharedPtr<FJsonObject>& 
     AWorldSettings* WS = World->GetWorldSettings();
     WS->Modify();
     WS->DefaultGameMode = GMCls;
-    WS->PostEditChange();
+    // Fire targeted PostEditChangeProperty for DefaultGameMode so listeners
+    // (PIE world settings, details panels) observe the change. Fall back to
+    // PostEditChange() if reflection lookup fails.
+    if (FProperty* GMProp = FindFProperty<FProperty>(
+            AWorldSettings::StaticClass(), TEXT("DefaultGameMode")))
+    {
+        FPropertyChangedEvent Evt(GMProp, EPropertyChangeType::ValueSet);
+        WS->PostEditChangeProperty(Evt);
+    }
+    else
+    {
+        WS->PostEditChange();
+    }
     World->MarkPackageDirty();
 
     auto R = MakeShared<FJsonObject>();

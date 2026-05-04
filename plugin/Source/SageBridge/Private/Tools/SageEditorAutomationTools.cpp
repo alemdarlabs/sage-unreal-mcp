@@ -37,26 +37,53 @@ namespace
 
 // Whitelist of console commands that are read-only or affect editor view
 // state only. Anything else requires allow_unsafe=true.
+//
+// Matching is exact-or-prefix-with-space — this prevents bypasses such as
+// `STATQUIT` matching `STAT`, or `OBJ DELETE` slipping past `OBJ`.
+bool IsAllowedConsoleCommand(const FString& Cmd, const TArray<FString>& Whitelist)
+{
+    const FString Trimmed = Cmd.TrimStartAndEnd();
+    for (const FString& W : Whitelist)
+    {
+        if (Trimmed.Equals(W, ESearchCase::IgnoreCase)) return true;
+        if (Trimmed.StartsWith(W + TEXT(" "), ESearchCase::IgnoreCase)) return true;
+    }
+    return false;
+}
+
+// Reject obviously dangerous IO-redirecting console forms even if their head
+// token is on the whitelist (e.g. `LOG OutputLog FILE=...`, redirection,
+// piping, or arbitrary `EXEC <script>`).
+bool IsConsoleCommandIODirected(const FString& Cmd)
+{
+    const FString Upper = Cmd.ToUpper();
+    if (Upper.Contains(TEXT(" FILE=")))    return true;
+    if (Upper.Contains(TEXT(" -FILE=")))   return true;
+    if (Upper.Contains(TEXT("OUTPUTLOG"))) return true;  // LOG OutputLog FILE=...
+    if (Upper.Contains(TEXT(" > ")))       return true;
+    if (Upper.Contains(TEXT(" >> ")))      return true;
+    if (Upper.Contains(TEXT(" | ")))       return true;
+    if (Upper.StartsWith(TEXT("EXEC ")))   return true;  // run arbitrary script
+    return false;
+}
+
 bool IsConsoleCommandWhitelisted(const FString& Cmd)
 {
-    static const TArray<FString> kPrefixes = {
-        TEXT("STAT "),       TEXT("STAT"),
-        TEXT("SHOW "),       TEXT("SHOW"),
-        TEXT("CAMERA "),
-        TEXT("VIEWMODE "),   TEXT("VIEWMODE"),
+    static const TArray<FString> kWhitelist = {
+        TEXT("STAT"),
+        TEXT("SHOW"),
+        TEXT("CAMERA"),
+        TEXT("VIEWMODE"),
         TEXT("R.SCREENPERCENTAGE"),
         TEXT("FREEZERENDERING"),
         TEXT("LISTLIGHTS"),
         TEXT("MEMREPORT"),
-        TEXT("OBJ LIST"),    TEXT("OBJ"),
-        TEXT("LOG "),        TEXT("LOG"),
-        TEXT("HELP "),       TEXT("HELP"),
+        TEXT("OBJ"),
+        TEXT("LOG"),
+        TEXT("HELP"),
     };
-    for (const FString& P : kPrefixes)
-    {
-        if (Cmd.StartsWith(P, ESearchCase::IgnoreCase)) return true;
-    }
-    return false;
+    if (IsConsoleCommandIODirected(Cmd)) return false;
+    return IsAllowedConsoleCommand(Cmd, kWhitelist);
 }
 
 // ---- editor.console_command ----------------------------------------------
@@ -71,6 +98,15 @@ FSageToolDispatch::FOutcome ConsoleCommandImpl(const TSharedPtr<FJsonObject>& Ar
     bool AllowUnsafe = false;
     Args->TryGetBoolField(TEXT("allow_unsafe"), AllowUnsafe);
 
+    // IO-redirection (FILE=, OutputLog dump, pipes, EXEC script) is rejected
+    // even when allow_unsafe=true unless the caller is explicit — these forms
+    // can write arbitrary files outside the project.
+    if (!AllowUnsafe && IsConsoleCommandIODirected(Cmd))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("console command rejected (IO redirection / file output): '%s'. "
+                "Set allow_unsafe=true if intentional."), *Cmd));
+    }
     if (!AllowUnsafe && !IsConsoleCommandWhitelisted(Cmd))
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602,
@@ -102,6 +138,29 @@ FSageToolDispatch::FOutcome TakeScreenshotImpl(const TSharedPtr<FJsonObject>& Ar
         const FString TS = FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"));
         Path = FPaths::ProjectSavedDir() / TEXT("Screenshots") /
                FString::Printf(TEXT("Sage_%s.png"), *TS);
+    }
+
+    // Sandbox: resolve to absolute, collapse .., and require the path to live
+    // under <Project>/Saved/Screenshots. Reject otherwise — a tool that
+    // accepts arbitrary paths could overwrite project files or leak data.
+    {
+        FString AbsPath = FPaths::ConvertRelativePathToFull(Path);
+        FPaths::CollapseRelativeDirectories(AbsPath);
+        const FString AllowedRoot = FPaths::ConvertRelativePathToFull(
+            FPaths::ProjectSavedDir() / TEXT("Screenshots"));
+
+#if PLATFORM_WINDOWS
+        const ESearchCase::Type kCase = ESearchCase::IgnoreCase;
+#else
+        const ESearchCase::Type kCase = ESearchCase::CaseSensitive;
+#endif
+        if (!AbsPath.StartsWith(AllowedRoot, kCase))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("screenshot path must be under '%s' (got '%s')"),
+                                *AllowedRoot, *AbsPath));
+        }
+        Path = AbsPath;
     }
 
     FHighResScreenshotConfig& Config = GetHighResScreenshotConfig();
@@ -239,6 +298,12 @@ FSageToolDispatch::FOutcome RunPythonImpl(const TSharedPtr<FJsonObject>& Args)
     R->SetStringField(TEXT("result"),      Cmd.CommandResult);
     R->SetArrayField (TEXT("log_output"),  Logs);
     R->SetNumberField(TEXT("log_count"),   Logs.Num());
+    // Phase 5+ auth-gate territory: this tool grants arbitrary Python with
+    // full UE editor access (filesystem, process spawn, asset write). Sage's
+    // server-side auth layer will gate the handler before public release;
+    // for now we surface a self-describing warning on every response.
+    R->SetStringField(TEXT("_security_warning"),
+        TEXT("executes arbitrary Python with full UE access; restrict before public release"));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -248,8 +313,27 @@ FSageToolDispatch::FOutcome RunPythonImpl(const TSharedPtr<FJsonObject>& Args)
 // Build commands fire-and-forget — the real status query is best-effort
 // (only IsLightingBuildCurrentlyRunning / Exporting are exposed in 5.7).
 
-FSageToolDispatch::FOutcome BuildAllImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+// Build operations are long-running (lighting can take hours on large levels)
+// and consume the editor — we require explicit confirmation per the
+// production project disciple in CLAUDE.md.
+bool RequireConfirmed(const TSharedPtr<FJsonObject>& Args, const TCHAR* Tool, FSageToolDispatch::FOutcome& Out)
 {
+    bool bConfirmed = false;
+    if (Args.IsValid()) Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    if (!bConfirmed)
+    {
+        Out = FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("long-running operation; pass confirmed:true to proceed (%s)"), Tool));
+        return true;
+    }
+    return false;
+}
+
+FSageToolDispatch::FOutcome BuildAllImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (RequireConfirmed(Args, TEXT("editor.build_all"), Reject)) return Reject;
+
     if (!GEditor) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
     UWorld* World = GEditor->GetEditorWorldContext().World();
     if (!World) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("editor world unavailable"));
@@ -264,8 +348,11 @@ FSageToolDispatch::FOutcome BuildAllImpl(const TSharedPtr<FJsonObject>& /*Args*/
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
-FSageToolDispatch::FOutcome BuildGeometryImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+FSageToolDispatch::FOutcome BuildGeometryImpl(const TSharedPtr<FJsonObject>& Args)
 {
+    FSageToolDispatch::FOutcome Reject;
+    if (RequireConfirmed(Args, TEXT("editor.build_geometry"), Reject)) return Reject;
+
     if (!GEditor) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
     UWorld* World = GEditor->GetEditorWorldContext().World();
     if (!World) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("editor world unavailable"));
@@ -277,6 +364,9 @@ FSageToolDispatch::FOutcome BuildGeometryImpl(const TSharedPtr<FJsonObject>& /*A
 
 FSageToolDispatch::FOutcome BuildLightingImpl(const TSharedPtr<FJsonObject>& Args)
 {
+    FSageToolDispatch::FOutcome Reject;
+    if (RequireConfirmed(Args, TEXT("editor.build_lighting"), Reject)) return Reject;
+
     if (!GEditor) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
     UWorld* World = GEditor->GetEditorWorldContext().World();
     if (!World) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("editor world unavailable"));
@@ -296,8 +386,11 @@ FSageToolDispatch::FOutcome BuildLightingImpl(const TSharedPtr<FJsonObject>& Arg
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
-FSageToolDispatch::FOutcome BuildHlodImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+FSageToolDispatch::FOutcome BuildHlodImpl(const TSharedPtr<FJsonObject>& Args)
 {
+    FSageToolDispatch::FOutcome Reject;
+    if (RequireConfirmed(Args, TEXT("editor.build_hlod"), Reject)) return Reject;
+
     if (!GEditor) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
     UWorld* World = GEditor->GetEditorWorldContext().World();
     if (!World) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("editor world unavailable"));
@@ -442,7 +535,11 @@ FSageToolDispatch::FOutcome ListCrashesImpl(const TSharedPtr<FJsonObject>& Args)
         const FDateTime TS = FM.GetTimeStamp(*D);
         O->SetStringField(TEXT("timestamp"), TS.ToIso8601());
         // Quick file presence flags (each crash dir always has these in modern UE).
-        O->SetBoolField(TEXT("has_log"),     FM.FileExists(*(D / TEXT("SageTest.log"))) ||
+        // Crash log filename: <ProjectName>.log (e.g. Lyra.log, Kale.log).
+        // The legacy hardcoded "SageTest.log" only matched the dogfooding
+        // sample project — broken for every real project. Compose dynamically.
+        const FString ProjLog = FString(FApp::GetProjectName()) + TEXT(".log");
+        O->SetBoolField(TEXT("has_log"),     FM.FileExists(*(D / ProjLog)) ||
                                               FM.FileExists(*(D / TEXT("UnrealEditor.log"))));
         O->SetBoolField(TEXT("has_dump"),    FM.FileExists(*(D / TEXT("minidump.dmp"))));
         O->SetBoolField(TEXT("has_context"), FM.FileExists(*(D / TEXT("CrashContext.runtime-xml"))));
@@ -506,9 +603,17 @@ FSageToolDispatch::FOutcome GetCrashInfoImpl(const TSharedPtr<FJsonObject>& Args
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'crash_dir'"));
     }
     // Safety: the crash_dir must live under the per-user crashes root.
+    // Windows paths are case-insensitive — `c:\users\...` vs `C:\Users\...`
+    // would otherwise spuriously fail the prefix check.
     const FString Root = FPaths::ConvertRelativePathToFull(GetUserCrashesRoot());
-    const FString Abs  = FPaths::ConvertRelativePathToFull(CrashDir);
-    if (!Abs.StartsWith(Root))
+    FString       Abs  = FPaths::ConvertRelativePathToFull(CrashDir);
+    FPaths::CollapseRelativeDirectories(Abs);
+#if PLATFORM_WINDOWS
+    const ESearchCase::Type kCase = ESearchCase::IgnoreCase;
+#else
+    const ESearchCase::Type kCase = ESearchCase::CaseSensitive;
+#endif
+    if (!Abs.StartsWith(Root, kCase))
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602,
             FString::Printf(TEXT("crash_dir outside crashes root: %s"), *Abs));
@@ -547,8 +652,23 @@ FSageToolDispatch::FOutcome GetCrashInfoImpl(const TSharedPtr<FJsonObject>& Args
         if (!Stack.IsEmpty())  R->SetStringField(TEXT("call_stack"),    Stack.Left(8192));
     }
 
-    // Tail of the crash log (last 50 lines).
-    TArray<FString> Candidates = { TEXT("UnrealEditor.log"), TEXT("SageTest.log") };
+    // Tail of the crash log. Caller can request a specific size via `lines`
+    // (default 50, max 10000) and skip from the end with `offset_from_end`.
+    int32 TailLines = 50;
+    int32 OffsetFromEnd = 0;
+    if (Args.IsValid())
+    {
+        double N = 0;
+        if (Args->TryGetNumberField(TEXT("lines"), N))
+            TailLines = FMath::Clamp(static_cast<int32>(N), 1, 10000);
+        if (Args->TryGetNumberField(TEXT("offset_from_end"), N))
+            OffsetFromEnd = FMath::Max(0, static_cast<int32>(N));
+    }
+
+    // Crash log filename derives from project (e.g. Lyra.log); keep
+    // UnrealEditor.log as a fallback for legacy/older crashes.
+    const FString ProjLog = FString(FApp::GetProjectName()) + TEXT(".log");
+    TArray<FString> Candidates = { TEXT("UnrealEditor.log"), ProjLog };
     for (const FString& Cand : Candidates)
     {
         const FString LP = Abs / Cand;
@@ -556,15 +676,18 @@ FSageToolDispatch::FOutcome GetCrashInfoImpl(const TSharedPtr<FJsonObject>& Args
         if (!FFileHelper::LoadFileToString(LogTxt, *LP)) continue;
         TArray<FString> Lines;
         LogTxt.ParseIntoArrayLines(Lines, false);
-        const int32 Tail = FMath::Max(0, Lines.Num() - 50);
+        const int32 EndExclusive = FMath::Max(0, Lines.Num() - OffsetFromEnd);
+        const int32 Tail         = FMath::Max(0, EndExclusive - TailLines);
         TArray<TSharedPtr<FJsonValue>> Out;
-        for (int32 i = Tail; i < Lines.Num(); ++i)
+        for (int32 i = Tail; i < EndExclusive; ++i)
         {
             Out.Add(MakeShared<FJsonValueString>(Lines[i].Left(500)));
         }
-        R->SetStringField(TEXT("log_path"),  LP);
-        R->SetArrayField (TEXT("log_tail"),  Out);
-        R->SetNumberField(TEXT("log_total_lines"), Lines.Num());
+        R->SetStringField(TEXT("log_path"),         LP);
+        R->SetArrayField (TEXT("log_tail"),         Out);
+        R->SetNumberField(TEXT("log_total_lines"),  Lines.Num());
+        R->SetNumberField(TEXT("lines"),            TailLines);
+        R->SetNumberField(TEXT("offset_from_end"),  OffsetFromEnd);
         break;
     }
 
@@ -782,9 +905,15 @@ FSageToolDispatch::FOutcome HotReloadImpl(const TSharedPtr<FJsonObject>& /*Args*
 
 FSageToolDispatch::FOutcome GetPerfStatsImpl(const TSharedPtr<FJsonObject>& /*Args*/)
 {
+    // Guard against zero/negative delta — FApp::GetDeltaTime() can be 0 on
+    // the very first tick of the editor or while paused, and 1/0 → inf
+    // serializes as `null` (or `inf`) in JSON, which clients reject.
+    double Delta = FApp::GetDeltaTime();
+    if (Delta <= 0.0) Delta = 1.0 / 60.0;
+
     auto R = MakeShared<FJsonObject>();
-    R->SetNumberField(TEXT("fps"),              1.0f / FApp::GetDeltaTime());
-    R->SetNumberField(TEXT("frame_time_ms"),    FApp::GetDeltaTime() * 1000.0);
+    R->SetNumberField(TEXT("fps"),              1.0 / Delta);
+    R->SetNumberField(TEXT("frame_time_ms"),    Delta * 1000.0);
     R->SetNumberField(TEXT("real_time"),        FApp::GetCurrentTime());
     R->SetBoolField  (TEXT("is_pie"),           GEditor && GEditor->IsPlayingSessionInEditor());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);

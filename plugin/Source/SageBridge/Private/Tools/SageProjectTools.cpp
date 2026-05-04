@@ -193,8 +193,44 @@ FSageToolDispatch::FOutcome ProjectReadCppHeaderImpl(const TSharedPtr<FJsonObjec
             FString::Printf(TEXT("could not read header: %s"), *Abs));
     }
 
+    TArray<FString> RawLines;
+    Content.ParseIntoArrayLines(RawLines, /*bCullEmpty*/ false);
+
+    // Strip C/C++ comments before macro scanning so we don't treat
+    // `// UCLASS(...)`, `/* UCLASS */`, or doxygen mentions as real
+    // declarations. We preserve line indices (one entry per source line)
+    // so the reported line numbers still match the original file.
     TArray<FString> Lines;
-    Content.ParseIntoArrayLines(Lines, /*bCullEmpty*/ false);
+    Lines.Reserve(RawLines.Num());
+    {
+        bool bInBlockComment = false;
+        for (const FString& Raw : RawLines)
+        {
+            FString S; S.Reserve(Raw.Len());
+            for (int32 i = 0; i < Raw.Len(); ++i)
+            {
+                if (bInBlockComment)
+                {
+                    if (i + 1 < Raw.Len() && Raw[i] == TEXT('*') && Raw[i + 1] == TEXT('/'))
+                    {
+                        bInBlockComment = false;
+                        ++i;
+                    }
+                    continue;
+                }
+                // // line comment terminates the rest of this line.
+                if (i + 1 < Raw.Len() && Raw[i] == TEXT('/') && Raw[i + 1] == TEXT('/')) break;
+                if (i + 1 < Raw.Len() && Raw[i] == TEXT('/') && Raw[i + 1] == TEXT('*'))
+                {
+                    bInBlockComment = true;
+                    ++i;
+                    continue;
+                }
+                S.AppendChar(Raw[i]);
+            }
+            Lines.Add(MoveTemp(S));
+        }
+    }
 
     // Lightweight regex-y scan. Captures the *next* identifier after the
     // macro keyword. Multi-line UCLASS(...) is handled by reading until
@@ -207,6 +243,13 @@ FSageToolDispatch::FOutcome ProjectReadCppHeaderImpl(const TSharedPtr<FJsonObjec
         {
             const FString& L = InLines[i];
             if (!L.Contains(Macro)) continue;
+            // Require macro to appear in a declarative position — i.e. the
+            // line, once leading whitespace is stripped, starts with the
+            // macro identifier and `(`. Filters out incidental mentions
+            // (string literals, identifiers like UCLASS_MARKER, etc.).
+            FString T = L; T.TrimStartAndEndInline();
+            const FString MacroParen = FString(Macro) + TEXT("(");
+            if (!T.StartsWith(MacroParen) && !T.Equals(Macro)) continue;
             // Look forward up to 5 lines for the keyword line
             for (int32 j = i; j < FMath::Min(InLines.Num(), i + 5); ++j)
             {
@@ -285,9 +328,18 @@ void SearchInDir(const FString& Root, const FString& Query,
         Files.Append(MoveTemp(Found));
     }
 
+    // Per-file cap to avoid OOM on huge codebases (e.g. Lyra at 1M+ LOC has
+    // a few generated headers in the multi-MB range). 1MB is well above any
+    // hand-written .h/.cpp; oversized files get skipped + reported.
+    constexpr int64 kPerFileMaxBytes = 1 * 1024 * 1024;
+
     for (const FString& F : Files)
     {
         if (Out.Num() >= MaxResults) return;
+
+        const int64 FileSize = FileMgr.FileSize(*F);
+        if (FileSize > kPerFileMaxBytes) continue;  // skip oversized
+
         FString Content;
         if (!FFileHelper::LoadFileToString(Content, *F)) continue;
         if (!Content.Contains(Query)) continue;
@@ -685,42 +737,88 @@ FSageToolDispatch::FOutcome ProjectListConfigTagsImpl(const TSharedPtr<FJsonObje
 
 // Phase 4.7-p4: INI write + plugin enable.
 
-// Atomic file write: write to <path>.tmp, then rename.
+// Atomic file write: write to <path>.tmp, COPY original to .sage_bak (so the
+// original stays at Path during the swap; if the editor crashes between the
+// backup and the rename, Path is still intact), then rename temp → final and
+// delete the backup on success. On failure, the temp file is removed.
 bool AtomicWriteString(const FString& Path, const FString& Content, FString& OutError)
 {
-    const FString TempPath = Path + TEXT(".sage_tmp");
+    const FString TempPath   = Path + TEXT(".sage_tmp");
+    const FString BackupPath = Path + TEXT(".sage_bak");
+
     if (!FFileHelper::SaveStringToFile(Content, *TempPath,
             FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
     {
         OutError = FString::Printf(TEXT("could not write temp: %s"), *TempPath);
         return false;
     }
+
     IFileManager& FM = IFileManager::Get();
-    if (FM.FileExists(*Path))
+    const bool bHadOriginal = FM.FileExists(*Path);
+    if (bHadOriginal)
     {
-        // Best-effort backup. If the user runs set_config on a freshly-
-        // generated INI the .bak gets overwritten on next call — that's
-        // fine, this isn't an undo log, just a one-shot safety net.
-        const FString BackupPath = Path + TEXT(".sage_bak");
+        // Backup as COPY (NOT move). Original must stay at Path for the
+        // entire swap window so a crash between here and the rename below
+        // leaves the file intact at its expected location.
         FM.Delete(*BackupPath, /*RequireExists*/ false, /*EvenReadOnly*/ true, /*Quiet*/ true);
-        FM.Move(*BackupPath, *Path, /*bReplace*/ true, /*bEvenIfReadOnly*/ true,
-                /*bAttributes*/ false, /*bDoNotRetryOrError*/ true);
+        // Copy returns COPY_OK (0) on success, COPY_Fail (non-zero) on error.
+        const uint32 CopyResult = FM.Copy(*BackupPath, *Path,
+            /*bReplace*/ true, /*bEvenIfReadOnly*/ true, /*bAttributes*/ false);
+        if (CopyResult != 0u)
+        {
+            // Backup failed; abort to avoid losing the original on rename.
+            FM.Delete(*TempPath, /*RequireExists*/ false, /*EvenReadOnly*/ true, /*Quiet*/ true);
+            OutError = FString::Printf(TEXT("could not create backup: %s"), *BackupPath);
+            return false;
+        }
     }
+
+    // Atomic rename temp → final (replaces the still-present original).
     if (!FM.Move(*Path, *TempPath, /*bReplace*/ true, /*bEvenIfReadOnly*/ true,
                  /*bAttributes*/ false, /*bDoNotRetryOrError*/ true))
     {
+        // Rename failed — temp leftover, original still at Path, backup
+        // (if any) untouched. Best-effort cleanup of temp; keep backup so
+        // the caller can recover manually if needed.
+        FM.Delete(*TempPath, /*RequireExists*/ false, /*EvenReadOnly*/ true, /*Quiet*/ true);
         OutError = FString::Printf(TEXT("rename failed: %s -> %s"), *TempPath, *Path);
         return false;
+    }
+
+    // Success: drop the backup.
+    if (bHadOriginal)
+    {
+        FM.Delete(*BackupPath, /*RequireExists*/ false, /*EvenReadOnly*/ true, /*Quiet*/ true);
     }
     return true;
 }
 
+// Detect line ending convention used in an existing file body. Returns
+// "\r\n" if any CRLF is present, "\n" otherwise. We bias toward CRLF on
+// Windows when the file is empty/unknown so freshly-created INIs match
+// UE's writer convention there.
+static FString DetectLineEnding(const FString& Content)
+{
+    if (Content.Contains(TEXT("\r\n"))) return FString(TEXT("\r\n"));
+    if (Content.Contains(TEXT("\n")))   return FString(TEXT("\n"));
+#if PLATFORM_WINDOWS
+    return FString(TEXT("\r\n"));
+#else
+    return FString(TEXT("\n"));
+#endif
+}
+
 // Modify or insert a key=value pair under [section] in INI text. Preserves
-// other lines verbatim. Modifier prefix (+/-/!/.) becomes part of the
-// emitted line if supplied. Returns true if anything changed.
+// other lines verbatim AND original line-ending convention (CRLF vs LF) so
+// VCS diffs stay clean on Windows where INI files are typically CRLF.
+// Modifier prefix (+/-/!/.) becomes part of the emitted line if supplied.
+// Returns true if anything changed.
 bool UpsertIniKey(FString& Content, const FString& Section, const FString& Key,
                   const FString& Value, const FString& Modifier)
 {
+    const FString EOL = DetectLineEnding(Content);
+
+    // ParseIntoArrayLines strips both \r\n and \n, so it's EOL-agnostic.
     TArray<FString> Lines;
     Content.ParseIntoArrayLines(Lines, /*bCullEmpty*/ false);
 
@@ -770,23 +868,23 @@ bool UpsertIniKey(FString& Content, const FString& Section, const FString& Key,
             if (ExistingKey == Key)
             {
                 Lines[i] = Emit;
-                Content = FString::Join(Lines, TEXT("\n"));
-                if (!Content.EndsWith(TEXT("\n"))) Content += TEXT("\n");
+                Content = FString::Join(Lines, *EOL);
+                if (!Content.EndsWith(EOL)) Content += EOL;
                 return true;
             }
         }
         // Insert at end of section.
         Lines.Insert(Emit, SectionEnd + 1);
-        Content = FString::Join(Lines, TEXT("\n"));
-        if (!Content.EndsWith(TEXT("\n"))) Content += TEXT("\n");
+        Content = FString::Join(Lines, *EOL);
+        if (!Content.EndsWith(EOL)) Content += EOL;
         return true;
     }
 
     // Section absent: append a fresh section block.
-    if (!Content.IsEmpty() && !Content.EndsWith(TEXT("\n"))) Content += TEXT("\n");
-    if (!Content.IsEmpty()) Content += TEXT("\n");
-    Content += SectionHeader + TEXT("\n");
-    Content += Emit + TEXT("\n");
+    if (!Content.IsEmpty() && !Content.EndsWith(EOL)) Content += EOL;
+    if (!Content.IsEmpty()) Content += EOL;
+    Content += SectionHeader + EOL;
+    Content += Emit + EOL;
     return true;
 }
 
@@ -847,7 +945,6 @@ FSageToolDispatch::FOutcome ProjectSetConfigImpl(const TSharedPtr<FJsonObject>& 
     R->SetStringField(TEXT("key"),      Key);
     R->SetStringField(TEXT("value"),    Value);
     R->SetBoolField  (TEXT("created"),  bCreated);
-    R->SetStringField(TEXT("backup"),   bCreated ? FString() : (Resolved + TEXT(".sage_bak")));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -861,6 +958,20 @@ FSageToolDispatch::FOutcome ProjectSetPluginEnabledImpl(const TSharedPtr<FJsonOb
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602,
             TEXT("missing 'plugin' or 'enabled'"));
+    }
+
+    // Modifying the .uproject Plugins[] array during a running editor session
+    // can have non-trivial side effects (modules unloaded, asset references
+    // dangling, editor state inconsistent until restart). Require explicit
+    // confirmation so an agent cannot toggle plugins by accident.
+    bool bConfirmed = false;
+    Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    if (!bConfirmed)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("modifying .uproject Plugins[] requires confirmed=true "
+                                 "(plugin='%s', enabled=%s); editor restart required after."),
+                            *PluginName, bEnabled ? TEXT("true") : TEXT("false")));
     }
 
     const FString UProjectPath = FPaths::Combine(
@@ -921,11 +1032,11 @@ FSageToolDispatch::FOutcome ProjectSetPluginEnabledImpl(const TSharedPtr<FJsonOb
     }
 
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("plugin"),         PluginName);
-    R->SetBoolField  (TEXT("enabled"),        bEnabled);
-    R->SetStringField(TEXT("uproject_path"),  UProjectPath);
-    R->SetBoolField  (TEXT("entry_existed"),  bUpdated);
-    R->SetStringField(TEXT("backup"),         UProjectPath + TEXT(".sage_bak"));
+    R->SetStringField(TEXT("plugin"),                  PluginName);
+    R->SetBoolField  (TEXT("enabled"),                 bEnabled);
+    R->SetStringField(TEXT("uproject_path"),           UProjectPath);
+    R->SetBoolField  (TEXT("entry_existed"),           bUpdated);
+    R->SetBoolField  (TEXT("requires_editor_restart"), true);
     R->SetStringField(TEXT("note"),
         TEXT("editor restart required for the change to take effect"));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
@@ -986,19 +1097,71 @@ FSageToolDispatch::FOutcome ProjectSetProjectImpl(const TSharedPtr<FJsonObject>&
     if (!Args.IsValid())
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing args"));
 
-    FString Err;
     const FString ConfigPath = FPaths::ConvertRelativePathToFull(
         FPaths::ProjectConfigDir() / TEXT("DefaultGame.ini"));
+    const TCHAR* const Section = TEXT("/Script/EngineSettings.GeneralProjectSettings");
+
+    // Serialize a JSON value into the right INI textual form so booleans
+    // emit as `True`/`False`, numbers as bare numerics, arrays as a single
+    // string per element (UE INI convention), and strings verbatim. Naive
+    // `AsString()` on a number still works (FJsonValueNumber stringifies),
+    // but on a bool it returns "true"/"false" lowercase which UE's FConfig
+    // accepts but doesn't round-trip cleanly.
+    auto FormatValue = [](const TSharedPtr<FJsonValue>& V) -> FString
+    {
+        if (!V.IsValid()) return FString();
+        switch (V->Type)
+        {
+            case EJson::Boolean: return V->AsBool() ? FString(TEXT("True")) : FString(TEXT("False"));
+            case EJson::Number:
+            {
+                const double D = V->AsNumber();
+                if (D == FMath::TruncToDouble(D))
+                    return FString::Printf(TEXT("%lld"), static_cast<int64>(D));
+                return FString::SanitizeFloat(D);
+            }
+            case EJson::String:  return V->AsString();
+            case EJson::Null:    return FString();
+            default:             return V->AsString();  // fallback for nested objects
+        }
+    };
 
     int32 Applied = 0;
+    TArray<TSharedPtr<FJsonValue>> Skipped;
     for (const auto& Pair : Args->Values)
     {
         if (Pair.Key.IsEmpty()) continue;
-        FString Val = Pair.Value->AsString();
-        // Write to DefaultGame.ini [/Script/EngineSettings.GeneralProjectSettings]
-        GConfig->SetString(
-            TEXT("/Script/EngineSettings.GeneralProjectSettings"),
-            *Pair.Key, *Val, ConfigPath);
+        if (!Pair.Value.IsValid()) continue;
+
+        if (Pair.Value->Type == EJson::Array)
+        {
+            // INI array convention: emit each element as a separate +Key=Val
+            // entry. Use SetArray on GConfig — UE collapses to multiple lines.
+            const TArray<TSharedPtr<FJsonValue>>& Arr = Pair.Value->AsArray();
+            TArray<FString> AsStrings;
+            AsStrings.Reserve(Arr.Num());
+            for (const auto& E : Arr) AsStrings.Add(FormatValue(E));
+            GConfig->SetArray(Section, *Pair.Key, AsStrings, ConfigPath);
+            ++Applied;
+            continue;
+        }
+
+        const FString Val = FormatValue(Pair.Value);
+        switch (Pair.Value->Type)
+        {
+            case EJson::Boolean:
+                GConfig->SetBool(Section, *Pair.Key, Pair.Value->AsBool(), ConfigPath);
+                break;
+            case EJson::Number:
+                GConfig->SetDouble(Section, *Pair.Key, Pair.Value->AsNumber(), ConfigPath);
+                break;
+            case EJson::String:
+                GConfig->SetString(Section, *Pair.Key, *Val, ConfigPath);
+                break;
+            default:
+                Skipped.Add(MakeShared<FJsonValueString>(Pair.Key));
+                continue;
+        }
         ++Applied;
     }
     GConfig->Flush(false, ConfigPath);
@@ -1006,6 +1169,7 @@ FSageToolDispatch::FOutcome ProjectSetProjectImpl(const TSharedPtr<FJsonObject>&
     auto R = MakeShared<FJsonObject>();
     R->SetNumberField(TEXT("settings_applied"), Applied);
     R->SetStringField(TEXT("config_path"),      ConfigPath);
+    if (Skipped.Num() > 0) R->SetArrayField(TEXT("skipped_keys"), Skipped);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1077,10 +1241,13 @@ FSageToolDispatch::FOutcome ProjectSearchEngineCppImpl(const TSharedPtr<FJsonObj
         TEXT("*.cpp"), true, false);
     AllFiles.Append(CppFiles);
 
+    constexpr int64 kPerFileMaxBytes = 1 * 1024 * 1024;
     TArray<TSharedPtr<FJsonValue>> Matches;
     for (const FString& FilePath : AllFiles)
     {
         if (Matches.Num() >= MaxResults) break;
+        const int64 FileSize = IFileManager::Get().FileSize(*FilePath);
+        if (FileSize > kPerFileMaxBytes) continue;  // skip oversized engine sources
         FString Content;
         if (!FFileHelper::LoadFileToString(Content, *FilePath)) continue;
         if (!Content.Contains(Query, ESearchCase::CaseSensitive)) continue;
@@ -1369,9 +1536,11 @@ static bool PatchUProjectAddModule(const FString& ModuleName, FString& OutErr)
         OutErr = TEXT("could not serialize .uproject");
         return false;
     }
-    if (!FFileHelper::SaveStringToFile(Out, *UProjectPath))
+    FString WriteErr;
+    if (!AtomicWriteString(UProjectPath, Out, WriteErr))
     {
-        OutErr = FString::Printf(TEXT("could not write .uproject: %s"), *UProjectPath);
+        OutErr = FString::Printf(TEXT("could not write .uproject: %s (%s)"),
+                                  *UProjectPath, *WriteErr);
         return false;
     }
     return true;
@@ -1436,7 +1605,7 @@ FSageToolDispatch::FOutcome ProjectCreateCppClassImpl(const TSharedPtr<FJsonObje
     Args->TryGetStringField(TEXT("module"),       ModuleName);
 
     bool bBootstrap = false;
-    Args.IsValid() && Args->TryGetBoolField(TEXT("bootstrap_module"), bBootstrap);
+    if (Args.IsValid()) Args->TryGetBoolField(TEXT("bootstrap_module"), bBootstrap);
 
     if (ParentClass.IsEmpty()) ParentClass = TEXT("UObject");
     if (ModuleName.IsEmpty())  ModuleName  = FApp::GetProjectName();
@@ -1521,12 +1690,25 @@ FSageToolDispatch::FOutcome ProjectCreateCppClassImpl(const TSharedPtr<FJsonObje
     const FString Source = FString::Printf(
         TEXT("#include \"%s.h\"\n"), *FinalClassName);
 
-    if (!FFileHelper::SaveStringToFile(Header, *HeaderPath))
-        return FSageToolDispatch::FOutcome::MakeError(-32000,
-            FString::Printf(TEXT("could not write: %s"), *HeaderPath));
-    if (!FFileHelper::SaveStringToFile(Source, *SourcePath))
-        return FSageToolDispatch::FOutcome::MakeError(-32000,
-            FString::Printf(TEXT("could not write: %s"), *SourcePath));
+    // Header + source must be a transactional pair: a half-written class
+    // (header alone) leaves UHT in an inconsistent state where the next
+    // build fails noisily and the user has to clean up by hand. Roll back
+    // the header if the source write fails.
+    {
+        FString WriteErr;
+        if (!AtomicWriteString(HeaderPath, Header, WriteErr))
+            return FSageToolDispatch::FOutcome::MakeError(-32000,
+                FString::Printf(TEXT("could not write header %s: %s"), *HeaderPath, *WriteErr));
+        if (!AtomicWriteString(SourcePath, Source, WriteErr))
+        {
+            // Best-effort rollback so the project doesn't have an orphan .h.
+            IFileManager::Get().Delete(*HeaderPath,
+                /*RequireExists*/ false, /*EvenReadOnly*/ true, /*Quiet*/ true);
+            return FSageToolDispatch::FOutcome::MakeError(-32000,
+                FString::Printf(TEXT("could not write source %s: %s; header rolled back"),
+                                *SourcePath, *WriteErr));
+        }
+    }
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("class_name"),     FinalClassName);
@@ -1546,6 +1728,7 @@ FSageToolDispatch::FOutcome ProjectCreateCppClassImpl(const TSharedPtr<FJsonObje
                                  "edit the .h to add the include manually."),
                             *ParentClass));
     R->SetBoolField(TEXT("bootstrapped"), bDidBootstrap);
+    R->SetBoolField(TEXT("requires_editor_restart"), bDidBootstrap);
     if (bDidBootstrap)
     {
         TArray<TSharedPtr<FJsonValue>> ScaffoldArr;
@@ -1620,17 +1803,57 @@ FSageToolDispatch::FOutcome ProjectWriteCppFileImpl(const TSharedPtr<FJsonObject
         || !Args->TryGetStringField(TEXT("content"), Content))
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path' or 'content'"));
 
+    // Arbitrary-path source overwrite is high-risk: agent could clobber
+    // critical project files, INI/uproject (which have dedicated tools that
+    // do atomic + structural validation), or — if path resolution lets
+    // EngineDir through — engine sources. Lock down with three gates.
+    bool bConfirmed = false;
+    Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    if (!bConfirmed)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("project.write_cpp_file requires confirmed=true (overwrites source on disk)"));
+
     FString Err;
     const FString Abs = ResolveSafeSourcePath(RelPath, Err);
     if (Abs.IsEmpty())
         return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
 
-    if (!FFileHelper::SaveStringToFile(Content, *Abs))
-        return FSageToolDispatch::FOutcome::MakeError(-32000,
-            FString::Printf(TEXT("could not write: %s"), *Abs));
+    // Sandbox: must resolve under ProjectDir(); reject EngineDir.
+    const FString ProjectDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+    if (!Abs.StartsWith(ProjectDir))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("write_cpp_file rejected: path '%s' is outside ProjectDir; "
+                                 "engine source writes are not permitted via this tool"),
+                            *Abs));
+
+    // Extension whitelist. Configs (.ini, .uproject, .uplugin) have dedicated
+    // tools that do structural patching; refuse to clobber them through here.
+    const FString Lower = Abs.ToLower();
+    auto EndsWith = [&Lower](const TCHAR* Suffix) { return Lower.EndsWith(Suffix); };
+    const bool bAllowed =
+           EndsWith(TEXT(".h"))
+        || EndsWith(TEXT(".cpp"))
+        || EndsWith(TEXT(".inl"))
+        || EndsWith(TEXT(".build.cs"))
+        || EndsWith(TEXT(".target.cs"))
+        || EndsWith(TEXT(".cs"));
+    if (!bAllowed)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("write_cpp_file rejected: extension not in whitelist "
+                                 "(.h/.cpp/.inl/.cs/.Build.cs/.Target.cs); for INI use "
+                                 "project.set_config, for .uproject use project.set_plugin_enabled."
+                                 " path='%s'"),
+                            *Abs));
+
+    {
+        FString WriteErr;
+        if (!AtomicWriteString(Abs, Content, WriteErr))
+            return FSageToolDispatch::FOutcome::MakeError(-32000,
+                FString::Printf(TEXT("could not write %s: %s"), *Abs, *WriteErr));
+    }
 
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("path"),         Abs);
+    R->SetStringField(TEXT("path"),          Abs);
     R->SetNumberField(TEXT("bytes_written"), Content.Len());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
@@ -1664,16 +1887,6 @@ FSageToolDispatch::FOutcome ProjectAddModuleDependencyImpl(const TSharedPtr<FJso
     if (!FFileHelper::LoadFileToString(Content, *BuildCsPath))
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("could not read Build.cs"));
 
-    // Check if already present
-    if (Content.Contains(*Dependency))
-    {
-        auto R = MakeShared<FJsonObject>();
-        R->SetStringField(TEXT("module"),        ModuleName);
-        R->SetStringField(TEXT("dependency"),    Dependency);
-        R->SetBoolField  (TEXT("already_present"), true);
-        return FSageToolDispatch::FOutcome::MakeSuccess(R);
-    }
-
     // Insert into PublicDependencyModuleNames (default) or
     // PrivateDependencyModuleNames (when private=true).
     bool bPrivate = false;
@@ -1688,6 +1901,45 @@ FSageToolDispatch::FOutcome ProjectAddModuleDependencyImpl(const TSharedPtr<FJso
     {
         InsertTarget = TargetArrayName + TEXT(".Add");
         Idx = Content.Find(InsertTarget);
+    }
+
+    // Lyra Gap #9 regression fix: substring-only `Content.Contains(*Dependency)`
+    // produces false-positive when adding "Core" to a Build.cs that already has
+    // "CoreUObject" / "CoreOnline" / etc. Parse the array literal block of the
+    // target dependency list and check for exact-quoted entry instead.
+    auto AlreadyPresentExact = [&]() -> bool
+    {
+        if (Idx == INDEX_NONE) return false;
+        const int32 OpenBrace = Content.Find(TEXT("{"), ESearchCase::IgnoreCase,
+                                              ESearchDir::FromStart, Idx);
+        const int32 CloseBrace = (OpenBrace != INDEX_NONE)
+            ? Content.Find(TEXT("}"), ESearchCase::IgnoreCase,
+                           ESearchDir::FromStart, OpenBrace + 1)
+            : INDEX_NONE;
+        if (OpenBrace == INDEX_NONE || CloseBrace == INDEX_NONE) return false;
+        const FString Block = Content.Mid(OpenBrace + 1, CloseBrace - OpenBrace - 1);
+        TArray<FString> Parts;
+        Block.ParseIntoArray(Parts, TEXT(","), /*bCullEmpty*/ true);
+        for (FString Part : Parts)
+        {
+            Part.TrimStartAndEndInline();
+            // Strip surrounding quotes.
+            if (Part.StartsWith(TEXT("\""))) Part.RemoveAt(0);
+            if (Part.EndsWith(TEXT("\""))) Part.RemoveAt(Part.Len() - 1);
+            Part.TrimStartAndEndInline();
+            if (Part == Dependency) return true;
+        }
+        return false;
+    };
+
+    if (AlreadyPresentExact())
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("module"),          ModuleName);
+        R->SetStringField(TEXT("dependency"),      Dependency);
+        R->SetStringField(TEXT("build_cs"),        BuildCsPath);
+        R->SetBoolField  (TEXT("already_present"), true);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
     }
 
     bool bPatched = false;
@@ -1741,8 +1993,12 @@ FSageToolDispatch::FOutcome ProjectAddModuleDependencyImpl(const TSharedPtr<FJso
         return FSageToolDispatch::FOutcome::MakeSuccess(R);
     }
 
-    if (!FFileHelper::SaveStringToFile(Content, *BuildCsPath))
-        return FSageToolDispatch::FOutcome::MakeError(-32000, TEXT("could not write Build.cs"));
+    {
+        FString WriteErr;
+        if (!AtomicWriteString(BuildCsPath, Content, WriteErr))
+            return FSageToolDispatch::FOutcome::MakeError(-32000,
+                FString::Printf(TEXT("could not write Build.cs: %s"), *WriteErr));
+    }
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("module"),     ModuleName);

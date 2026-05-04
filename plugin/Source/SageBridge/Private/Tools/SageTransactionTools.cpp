@@ -99,6 +99,22 @@ FSageToolDispatch::FOutcome CommitTransactionOnGameThread(const TSharedPtr<FJson
                 FString::Printf(TEXT("unknown tx_id: %s"), *TxId));
         }
         Index = Active[TxId];
+        // UTransactor is LIFO: GEditor->EndTransaction() always finalizes the
+        // most-recently-begun transaction, regardless of which Index we pass.
+        // Refuse out-of-order commits so callers can't accidentally finalize
+        // the wrong transaction.
+        int32 TopIndex = INDEX_NONE;
+        for (const auto& KV : Active)
+        {
+            if (KV.Value > TopIndex) TopIndex = KV.Value;
+        }
+        if (Index != TopIndex)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("transaction commit out of order; LIFO only "
+                                     "(tx %s index=%d, top=%d)"),
+                                *TxId, Index, TopIndex));
+        }
         Active.Remove(TxId);
     }
 
@@ -140,6 +156,21 @@ FSageToolDispatch::FOutcome RollbackTransactionOnGameThread(const TSharedPtr<FJs
                 FString::Printf(TEXT("unknown tx_id: %s"), *TxId));
         }
         Index = Active[TxId];
+        // LIFO guard mirrors commit_transaction — UTransactor walks back
+        // from the top so cancelling out-of-order would invalidate higher
+        // entries that the caller still expects to be live.
+        int32 TopIndex = INDEX_NONE;
+        for (const auto& KV : Active)
+        {
+            if (KV.Value > TopIndex) TopIndex = KV.Value;
+        }
+        if (Index != TopIndex)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("transaction rollback out of order; LIFO only "
+                                     "(tx %s index=%d, top=%d)"),
+                                *TxId, Index, TopIndex));
+        }
         Active.Remove(TxId);
     }
 

@@ -251,14 +251,16 @@ int main(int argc, char* argv[]) {
     registerRemote(sage::mcp::Tool{
         .name        = "delete_actor",
         .description = "Destroy an actor by full path. FScopedTransaction wrapped. "
-                       "Rejects during PIE (-32004).",
+                       "Rejects during PIE (-32004). Destructive — pass "
+                       "`confirmed:true` to proceed.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
                 {"actor_id", {{"type", "string"},
                               {"description", "Full UE path returned by spawn_actor"}}},
+                {"confirmed", {{"type", "boolean"}}},
             }},
-            {"required", nlohmann::json::array({"actor_id"})},
+            {"required", nlohmann::json::array({"actor_id", "confirmed"})},
             {"additionalProperties", false},
         },
         .handler = nullptr,
@@ -499,13 +501,15 @@ int main(int argc, char* argv[]) {
     registerRemote(sage::mcp::Tool{
         .name        = "delete_asset",
         .description = "Delete an asset by path (UEditorAssetSubsystem::"
-                       "DeleteAsset). FScopedTransaction. PIE rejected.",
+                       "DeleteAsset). FScopedTransaction. PIE rejected. "
+                       "Pass `confirmed:true` to proceed (destructive).",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
                 {"asset_path", {{"type", "string"}}},
+                {"confirmed",  {{"type", "boolean"}}},
             }},
-            {"required", nlohmann::json::array({"asset_path"})},
+            {"required", nlohmann::json::array({"asset_path", "confirmed"})},
             {"additionalProperties", false},
         },
         .handler = nullptr,
@@ -1157,12 +1161,14 @@ int main(int argc, char* argv[]) {
     });
     registerRemote(sage::mcp::Tool{
         .name = "bp.delete_variable",
-        .description = "Remove a member variable + fix up references. PIE rejected.",
+        .description = "Remove a member variable + fix up references. PIE rejected. "
+                       "Pass `confirmed:true` to proceed.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
-                {"path", {{"type", "string"}}},
-                {"name", {{"type", "string"}}},
+                {"path",      {{"type", "string"}}},
+                {"name",      {{"type", "string"}}},
+                {"confirmed", {{"type", "boolean"}}},
             }},
             {"required", nlohmann::json::array({"path", "name"})},
             {"additionalProperties", false},
@@ -1591,7 +1597,9 @@ int main(int argc, char* argv[]) {
                        "Cycle-guarded — rejects with -32602 if the new "
                        "parent is a descendant of the moved component. "
                        "Detaches from the current parent (or root list) "
-                       "and attaches to the new parent. PIE rejected.",
+                       "and attaches to the new parent. PIE rejected. "
+                       "Both component and new_parent must be "
+                       "USceneComponent descendants.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
@@ -1635,7 +1643,11 @@ int main(int argc, char* argv[]) {
                        "FGuids so re-pasting into the same graph doesn't "
                        "collide. Optional pos_x + pos_y anchors the pasted "
                        "set's centroid at the given position. Returns "
-                       "{count, node_ids[], recentered}. PIE rejected.",
+                       "{count, node_ids[], recentered, _warning?}. PIE "
+                       "rejected. When the destination graph already has "
+                       "entry/return nodes, those nodes in the T3D are "
+                       "silently dropped; a `_warning` field is emitted "
+                       "with the dropped count.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
@@ -1863,12 +1875,14 @@ int main(int argc, char* argv[]) {
     });
     registerRemote(sage::mcp::Tool{
         .name = "bp.delete_function",
-        .description = "Remove a user function graph. PIE rejected.",
+        .description = "Remove a user function graph. PIE rejected. "
+                       "Pass `confirmed:true` to proceed.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
-                {"path", {{"type", "string"}}},
-                {"name", {{"type", "string"}}},
+                {"path",      {{"type", "string"}}},
+                {"name",      {{"type", "string"}}},
+                {"confirmed", {{"type", "boolean"}}},
             }},
             {"required", nlohmann::json::array({"path", "name"})},
             {"additionalProperties", false},
@@ -1922,7 +1936,9 @@ int main(int argc, char* argv[]) {
                        "SetVar, Branch (=K2Node_IfThenElse), If. node_params for "
                        "CallFunction: {function_name, target_class}. node_params "
                        "for GetVar/SetVar: {variable_name}. Returns "
-                       "{node_id (guid), node_class, pos, pins[]}. PIE rejected.",
+                       "{node_id (guid), node_class, pos, pins[]}. PIE rejected. "
+                       "Reject AnimGraph contexts; use "
+                       "`animation.add_animgraph_node` instead.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
@@ -2320,12 +2336,17 @@ int main(int argc, char* argv[]) {
                        "given folders (default /Game). Uses IAssetTools::"
                        "FixupReferencers — referencing assets get re-saved "
                        "to point at the new path, then the redirector is "
-                       "deleted. PIE rejected.",
+                       "deleted. PIE rejected. Pass `confirmed:true` to "
+                       "proceed (destructive — mid-refactor redirect chains "
+                       "will be lost; FixupReferencers rewrites referencing "
+                       "assets and deletes the redirectors).",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
-                {"paths", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"paths",     {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"confirmed", {{"type", "boolean"}}},
             }},
+            {"required", nlohmann::json::array({"confirmed"})},
             {"additionalProperties", false},
         },
         .handler = nullptr, .remote = true,
@@ -2558,19 +2579,23 @@ int main(int argc, char* argv[]) {
         .name = "project.set_plugin_enabled",
         .description = "Set a plugin's Enabled flag in .uproject's "
                        "Plugins[] array. Updates an existing entry or "
-                       "appends a fresh {Name, Enabled} entry. Backup-"
-                       "then-rename atomic write of the .uproject. Editor "
-                       "restart is required for the new state to take "
-                       "effect (returned in the 'note' field). Returns "
+                       "appends a fresh {Name, Enabled} entry. Atomic "
+                       "write of the .uproject. Editor restart is required "
+                       "for the new state to take effect. Returns "
                        "{plugin, enabled, uproject_path, entry_existed, "
-                       "backup, note}.",
+                       "requires_editor_restart, note}. Destructive — "
+                       "modifying .uproject Plugins[] during a running "
+                       "editor session has non-trivial side effects "
+                       "(modules unload, refs dangle, restart required). "
+                       "Pass `confirmed:true` to proceed.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
-                {"plugin",  {{"type", "string"}}},
-                {"enabled", {{"type", "boolean"}}},
+                {"plugin",    {{"type", "string"}}},
+                {"enabled",   {{"type", "boolean"}}},
+                {"confirmed", {{"type", "boolean"}}},
             }},
-            {"required", nlohmann::json::array({"plugin", "enabled"})},
+            {"required", nlohmann::json::array({"plugin", "enabled", "confirmed"})},
             {"additionalProperties", false},
         },
         .handler = nullptr, .remote = true,
@@ -2791,15 +2816,19 @@ int main(int argc, char* argv[]) {
     registerRemote(sage::mcp::Tool{
         .name = "asset.import_animation",
         .description = "Import a UAnimSequence from FBX. Verifies the "
-                       "produced asset is a UAnimSequence.",
+                       "produced asset is a UAnimSequence. Requires "
+                       "`skeleton` (USkeleton path) — wired into "
+                       "UFbxImportUI->Skeleton + bImportAnimations=true. "
+                       "-32602 if skeleton missing/wrong class.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
                 {"file",             {{"type", "string"}}},
                 {"destination",      {{"type", "string"}}},
+                {"skeleton",         {{"type", "string"}}},
                 {"replace_existing", {{"type", "boolean"}}},
             }},
-            {"required", nlohmann::json::array({"file", "destination"})},
+            {"required", nlohmann::json::array({"file", "destination", "skeleton"})},
             {"additionalProperties", false},
         },
         .handler = nullptr, .remote = true,
@@ -2879,15 +2908,20 @@ int main(int argc, char* argv[]) {
         .name = "asset.read_datatable",
         .description = "Read all rows of a UDataTable. Returns "
                        "{row_struct (path), row_count, rows: [{name, "
-                       "fields: {<col>: <value>}}], returned, capped}. "
+                       "fields: {<col>: <value>}}], returned, offset, capped}. "
                        "Each row's fields go through Sage's reflection "
                        "(structs/arrays/enums round-trip). max_rows "
-                       "clamped 1..100000 (default 1000).",
+                       "clamped 1..100000 (default 1000). Optional `offset` "
+                       "(>=0, default 0) skips first N rows. Optional "
+                       "`fields` (string array) projects each row's fields "
+                       "object to listed columns only.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
                 {"path",     {{"type", "string"}}},
                 {"max_rows", {{"type", "integer"}, {"minimum", 1}, {"maximum", 100000}}},
+                {"offset",   {{"type", "integer"}, {"minimum", 0}}},
+                {"fields",   {{"type", "array"}, {"items", {{"type", "string"}}}}},
             }},
             {"required", nlohmann::json::array({"path"})},
             {"additionalProperties", false},
@@ -3033,7 +3067,10 @@ int main(int argc, char* argv[]) {
                        "rollup counters {deleted, missing, failed, "
                        "total}. Soft-tolerates missing paths (no error). "
                        "Wrapped in single FScopedTransaction so the "
-                       "whole batch is one undo step. PIE rejected.",
+                       "whole batch is one undo step. PIE rejected. "
+                       "Pass `confirmed:true` to proceed (destructive — "
+                       "deletes every listed asset; only undoable while "
+                       "editor is alive).",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
@@ -3042,8 +3079,9 @@ int main(int argc, char* argv[]) {
                     {"items", {{"type", "string"}}},
                     {"minItems", 1},
                 }},
+                {"confirmed", {{"type", "boolean"}}},
             }},
-            {"required", nlohmann::json::array({"paths"})},
+            {"required", nlohmann::json::array({"paths", "confirmed"})},
             {"additionalProperties", false},
         },
         .handler = nullptr, .remote = true,
@@ -3056,11 +3094,16 @@ int main(int argc, char* argv[]) {
                        "be either a package path '/Game/Foo/Bar' or a "
                        "full object path '/Game/Foo/Bar.Bar' (the dot "
                        "suffix is stripped automatically). Errors -32602 "
-                       "if the package can't be found or loaded. PIE rejected.",
+                       "if the package can't be found or loaded. PIE rejected. "
+                       "Pass `confirmed:true` to proceed (destructive — "
+                       "discards in-memory edits, irreversible without git).",
         .inputSchema = nlohmann::json{
             {"type", "object"},
-            {"properties", {{"path", {{"type", "string"}}}}},
-            {"required", nlohmann::json::array({"path"})},
+            {"properties", {
+                {"path",      {{"type", "string"}}},
+                {"confirmed", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "confirmed"})},
             {"additionalProperties", false},
         },
         .handler = nullptr, .remote = true,
@@ -3277,7 +3320,8 @@ int main(int argc, char* argv[]) {
                        "VIEWMODE, CAMERA, R.SCREENPERCENTAGE, MEMREPORT, "
                        "OBJ, LOG, HELP). allow_unsafe=true bypasses — UE "
                        "console can crash the editor with the wrong command, "
-                       "use with care.",
+                       "use with care. IO-redirecting console forms (FILE=, "
+                       "pipes, EXEC) are rejected unless allow_unsafe=true.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
@@ -3293,8 +3337,10 @@ int main(int argc, char* argv[]) {
         .name = "editor.take_screenshot",
         .description = "Capture the active viewport as a PNG. Default path: "
                        "ProjectSavedDir/Screenshots/Sage_<timestamp>.png. "
-                       "Returns the saved path. Async — UE writes the file "
-                       "shortly after the call returns.",
+                       "path must resolve under <Project>/Saved/Screenshots; "
+                       "absolute paths and `..` escapes outside that directory "
+                       "are rejected. Returns the saved path. Async — UE "
+                       "writes the file shortly after the call returns.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {{"path", {{"type", "string"}}}}},
@@ -3506,13 +3552,19 @@ int main(int argc, char* argv[]) {
         .name = "editor.get_crash_info",
         .description = "Read a specific crash dir's CrashContext.runtime-"
                        "xml (extracts <ErrorMessage> + <CallStack>) plus "
-                       "the last 50 lines of UnrealEditor.log / "
-                       "<Project>.log inside the dir. crash_dir must live "
-                       "under the per-user crashes root (path-safety "
-                       "guard, -32602 otherwise).",
+                       "a tail of UnrealEditor.log / <Project>.log inside "
+                       "the dir. crash_dir must live under the per-user "
+                       "crashes root (path-safety guard, -32602 otherwise). "
+                       "Optional `lines` (default 50, max 10000) and "
+                       "`offset_from_end` (default 0) control the log tail "
+                       "window.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
-            {"properties", {{"crash_dir", {{"type", "string"}}}}},
+            {"properties", {
+                {"crash_dir",       {{"type", "string"}}},
+                {"lines",           {{"type", "integer"}, {"minimum", 1}, {"maximum", 10000}}},
+                {"offset_from_end", {{"type", "integer"}, {"minimum", 0}}},
+            }},
             {"required", nlohmann::json::array({"crash_dir"})},
             {"additionalProperties", false},
         },
@@ -3524,9 +3576,15 @@ int main(int argc, char* argv[]) {
         .name = "editor.build_all",
         .description = "Trigger a full level build: MAP REBUILD (BSP) + "
                        "BUILD LIGHTING + RebuildNavigation. Fire-and-"
-                       "forget — async; poll editor.get_build_status.",
+                       "forget — async; poll editor.get_build_status. "
+                       "Long-running destructive op (lighting can take "
+                       "hours). Pass `confirmed:true` to proceed.",
         .inputSchema = nlohmann::json{
-            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"type", "object"},
+            {"properties", {
+                {"confirmed", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"confirmed"})},
             {"additionalProperties", false},
         },
         .handler = nullptr, .remote = true,
@@ -3535,9 +3593,13 @@ int main(int argc, char* argv[]) {
         .name = "editor.build_geometry",
         .description = "Rebuild BSP geometry only via 'MAP REBUILD' "
                        "console command. Useful before lighting build "
-                       "after volume/CSG edits.",
+                       "after volume/CSG edits. Pass `confirmed:true` to proceed.",
         .inputSchema = nlohmann::json{
-            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"type", "object"},
+            {"properties", {
+                {"confirmed", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"confirmed"})},
             {"additionalProperties", false},
         },
         .handler = nullptr, .remote = true,
@@ -3548,14 +3610,16 @@ int main(int argc, char* argv[]) {
                        "console command. quality ∈ {Preview (default), "
                        "Medium, High, Production}. Async — agent should "
                        "poll editor.get_build_status until lighting_"
-                       "running becomes false.",
+                       "running becomes false. Pass `confirmed:true` to proceed.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
                 {"quality", {{"type", "string"},
                              {"enum", nlohmann::json::array({
                                  "Preview","Medium","High","Production"})}}},
+                {"confirmed", {{"type", "boolean"}}},
             }},
+            {"required", nlohmann::json::array({"confirmed"})},
             {"additionalProperties", false},
         },
         .handler = nullptr, .remote = true,
@@ -3563,9 +3627,13 @@ int main(int argc, char* argv[]) {
     registerRemote(sage::mcp::Tool{
         .name = "editor.build_hlod",
         .description = "Trigger HLOD build via 'BuildHLODs' console "
-                       "command. Async.",
+                       "command. Async. Pass `confirmed:true` to proceed.",
         .inputSchema = nlohmann::json{
-            {"type", "object"}, {"properties", nlohmann::json::object()},
+            {"type", "object"},
+            {"properties", {
+                {"confirmed", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"confirmed"})},
             {"additionalProperties", false},
         },
         .handler = nullptr, .remote = true,
@@ -3591,11 +3659,13 @@ int main(int argc, char* argv[]) {
         .description = "Run a Python snippet inside the editor's "
                        "PythonScriptPlugin host. Returns {success, "
                        "result (last expression), log_output[] (entries: "
-                       "type ∈ Info/Warning/Error, output)}. -32603 if "
-                       "the project hasn't enabled the PythonScriptPlugin "
-                       "(IsPythonAvailable=false). The agent gets full "
-                       "access to UE Python API including unreal module — "
-                       "treat as a powerful but unsandboxed tool.",
+                       "type ∈ Info/Warning/Error, output), _security_warning}. "
+                       "-32603 if the project hasn't enabled the "
+                       "PythonScriptPlugin (IsPythonAvailable=false). "
+                       "Returns `_security_warning`; this tool exposes "
+                       "arbitrary Python with full UE editor access and is "
+                       "expected to be auth-gated server-side before public "
+                       "release.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {{"code", {{"type", "string"}}}}},

@@ -10,8 +10,14 @@
 #include "MovieScene.h"
 #include "MovieSceneSpawnable.h"
 #include "MovieSceneTrack.h"
+#include "MovieSceneSection.h"
 #include "ScopedTransaction.h"
 #include "UObject/Package.h"
+#include "Channels/MovieSceneChannelProxy.h"
+#include "Channels/MovieSceneFloatChannel.h"
+#include "Channels/MovieSceneDoubleChannel.h"
+#include "Channels/MovieSceneIntegerChannel.h"
+#include "Channels/MovieSceneBoolChannel.h"
 
 #define LOCTEXT_NAMESPACE "SageSeq"
 
@@ -125,7 +131,10 @@ FSageToolDispatch::FOutcome ListTracksImpl(const TSharedPtr<FJsonObject>& Args)
     }
     R->SetArrayField (TEXT("tracks"),       Tracks);
     R->SetNumberField(TEXT("track_count"),  Tracks.Num());
-    R->SetNumberField(TEXT("binding_count"), MS->GetBindings().Num());
+    // UE 5.7: non-const GetBindings() is deprecated (UE_DEPRECATED on
+    // UMovieScene). Force the const overload via a const-qualified pointer.
+    const UMovieScene* CMS = MS;
+    R->SetNumberField(TEXT("binding_count"), CMS->GetBindings().Num());
     R->SetNumberField(TEXT("possessable_count"), MS->GetPossessableCount());
     R->SetNumberField(TEXT("spawnable_count"),   MS->GetSpawnableCount());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
@@ -201,12 +210,27 @@ FSageToolDispatch::FOutcome AddKeyframeImpl(const TSharedPtr<FJsonObject>& Args)
     FSageToolDispatch::FOutcome Reject;
     if (detail::RejectIfPie(Reject)) return Reject;
 
-    FString Path;
+    FString Path, TrackName;
     if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("track_name"), TrackName) || TrackName.IsEmpty())
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'track_name'"));
 
-    double TimeVal = 0.0;
-    if (Args.IsValid()) Args->TryGetNumberField(TEXT("time"), TimeVal);
+    double TimeSeconds = 0.0;
+    if (!Args->TryGetNumberField(TEXT("time"), TimeSeconds))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'time' (seconds)"));
+
+    const TSharedPtr<FJsonValue> ValueField = Args->Values.FindRef(TEXT("value"));
+    if (!ValueField.IsValid())
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'value'"));
+
+    int32 ChannelIndex = 0;
+    if (Args.IsValid())
+    {
+        double N = 0;
+        if (Args->TryGetNumberField(TEXT("channel_index"), N))
+            ChannelIndex = FMath::Max(0, static_cast<int32>(N));
+    }
 
     UObject* Asset = ResolveAsset(Path);
     ULevelSequence* Seq = Cast<ULevelSequence>(Asset);
@@ -216,12 +240,119 @@ FSageToolDispatch::FOutcome AddKeyframeImpl(const TSharedPtr<FJsonObject>& Args)
     UMovieScene* MS = Seq->GetMovieScene();
     if (!MS) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no MovieScene"));
 
+    UMovieSceneTrack* Track = nullptr;
+    for (UMovieSceneTrack* T : MS->GetTracks())
+    {
+        if (T && T->GetName() == TrackName) { Track = T; break; }
+    }
+    if (!Track)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("track '%s' not found on sequence"), *TrackName));
+    }
+
+    UMovieSceneSection* Section = nullptr;
+    for (UMovieSceneSection* S : Track->GetAllSections())
+    {
+        if (S) { Section = S; break; }
+    }
+    if (!Section)
+    {
+        Section = Track->CreateNewSection();
+        if (!Section)
+            return FSageToolDispatch::FOutcome::MakeError(-32000,
+                TEXT("CreateNewSection returned null"));
+        Section->SetRange(TRange<FFrameNumber>::All());
+        Track->AddSection(*Section);
+    }
+
+    const FFrameRate Tick = MS->GetTickResolution();
+    const FFrameNumber Frame = Tick.AsFrameTime(TimeSeconds).RoundToFrame();
+
+    FScopedTransaction Tx(LOCTEXT("SeqAddKey", "Add Sequencer Keyframe"));
+    Section->Modify();
+
+    FString ChannelTypeUsed;
+    bool bAdded = false;
+
+    // Try float channel first, then double, integer, bool — in declaration order.
+    FMovieSceneChannelProxy& Proxy = Section->GetChannelProxy();
+    {
+        TArrayView<FMovieSceneFloatChannel*> Channels =
+            Proxy.GetChannels<FMovieSceneFloatChannel>();
+        if (Channels.IsValidIndex(ChannelIndex))
+        {
+            double V = 0.0; ValueField->TryGetNumber(V);
+            Channels[ChannelIndex]->AddCubicKey(Frame, static_cast<float>(V));
+            ChannelTypeUsed = TEXT("float");
+            bAdded = true;
+        }
+    }
+    if (!bAdded)
+    {
+        TArrayView<FMovieSceneDoubleChannel*> Channels =
+            Proxy.GetChannels<FMovieSceneDoubleChannel>();
+        if (Channels.IsValidIndex(ChannelIndex))
+        {
+            double V = 0.0; ValueField->TryGetNumber(V);
+            Channels[ChannelIndex]->AddCubicKey(Frame, V);
+            ChannelTypeUsed = TEXT("double");
+            bAdded = true;
+        }
+    }
+    if (!bAdded)
+    {
+        TArrayView<FMovieSceneIntegerChannel*> Channels =
+            Proxy.GetChannels<FMovieSceneIntegerChannel>();
+        if (Channels.IsValidIndex(ChannelIndex))
+        {
+            double V = 0.0; ValueField->TryGetNumber(V);
+            Channels[ChannelIndex]->GetData().AddKey(Frame, static_cast<int32>(V));
+            ChannelTypeUsed = TEXT("integer");
+            bAdded = true;
+        }
+    }
+    if (!bAdded)
+    {
+        TArrayView<FMovieSceneBoolChannel*> Channels =
+            Proxy.GetChannels<FMovieSceneBoolChannel>();
+        if (Channels.IsValidIndex(ChannelIndex))
+        {
+            bool B = false;
+            if (!ValueField->TryGetBool(B))
+            {
+                double V = 0.0; ValueField->TryGetNumber(V);
+                B = V != 0.0;
+            }
+            Channels[ChannelIndex]->GetData().AddKey(Frame, B);
+            ChannelTypeUsed = TEXT("bool");
+            bAdded = true;
+        }
+    }
+
+    if (!bAdded)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("track '%s' has no float/double/integer/bool channel "
+                                  "at index %d (or unsupported channel type)"),
+                            *TrackName, ChannelIndex));
+    }
+
+    TRange<FFrameNumber> Range = MS->GetPlaybackRange();
+    if (Range.HasUpperBound() && Frame > Range.GetUpperBoundValue())
+    {
+        MS->SetPlaybackRange(TRange<FFrameNumber>(Range.GetLowerBoundValue(), Frame));
+    }
+    Seq->MarkPackageDirty();
+
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("path"),     Seq->GetPathName());
-    R->SetNumberField(TEXT("time"),     TimeVal);
-    R->SetStringField(TEXT("note"),
-        TEXT("Keyframe addition requires a specific track and channel; "
-             "use MovieSceneSection::GetChannelProxy() on the target track's section"));
+    R->SetStringField(TEXT("path"),          Seq->GetPathName());
+    R->SetStringField(TEXT("track_name"),    TrackName);
+    R->SetNumberField(TEXT("time"),          TimeSeconds);
+    R->SetNumberField(TEXT("frame"),         Frame.Value);
+    R->SetNumberField(TEXT("channel_index"), ChannelIndex);
+    R->SetStringField(TEXT("channel_type"),  ChannelTypeUsed);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -296,15 +427,25 @@ FSageToolDispatch::FOutcome AddSpawnableImpl(const TSharedPtr<FJsonObject>& Args
     Seq->Modify();
     MS->Modify();
 
-    // Create a template object for the spawnable
+    // Create a template object for the spawnable. UE 5.7 spawnable templates
+    // require RF_ArchetypeObject in addition to RF_Transactional — without it
+    // the spawnable serialize/instantiate path treats the object as a regular
+    // outer-of-MovieScene UObject and fails to spawn at runtime.
     UObject* Template = NewObject<UObject>(Seq, Cls,
-        FName(*Cls->GetName()), RF_Transactional);
-    MS->AddSpawnable(Cls->GetName(), *Template);
+        FName(*Cls->GetName()), RF_Transactional | RF_ArchetypeObject);
+    if (!Template)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32000,
+            FString::Printf(TEXT("NewObject(template) returned null for %s"), *Cls->GetName()));
+    }
+    const FGuid SpawnableGuid = MS->AddSpawnable(Cls->GetName(), *Template);
     Seq->MarkPackageDirty();
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("sequence"),   Seq->GetPathName());
     R->SetStringField(TEXT("class"),      Cls->GetName());
+    R->SetStringField(TEXT("guid"),       SpawnableGuid.ToString(EGuidFormats::DigitsWithHyphens));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 

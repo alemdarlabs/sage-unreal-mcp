@@ -111,7 +111,7 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.set_bone_keyframes",
-        .description="Write bone transform keyframes into an AnimSequence.",
+        .description="[NOT IMPLEMENTED] Write bone transform keyframes into an AnimSequence.",
         .inputSchema=obj({{"path",str()},{"bone",str()},{"keyframes",arr()}},{"path","bone","keyframes"}),
         .handler=nullptr,.remote=true});
 
@@ -121,7 +121,7 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.bake_root_motion_from_bone",
-        .description="Bake root motion from a reference bone into an AnimSequence.",
+        .description="[NOT IMPLEMENTED] Bake root motion from a reference bone into an AnimSequence.",
         .inputSchema=obj({{"path",str()},{"bone",str()}},{"path","bone"}),
         .handler=nullptr,.remote=true});
 
@@ -136,12 +136,12 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.create_montage",
-        .description="Create an AnimMontage asset from a skeleton.",
-        .inputSchema=obj({{"path",str()},{"skeleton",str()}},{"path","skeleton"}),
+        .description="Create an AnimMontage asset from a skeleton. Optional `sequence_path` (UAnimSequence) seeds the first slot track.",
+        .inputSchema=obj({{"path",str()},{"skeleton",str()},{"sequence_path",str()}},{"path","skeleton"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.set_montage_sequence",
-        .description="Set the primary sequence referenced by an AnimMontage slot track.",
+        .description="[NOT IMPLEMENTED] Set the primary sequence referenced by an AnimMontage slot track.",
         .inputSchema=obj({{"path",str()},{"sequence",str()}},{"path","sequence"}),
         .handler=nullptr,.remote=true});
 
@@ -151,8 +151,8 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.set_montage_slot",
-        .description="Set the slot track name on an AnimMontage.",
-        .inputSchema=obj({{"path",str()},{"slot",str()}},{"path","slot"}),
+        .description="Set the slot track name on an AnimMontage. Optional `slot_index` (default 0) targets a specific slot when the montage has multiple.",
+        .inputSchema=obj({{"path",str()},{"slot",str()},{"slot_index",i32()}},{"path","slot"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.add_montage_section",
@@ -166,7 +166,7 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.add_curve",
-        .description="Add a named float curve to an AnimSequence. Note: SmartName API removed in UE 5.5+; returns guidance.",
+        .description="Add a named float curve to an AnimSequence via IAnimationDataController (UE 5.5+ canonical path). Returns {added: bool}.",
         .inputSchema=obj({{"path",str()},{"curve_name",str()}},{"path","curve_name"}),
         .handler=nullptr,.remote=true});
 
@@ -186,33 +186,33 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.create_state_machine",
-        .description="Create a named state machine inside an AnimBlueprint's anim graph.",
-        .inputSchema=obj({{"path",str()},{"name",str()}},{"path","name"}),
+        .description="Create a named state machine sub-graph inside an AnimBlueprint's AnimGraph (UAnimationStateMachineGraph + UAnimationStateMachineSchema). Spawns a UAnimGraphNode_StateMachine in the AnimGraph and optionally wires it to the AnimGraph Output Pose root. Returns {state_machine_name, state_machine_node_id, connected_to_root, compiled}. -32602 if name already exists.",
+        .inputSchema=obj({{"path",str()},{"name",str()},{"connect_to_root",bln()},{"compile",bln()}},{"path","name"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.read_state_machine",
         .description="Read a state machine's states and transitions from an AnimBlueprint.",
-        .inputSchema=obj({{"path",str()},{"state_machine",str()}},{"path"}),
+        .inputSchema=obj({{"path",str()},{"state_machine_name",str()}},{"path"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.add_state",
-        .description="Add a new state node to a state machine in an AnimBlueprint.",
-        .inputSchema=obj({{"path",str()},{"state_machine",str()},{"state_name",str()}},{"path","state_machine","state_name"}),
+        .description="Add a new UAnimStateNode to a state machine sub-graph. The state's BoundGraph (the inner anim graph driving the state's output pose) is renamed to match. Returns {state_id (FGuid digits), state_name, x, y}. Use the returned state_id in add_transition / set_state_animation calls.",
+        .inputSchema=obj({{"path",str()},{"state_machine_name",str()},{"state_name",str()},{"x",num()},{"y",num()}},{"path","state_machine_name","state_name"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.add_transition",
-        .description="Add a transition between two states in an AnimBlueprint state machine.",
-        .inputSchema=obj({{"path",str()},{"state_machine",str()},{"from",str()},{"to",str()}},{"path","state_machine","from","to"}),
+        .description="Add a UAnimStateTransitionNode between two states (matched by FGuid id from add_state). Wires from_state.OutputPose -> transition.InputPose -> to_state.InputPose. Returns {transition_id, from_state_id, to_state_id}.",
+        .inputSchema=obj({{"path",str()},{"state_machine_name",str()},{"from_state_id",str()},{"to_state_id",str()}},{"path","state_machine_name","from_state_id","to_state_id"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.set_state_animation",
-        .description="Link an animation sequence to a state node in an AnimBlueprint state machine.",
-        .inputSchema=obj({{"path",str()},{"state_machine",str()},{"state",str()},{"animation",str()}},{"path","state_machine","state","animation"}),
+        .description="Drive a state's output pose with the given UAnimSequenceBase via a UAnimGraphNode_SequencePlayer in the state's BoundGraph (any pre-existing sequence players are removed for idempotency). Returns {state_id, animation, connected, player_node_id}.",
+        .inputSchema=obj({{"path",str()},{"state_machine_name",str()},{"state_id",str()},{"animation",str()},{"loop",bln()}},{"path","state_machine_name","state_id","animation"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.set_transition_blend",
-        .description="Set blend duration and logic type on a state machine transition.",
-        .inputSchema=obj({{"path",str()},{"state_machine",str()},{"from",str()},{"to",str()},{"duration",num()},{"logic",str()}},{"path","state_machine","from","to"}),
+        .description="Set the CrossfadeDuration on a UAnimStateTransitionNode (matched by FGuid id from add_transition). Returns {transition_id, blend_time}.",
+        .inputSchema=obj({{"path",str()},{"state_machine_name",str()},{"transition_id",str()},{"blend_time",num()}},{"path","state_machine_name","transition_id"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.create_ik_rig",
@@ -261,17 +261,17 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.set_pose_search_schema",
-        .description="Assign a PoseSearchSchema asset to a PoseSearch database.",
+        .description="[NOT IMPLEMENTED] Assign a PoseSearchSchema asset to a PoseSearch database.",
         .inputSchema=obj({{"path",str()},{"schema",str()}},{"path","schema"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.add_pose_search_sequence",
-        .description="Add an AnimSequence to a PoseSearch database.",
+        .description="[NOT IMPLEMENTED] Add an AnimSequence to a PoseSearch database.",
         .inputSchema=obj({{"path",str()},{"sequence",str()}},{"path","sequence"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.build_pose_search_index",
-        .description="Build/rebuild the index of a PoseSearch database.",
+        .description="[NOT IMPLEMENTED] Build/rebuild the index of a PoseSearch database.",
         .inputSchema=obj({{"path",str()}},{"path"}),
         .handler=nullptr,.remote=true});
 
@@ -283,6 +283,359 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
     reg(registry, Tool{.name="animation.create_anim_blueprint",
         .description="Create an AnimBlueprint asset bound to a skeleton.",
         .inputSchema=obj({{"path",str()},{"skeleton",str()}},{"path","skeleton"}),
+        .handler=nullptr,.remote=true});
+
+    // ----- Phase 4-r6 (Lyra Sage Gap #17/#18) -------------------------------
+
+    reg(registry, Tool{.name="animation.create_anim_notify",
+        .description="Create a UAnimNotify subclass Blueprint asset. The BP starts blank; wire `Received_Notify` via Sage BP graph tools (bp.add_event_node + bp.add_function_call). Optional `parent_class` lets you derive from an existing UAnimNotify subclass (e.g. /Script/Engine.AnimNotify_PlayParticleEffect). Returns {path, parent_class}. -32602 if parent_class isn't a UAnimNotify subclass.",
+        .inputSchema=obj({{"path",str()},{"parent_class",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.create_anim_notify_state",
+        .description="Create a UAnimNotifyState subclass Blueprint asset. The BP starts blank; wire `Received_NotifyBegin` / `Received_NotifyTick` / `Received_NotifyEnd` via Sage BP graph tools. Optional `parent_class` defaults to /Script/Engine.AnimNotifyState. Returns {path, parent_class}.",
+        .inputSchema=obj({{"path",str()},{"parent_class",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.add_blendspace_sample",
+        .description="Append a single anim sample to a UBlendSpace at the given (x, y) coordinate. For 1D blendspaces only `x` is used. Accepts either {x, y} scalar pair or {position: [a, b]} array form. Returns {added: bool, sample_count, x, y}.",
+        .inputSchema=obj({{"path",str()},{"animation",str()},{"x",num()},{"y",num()},{"position",arr()}},{"path","animation"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.set_blendspace_samples",
+        .description="Bulk-replace all samples on a UBlendSpace. `samples` is an array of {animation, x?, y?, position?} entries. Existing samples are removed first (idempotent). Returns {sample_count, added, skipped: [...]}. Each item where `animation` is missing or fails to resolve goes into `skipped`.",
+        .inputSchema=obj({{"path",str()},{"samples",arr()}},{"path","samples"}),
+        .handler=nullptr,.remote=true});
+
+    // ----- Phase 4-r6 Cluster A (AnimGraph node creation core) ------------
+
+    reg(registry, Tool{.name="animation.add_animgraph_node",
+        .description="Spawn a UAnimGraphNode_* subclass node into a target graph (root AnimGraph by default, or a state machine sub-graph via `graph_name`). `node_class` is a UClass path like '/Script/AnimGraph.AnimGraphNode_SequencePlayer'. Returns {node_id, class, graph, x, y}. -32602 if class isn't a UAnimGraphNode_Base subclass or is abstract.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_class",str()},{"x",num()},{"y",num()}},{"path","node_class"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.remove_animgraph_node",
+        .description="Remove an AnimGraph node from a graph by FGuid id (returned by add_animgraph_node / list_animgraph_nodes). Disconnects all pins. Returns {removed: true}.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()}},{"path","node_id"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.connect_pose_pin",
+        .description="Connect an output pose pin on `from_node_id` to an input pose pin on `to_node_id` inside the target graph. Pin names default to first-output-pose / first-input-pose if `from_pin` / `to_pin` are omitted (handles common case). Use FGuid digits as ids. Returns {connected: true}.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"from_node_id",str()},{"to_node_id",str()},{"from_pin",str()},{"to_pin",str()}},{"path","from_node_id","to_node_id"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.disconnect_pose_pin",
+        .description="Break the link between two pose pins (mirror of connect_pose_pin args). Returns {disconnected: true}.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"from_node_id",str()},{"to_node_id",str()},{"from_pin",str()},{"to_pin",str()}},{"path","from_node_id","to_node_id"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.set_anim_node_property",
+        .description="Mutate a single property on the inner FAnimNode_* struct of a UAnimGraphNode_*. Looks up `property` first on the wrapper UObject (rare display flags), then descends into the `Node` UPROPERTY struct. JSON value coerces: string→FName/object path/FString/enum-by-name, number→float/int/bool, array→FVector/FRotator/FLinearColor by length. Returns {set: true}. -32602 if property unknown or value can't coerce.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()},{"property",str()},{"value",nlohmann::json::object()}},{"path","node_id","property","value"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.bind_anim_node_property",
+        .description="DEPRECATED — current build returns -32601. UE 5.7 marked UAnimGraphNode_Base::PropertyBindings as PropertyBindings_DEPRECATED; the canonical replacement uses the UAnimBlueprintExtension subsystem and is pending Sage implementation. Until then, set node properties via animation.set_anim_node_property and accept the literal-value semantics.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()},{"property",str()},{"variable",str()}},{"path","node_id","property","variable"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.list_animgraph_nodes",
+        .description="List every node in a target graph. Returns {graph, count, nodes: [{node_id, class, x, y, pin_count, binding_count?}]}. binding_count present only for UAnimGraphNode_Base derivatives.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.set_animgraph_root_pose",
+        .description="Wire a node's first-output-pose pin to the AnimGraph Root node's first-input-pose (the canonical 'Output Pose' in the root AnimGraph or any state's BoundGraph). Works for both UAnimGraphNode_Root (root AnimGraph) and UAnimGraphNode_StateResult (state BoundGraph). Replaces whatever currently feeds root. Returns {connected: true, root_id}.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()}},{"path","node_id"}),
+        .handler=nullptr,.remote=true});
+
+    // ----- Phase 4-r6 Cluster B (AnimGraph convenience nodes) ------------
+
+    reg(registry, Tool{.name="animation.add_sequence_player",
+        .description="Spawn a UAnimGraphNode_SequencePlayer in the target graph and (optionally) bind its `Sequence` property to a UAnimSequenceBase asset. Returns {node_id, class, sequence?, loop, rate}. For non-default loop/rate use animation.set_anim_node_property after.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"sequence",str()},{"x",num()},{"y",num()},{"loop",bln()},{"rate",num()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.add_blendspace_player",
+        .description="Spawn a UAnimGraphNode_BlendSpacePlayer and bind its asset to a UBlendSpace path. Returns {node_id, class, blendspace?}. Bind axis variables via animation.bind_anim_node_property when that's wired (currently DEPRECATED — see bind tool).",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"blendspace",str()},{"x",num()},{"y",num()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.add_state_machine_node",
+        .description="Spawn a UAnimGraphNode_StateMachine that references an existing state machine sub-graph by name (must be created via animation.create_state_machine first). Useful for putting a single SM under a BlendListByBool or behind a state. -32602 if the named SM doesn't exist. Returns {node_id, class, state_machine_name}.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"state_machine_name",str()},{"x",num()},{"y",num()}},{"path","state_machine_name"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.add_blend_list_by_bool",
+        .description="Spawn a UAnimGraphNode_BlendListByBool. After spawn, set the `bActiveValue` (input bool pin's literal default) via animation.set_anim_node_property and connect its True/False pose inputs. Returns {node_id, class}.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"x",num()},{"y",num()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.add_blend_list_by_enum",
+        .description="Spawn a UAnimGraphNode_BlendListByEnum. Set the `BoundEnum` UEnum class via animation.set_anim_node_property after spawn. Returns {node_id, class}.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"x",num()},{"y",num()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.add_layered_blend_per_bone",
+        .description="Spawn a UAnimGraphNode_LayeredBoneBlend (upper/lower body split, etc.). Set the BlendPoseList / BoneFilters via animation.set_anim_node_property after spawn. Returns {node_id, class}.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"x",num()},{"y",num()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.add_apply_additive",
+        .description="Spawn a UAnimGraphNode_ApplyAdditive (additive layering). Returns {node_id, class}. Connect base pose + additive pose inputs separately via animation.connect_pose_pin.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"x",num()},{"y",num()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.add_two_bone_ik",
+        .description="Spawn a UAnimGraphNode_TwoBoneIK (foot IK / arm IK). Set IKBone / EffectorLocation / JointTargetLocation via animation.set_anim_node_property. Returns {node_id, class}.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"x",num()},{"y",num()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.add_skeletal_control_node",
+        .description="Generic spawn for any UAnimGraphNode_SkeletalControlBase derivative (CopyBone, ModifyBone, RotationMultiplier, FabrikIK, etc.). Pass full UClass path via `control_class`. -32602 if class isn't a SkeletalControlBase subclass. Returns {node_id, class}.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"control_class",str()},{"x",num()},{"y",num()}},{"path","control_class"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.add_play_montage_notify_window",
+        .description="Spawn a UAnimGraphNode_Slot (montage slot — anim-graph integration of montage playback). Set SlotName via animation.set_anim_node_property. Returns {node_id, class}.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"x",num()},{"y",num()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.add_link_anim_layer",
+        .description="Spawn a UAnimGraphNode_LinkedAnimLayer (calls into a layer interface function on a runtime-linked AnimInstance). Set Interface + LayerFunctionName via animation.set_anim_node_property after. Returns {node_id, class}.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"x",num()},{"y",num()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    // ----- Phase 4-r6 Cluster J (runtime character.* — PIE-only) ----------
+
+    reg(registry, Tool{.name="character.play_root_motion_source",
+        .description="Apply a FRootMotionSource_* to an ACharacter's UCharacterMovementComponent (Lyra Sage Gap #19 — predicted, replicated movement push). `source_type`: 'ConstantForce' (linear over duration) | 'JumpForce' (vertical impulse) | 'RadialForce' (`location` + `radius` define influence sphere) | 'MoveToForce' (`target_location` + optional `start_location`). `direction` is a [x,y,z] vector (will be normalized for ConstantForce). `accumulate_mode`: 'Override'|'Additive'. `finish_velocity_mode`: 'MaintainLastRootMotion'|'SetVelocity'|'ClampVelocity'. JumpForce optional curves: `path_offset_curve` (UCurveVector path), `time_mapping_curve` (UCurveFloat path). `sensitive_liftoff_check` (default true) for ConstantForce + JumpForce. PIE-only. Returns {source_id (uint16), duration, strength}.",
+        .inputSchema=obj({{"actor",str()},{"source_type",str()},{"direction",arr()},{"strength",num()},{"duration",num()},{"accumulate_mode",str()},{"finish_velocity_mode",str()},{"debug_name",str()},{"location",arr()},{"radius",num()},{"target_location",arr()},{"start_location",arr()},{"path_offset_curve",str()},{"time_mapping_curve",str()},{"sensitive_liftoff_check",bln()}},{"actor"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="character.remove_root_motion_source",
+        .description="Cancel a running root-motion source by ID on a Character's CMC. PIE-only.",
+        .inputSchema=obj({{"actor",str()},{"source_id",num()}},{"actor","source_id"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="character.play_montage",
+        .description="Play a UAnimMontage on the actor's AnimInstance (PIE runtime). Optional `start_section` jumps to a named section after start. Optional `start_position` (seconds) calls Montage_SetPosition post-Play. Returns {actor, montage, length, play_rate}. -32603 if Montage_Play returns 0.",
+        .inputSchema=obj({{"actor",str()},{"montage",str()},{"play_rate",num()},{"start_section",str()},{"start_position",num()}},{"actor","montage"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="character.stop_montage",
+        .description="Stop montages on the actor's AnimInstance with the supplied blend-out time (default 0.25s). Optional `montage` (UAnimMontage path) stops only that specific montage instead of all. PIE-only. Returns {stopped: true}.",
+        .inputSchema=obj({{"actor",str()},{"blend_out_time",num()},{"montage",str()}},{"actor"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="character.set_anim_instance_class",
+        .description="Swap an actor's runtime AnimInstance class (USkeletalMeshComponent::SetAnimInstanceClass). Useful for Lyra-style HeroData layer swaps. PIE-only. -32602 if class isn't a UAnimInstance subclass. Returns {swapped: true}.",
+        .inputSchema=obj({{"actor",str()},{"anim_class",str()}},{"actor","anim_class"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="character.list_active_montages",
+        .description="List active FAnimMontageInstance entries on the actor's AnimInstance. PIE-only. Returns {actor, count, montages: [{montage, position, weight, play_rate}]}.",
+        .inputSchema=obj({{"actor",str()}},{"actor"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="character.set_animation_mode",
+        .description="Set the SkeletalMeshComponent's animation mode: 'AnimBlueprint' (default), 'AnimAsset' (single asset playback), 'Custom'. PIE-only. Returns {actor, mode}.",
+        .inputSchema=obj({{"actor",str()},{"mode",str()}},{"actor","mode"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="character.play_animation",
+        .description="Play a single UAnimationAsset on the actor's SkeletalMeshComponent (side-steps AnimBP — sets AnimationMode to AnimationSingleNode). PIE-only. Returns {animation, looping}.",
+        .inputSchema=obj({{"actor",str()},{"animation",str()},{"looping",bln()}},{"actor","animation"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="character.set_morph_target",
+        .description="Drive a named morph target on the actor's SkeletalMeshComponent. Value typically [0..1]. PIE-only. Returns {target_name, value}.",
+        .inputSchema=obj({{"actor",str()},{"target_name",str()},{"value",num()}},{"actor","target_name","value"}),
+        .handler=nullptr,.remote=true});
+
+    // ----- Phase 4-r6 Cluster C ek (state machine deep CRUD) -------------
+
+    reg(registry, Tool{.name="animation.add_conduit",
+        .description="Add a UAnimStateConduitNode (transient state with rule expression) to a state machine. Conduits don't play animation — they evaluate transition logic and route. Returns {conduit_id, name}.",
+        .inputSchema=obj({{"path",str()},{"state_machine_name",str()},{"name",str()},{"x",num()},{"y",num()}},{"path","state_machine_name","name"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.add_state_alias",
+        .description="Add a UAnimStateAliasNode (UE 5.0+) — multi-source transition target representing a group of states. Optional `aliased_states` (FGuid string list of state ids) and `global_alias` (default false). Returns {alias_id, name, global_alias, aliased_count}.",
+        .inputSchema=obj({{"path",str()},{"state_machine_name",str()},{"name",str()},{"x",num()},{"y",num()},{"aliased_states",arr()},{"global_alias",bln()}},{"path","state_machine_name","name"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.set_transition_priority",
+        .description="Set the integer priority (PriorityOrder) on a transition — lower number = higher priority when multiple transitions are eligible.",
+        .inputSchema=obj({{"path",str()},{"state_machine_name",str()},{"transition_id",str()},{"priority",i32()}},{"path","state_machine_name","transition_id","priority"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.set_state_machine_initial_state",
+        .description="Set the state machine's initial state by re-linking the entry node's output to the supplied state_id.",
+        .inputSchema=obj({{"path",str()},{"state_machine_name",str()},{"state_id",str()}},{"path","state_machine_name","state_id"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.list_states",
+        .description="Read every UAnimStateNodeBase in a state machine. Returns {count, states: [{state_id, class, name, x, y}]}.",
+        .inputSchema=obj({{"path",str()},{"state_machine_name",str()}},{"path","state_machine_name"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.list_transitions",
+        .description="Read every UAnimStateTransitionNode in a state machine. Returns {count, transitions: [{transition_id, blend_time, priority}]}.",
+        .inputSchema=obj({{"path",str()},{"state_machine_name",str()}},{"path","state_machine_name"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.set_transition_rule",
+        .description="[NOT IMPLEMENTED] Boolean expression authoring inside transition's BoundGraph.",
+        .inputSchema=obj({{"path",str()},{"state_machine_name",str()},{"transition_id",str()},{"expression",str()},{"source_blueprint_path",str()}},{"path","state_machine_name","transition_id"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.set_state_entered_event",
+        .description="[NOT IMPLEMENTED] State OnEntered/OnExited custom event hook.",
+        .inputSchema=obj({{"path",str()},{"state_machine_name",str()},{"state_id",str()},{"custom_event_name",str()}},{"path","state_machine_name","state_id","custom_event_name"}),
+        .handler=nullptr,.remote=true});
+
+    // ----- Phase 4-r6 Cluster D ek (notify track CRUD) -------------------
+
+    reg(registry, Tool{.name="animation.add_notify_track",
+        .description="Append a new notify track on an AnimSequenceBase (multi-track support beyond default index 0).",
+        .inputSchema=obj({{"path",str()},{"track_name",str()}},{"path","track_name"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.list_notifies",
+        .description="List every FAnimNotifyEvent on an AnimSequenceBase. Returns {count, notifies: [{index, name, time, duration, track, class?}]}.",
+        .inputSchema=obj({{"path",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.remove_notify",
+        .description="Remove a single notify entry by index (from list_notifies).",
+        .inputSchema=obj({{"path",str()},{"index",i32()}},{"path","index"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.set_notify_position",
+        .description="Update a notify entry's time (and optionally duration) by index.",
+        .inputSchema=obj({{"path",str()},{"index",i32()},{"time",num()},{"duration",num()}},{"path","index","time"}),
+        .handler=nullptr,.remote=true});
+
+    // ----- Phase 4-r6 Cluster E ek (blendspace axis settings) ------------
+
+    reg(registry, Tool{.name="animation.remove_blendspace_sample",
+        .description="Delete a single blendspace sample by index. Returns {sample_count, removed}.",
+        .inputSchema=obj({{"path",str()},{"index",i32()}},{"path","index"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.set_blendspace_axis",
+        .description="[STUB — pending implementation] Configure a blendspace axis: display name, min/max range, grid divisions. axis: 'X' or 'Y'.",
+        .inputSchema=obj({{"path",str()},{"axis",str()},{"name",str()},{"min",num()},{"max",num()},{"grid_divisions",i32()}},{"path","axis"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.set_blendspace_smoothing",
+        .description="[STUB — pending implementation] Set per-axis interpolation time (smoothing) on a blendspace.",
+        .inputSchema=obj({{"path",str()},{"axis",str()},{"interpolation_speed",num()}},{"path","axis","interpolation_speed"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.set_blendspace_target_weight_interpolation",
+        .description="[STUB — pending implementation] Set TargetWeightInterpolationSpeedPerSec on a blendspace (sample-weight smoothing).",
+        .inputSchema=obj({{"path",str()},{"time",num()}},{"path","time"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.read_blendspace_samples",
+        .description="Read every sample on a blendspace. Returns {count, samples: [{animation, x, y}]}.",
+        .inputSchema=obj({{"path",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    // ----- Phase 4-r6 Cluster F (sync markers + compression + modifier) --
+
+    reg(registry, Tool{.name="animation.add_sync_marker",
+        .description="Append an FAnimSyncMarker (named time-tagged sync point) on a UAnimSequence.",
+        .inputSchema=obj({{"path",str()},{"marker_name",str()},{"time",num()}},{"path","marker_name","time"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.remove_sync_marker",
+        .description="Remove a sync marker by index.",
+        .inputSchema=obj({{"path",str()},{"index",i32()}},{"path","index"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.list_sync_markers",
+        .description="Read all authored sync markers on a UAnimSequence. Returns {count, markers: [{index, name, time}]}.",
+        .inputSchema=obj({{"path",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.set_curve_compression",
+        .description="[NOT IMPLEMENTED] UAnimCurveCompressionCodec asset reference assignment.",
+        .inputSchema=obj({{"path",str()},{"codec",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.run_animation_modifier",
+        .description="[NOT IMPLEMENTED] UAnimationModifier::ApplyToAnimationSequence.",
+        .inputSchema=obj({{"path",str()},{"modifier_class_path",str()}},{"path","modifier_class_path"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.add_animation_modifier",
+        .description="[NOT IMPLEMENTED] Sequence->AnimationModifier_AddInstance.",
+        .inputSchema=obj({{"path",str()},{"modifier_class_path",str()}},{"path","modifier_class_path"}),
+        .handler=nullptr,.remote=true});
+
+    // ----- Phase 4-r6 Cluster G (anim layer interface — stubbed) --------
+
+    reg(registry, Tool{.name="animation.create_anim_layer_interface",
+        .description="[NOT IMPLEMENTED] UAnimLayerInterface BP factory.",
+        .inputSchema=obj({{"path",str()},{"name",str()}},{"path","name"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.add_layer_function",
+        .description="[NOT IMPLEMENTED] Anim layer interface function.",
+        .inputSchema=obj({{"path",str()},{"function_name",str()}},{"path","function_name"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.implement_anim_layer_interface",
+        .description="[NOT IMPLEMENTED] AnimBP implements layer interface.",
+        .inputSchema=obj({{"path",str()},{"layer_interface_path",str()}},{"path","layer_interface_path"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.set_linked_anim_layer",
+        .description="[NOT IMPLEMENTED] Runtime SetLinkedAnimLayer on AnimInstance.",
+        .inputSchema=obj({{"actor",str()},{"layer_function_name",str()},{"anim_class_path",str()}},{"actor","layer_function_name","anim_class_path"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.list_implemented_layers",
+        .description="[NOT IMPLEMENTED] List anim layer interface implementations.",
+        .inputSchema=obj({{"path",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    // ----- Phase 4-r6 Cluster H (sequence/montage advanced) -------------
+
+    reg(registry, Tool{.name="animation.set_sequence_additive_settings",
+        .description="Configure a UAnimSequence's additive settings: additive_type ('LocalSpaceBase'|'MeshSpaceBase'|'None'), base_animation reference for ref pose.",
+        .inputSchema=obj({{"path",str()},{"additive_type",str()},{"base_pose_type",str()},{"base_animation",str()}},{"path","additive_type"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.set_sequence_compression_scheme",
+        .description="[NOT IMPLEMENTED] BoneCompressionSettings asset binding.",
+        .inputSchema=obj({{"path",str()},{"scheme_path",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.add_montage_branching_point",
+        .description="Append a branching point marker (cooked-time event tagged with branch name).",
+        .inputSchema=obj({{"path",str()},{"branch_name",str()},{"time",num()}},{"path","branch_name","time"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.set_montage_blend_curve",
+        .description="[NOT IMPLEMENTED] BlendIn/Out curve type.",
+        .inputSchema=obj({{"path",str()},{"blend_in_or_out",str()},{"curve_path",str()}},{"path","blend_in_or_out"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.set_montage_section_loop",
+        .description="Configure a montage section to loop (NextSectionName == self) or not (NextSectionName cleared).",
+        .inputSchema=obj({{"path",str()},{"section_name",str()},{"loop",bln()}},{"path","section_name"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.set_montage_section_next",
+        .description="Chain section1 → section2 (NextSectionName). Pass empty next_section_name to clear.",
+        .inputSchema=obj({{"path",str()},{"section_name",str()},{"next_section_name",str()}},{"path","section_name"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.copy_animation_curves",
+        .description="[NOT IMPLEMENTED] Curve transfer between sequences.",
+        .inputSchema=obj({{"from_sequence",str()},{"to_sequence",str()},{"curve_names",arr()}},{"from_sequence","to_sequence"}),
+        .handler=nullptr,.remote=true});
+
+    // ----- Phase 4-r6 Cluster I (skeleton authoring) --------------------
+
+    reg(registry, Tool{.name="animation.add_skeleton_socket",
+        .description="Add a USkeletalMeshSocket to a USkeleton, attached to parent_bone. Transform optional (defaults to identity at parent bone).",
+        .inputSchema=obj({{"path",str()},{"socket_name",str()},{"parent_bone",str()},{"transform",obj({})}},{"path","socket_name","parent_bone"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.remove_skeleton_socket",
+        .description="Remove a socket by name.",
+        .inputSchema=obj({{"path",str()},{"socket_name",str()}},{"path","socket_name"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.add_slot",
+        .description="Define an animation slot on a skeleton (binds slot_name to group_name). Slot groups required for montage playback.",
+        .inputSchema=obj({{"path",str()},{"slot_name",str()},{"group_name",str()}},{"path","slot_name"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.add_slot_group",
+        .description="Define a slot group on a skeleton.",
+        .inputSchema=obj({{"path",str()},{"group_name",str()}},{"path","group_name"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.set_bone_translation_retargeting",
+        .description="DEPRECATED — pending Sage implementation (Animation/Skeleton/AnimationScaled/AnimationRelativeToRefPose/OrientAndScale modes per bone).",
+        .inputSchema=obj({{"path",str()},{"bone",str()},{"mode",str()}},{"path","bone","mode"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.add_skeleton_curve_metadata",
+        .description="DEPRECATED — pending Sage implementation (MaterialCurve / MorphTarget metadata).",
+        .inputSchema=obj({{"path",str()},{"curve_name",str()},{"type",str()}},{"path","curve_name","type"}),
         .handler=nullptr,.remote=true});
 
     // ========================================================================
@@ -375,7 +728,10 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
                      "names are dropped silently and reported in "
                      "`skipped_triggers`/`skipped_modifiers`. Returns "
                      "{asset_path, action, key, trigger_count, "
-                     "modifier_count, mapping_count, skipped_*?}. -32602 if "
+                     "modifier_count, mapping_count, mapping_index, skipped_*?}. "
+                     "`mapping_index` is the index of the mapping just appended "
+                     "(use for subsequent set_mapping_modifiers / "
+                     "remove_imc_mapping calls without re-listing). -32602 if "
                      "asset/action/key is invalid. (Lyra Sage Gap #10 fix.)",
         .inputSchema=obj({
             {"path",str()},{"action",str()},{"key",str()},
@@ -546,8 +902,8 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="gameplay.set_world_game_mode",
-        .description="Override the default GameMode class in World Settings.",
-        .inputSchema=obj({{"game_mode",str()}},{"game_mode"}),
+        .description="Override the default GameMode class in World Settings (TSubclassOf<AGameModeBase>). Destructive — pass `confirmed:true` to proceed.",
+        .inputSchema=obj({{"game_mode_class",str()},{"confirmed",bln()}},{"game_mode_class","confirmed"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="gameplay.get_framework_info",
@@ -1028,8 +1384,8 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="level.load",
-        .description="Load a level asset (replaces persistent level). Rejects during PIE.",
-        .inputSchema=obj({{"path",str()}},{"path"}),
+        .description="Load a level asset (replaces persistent level). Rejects during PIE. If the current world is dirty, rejects -32602 unless `discard_unsaved:true` is set (mirrors editor's 'Save before opening?' dialog).",
+        .inputSchema=obj({{"path",str()},{"discard_unsaved",bln()}},{"path"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="level.list",
@@ -1038,8 +1394,8 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="level.create",
-        .description="Create a new level asset.",
-        .inputSchema=obj({{"path",str()}},{"path"}),
+        .description="Create a new level asset via UWorld::CreateWorld pipeline (registers FXSystem/Niagara). Destructive — writes a new UWorld asset. Pass `confirmed:true` to proceed.",
+        .inputSchema=obj({{"path",str()},{"confirmed",bln()}},{"path","confirmed"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="level.spawn_volume",
@@ -1158,7 +1514,7 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
 
     reg(registry, Tool{.name="mat.duplicate",
         .description="Duplicate a material asset to a new path.",
-        .inputSchema=obj({{"path",str()},{"dest",str()}},{"path","dest"}),
+        .inputSchema=obj({{"path",str()},{"destination",str()}},{"path","destination"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="mat.get_shader_stats",
@@ -1172,13 +1528,13 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="mat.import_graph",
-        .description="Rebuild a material from a previously exported JSON node+edge spec.",
-        .inputSchema=obj({{"path",str()},{"graph",{{"type","object"}}}},{"path","graph"}),
+        .description="Rebuild a material from a previously exported JSON node+edge spec. Symmetric round-trip with mat.export_graph (top-level `nodes` array).",
+        .inputSchema=obj({{"path",str()},{"nodes",arr()}},{"path","nodes"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="mat.build_graph",
-        .description="Create a material from a declarative JSON spec (expressions + connections + property bindings) in one call.",
-        .inputSchema=obj({{"path",str()},{"spec",{{"type","object"}}}},{"path","spec"}),
+        .description="Create a material from a declarative spec (PBR helper) in one call. Flat shape: `base_color` (RGB array), `metallic` (0..1), `roughness` (0..1), `emissive` (RGB array).",
+        .inputSchema=obj({{"path",str()},{"base_color",arr()},{"metallic",num()},{"roughness",num()},{"emissive",arr()}},{"path"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="mat.render_preview",
@@ -1187,13 +1543,13 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="mat.begin_transaction",
-        .description="Open an FScopedTransaction for a sequence of material graph edits.",
-        .inputSchema=obj({{"label",str()}}),
+        .description="Open an FScopedTransaction for a sequence of material graph edits. `path` keys the per-material transaction (ADR-017 safe). `description` shows in the editor's Undo/Redo history.",
+        .inputSchema=obj({{"path",str()},{"description",str()}},{"path"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="mat.end_transaction",
-        .description="Commit the open material editing transaction.",
-        .inputSchema=obj({}),
+        .description="Commit the open material editing transaction. Optional `path` selects the per-material transaction; omit to commit the global slot.",
+        .inputSchema=obj({{"path",str()}}),
         .handler=nullptr,.remote=true});
 
     // ========================================================================
@@ -1303,8 +1659,8 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="project.write_cpp_file",
-        .description="Write or overwrite a .h/.cpp/.inl file under the project Source/ directory.",
-        .inputSchema=obj({{"path",str()},{"content",str()}},{"path","content"}),
+        .description="Write or overwrite a .h/.cpp/.inl/.cs/.Build.cs/.Target.cs file under the project Source/ directory. path must resolve under FPaths::ProjectDir() (engine source writes rejected). INI/.uproject/.uplugin are explicitly rejected — use project.set_config / project.set_plugin_enabled. Destructive — pass `confirmed:true` to proceed.",
+        .inputSchema=obj({{"path",str()},{"content",str()},{"confirmed",bln()}},{"path","content","confirmed"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="project.add_module_dependency",
@@ -1335,12 +1691,12 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="widget.create_utility_widget",
-        .description="Create an EditorUtilityWidget Blueprint asset.",
+        .description="Create an EditorUtilityWidget Blueprint asset (UEditorUtilityWidgetBlueprint). asset is a UEditorUtilityWidgetBlueprint — required form for Editor Utility menu and widget.run_utility_widget.",
         .inputSchema=obj({{"path",str()}},{"path"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="widget.run_utility_widget",
-        .description="Run an EditorUtilityWidget via UEditorUtilitySubsystem. Returns note about API.",
+        .description="Spawns the editor utility widget as a registered nomad tab via UEditorUtilitySubsystem. Requires the asset to be a UEditorUtilityWidgetBlueprint (created by widget.create_utility_widget).",
         .inputSchema=obj({{"path",str()}},{"path"}),
         .handler=nullptr,.remote=true});
 
@@ -1356,7 +1712,7 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
 
     reg(registry, Tool{.name="widget.move_widget",
         .description="Move a widget from one parent panel to another inside a WidgetBlueprint.",
-        .inputSchema=obj({{"path",str()},{"widget",str()},{"new_parent",str()}},{"path","widget","new_parent"}),
+        .inputSchema=obj({{"path",str()},{"widget_name",str()},{"new_parent",str()}},{"path","widget_name","new_parent"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="widget.list_classes",
@@ -1483,8 +1839,9 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .inputSchema=obj({
             {"asset_path",str()},
             {"array_property",str()},
-            {"element_value",{}},
+            {"element_value",nlohmann::json::object()},
             {"class_name",str()},
+            {"allow_empty",bln()},
         },{"asset_path","array_property","element_value"}),
         .handler=nullptr,.remote=true});
 
@@ -1511,7 +1868,9 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
                      "instanced-recursion property reader (depth 2); "
                      "`include_world_settings` adds the AWorldSettings "
                      "reflected props (depth 3). `max_actors` defaults "
-                     "to 10000 (range 1..200000).",
+                     "to 10000 (range 1..200000). Returns optional "
+                     "`_perf_warning` when include_actor_props=true and "
+                     "many actors are returned; consider simplify=stripped.",
         .inputSchema=obj({
             {"path",str()},
             {"actor_class_filter",str()},
@@ -1646,7 +2005,9 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
                      "interfaces, cdo_properties, dependencies (assets + class "
                      "refs). Required: path. Optional: output_path (project-"
                      "relative or absolute; pretty-prints JSON to file and "
-                     "returns the absolute path). Defaults: "
+                     "returns the absolute path). When set, output_path resolves "
+                     "under the project directory; absolute paths and `..` "
+                     "escapes outside the project are rejected. Defaults: "
                      "include_function_graphs=true, include_referenced_assets=true, "
                      "include_component_defaults=true, include_t3d=false. "
                      "Designed as a destructive-change safety net — capture "
@@ -1691,18 +2052,18 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
     // ========================================================================
 
     reg(registry, Tool{.name="seq.add_keyframe",
-        .description="Add a keyframe to a specific track/channel in a Level Sequence. Note: requires track-specific API.",
-        .inputSchema=obj({{"path",str()},{"track",str()},{"time",num()},{"value",{{"description","JSON value"}}}},{"path","track","time","value"}),
+        .description="Add a keyframe to the first section of a named track. Auto-creates the section if absent. Resolves channel by type fallback: float → double → integer → bool at the given index. `track_name` is the UMovieSceneTrack object name (use the `name` field from seq.list_tracks). `value` is numeric for float/double/integer, boolean for bool channels. Returns {track_name, frame, channel_index, channel_type}.",
+        .inputSchema=obj({{"path",str()},{"track_name",str()},{"time",num()},{"value",{{"description","JSON value"}}},{"channel_index",i32()}},{"path","track_name","time","value"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="seq.add_possessable",
         .description="Add a possessable binding (existing level actor) to a Level Sequence.",
-        .inputSchema=obj({{"path",str()},{"actor",str()}},{"path","actor"}),
+        .inputSchema=obj({{"path",str()},{"actor_id",str()}},{"path","actor_id"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="seq.add_spawnable",
-        .description="Add a spawnable binding (template object) to a Level Sequence.",
-        .inputSchema=obj({{"path",str()},{"class",str()},{"name",str()}},{"path","class"}),
+        .description="Add a spawnable binding (template object) to a Level Sequence. Returns {guid} for subsequent binding targeting.",
+        .inputSchema=obj({{"path",str()},{"class_path",str()}},{"path","class_path"}),
         .handler=nullptr,.remote=true});
 
     // ========================================================================

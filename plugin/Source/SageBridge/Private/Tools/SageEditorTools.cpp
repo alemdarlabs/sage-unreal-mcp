@@ -75,7 +75,10 @@ FSageToolDispatch::FOutcome SaveLevelOnGameThread(const TSharedPtr<FJsonObject>&
 
     const bool bWasDirty = Pkg->IsDirty();
     const TArray<UPackage*> Packages{Pkg};
-    UEditorLoadingAndSavingUtils::SavePackages(Packages, /*bOnlyDirty=*/false);
+    // bOnlyDirty=true: skip clean packages to avoid VCS noise + disk waste.
+    // Callers asking save_level on an unmodified world should be a no-op,
+    // not a forced rewrite that bumps mtimes and dirties source-control.
+    UEditorLoadingAndSavingUtils::SavePackages(Packages, /*bOnlyDirty=*/true);
 
     UE_LOG(LogSageBridge, Log, TEXT("Saved level package: %s"), *Pkg->GetName());
 

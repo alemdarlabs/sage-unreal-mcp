@@ -70,6 +70,12 @@ public class SageBridge : ModuleRules
             // UClass set (Lyra Sage Gap #10). EnabledByDefault on every UE 5.7
             // project, so the hard dep is safe.
             "EnhancedInput",
+            // AnimGraph + AnimGraphRuntime (Phase 4-r6 — Lyra Sage Gap #16/#20).
+            // AnimGraph: UAnimGraphNode_*, UAnimationGraph, UAnimationStateMachineGraph,
+            //            UAnimationStateMachineSchema, UAnimStateNode, UAnimStateTransitionNode.
+            // AnimGraphRuntime: FAnimNode_* runtime structs (BlendSpace, BlendListByBool, ...).
+            "AnimGraph",
+            "AnimGraphRuntime",
         });
         // Note: Niagara, PCG, Landscape, Foliage, GAS, MetaSound are loaded via
         // FindObject<UClass> at runtime — no hard Build.cs dep needed.

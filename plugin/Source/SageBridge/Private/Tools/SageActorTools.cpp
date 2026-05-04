@@ -193,6 +193,14 @@ FSageToolDispatch::FOutcome DeleteActorOnGameThread(const TSharedPtr<FJsonObject
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor_id'"));
     }
 
+    bool bConfirmed = false;
+    Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    if (!bConfirmed)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("destructive op: pass 'confirmed':true to proceed (delete_actor)"));
+    }
+
     if (GEditor == nullptr)
     {
         return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));

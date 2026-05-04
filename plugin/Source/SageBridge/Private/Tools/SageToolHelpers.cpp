@@ -643,6 +643,21 @@ TSharedPtr<FJsonValue> GetPropertyValueAtPtr(const FProperty* Property,
             --Ctx->CurrentDepth;
             return MakeShared<FJsonValueObject>(Sub);
         }
+        // Recursion-aware truncation marker: when an instanced subobject was
+        // requested but we hit MaxDepth, emit a structured tombstone instead
+        // of a bare path string so callers can detect the truncation point.
+        // (Visited-cycle short-circuits and unbounded paths still emit bare
+        // path — only the depth-limit case gets the marker.)
+        if (Ctx != nullptr && bInstanced
+            && Ctx->CurrentDepth >= Ctx->MaxDepth
+            && !Ctx->Visited.Contains(Obj))
+        {
+            auto Trunc = MakeShared<FJsonObject>();
+            Trunc->SetStringField(TEXT("_path"),      FSoftObjectPath(Obj).ToString());
+            Trunc->SetBoolField  (TEXT("_truncated"), true);
+            Trunc->SetStringField(TEXT("_reason"),    TEXT("max_depth"));
+            return MakeShared<FJsonValueObject>(Trunc);
+        }
         return MakeShared<FJsonValueString>(FSoftObjectPath(Obj).ToString());
     }
     if (const FSoftObjectProperty* P = CastField<FSoftObjectProperty>(Property))

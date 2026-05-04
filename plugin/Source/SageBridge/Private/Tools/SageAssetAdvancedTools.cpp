@@ -33,9 +33,13 @@
 #include "PhysicsEngine/BodySetup.h"
 #include "ScopedTransaction.h"
 #include "Subsystems/EditorAssetSubsystem.h"
+#include "ObjectTools.h"
 #include "UObject/ObjectRedirector.h"
 #include "UObject/Package.h"
 #include "UObject/SoftObjectPath.h"
+#include "Factories/FbxImportUI.h"
+#include "Factories/FbxAnimSequenceImportData.h"
+#include "Animation/Skeleton.h"
 
 #define LOCTEXT_NAMESPACE "SageAssetAdv"
 
@@ -158,16 +162,29 @@ FSageToolDispatch::FOutcome BulkRenameImpl(const TSharedPtr<FJsonObject>& Args)
 
     FScopedTransaction Tx(LOCTEXT("BulkRename", "Sage: Bulk Rename Assets"));
     TArray<TSharedPtr<FJsonValue>> Results;
+    TArray<TSharedPtr<FJsonValue>> Failures;
     int32 Renamed = 0, Failed = 0;
 
     for (const auto& V : *Pairs)
     {
         const auto Obj = V->AsObject();
-        if (!Obj.IsValid()) { ++Failed; continue; }
+        if (!Obj.IsValid())
+        {
+            ++Failed;
+            auto F = MakeShared<FJsonObject>();
+            F->SetStringField(TEXT("reason"), TEXT("entry not an object"));
+            Failures.Add(MakeShared<FJsonValueObject>(F));
+            continue;
+        }
         FString Src, Dst;
         if (!Obj->TryGetStringField(TEXT("src"), Src) || !Obj->TryGetStringField(TEXT("dst"), Dst))
         {
             ++Failed;
+            auto F = MakeShared<FJsonObject>();
+            F->SetStringField(TEXT("src"),    Src);
+            F->SetStringField(TEXT("dst"),    Dst);
+            F->SetStringField(TEXT("reason"), TEXT("missing 'src' or 'dst'"));
+            Failures.Add(MakeShared<FJsonValueObject>(F));
             continue;
         }
         const bool bOk = Sub->RenameAsset(Src, Dst);
@@ -176,7 +193,45 @@ FSageToolDispatch::FOutcome BulkRenameImpl(const TSharedPtr<FJsonObject>& Args)
         Row->SetStringField(TEXT("dst"),   Dst);
         Row->SetBoolField  (TEXT("ok"),    bOk);
         Results.Add(MakeShared<FJsonValueObject>(Row));
-        if (bOk) ++Renamed; else ++Failed;
+        if (bOk)
+        {
+            ++Renamed;
+        }
+        else
+        {
+            ++Failed;
+            auto F = MakeShared<FJsonObject>();
+            F->SetStringField(TEXT("src"),    Src);
+            F->SetStringField(TEXT("dst"),    Dst);
+            F->SetStringField(TEXT("reason"), TEXT("RenameAsset returned false"));
+            Failures.Add(MakeShared<FJsonValueObject>(F));
+        }
+    }
+
+    if (Failed > 0)
+    {
+        // Atomic-or-rollback: cancel the scoped transaction so all prior renames
+        // in this batch are reverted. Caller may retry per-item if they want
+        // partial-success semantics.
+        Tx.Cancel();
+        // FOutcome::MakeError carries only message; flatten the failure list
+        // into the message so the caller can act on it.
+        FString FailureSummary;
+        for (const TSharedPtr<FJsonValue>& FV : Failures)
+        {
+            const TSharedPtr<FJsonObject>* O = nullptr;
+            if (!FV.IsValid() || !FV->TryGetObject(O) || !O || !O->IsValid()) continue;
+            FString S, D, Why;
+            (*O)->TryGetStringField(TEXT("src"),    S);
+            (*O)->TryGetStringField(TEXT("dst"),    D);
+            (*O)->TryGetStringField(TEXT("reason"), Why);
+            if (!FailureSummary.IsEmpty()) FailureSummary += TEXT("; ");
+            FailureSummary += FString::Printf(TEXT("%s -> %s (%s)"), *S, *D, *Why);
+        }
+        return FSageToolDispatch::FOutcome::MakeError(-32000,
+            FString::Printf(TEXT("bulk_rename rolled back: %d failure(s); "
+                                 "%d successful rename(s) reverted; failures: [%s]"),
+                            Failed, Renamed, *FailureSummary));
     }
 
     auto R = MakeShared<FJsonObject>();
@@ -205,28 +260,93 @@ FSageToolDispatch::FOutcome MoveFolderImpl(const TSharedPtr<FJsonObject>& Args)
     if (!Sub) return FSageToolDispatch::FOutcome::MakeError(-32603,
         TEXT("EditorAssetSubsystem unavailable"));
 
-    FScopedTransaction Tx(LOCTEXT("MoveFolder", "Sage: Move Folder"));
     TArray<FString> AssetsInFolder = Sub->ListAssets(Src, /*Recursive*/ true);
+
+    // Pre-compute destination paths and detect collisions BEFORE mutating.
+    struct FMove { FString Src; FString Dst; };
+    TArray<FMove> Plan;
+    Plan.Reserve(AssetsInFolder.Num());
+    TArray<FString> Collisions;
+    TArray<FString> PrefixSkipped;
+    for (const FString& AssetPath : AssetsInFolder)
+    {
+        FString Tail = AssetPath;
+        if (!Tail.RemoveFromStart(Src))
+        {
+            PrefixSkipped.Add(AssetPath);
+            continue;
+        }
+        const FString NewPath = Dst / Tail;
+        if (Sub->DoesAssetExist(NewPath))
+        {
+            Collisions.Add(NewPath);
+        }
+        Plan.Add({AssetPath, NewPath});
+    }
+
+    if (Collisions.Num() > 0)
+    {
+        FString List;
+        for (int32 I = 0; I < Collisions.Num() && I < 16; ++I)
+        {
+            if (!List.IsEmpty()) List += TEXT(", ");
+            List += Collisions[I];
+        }
+        if (Collisions.Num() > 16) List += FString::Printf(TEXT(" (+%d more)"), Collisions.Num() - 16);
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("destination collision: %s"), *List));
+    }
+    if (PrefixSkipped.Num() > 0)
+    {
+        FString List;
+        for (int32 I = 0; I < PrefixSkipped.Num() && I < 8; ++I)
+        {
+            if (!List.IsEmpty()) List += TEXT(", ");
+            List += PrefixSkipped[I];
+        }
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("asset(s) outside src prefix: %s"), *List));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("MoveFolder", "Sage: Move Folder"));
 
     int32 Moved = 0, Failed = 0;
     TArray<TSharedPtr<FJsonValue>> Results;
-    for (const FString& AssetPath : AssetsInFolder)
+    TArray<FString> FailureSummary;
+    for (const FMove& M : Plan)
     {
-        // Compute destination path by replacing src prefix with dst.
-        FString NewPath = AssetPath;
-        if (!NewPath.RemoveFromStart(Src))
-        {
-            ++Failed;
-            continue;
-        }
-        NewPath = Dst / NewPath;
-        const bool bOk = Sub->RenameAsset(AssetPath, NewPath);
+        const bool bOk = Sub->RenameAsset(M.Src, M.Dst);
         auto Row = MakeShared<FJsonObject>();
-        Row->SetStringField(TEXT("src"), AssetPath);
-        Row->SetStringField(TEXT("dst"), NewPath);
+        Row->SetStringField(TEXT("src"), M.Src);
+        Row->SetStringField(TEXT("dst"), M.Dst);
         Row->SetBoolField  (TEXT("ok"),  bOk);
         Results.Add(MakeShared<FJsonValueObject>(Row));
-        if (bOk) ++Moved; else ++Failed;
+        if (bOk)
+        {
+            ++Moved;
+        }
+        else
+        {
+            ++Failed;
+            FailureSummary.Add(FString::Printf(TEXT("%s -> %s"), *M.Src, *M.Dst));
+        }
+    }
+
+    if (Failed > 0)
+    {
+        // Atomic-or-rollback: cancel transaction; all prior moves revert.
+        Tx.Cancel();
+        FString List;
+        for (int32 I = 0; I < FailureSummary.Num() && I < 16; ++I)
+        {
+            if (!List.IsEmpty()) List += TEXT("; ");
+            List += FailureSummary[I];
+        }
+        if (FailureSummary.Num() > 16) List += FString::Printf(TEXT(" (+%d more)"), FailureSummary.Num() - 16);
+        return FSageToolDispatch::FOutcome::MakeError(-32000,
+            FString::Printf(TEXT("move_folder rolled back: %d failure(s); "
+                                 "%d successful move(s) reverted; failures: [%s]"),
+                            Failed, Moved, *List));
     }
 
     auto R = MakeShared<FJsonObject>();
@@ -276,6 +396,15 @@ FSageToolDispatch::FOutcome FixupRedirectorsImpl(const TSharedPtr<FJsonObject>& 
 {
     FSageToolDispatch::FOutcome PieErr;
     if (detail::RejectIfPie(PieErr)) return PieErr;
+
+    bool bConfirmed = false;
+    if (Args.IsValid()) Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    if (!bConfirmed)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("destructive operation; pass confirmed:true to proceed "
+                 "(mid-refactor redirect chains will be lost — fixup rewrites referencers and deletes redirectors)"));
+    }
 
     TArray<FString> Paths;
     if (Args.IsValid())
@@ -673,8 +802,12 @@ FSageToolDispatch::FOutcome ExportAssetImpl(const TSharedPtr<FJsonObject>& Args)
 
 namespace import_helpers
 {
+    using ImportUIConfigurator = TFunction<FSageToolDispatch::FOutcome(
+        UFbxImportUI* /*UI*/, const TSharedPtr<FJsonObject>& /*Args*/)>;
+
     FSageToolDispatch::FOutcome RunImport(const TSharedPtr<FJsonObject>& Args,
-                                          UClass* ExpectedBase)
+                                          UClass* ExpectedBase,
+                                          ImportUIConfigurator ConfigureUI = nullptr)
     {
         FSageToolDispatch::FOutcome Reject;
         if (detail::RejectIfPie(Reject)) return Reject;
@@ -725,6 +858,15 @@ namespace import_helpers
         Task->bReplaceExisting = bReplace;
         Task->bReplaceExistingSettings = bReplace;
 
+        // Optional: caller-supplied ImportUI configuration (e.g. anim skeleton).
+        if (ConfigureUI)
+        {
+            UFbxImportUI* UI = NewObject<UFbxImportUI>(Task);
+            FSageToolDispatch::FOutcome UIErr = ConfigureUI(UI, Args);
+            if (!UIErr.bSuccess) return UIErr;
+            Task->Options = UI;
+        }
+
         FAssetToolsModule& AssetToolsMod = FModuleManager::LoadModuleChecked<FAssetToolsModule>(
             TEXT("AssetTools"));
         IAssetTools& AssetTools = AssetToolsMod.Get();
@@ -749,10 +891,26 @@ namespace import_helpers
             }
             if (!bAnyMatched)
             {
+                // Clean up any orphan objects produced by the mismatched import
+                // so a stale package isn't left on disk. Best-effort: failures
+                // here are surfaced in the error message but don't override
+                // the primary error.
+                int32 Cleaned = 0;
+                for (const FString& P : Task->ImportedObjectPaths)
+                {
+                    FSoftObjectPath Soft(P);
+                    UObject* Obj = Soft.ResolveObject();
+                    if (!Obj) Obj = Soft.TryLoad();
+                    if (Obj && ObjectTools::DeleteSingleObject(Obj, /*bPerformReferenceCheck*/ false))
+                    {
+                        ++Cleaned;
+                    }
+                }
                 return FSageToolDispatch::FOutcome::MakeError(-32000,
-                    FString::Printf(TEXT("import produced no %s (got %d objects)"),
+                    FString::Printf(TEXT("import produced no %s (got %d objects, cleaned %d)"),
                                     *ExpectedBase->GetName(),
-                                    Task->ImportedObjectPaths.Num()));
+                                    Task->ImportedObjectPaths.Num(),
+                                    Cleaned));
             }
         }
 
@@ -793,7 +951,43 @@ FSageToolDispatch::FOutcome ImportSkeletalMeshImpl(const TSharedPtr<FJsonObject>
 FSageToolDispatch::FOutcome ImportAnimationImpl(const TSharedPtr<FJsonObject>& Args)
 {
     UClass* AnimSeq = FindObject<UClass>(nullptr, TEXT("/Script/Engine.AnimSequence"));
-    return import_helpers::RunImport(Args, AnimSeq);
+
+    // Animation imports REQUIRE a target Skeleton — without it, UFbxImportUI
+    // refuses to bind the AnimSequence and the asset is unusable. Wire the
+    // schema-declared `skeleton` param through to UFbxImportUI->Skeleton so
+    // ImportAssetTasks gets a fully-configured option block.
+    auto ConfigureUI = [](UFbxImportUI* UI, const TSharedPtr<FJsonObject>& A)
+        -> FSageToolDispatch::FOutcome
+    {
+        FString SkeletonPath;
+        if (!A.IsValid() || !A->TryGetStringField(TEXT("skeleton"), SkeletonPath)
+            || SkeletonPath.IsEmpty())
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("missing 'skeleton' (animation import requires target USkeleton path)"));
+        }
+        FSoftObjectPath Soft(SkeletonPath);
+        UObject* Obj = Soft.ResolveObject();
+        if (!Obj) Obj = Soft.TryLoad();
+        USkeleton* Skel = Cast<USkeleton>(Obj);
+        if (!Skel)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("skeleton not found or wrong class: %s"),
+                                *SkeletonPath));
+        }
+        UI->Skeleton           = Skel;
+        UI->MeshTypeToImport   = FBXIT_Animation;
+        UI->OriginalImportType = FBXIT_Animation;
+        UI->bImportAnimations  = true;
+        UI->bImportMesh        = false;
+        UI->bImportMaterials   = false;
+        UI->bImportTextures    = false;
+        // Empty result — caller only inspects bSuccess.
+        return FSageToolDispatch::FOutcome::MakeSuccess(MakeShared<FJsonObject>());
+    };
+
+    return import_helpers::RunImport(Args, AnimSeq, ConfigureUI);
 }
 
 FSageToolDispatch::FOutcome ReimportImpl(const TSharedPtr<FJsonObject>& Args)
@@ -873,12 +1067,31 @@ FSageToolDispatch::FOutcome ReadDataTableImpl(const TSharedPtr<FJsonObject>& Arg
                         Asset ? *Asset->GetClass()->GetName() : TEXT("<not found>")));
 
     int32 MaxRows = 1000;
+    int32 Offset = 0;
+    TSet<FString> FieldsFilter;
     if (Args.IsValid())
     {
         double N = 0;
         if (Args->TryGetNumberField(TEXT("max_rows"), N))
         {
             MaxRows = FMath::Clamp(static_cast<int32>(N), 1, 100000);
+        }
+        double OffN = 0;
+        if (Args->TryGetNumberField(TEXT("offset"), OffN))
+        {
+            Offset = FMath::Max(0, static_cast<int32>(OffN));
+        }
+        const TArray<TSharedPtr<FJsonValue>>* FieldsArr = nullptr;
+        if (Args->TryGetArrayField(TEXT("fields"), FieldsArr) && FieldsArr)
+        {
+            for (const TSharedPtr<FJsonValue>& V : *FieldsArr)
+            {
+                FString S;
+                if (V.IsValid() && V->TryGetString(S) && !S.IsEmpty())
+                {
+                    FieldsFilter.Add(S);
+                }
+            }
         }
     }
 
@@ -889,13 +1102,16 @@ FSageToolDispatch::FOutcome ReadDataTableImpl(const TSharedPtr<FJsonObject>& Arg
 
     TArray<FName> RowNames = DT->GetRowNames();
     R->SetNumberField(TEXT("row_count"), RowNames.Num());
+    R->SetNumberField(TEXT("offset"),    Offset);
 
     TArray<TSharedPtr<FJsonValue>> Rows;
     int32 Returned = 0;
+    int32 Skipped = 0;
     if (DT->RowStruct)
     {
         for (const FName& Name : RowNames)
         {
+            if (Skipped < Offset) { ++Skipped; continue; }
             if (Returned >= MaxRows) break;
             const uint8* RowData = DT->GetRowMap().FindRef(Name);
             if (!RowData) continue;
@@ -907,11 +1123,13 @@ FSageToolDispatch::FOutcome ReadDataTableImpl(const TSharedPtr<FJsonObject>& Arg
             {
                 FProperty* P = *It;
                 if (!P) continue;
+                const FString FieldName = P->GetName();
+                if (FieldsFilter.Num() > 0 && !FieldsFilter.Contains(FieldName)) continue;
                 const void* Value = P->ContainerPtrToValuePtr<const void>(RowData);
                 TSharedPtr<FJsonValue> JV = detail::GetPropertyValueAtPtr(P, Value);
                 if (JV.IsValid())
                 {
-                    Fields->SetField(P->GetName(), JV);
+                    Fields->SetField(FieldName, JV);
                 }
             }
             Row->SetObjectField(TEXT("fields"), Fields);
@@ -919,9 +1137,9 @@ FSageToolDispatch::FOutcome ReadDataTableImpl(const TSharedPtr<FJsonObject>& Arg
             ++Returned;
         }
     }
-    R->SetArrayField(TEXT("rows"),     Rows);
+    R->SetArrayField (TEXT("rows"),     Rows);
     R->SetNumberField(TEXT("returned"), Returned);
-    R->SetBoolField  (TEXT("capped"),   Returned < RowNames.Num());
+    R->SetBoolField  (TEXT("capped"),   (Offset + Returned) < RowNames.Num());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1213,51 +1431,76 @@ FSageToolDispatch::FOutcome SetSkMaterialSlotsImpl(const TSharedPtr<FJsonObject>
 
     TArray<FSkeletalMaterial>& Mats = SK->GetMaterials();
 
+    // Pre-validate ALL slots before mutating. Validate-then-apply: reject the
+    // entire request if any entry is malformed or out-of-range, so the asset
+    // is not left in a partially-mutated state.
+    struct FResolved
+    {
+        int32 Index;
+        bool  bClearMaterial;
+        UMaterialInterface* Mat;
+        bool  bSetSlotName;
+        FName SlotName;
+    };
+    TArray<FResolved> Resolved;
+    Resolved.Reserve(SlotArr->Num());
+    for (int32 I = 0; I < SlotArr->Num(); ++I)
+    {
+        const TSharedPtr<FJsonValue>& V = (*SlotArr)[I];
+        const TSharedPtr<FJsonObject>* Item = nullptr;
+        if (!V.IsValid() || !V->TryGetObject(Item) || !Item || !Item->IsValid())
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("slots[%d] is not an object"), I));
+        }
+        double IndexN = -1;
+        if (!(*Item)->TryGetNumberField(TEXT("index"), IndexN))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("slots[%d] missing 'index'"), I));
+        }
+        FResolved R;
+        R.Index = static_cast<int32>(IndexN);
+        if (R.Index < 0 || R.Index >= Mats.Num())
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("slots[%d] index %d out of range (have %d)"),
+                                I, R.Index, Mats.Num()));
+        }
+        FString MatPath;
+        (*Item)->TryGetStringField(TEXT("material"), MatPath);
+        R.bClearMaterial = MatPath.IsEmpty();
+        R.Mat = nullptr;
+        if (!R.bClearMaterial)
+        {
+            R.Mat = mat_helpers::ResolveMaterial(MatPath);
+            if (!R.Mat)
+            {
+                return FSageToolDispatch::FOutcome::MakeError(-32602,
+                    FString::Printf(TEXT("slots[%d] material not found: %s"), I, *MatPath));
+            }
+        }
+        FString SlotName;
+        R.bSetSlotName = (*Item)->TryGetStringField(TEXT("slot_name"), SlotName);
+        R.SlotName = R.bSetSlotName ? FName(*SlotName) : NAME_None;
+        Resolved.Add(R);
+    }
+
+    // All entries valid — apply mutations under a single transaction.
     FScopedTransaction Tx(LOCTEXT("SetSkMaterialSlots", "Set SK Material Slots"));
     SK->Modify();
 
     int32 NumApplied = 0;
     TArray<TSharedPtr<FJsonValue>> Applied;
-    for (const TSharedPtr<FJsonValue>& V : *SlotArr)
+    for (const FResolved& R : Resolved)
     {
-        const TSharedPtr<FJsonObject>* Item = nullptr;
-        if (!V.IsValid() || !V->TryGetObject(Item) || !Item || !Item->IsValid()) continue;
-        double IndexN = -1;
-        if (!(*Item)->TryGetNumberField(TEXT("index"), IndexN)) continue;
-        int32 Index = static_cast<int32>(IndexN);
-        if (Index < 0 || Index >= Mats.Num())
-        {
-            return FSageToolDispatch::FOutcome::MakeError(-32602,
-                FString::Printf(TEXT("slot %d out of range (have %d)"),
-                                Index, Mats.Num()));
-        }
-        FString MatPath;
-        (*Item)->TryGetStringField(TEXT("material"), MatPath);
-
-        if (!MatPath.IsEmpty())
-        {
-            UMaterialInterface* Mat = mat_helpers::ResolveMaterial(MatPath);
-            if (!Mat)
-            {
-                return FSageToolDispatch::FOutcome::MakeError(-32602,
-                    FString::Printf(TEXT("material not found: %s"), *MatPath));
-            }
-            Mats[Index].MaterialInterface = Mat;
-        }
-        else
-        {
-            Mats[Index].MaterialInterface = nullptr;
-        }
-        FString SlotName;
-        if ((*Item)->TryGetStringField(TEXT("slot_name"), SlotName))
-        {
-            Mats[Index].MaterialSlotName = FName(*SlotName);
-        }
+        Mats[R.Index].MaterialInterface = R.bClearMaterial ? nullptr : R.Mat;
+        if (R.bSetSlotName) Mats[R.Index].MaterialSlotName = R.SlotName;
         ++NumApplied;
         auto E = MakeShared<FJsonObject>();
-        E->SetNumberField(TEXT("index"),    Index);
-        E->SetStringField(TEXT("material"), Mats[Index].MaterialInterface
-            ? Mats[Index].MaterialInterface->GetPathName() : TEXT(""));
+        E->SetNumberField(TEXT("index"),    R.Index);
+        E->SetStringField(TEXT("material"), Mats[R.Index].MaterialInterface
+            ? Mats[R.Index].MaterialInterface->GetPathName() : TEXT(""));
         Applied.Add(MakeShared<FJsonValueObject>(E));
     }
     SK->MarkPackageDirty();
@@ -1372,6 +1615,14 @@ FSageToolDispatch::FOutcome DeleteBatchImpl(const TSharedPtr<FJsonObject>& Args)
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing/empty 'paths'"));
     }
 
+    bool bConfirmed = false;
+    Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    if (!bConfirmed)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("destructive operation; pass confirmed:true to proceed"));
+    }
+
     if (GEditor == nullptr)
     {
         return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("GEditor unavailable"));
@@ -1428,6 +1679,14 @@ FSageToolDispatch::FOutcome ReloadPackageImpl(const TSharedPtr<FJsonObject>& Arg
     if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+
+    bool bConfirmed = false;
+    Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    if (!bConfirmed)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("destructive operation; pass confirmed:true to proceed (discards in-memory edits — irreversible without git)"));
     }
 
     // Path can be /Game/Foo/Bar.Bar or /Game/Foo/Bar — strip object name if present
@@ -1738,6 +1997,9 @@ FSageToolDispatch::FOutcome SetTextureSettingsImpl(const TSharedPtr<FJsonObject>
         if (bChanged)
         {
             Tex->PostEditChange();
+            // Refresh GPU resource so editor preview matches the edited settings
+            // (compression / sRGB / address modes only show after a resource update).
+            Tex->UpdateResource();
             Tex->MarkPackageDirty();
         }
     }
@@ -2000,27 +2262,19 @@ FSageToolDispatch::FOutcome RecentrePivotImpl(const TSharedPtr<FJsonObject>& Arg
     FVector PivotOffset = FVector::ZeroVector;
     detail::ParseVector3(Args, TEXT("pivot_offset"), PivotOffset);
 
-    FScopedTransaction Tx(LOCTEXT("RecentrePivot", "Recenter Mesh Pivot"));
-    SM->Modify();
-
-    // Apply offset to all SourceModels build settings
-    bool bApplied = false;
-    if (SM->GetNumSourceModels() > 0)
-    {
-        FMeshBuildSettings& BuildSettings = SM->GetSourceModel(0).BuildSettings;
-        BuildSettings.BuildScale3D = FVector::OneVector; // Preserve existing scale
-        bApplied = true;
-    }
-
-    // Store the pivot as a custom offset note — actual vertex offset requires FbxImport pipeline
-    SM->MarkPackageDirty();
-
+    // NOTE: this handler does NOT actually recenter the pivot. True recentering
+    // requires baking a vertex offset (FbxImport pipeline or BuildSettings
+    // BuildOrigin manipulation + rebuild). Setting BuildScale3D = OneVector is
+    // a no-op for pivot. We return modified=false with an honest note so callers
+    // see this and don't assume the asset changed.
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"),         SM->GetPathName());
-    R->SetBoolField  (TEXT("modified"),     bApplied);
+    R->SetBoolField  (TEXT("modified"),     false);
     R->SetStringField(TEXT("note"),
-        TEXT("Vertex-level pivot recentering requires re-import with adjusted origin; "
-             "editor UI: right-click in viewport > Pivot > Set as Pivot Offset"));
+        TEXT("BuildScale3D reset to identity; true pivot recentering requires "
+             "vertex offset baking (not implemented). Editor UI workaround: "
+             "right-click in viewport > Pivot > Set as Pivot Offset, or re-import "
+             "FBX with adjusted origin."));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -2047,16 +2301,42 @@ FSageToolDispatch::FOutcome SetMeshNavImpl(const TSharedPtr<FJsonObject>& Args)
     FScopedTransaction Tx(LOCTEXT("SetMeshNav", "Set Mesh Nav"));
     SM->Modify();
 
+    TArray<FString> FailedFields;
+    bool bApplied = false;
     // Set nav mesh collision property via reflection
     FProperty* Prop = FindFProperty<FProperty>(SM->GetClass(), TEXT("bCanEverAffectNavigation"));
     if (Prop)
-        detail::SetUPropertyFromJson(SM, Prop, MakeShared<FJsonValueBoolean>(bNavAllowed));
+    {
+        if (detail::SetUPropertyFromJson(SM, Prop,
+                MakeShared<FJsonValueBoolean>(bNavAllowed)))
+        {
+            bApplied = true;
+        }
+        else
+        {
+            FailedFields.Add(TEXT("bCanEverAffectNavigation"));
+        }
+    }
+    else
+    {
+        FailedFields.Add(TEXT("bCanEverAffectNavigation"));
+    }
 
-    SM->MarkPackageDirty();
+    if (bApplied) SM->MarkPackageDirty();
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"),                         SM->GetPathName());
     R->SetBoolField  (TEXT("can_ever_affect_navigation"),   bNavAllowed);
+    R->SetBoolField  (TEXT("modified"),                     bApplied);
+    if (FailedFields.Num() > 0)
+    {
+        TArray<TSharedPtr<FJsonValue>> Skipped;
+        for (const FString& F : FailedFields)
+        {
+            Skipped.Add(MakeShared<FJsonValueString>(F));
+        }
+        R->SetArrayField(TEXT("skipped_fields"), Skipped);
+    }
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -2186,6 +2466,9 @@ FSageToolDispatch::FOutcome AddArrayElementImpl(const TSharedPtr<FJsonObject>& A
     void* ElemPtr = Helper.GetRawPtr(NewIndex);
 
     bool bOk = false;
+    TArray<FString> FailedFields;
+    bool bAllowEmpty = false;
+    Args->TryGetBoolField(TEXT("allow_empty"), bAllowEmpty);
     if (!ClassName.IsEmpty())
     {
         // Instanced UObject branch: synthesize a subobject of class_name and
@@ -2220,17 +2503,49 @@ FSageToolDispatch::FOutcome AddArrayElementImpl(const TSharedPtr<FJsonObject>& A
             NAME_None, RF_Public | RF_Transactional);
         InnerObj->SetObjectPropertyValue(ElemPtr, Inst);
         // Apply element_value (object dict) as Inst's properties.
+        // Track how many fields successfully applied; require >0 unless
+        // allow_empty is set so we don't silently produce an empty subobject.
+        int32 SetCount = 0;
         if (ElemField->Type == EJson::Object)
         {
             const auto& EO = ElemField->AsObject();
-            for (TFieldIterator<FProperty> It(Inst->GetClass()); It && EO.IsValid(); ++It)
+            if (EO.IsValid())
             {
-                FProperty* SubP = *It;
-                if (!SubP) continue;
-                const TSharedPtr<FJsonValue>* Field = EO->Values.Find(SubP->GetName());
-                if (!Field || !Field->IsValid()) continue;
-                detail::SetUPropertyFromJson(Inst, SubP, *Field);
+                for (TFieldIterator<FProperty> It(Inst->GetClass()); It; ++It)
+                {
+                    FProperty* SubP = *It;
+                    if (!SubP) continue;
+                    const TSharedPtr<FJsonValue>* Field = EO->Values.Find(SubP->GetName());
+                    if (!Field || !Field->IsValid()) continue;
+                    if (detail::SetUPropertyFromJson(Inst, SubP, *Field))
+                    {
+                        ++SetCount;
+                    }
+                    else
+                    {
+                        FailedFields.Add(SubP->GetName());
+                    }
+                }
             }
+        }
+        if (SetCount == 0 && !bAllowEmpty)
+        {
+            // Mark the orphan subobject as garbage BEFORE shrinking the array
+            // so the orphan is collected on the next GC pass instead of leaking.
+            InnerObj->SetObjectPropertyValue(ElemPtr, nullptr);
+            Inst->MarkAsGarbage();
+            Helper.Resize(NewIndex);
+            Tx.Cancel();
+            FString FailList;
+            for (const FString& F : FailedFields)
+            {
+                if (!FailList.IsEmpty()) FailList += TEXT(", ");
+                FailList += F;
+            }
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("instanced subobject '%s' had zero fields applied "
+                                     "(failed: [%s]); pass allow_empty:true to accept"),
+                                *Cls->GetName(), *FailList));
         }
         bOk = true;
     }
@@ -2258,6 +2573,15 @@ FSageToolDispatch::FOutcome AddArrayElementImpl(const TSharedPtr<FJsonObject>& A
     R->SetStringField(TEXT("array_property"), ArrayProp);
     R->SetNumberField(TEXT("index"),          NewIndex);
     R->SetNumberField(TEXT("length"),         Helper.Num());
+    if (FailedFields.Num() > 0)
+    {
+        TArray<TSharedPtr<FJsonValue>> Skipped;
+        for (const FString& F : FailedFields)
+        {
+            Skipped.Add(MakeShared<FJsonValueString>(F));
+        }
+        R->SetArrayField(TEXT("skipped_fields"), Skipped);
+    }
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 

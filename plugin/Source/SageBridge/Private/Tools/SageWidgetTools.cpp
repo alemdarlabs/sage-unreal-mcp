@@ -22,6 +22,15 @@
 #include "WidgetBlueprint.h"
 #include "WidgetBlueprintFactory.h"
 
+// Editor utility widget support (Blutility). Pulled in dynamically via class
+// lookup at runtime so plugin still loads when Blutility is disabled, but the
+// concrete factory + subsystem types are referenced when available.
+#include "EditorUtilityWidget.h"
+#include "EditorUtilityWidgetBlueprint.h"
+#include "EditorUtilityWidgetBlueprintFactory.h"
+#include "EditorUtilitySubsystem.h"
+#include "Editor/EditorEngine.h"
+
 // Widget animation authoring (Phase 4.11-r3 — CommonAIExport parity).
 // Storage: UWidgetBlueprint::Animations is a TArray<UWidgetAnimation*>. Each
 // UWidgetAnimation owns a UMovieScene + a TArray<FWidgetAnimationBinding>
@@ -570,10 +579,7 @@ FSageToolDispatch::FOutcome CreateUtilityWidgetImpl(const TSharedPtr<FJsonObject
     if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
 
-    UClass* EUWCls = FindObject<UClass>(nullptr,
-        TEXT("/Script/Blutility.EditorUtilityWidget"));
-    if (!EUWCls) EUWCls = LoadObject<UClass>(nullptr,
-        TEXT("/Script/Blutility.EditorUtilityWidget"));
+    UClass* EUWCls = UEditorUtilityWidget::StaticClass();
     if (!EUWCls) return FSageToolDispatch::FOutcome::MakeError(-32602,
         TEXT("EditorUtilityWidget not found — Blutility plugin required"));
 
@@ -582,8 +588,13 @@ FSageToolDispatch::FOutcome CreateUtilityWidgetImpl(const TSharedPtr<FJsonObject
         ESearchCase::IgnoreCase, ESearchDir::FromEnd))
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("invalid path"));
 
-    // Use WidgetBlueprintFactory with EditorUtilityWidget parent
-    UWidgetBlueprintFactory* Factory = NewObject<UWidgetBlueprintFactory>();
+    // UEditorUtilityWidgetBlueprintFactory produces a UEditorUtilityWidgetBlueprint
+    // (vs. UWidgetBlueprintFactory which makes a plain UWidgetBlueprint). The
+    // distinction matters: only UEditorUtilityWidgetBlueprint surfaces in the
+    // "Run Editor Utility Widget" right-click menu and is accepted by
+    // UEditorUtilitySubsystem::SpawnAndRegisterTab().
+    UEditorUtilityWidgetBlueprintFactory* Factory =
+        NewObject<UEditorUtilityWidgetBlueprintFactory>();
     Factory->ParentClass = EUWCls;
 
     IAssetTools& AT = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
@@ -592,6 +603,7 @@ FSageToolDispatch::FOutcome CreateUtilityWidgetImpl(const TSharedPtr<FJsonObject
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"),         NewObj->GetPathName());
+    R->SetStringField(TEXT("class"),        NewObj->GetClass()->GetName());
     R->SetStringField(TEXT("parent_class"), TEXT("EditorUtilityWidget"));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
@@ -604,17 +616,42 @@ FSageToolDispatch::FOutcome RunUtilityWidgetImpl(const TSharedPtr<FJsonObject>& 
     if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
 
-    UClass* EUWSCls = FindObject<UClass>(nullptr,
-        TEXT("/Script/Blutility.EditorUtilityWidgetBlueprint"));
-    if (!EUWSCls) EUWSCls = LoadObject<UClass>(nullptr,
-        TEXT("/Script/Blutility.EditorUtilityWidgetBlueprint"));
+    UObject* Asset = ResolveAsset(Path);
+    UEditorUtilityWidgetBlueprint* EUWBP = Cast<UEditorUtilityWidgetBlueprint>(Asset);
+    if (!EUWBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UEditorUtilityWidgetBlueprint: %s "
+                                  "(create via widget.create_utility_widget)"),
+                Asset ? *Asset->GetClass()->GetName() : TEXT("<not found>")));
+    }
+
+    if (!GEditor)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("GEditor null — cannot spawn editor utility widget"));
+    }
+    UEditorUtilitySubsystem* Subsys = GEditor->GetEditorSubsystem<UEditorUtilitySubsystem>();
+    if (!Subsys)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("UEditorUtilitySubsystem unavailable"));
+    }
+
+    FName TabId = NAME_None;
+    UEditorUtilityWidget* Spawned = Subsys->SpawnAndRegisterTabAndGetID(EUWBP, TabId);
+    if (!Spawned)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32000,
+            FString::Printf(TEXT("SpawnAndRegisterTab returned null for %s"), *Path));
+    }
 
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("path"), Path);
-    R->SetStringField(TEXT("note"),
-        TEXT("Use editor.run_python: 'import unreal; "
-             "unreal.EditorUtilitySubsystem.spawn_and_register_tab(asset)' "
-             "or trigger via editor right-click context menu"));
+    R->SetStringField(TEXT("path"),    EUWBP->GetPathName());
+    R->SetStringField(TEXT("tab_id"),  TabId.ToString());
+    R->SetStringField(TEXT("widget"),  Spawned->GetName());
+    R->SetStringField(TEXT("class"),   Spawned->GetClass()->GetName());
+    R->SetBoolField  (TEXT("spawned"), true);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -894,9 +931,17 @@ FSageToolDispatch::FOutcome GetRuntimeDelegatesImpl(const TSharedPtr<FJsonObject
 UWidgetAnimation* FindWidgetAnimation(UWidgetBlueprint* WB, const FString& AnimName)
 {
     if (!WB) return nullptr;
-    for (UWidgetAnimation* A : WB->Animations)
+    // DoS guard: pathological assets with thousands of animation slots should not
+    // burn handler time on a linear scan. UMG editor tops out far below 1024 in
+    // practice; anything beyond is corrupt or hostile input.
+    constexpr int32 MAX_ANIMATIONS = 1024;
+    const int32 Limit = FMath::Min(WB->Animations.Num(), MAX_ANIMATIONS);
+    for (int32 I = 0; I < Limit; ++I)
     {
-        if (A && A->GetName() == AnimName) return A;
+        UWidgetAnimation* A = WB->Animations[I];
+        // Case-insensitive: editor allows mixed-case rename, but client callers
+        // often canonicalize to lowercase. Mirror that tolerance.
+        if (A && A->GetName().Equals(AnimName, ESearchCase::IgnoreCase)) return A;
     }
     return nullptr;
 }
@@ -1008,6 +1053,13 @@ FSageToolDispatch::FOutcome AnimBindImpl(const TSharedPtr<FJsonObject>& Args)
     WB->Modify();
     Anim->Modify();
 
+    // FWidgetAnimationBinding::WidgetName resolution at runtime:
+    // FWidgetAnimationBinding::FindRuntimeObject(...) calls
+    //   WidgetTree.FindWidget(*WidgetName.ToString())
+    // which compares against UWidget::GetName(). For BP-generated widgets the
+    // object name == the property/variable name on the WidgetTree, so passing
+    // Target->GetName() is correct — verified against UE 5.7
+    // Runtime/UMG/Private/Animation/WidgetAnimationBinding.cpp.
     const FGuid Guid = Anim->MovieScene->AddPossessable(
         Target->GetName(), Target->GetClass());
 
@@ -1066,6 +1118,17 @@ FSageToolDispatch::FOutcome AnimAddTrackImpl(const TSharedPtr<FJsonObject>& Args
     if (!FGuid::Parse(GuidStr, Guid))
         return FSageToolDispatch::FOutcome::MakeError(-32602,
             FString::Printf(TEXT("invalid binding_guid: %s"), *GuidStr));
+
+    // Reject orphan tracks: GUID must already correspond to a possessable on the
+    // MovieScene (added via widget.anim.bind). Otherwise AddTrack succeeds but the
+    // track has no binding, which is invisible to the runtime/editor.
+    if (!Anim->MovieScene->FindPossessable(Guid))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("binding_guid %s is not a possessable on animation '%s' "
+                                  "(call widget.anim.bind first)"),
+                            *GuidStr, *AnimName));
+    }
 
     FScopedTransaction Tx(LOCTEXT("WidgetAnimAddTrack", "Add Widget Animation Track"));
     Anim->MovieScene->Modify();

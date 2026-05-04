@@ -38,6 +38,7 @@
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Kismet2/KismetReinstanceUtilities.h"
 #include "ScopedTransaction.h"
+#include "Misc/ScopeExit.h"
 #include "GameFramework/Actor.h"
 #include "UObject/Class.h"
 #include "UObject/Package.h"
@@ -323,6 +324,14 @@ FEdGraphPinType MakePinType(const FString& TypeStr,
         PinType.PinCategory = UEdGraphSchema_K2::PC_SoftObject;
     else if (L == TEXT("softclass"))
         PinType.PinCategory = UEdGraphSchema_K2::PC_SoftClass;
+    else if (L == TEXT("pc_real"))
+    {
+        // Verbatim enum echo — must still carry float/double subcategory
+        // or KismetCompilerMisc.cpp:1453 asserts ("Erroneous pin
+        // subcategory for PC_Real: None").
+        PinType.PinCategory    = UEdGraphSchema_K2::PC_Real;
+        PinType.PinSubCategory = UEdGraphSchema_K2::PC_Double;
+    }
     else
     {
         // Pass-through for anything else (e.g. agent passed a verbatim
@@ -765,6 +774,13 @@ FSageToolDispatch::FOutcome BpDeleteVariableImpl(const TSharedPtr<FJsonObject>& 
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602,
             TEXT("missing 'path' or 'name'"));
+    }
+    bool bConfirmed = false;
+    Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    if (!bConfirmed)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("destructive operation; pass confirmed:true to proceed"));
     }
     FSageToolDispatch::FOutcome PieErr;
     if (detail::RejectIfPie(PieErr)) return PieErr;
@@ -1631,6 +1647,13 @@ FSageToolDispatch::FOutcome BpDeleteFunctionImpl(const TSharedPtr<FJsonObject>& 
         return FSageToolDispatch::FOutcome::MakeError(-32602,
             TEXT("missing 'path' or 'name'"));
     }
+    bool bConfirmed = false;
+    Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    if (!bConfirmed)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("destructive operation; pass confirmed:true to proceed"));
+    }
     FSageToolDispatch::FOutcome PieErr;
     if (detail::RejectIfPie(PieErr)) return PieErr;
     UBlueprint* BP = ResolveBlueprint(Path);
@@ -1891,7 +1914,10 @@ FSageToolDispatch::FOutcome BpGetCdoPropertiesImpl(const TSharedPtr<FJsonObject>
     if (!Cls) return FSageToolDispatch::FOutcome::MakeError(-32602,
         FString::Printf(TEXT("class not found: %s"), *ClassName));
 
-    UObject* CDO = Cls->GetDefaultObject();
+    // bCreateIfNeeded=true: cold-loaded native classes may not have a CDO
+    // yet. Lyra Sage Gap #13 surfaced this on ACharacter descendants —
+    // GetDefaultObject() with default arg returns nullptr first call.
+    UObject* CDO = Cls->GetDefaultObject(/*bCreateIfNeeded=*/true);
     if (!CDO) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no CDO"));
 
     // Optional name filter
@@ -1918,11 +1944,49 @@ FSageToolDispatch::FOutcome BpGetCdoPropertiesImpl(const TSharedPtr<FJsonObject>
         if (V.IsValid()) { Props->SetField(N, V); ++Count; }
     }
 
+    // Component subobject pass (Lyra Sage Gap #13). ACharacter and other
+    // native AActor subclasses install components via CreateDefaultSubobject;
+    // those don't show up as plain FProperty values — they're named
+    // subobjects on the CDO. Surface them as a `components` array so callers
+    // (e.g. Sage Gap #13: char-move-comp inspection) can see what native
+    // components ship with the parent class without reflecting through SCS.
+    TArray<UObject*> Subs;
+    CDO->GetDefaultSubobjects(Subs);
+    TArray<TSharedPtr<FJsonValue>> CompsJson;
+    for (UObject* So : Subs)
+    {
+        if (!So) continue;
+        UActorComponent* Comp = Cast<UActorComponent>(So);
+        if (!Comp) continue;
+        auto Entry = MakeShared<FJsonObject>();
+        Entry->SetStringField(TEXT("name"),  Comp->GetName());
+        Entry->SetStringField(TEXT("class"), Comp->GetClass()->GetPathName());
+        // Lightweight properties_summary: name list + count, NOT full values
+        // (full per-component dump lives in bp.read_component_properties).
+        auto Summary = MakeShared<FJsonObject>();
+        TArray<TSharedPtr<FJsonValue>> Names;
+        int32 PropCount = 0;
+        for (TFieldIterator<FProperty> It(Comp->GetClass()); It; ++It)
+        {
+            FProperty* PP = *It;
+            if (!PP) continue;
+            if (PP->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient)) continue;
+            Names.Add(MakeShared<FJsonValueString>(PP->GetName()));
+            ++PropCount;
+        }
+        Summary->SetArrayField (TEXT("property_names"), Names);
+        Summary->SetNumberField(TEXT("property_count"), PropCount);
+        Entry->SetObjectField(TEXT("properties_summary"), Summary);
+        CompsJson.Add(MakeShared<FJsonValueObject>(Entry));
+    }
+
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("class"),      Cls->GetPathName());
     R->SetStringField(TEXT("class_name"), Cls->GetName());
     R->SetObjectField(TEXT("properties"), Props);
     R->SetNumberField(TEXT("count"),      Count);
+    R->SetArrayField (TEXT("components"), CompsJson);
+    R->SetNumberField(TEXT("component_count"), CompsJson.Num());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -2001,9 +2065,17 @@ FSageToolDispatch::FOutcome BpValidateImpl(const TSharedPtr<FJsonObject>& Args)
     UBlueprint* BP = ResolveBlueprint(Path);
     if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
 
+    // EBlueprintCompileOptions::SkipSave still mutates BP and regenerates
+    // the skeleton class — which flips package dirty even on read-only
+    // validation. Snapshot pre-compile dirty state and restore after.
+    UPackage* const BpPkg = BP->GetOutermost();
+    const bool bWasDirty = BpPkg ? BpPkg->IsDirty() : false;
+
     FCompilerResultsLog Log;
     Log.bSilentMode = true;
     FKismetEditorUtilities::CompileBlueprint(BP, EBlueprintCompileOptions::SkipSave, &Log);
+
+    if (BpPkg && !bWasDirty) BpPkg->SetDirtyFlag(false);
 
     TArray<TSharedPtr<FJsonValue>> Messages;
     for (TSharedRef<FTokenizedMessage> Msg : Log.Messages)
@@ -2074,6 +2146,17 @@ FSageToolDispatch::FOutcome BpRunConstructionScriptImpl(const TSharedPtr<FJsonOb
         return FSageToolDispatch::FOutcome::MakeError(-32603,
             TEXT("SpawnActor returned nullptr"));
     }
+    // RAII cleanup of throwaway actor — fires on every return path including
+    // the (theoretically) exception case. Without this guard a mid-handler
+    // failure would leak the transient actor into the editor world.
+    ON_SCOPE_EXIT
+    {
+        if (Temp && IsValid(Temp) && World)
+        {
+            World->DestroyActor(Temp);
+        }
+    };
+
     // SpawnActor calls UCS automatically; this is a belt-and-braces re-run
     // in case the agent passes a pre-spawned, mutated transform later.
     Temp->RerunConstructionScripts();
@@ -2098,7 +2181,7 @@ FSageToolDispatch::FOutcome BpRunConstructionScriptImpl(const TSharedPtr<FJsonOb
         Comps.Add(MakeShared<FJsonValueObject>(O));
     }
 
-    World->DestroyActor(Temp);
+    // Note: Temp destroyed by ON_SCOPE_EXIT above on every return path.
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("blueprint"),  BP->GetName());
@@ -2249,6 +2332,25 @@ FSageToolDispatch::FOutcome BpReparentComponentImpl(const TSharedPtr<FJsonObject
         Walk = SCS->FindParentNode(Walk);
     }
 
+    // Pre-validate USceneComponent ancestry on BOTH sides BEFORE we touch
+    // SCS state. SCS-level reparenting only makes sense for scene
+    // components — non-scene UActorComponents have no transform parent.
+    // If we detach Node first and only then discover NewParentNode is a
+    // bare UActorComponent, the SCS is left half-detached. Validate up
+    // front so any failure short-circuits before mutation.
+    if (!Node->ComponentClass
+        || !Node->ComponentClass->IsChildOf(USceneComponent::StaticClass()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("component is not a USceneComponent; SCS reparent only valid for scene components"));
+    }
+    if (!NewParentNode->ComponentClass
+        || !NewParentNode->ComponentClass->IsChildOf(USceneComponent::StaticClass()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("new_parent is not a USceneComponent; cannot host scene-component children"));
+    }
+
     FScopedTransaction Tx(LOCTEXT("BpReparentComp", "Sage: Reparent BP Component"));
     BP->Modify();
     SCS->Modify();
@@ -2388,6 +2490,21 @@ FSageToolDispatch::FOutcome BpImportNodesT3DImpl(const TSharedPtr<FJsonObject>& 
             TEXT("t3d not importable into this graph (schema mismatch or malformed)"));
     }
 
+    // Heuristic count of nodes encoded in the T3D blob — UE's pasteboard
+    // format starts each node with "Begin Object Class=...". Used purely
+    // to detect entry/return dedup vs the destination graph (UE silently
+    // drops duplicates of FunctionEntry / FunctionResult / Tunnel nodes).
+    int32 ExpectedNodeCount = 0;
+    {
+        const FString Marker = TEXT("Begin Object Class=");
+        int32 Idx = 0;
+        while ((Idx = T3D.Find(Marker, ESearchCase::IgnoreCase, ESearchDir::FromStart, Idx)) != INDEX_NONE)
+        {
+            ++ExpectedNodeCount;
+            Idx += Marker.Len();
+        }
+    }
+
     FScopedTransaction Tx(LOCTEXT("BpImportT3D", "Sage: Import T3D Nodes"));
     Graph->Modify();
 
@@ -2435,6 +2552,13 @@ FSageToolDispatch::FOutcome BpImportNodesT3DImpl(const TSharedPtr<FJsonObject>& 
     R->SetNumberField(TEXT("count"),     Pasted.Num());
     R->SetArrayField (TEXT("node_ids"),  Ids);
     R->SetBoolField  (TEXT("recentered"), bRecenter);
+    if (ExpectedNodeCount > 0 && Pasted.Num() < ExpectedNodeCount)
+    {
+        const int32 DroppedCount = ExpectedNodeCount - Pasted.Num();
+        R->SetStringField(TEXT("_warning"),
+            FString::Printf(TEXT("%d entry/return node(s) deduped against existing graph (T3D contained %d, %d pasted)"),
+                DroppedCount, ExpectedNodeCount, Pasted.Num()));
+    }
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -3424,6 +3548,25 @@ FSageToolDispatch::FOutcome BpAddNodeImpl(const TSharedPtr<FJsonObject>& Args)
     UEdGraph* Graph = FindFunctionGraph(BP, FnName);
     if (!Graph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("graph not found"));
 
+    // AnimGraph guard. UAnimBlueprint AnimGraphs use UAnimationGraphSchema —
+    // the K2 spawn path here can't satisfy AnimGraphNode pin layout (skeleton
+    // / pose pin requirements live in the anim schema). Route the caller to
+    // the canonical animation.add_animgraph_node tool instead of crashing
+    // mid-spawn. Schema name lookup avoids a hard dependency on the AnimGraph
+    // module from this TU.
+    if (Graph->Schema)
+    {
+        const FString SchemaName = Graph->Schema->GetName();
+        if (SchemaName == TEXT("AnimationGraphSchema")
+            || SchemaName == TEXT("AnimationStateGraphSchema")
+            || SchemaName == TEXT("AnimationStateMachineSchema")
+            || SchemaName == TEXT("AnimationTransitionSchema"))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("use animation.add_animgraph_node for AnimGraph nodes (canonical Cluster A path)"));
+        }
+    }
+
     UClass* NodeUClass = ResolveEdGraphNodeClass(NodeClass);
     if (!NodeUClass)
     {
@@ -4168,6 +4311,17 @@ FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
             Dump->SetArrayField(DstField, *Arr);
     };
 
+    // Extract '.message' from a sub-handler's Error JSON; falls back to
+    // 'unknown' so the dump never silently drops the failure (Gap #7/#11
+    // discipline).
+    auto OutcomeErrorMessage = [](const FSageToolDispatch::FOutcome& Out) -> FString
+    {
+        if (!Out.Error.IsValid()) return FString(TEXT("unknown"));
+        FString Msg;
+        if (Out.Error->TryGetStringField(TEXT("message"), Msg) && !Msg.IsEmpty()) return Msg;
+        return FString(TEXT("unknown"));
+    };
+
     TSharedPtr<FJsonObject> Dump = MakeShared<FJsonObject>();
     Dump->SetStringField(TEXT("schema_version"), TEXT("1"));
     Dump->SetStringField(TEXT("captured_at"),    FDateTime::UtcNow().ToIso8601());
@@ -4184,12 +4338,23 @@ FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
     // 2. variables
     {
         auto Out = BpListVariablesImpl(MakePathArgs());
-        AttachArray(Dump, Out.Result, TEXT("variables"), TEXT("variables"));
+        if (Out.bSuccess)
+        {
+            AttachArray(Dump, Out.Result, TEXT("variables"), TEXT("variables"));
+        }
+        else
+        {
+            Dump->SetStringField(TEXT("variables_skip_reason"), OutcomeErrorMessage(Out));
+        }
     }
 
     // 3. components (+ optional per-component defaults)
     {
         auto Out = BpReadComponentsImpl(MakePathArgs());
+        if (!Out.bSuccess)
+        {
+            Dump->SetStringField(TEXT("components_skip_reason"), OutcomeErrorMessage(Out));
+        }
         if (Out.bSuccess && Out.Result.IsValid())
         {
             const TArray<TSharedPtr<FJsonValue>>* Comps = nullptr;
@@ -4228,6 +4393,10 @@ FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
     // 4. functions / graphs (+ optional graph detail, T3D, params, locals)
     {
         auto Out = BpListGraphsImpl(MakePathArgs());
+        if (!Out.bSuccess)
+        {
+            Dump->SetStringField(TEXT("graphs_skip_reason"), OutcomeErrorMessage(Out));
+        }
         if (Out.bSuccess && Out.Result.IsValid())
         {
             const TArray<TSharedPtr<FJsonValue>>* Graphs = nullptr;
@@ -4321,6 +4490,10 @@ FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
     // 5. event_dispatchers
     {
         auto Out = BpListEventDispatchersImpl(MakePathArgs());
+        if (!Out.bSuccess)
+        {
+            Dump->SetStringField(TEXT("event_dispatchers_skip_reason"), OutcomeErrorMessage(Out));
+        }
         AttachArray(Dump, Out.Result, TEXT("dispatchers"),       TEXT("event_dispatchers"));
         AttachArray(Dump, Out.Result, TEXT("event_dispatchers"), TEXT("event_dispatchers"));
     }
@@ -4349,6 +4522,15 @@ FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
                 else
                     Dump->SetObjectField(TEXT("cdo_properties"), Out.Result);
             }
+            else
+            {
+                Dump->SetStringField(TEXT("cdo_skip_reason"), OutcomeErrorMessage(Out));
+            }
+        }
+        else
+        {
+            Dump->SetStringField(TEXT("cdo_skip_reason"),
+                TEXT("BP missing or has no GeneratedClass"));
         }
     }
 
@@ -4363,6 +4545,10 @@ FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
             Out.Result->RemoveField(TEXT("blueprint"));
             Out.Result->RemoveField(TEXT("reverse"));
             Dump->SetObjectField(TEXT("dependencies"), Out.Result);
+        }
+        else
+        {
+            Dump->SetStringField(TEXT("dependencies_skip_reason"), OutcomeErrorMessage(Out));
         }
     }
 
@@ -4379,10 +4565,29 @@ FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
             TJsonWriterFactory<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>::Create(&JsonStr);
         FJsonSerializer::Serialize(Dump.ToSharedRef(), Writer);
 
-        FString AbsPath = OutputPath;
-        if (FPaths::IsRelative(AbsPath))
-            AbsPath = FPaths::ProjectDir() / AbsPath;
+        // Sandbox: confine writes to ProjectDir(). Caller-supplied
+        // OutputPath may be relative ("Saved/X.json"), absolute outside
+        // the project, or weaponised with `..` segments. Normalise BOTH
+        // candidate and project root to absolute, collapse `..`, then
+        // require StartsWith(ProjRoot). Without this guard a malicious /
+        // confused agent could overwrite arbitrary files.
+        FString AbsPath = FPaths::ConvertRelativePathToFull(
+            FPaths::IsRelative(OutputPath)
+                ? FPaths::ProjectDir() / OutputPath
+                : OutputPath);
+        FPaths::CollapseRelativeDirectories(AbsPath);
         FPaths::NormalizeFilename(AbsPath);
+
+        FString ProjRoot = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+        FPaths::NormalizeDirectoryName(ProjRoot);
+        // Trailing slash so "/Foo/Project" doesn't accept "/Foo/ProjectEvil/x".
+        if (!ProjRoot.EndsWith(TEXT("/"))) ProjRoot += TEXT("/");
+
+        if (!AbsPath.StartsWith(ProjRoot))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("output_path must resolve inside project directory"));
+        }
 
         const FString ParentDir = FPaths::GetPath(AbsPath);
         if (!ParentDir.IsEmpty() && !IFileManager::Get().DirectoryExists(*ParentDir))
@@ -4465,15 +4670,25 @@ FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
 //       (path to a UClass derived from the parent's component class).
 // Returns: {blueprint, component, old_class, new_class, recompiled}.
 
+// Resolve the inherited component class for `Name` walking the parent chain.
+// Two layers, in order:
+//   1) BP-side SimpleConstructionScript on every parent BlueprintGeneratedClass
+//   2) Native CreateDefaultSubobject components on the topmost native CDO
+//      (e.g. ACharacter::CharMoveComp / CharacterMesh0 / CollisionCylinder).
+// `OutNode` is populated only for layer 1; `bOutIsNative` flips true for
+// layer 2. Either layer satisfies UBlueprint::ComponentClassOverrides — the
+// engine's BPGC compile pass walks both BP-SCS and native CDO subobjects when
+// applying overrides (verified against TopDownArena B_Hero_Arena.CharMoveComp
+// → UTopDownArenaMovementComponent, which uses native fallback exactly).
 UClass* FindParentSCSComponentClass(UBlueprint* BP, const FName& Name,
-                                    USCS_Node** OutNode = nullptr)
+                                    USCS_Node** OutNode = nullptr,
+                                    bool* bOutIsNative = nullptr)
 {
-    if (OutNode) *OutNode = nullptr;
-    UClass* SuperCls = BP->GetClass()->GetSuperClass();
-    // We need the parent's SimpleConstructionScript chain. Walk parent
-    // BlueprintGeneratedClasses upward.
-    UClass* C = BP->ParentClass;
-    while (C)
+    if (OutNode)      *OutNode = nullptr;
+    if (bOutIsNative) *bOutIsNative = false;
+
+    // Layer 1: BP-side SCS chain.
+    for (UClass* C = BP->ParentClass; C; C = C->GetSuperClass())
     {
         if (UBlueprintGeneratedClass* BGC = Cast<UBlueprintGeneratedClass>(C))
         {
@@ -4490,11 +4705,37 @@ UClass* FindParentSCSComponentClass(UBlueprint* BP, const FName& Name,
                 }
             }
         }
-        // Native parents have UCS components via ObjectInitializer; we don't
-        // surface those here (override only applies to BP-side SCS).
-        C = C->GetSuperClass();
     }
-    (void)SuperCls;
+
+    // Layer 2: native CDO subobjects (Lyra Sage Gap #13). ACharacter and other
+    // native AActor subclasses install components via CreateDefaultSubobject;
+    // those land as named subobjects of the CDO, NOT as USCS_Nodes. Walk the
+    // CDO's default subobjects on the parent class.
+    if (UClass* PC = BP->ParentClass)
+    {
+        // bCreateIfNeeded=true: cold-loaded native classes (Lyra hot-imports,
+        // first-touch ACharacter on a fresh editor) may not have a CDO yet —
+        // GetDefaultObject(false) returns nullptr and the override falsely
+        // reports "no native component" even when CharMoveComp etc. exist.
+        if (UObject* CDO = PC->GetDefaultObject(/*bCreateIfNeeded=*/true))
+        {
+            TArray<UObject*> Subobjects;
+            CDO->GetDefaultSubobjects(Subobjects);
+            for (UObject* So : Subobjects)
+            {
+                if (!So) continue;
+                if (UActorComponent* Comp = Cast<UActorComponent>(So))
+                {
+                    if (Comp->GetFName() == Name)
+                    {
+                        if (bOutIsNative) *bOutIsNative = true;
+                        return Comp->GetClass();
+                    }
+                }
+            }
+        }
+    }
+
     return nullptr;
 }
 
@@ -4526,19 +4767,22 @@ FSageToolDispatch::FOutcome BpOverrideInheritedComponentClassImpl(
         return FSageToolDispatch::FOutcome::MakeError(-32602,
             FString::Printf(TEXT("class not found: %s"), *NewClassPath));
 
-    // Verify the parent's SCS contains a component with this name and that
-    // NewClass is a subclass of the parent's declared component class.
+    // Verify the parent chain (SCS or native CDO subobjects, Gap #13) declares
+    // a component with this name, then enforce subclass relationship on the
+    // override class.
     USCS_Node* ParentNode = nullptr;
+    bool bIsNative = false;
     UClass* ParentCompClass = FindParentSCSComponentClass(
-        BP, FName(*CompName), &ParentNode);
-    if (!ParentNode)
+        BP, FName(*CompName), &ParentNode, &bIsNative);
+    if (!ParentCompClass)
         return FSageToolDispatch::FOutcome::MakeError(-32602,
-            FString::Printf(TEXT("no SCS component '%s' on any parent BP of %s"),
+            FString::Printf(TEXT("no SCS or native component '%s' on any parent of %s"),
                             *CompName, *BP->GetName()));
-    if (ParentCompClass && !NewClass->IsChildOf(ParentCompClass))
+    if (!NewClass->IsChildOf(ParentCompClass))
         return FSageToolDispatch::FOutcome::MakeError(-32602,
-            FString::Printf(TEXT("%s isn't a subclass of %s (parent SCS class)"),
-                            *NewClass->GetName(), *ParentCompClass->GetName()));
+            FString::Printf(TEXT("%s isn't a subclass of %s (%s component)"),
+                            *NewClass->GetName(), *ParentCompClass->GetName(),
+                            bIsNative ? TEXT("native") : TEXT("parent SCS")));
 
     FScopedTransaction Tx(LOCTEXT("BpOverrideInherited",
         "Sage: Override Inherited Component Class"));

@@ -12,12 +12,14 @@
 #include "Materials/MaterialExpressionConstant.h"
 #include "Materials/MaterialExpressionConstant3Vector.h"
 #include "Materials/MaterialExpressionConstant4Vector.h"
+#include "Materials/MaterialExpressionConstantBiasScale.h"
 #include "Materials/MaterialExpressionScalarParameter.h"
 #include "Materials/MaterialExpressionVectorParameter.h"
 #include "Materials/MaterialExpressionTextureSampleParameter.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "Materials/MaterialInstance.h"
 #include "MaterialEditingLibrary.h"
+#include "Factories/MaterialFactoryNew.h"
 #include "Factories/MaterialInstanceConstantFactoryNew.h"
 #include "AssetToolsModule.h"
 #include "IAssetTools.h"
@@ -119,7 +121,12 @@ const TCHAR* ShadingModelName(EMaterialShadingModel M)
     case MSM_Eye:                  return TEXT("Eye");
     case MSM_SingleLayerWater:     return TEXT("SingleLayerWater");
     case MSM_ThinTranslucent:      return TEXT("ThinTranslucent");
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7)
+    // UE 5.7 renamed Strata display name to "Substrate" (enum still MSM_Strata, hidden).
+    case MSM_Strata:               return TEXT("Substrate");
+#else
     case MSM_Strata:               return TEXT("Strata");
+#endif
     default:                       return TEXT("Unknown");
     }
 }
@@ -138,6 +145,7 @@ EMaterialShadingModel ParseShadingModel(const FString& Name)
     if (Name == TEXT("Eye"))               return MSM_Eye;
     if (Name == TEXT("SingleLayerWater"))  return MSM_SingleLayerWater;
     if (Name == TEXT("ThinTranslucent"))   return MSM_ThinTranslucent;
+    if (Name == TEXT("Substrate") || Name == TEXT("Strata")) return MSM_Strata;
     return MSM_DefaultLit;
 }
 
@@ -331,13 +339,18 @@ FSageToolDispatch::FOutcome MatSetShadingModelImpl(const TSharedPtr<FJsonObject>
     if (!M) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("base material not found"));
 
     FScopedTransaction Tx(LOCTEXT("MatShading", "Sage: Set Shading Model"));
+    M->PreEditChange(nullptr);
+    if (UMaterialEditorOnlyData* EOD = M->GetEditorOnlyData()) EOD->Modify();
     M->Modify();
     M->SetShadingModel(ParseShadingModel(ModelName));
+    M->PostEditChange();
     UMaterialEditingLibrary::RecompileMaterial(M);
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("material"), M->GetName());
     R->SetStringField(TEXT("shading_model"), ModelName);
+    R->SetStringField(TEXT("_compile_warning"),
+        TEXT("shader compilation runs async; preview may take seconds to update"));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -370,6 +383,9 @@ FSageToolDispatch::FOutcome MatSetBaseColorImpl(const TSharedPtr<FJsonObject>& A
     const float A = ColArr->Num() > 3 ? (*ColArr)[3]->AsNumber() : 1.0f;
 
     FScopedTransaction Tx(LOCTEXT("MatBaseColor", "Sage: Set Material Base Color"));
+    // Modify discipline: editor-only data won't transact unless explicitly marked.
+    M->PreEditChange(nullptr);
+    if (UMaterialEditorOnlyData* EOD = M->GetEditorOnlyData()) EOD->Modify();
     M->Modify();
 
     UMaterialExpressionConstant3Vector* C3 = NewObject<UMaterialExpressionConstant3Vector>(M);
@@ -381,11 +397,14 @@ FSageToolDispatch::FOutcome MatSetBaseColorImpl(const TSharedPtr<FJsonObject>& A
 
     M->GetEditorOnlyData()->BaseColor.Expression = C3;
     M->GetEditorOnlyData()->BaseColor.OutputIndex = 0;
+    M->PostEditChange();
     UMaterialEditingLibrary::RecompileMaterial(M);
 
     auto Out = MakeShared<FJsonObject>();
     Out->SetStringField(TEXT("material"), M->GetName());
     Out->SetStringField(TEXT("expression_id"), C3->MaterialExpressionGuid.ToString());
+    Out->SetStringField(TEXT("_compile_warning"),
+        TEXT("shader compilation runs async; preview may take seconds to update"));
     return FSageToolDispatch::FOutcome::MakeSuccess(Out);
 }
 
@@ -492,12 +511,17 @@ FSageToolDispatch::FOutcome MatConnectExprsImpl(const TSharedPtr<FJsonObject>& A
     M->Modify();
     if (!UMaterialEditingLibrary::ConnectMaterialExpressions(From, FromOut, To, ToIn))
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("connect failed"));
+        // ConnectMaterialExpressions performs internal type-compat checks; failure
+        // typically means the named output/input doesn't exist or types collide.
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("connect failed: output/input name mismatch or incompatible types"));
     }
     UMaterialEditingLibrary::RecompileMaterial(M);
 
     auto Out = MakeShared<FJsonObject>();
     Out->SetStringField(TEXT("material"), M->GetName());
+    Out->SetStringField(TEXT("_compile_warning"),
+        TEXT("shader compilation runs async; preview may take seconds to update"));
     return FSageToolDispatch::FOutcome::MakeSuccess(Out);
 }
 
@@ -551,6 +575,8 @@ FSageToolDispatch::FOutcome MatConnectToPropertyImpl(const TSharedPtr<FJsonObjec
     auto Out = MakeShared<FJsonObject>();
     Out->SetStringField(TEXT("material"), M->GetName());
     Out->SetStringField(TEXT("property"), PropName);
+    Out->SetStringField(TEXT("_compile_warning"),
+        TEXT("shader compilation runs async; preview may take seconds to update"));
     return FSageToolDispatch::FOutcome::MakeSuccess(Out);
 }
 
@@ -576,25 +602,81 @@ FSageToolDispatch::FOutcome MatSetExpressionValueImpl(const TSharedPtr<FJsonObje
     if (!E) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("expression not found"));
 
     FScopedTransaction Tx(LOCTEXT("MatSetExprVal", "Sage: Set Material Expression Value"));
+    M->PreEditChange(nullptr);
+    if (UMaterialEditorOnlyData* EOD = M->GetEditorOnlyData()) EOD->Modify();
     M->Modify();
+    E->Modify();
+
+    auto AsLinearColor = [](const TSharedPtr<FJsonValue>& V, FLinearColor& Out, int32 MinComponents) -> bool
+    {
+        if (V->Type != EJson::Array) return false;
+        const auto& A = V->AsArray();
+        if (A.Num() < MinComponents) return false;
+        Out = FLinearColor(
+            static_cast<float>(A[0]->AsNumber()),
+            static_cast<float>(A[1]->AsNumber()),
+            static_cast<float>(A[2]->AsNumber()),
+            A.Num() > 3 ? static_cast<float>(A[3]->AsNumber()) : 1.0f);
+        return true;
+    };
 
     if (auto* C = Cast<UMaterialExpressionConstant>(E))
     {
-        C->R = (*It)->AsNumber();
+        C->R = static_cast<float>((*It)->AsNumber());
     }
     else if (auto* C3 = Cast<UMaterialExpressionConstant3Vector>(E))
     {
-        if ((*It)->Type != EJson::Array) return FSageToolDispatch::FOutcome::MakeError(-32602,
-            TEXT("Constant3Vector requires array [r,g,b]"));
-        const auto& A = (*It)->AsArray();
-        if (A.Num() < 3) return FSageToolDispatch::FOutcome::MakeError(-32602,
-            TEXT("array too short"));
-        C3->Constant = FLinearColor(A[0]->AsNumber(), A[1]->AsNumber(), A[2]->AsNumber(),
-                                     A.Num() > 3 ? A[3]->AsNumber() : 1.0f);
+        FLinearColor Col;
+        if (!AsLinearColor(*It, Col, 3))
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("Constant3Vector requires array [r,g,b]"));
+        C3->Constant = Col;
+    }
+    else if (auto* C4 = Cast<UMaterialExpressionConstant4Vector>(E))
+    {
+        FLinearColor Col;
+        if (!AsLinearColor(*It, Col, 4))
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("Constant4Vector requires array [r,g,b,a]"));
+        C4->Constant = Col;
+    }
+    else if (auto* VP = Cast<UMaterialExpressionVectorParameter>(E))
+    {
+        FLinearColor Col;
+        if (!AsLinearColor(*It, Col, 3))
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("VectorParameter requires array [r,g,b] or [r,g,b,a]"));
+        VP->DefaultValue = Col;
     }
     else if (auto* SP = Cast<UMaterialExpressionScalarParameter>(E))
     {
-        SP->DefaultValue = (*It)->AsNumber();
+        SP->DefaultValue = static_cast<float>((*It)->AsNumber());
+    }
+    else if (auto* CBS = Cast<UMaterialExpressionConstantBiasScale>(E))
+    {
+        // Accepts {bias:N, scale:M} object or array [bias, scale].
+        if ((*It)->Type == EJson::Object)
+        {
+            const TSharedPtr<FJsonObject>& O = (*It)->AsObject();
+            double Bias = CBS->Bias, Scale = CBS->Scale;
+            O->TryGetNumberField(TEXT("bias"),  Bias);
+            O->TryGetNumberField(TEXT("scale"), Scale);
+            CBS->Bias  = static_cast<float>(Bias);
+            CBS->Scale = static_cast<float>(Scale);
+        }
+        else if ((*It)->Type == EJson::Array)
+        {
+            const auto& A = (*It)->AsArray();
+            if (A.Num() < 2) return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("ConstantBiasScale requires [bias, scale]"));
+            CBS->Bias  = static_cast<float>(A[0]->AsNumber());
+            CBS->Scale = static_cast<float>(A[1]->AsNumber());
+        }
+        else
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("ConstantBiasScale value must be {bias,scale} object or [bias,scale] array"));
+        }
     }
     else
     {
@@ -602,12 +684,16 @@ FSageToolDispatch::FOutcome MatSetExpressionValueImpl(const TSharedPtr<FJsonObje
             FString::Printf(TEXT("unsupported expression class for value set: %s"),
                             *E->GetClass()->GetName()));
     }
+    E->PostEditChange();
+    M->PostEditChange();
     UMaterialEditingLibrary::RecompileMaterial(M);
 
     auto Out = MakeShared<FJsonObject>();
     Out->SetStringField(TEXT("material"), M->GetName());
     Out->SetStringField(TEXT("expression_id"), NodeId);
     Out->SetField(TEXT("value"), *It);
+    Out->SetStringField(TEXT("_compile_warning"),
+        TEXT("shader compilation runs async; preview may take seconds to update"));
     return FSageToolDispatch::FOutcome::MakeSuccess(Out);
 }
 
@@ -673,6 +759,10 @@ FSageToolDispatch::FOutcome MatValidateImpl(const TSharedPtr<FJsonObject>& Args)
     auto Out = MakeShared<FJsonObject>();
     Out->SetStringField(TEXT("material"), MI->GetName());
     Out->SetBoolField  (TEXT("recompiled"), true);
+    Out->SetStringField(TEXT("_status"),
+        TEXT("queued; UE shader compile is async, validation result not synchronous"));
+    Out->SetStringField(TEXT("_compile_warning"),
+        TEXT("poll mat.get_shader_stats or watch editor log for compilation completion"));
     return FSageToolDispatch::FOutcome::MakeSuccess(Out);
 }
 
@@ -695,11 +785,22 @@ FSageToolDispatch::FOutcome MatCreateImpl(const TSharedPtr<FJsonObject>& Args)
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("asset already exists"));
 
     IAssetTools& AT = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+
+    // Resolve UMaterialFactoryNew explicitly; if the engine module hasn't loaded
+    // it yet (rare in headless/build-machine flows) we surface a descriptive
+    // error rather than letting CreateAsset return null with no clue.
+    UMaterialFactoryNew* Factory = NewObject<UMaterialFactoryNew>();
+    if (!Factory)
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("UMaterialFactoryNew unavailable (engine material module not loaded)"));
+
     UObject* NewObj = AT.CreateAsset(AssetName, PackagePath,
-        UMaterial::StaticClass(), nullptr);
+        UMaterial::StaticClass(), Factory);
     if (!NewObj) return FSageToolDispatch::FOutcome::MakeError(-32000, TEXT("CreateAsset failed"));
 
     UMaterial* Mat = Cast<UMaterial>(NewObj);
+    if (!Mat) return FSageToolDispatch::FOutcome::MakeError(-32603,
+        TEXT("CreateAsset returned non-UMaterial (factory mismatch)"));
 
     FString ShadingStr;
     if (Args->TryGetStringField(TEXT("shading_model"), ShadingStr))
@@ -724,6 +825,8 @@ FSageToolDispatch::FOutcome MatCreateImpl(const TSharedPtr<FJsonObject>& Args)
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"),  Mat->GetPathName());
     R->SetStringField(TEXT("name"),  Mat->GetName());
+    R->SetStringField(TEXT("_compile_warning"),
+        TEXT("shader compilation runs async; preview may take seconds to update"));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -737,8 +840,10 @@ FSageToolDispatch::FOutcome MatSetBlendModeImpl(const TSharedPtr<FJsonObject>& A
     FString Path, BlendStr;
     if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
-    if (!Args->TryGetStringField(TEXT("blend_mode"), BlendStr))
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'blend_mode'"));
+    // Schema field is 'mode'; legacy alias 'blend_mode' kept for compatibility.
+    if (!Args->TryGetStringField(TEXT("mode"), BlendStr) &&
+        !Args->TryGetStringField(TEXT("blend_mode"), BlendStr))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'mode'"));
 
     UMaterial* Mat = ResolveMaterial(Path);
     if (!Mat) return FSageToolDispatch::FOutcome::MakeError(-32602,
@@ -754,18 +859,29 @@ FSageToolDispatch::FOutcome MatSetBlendModeImpl(const TSharedPtr<FJsonObject>& A
         FString::Printf(TEXT("unknown blend_mode: %s"), *BlendStr));
 
     FScopedTransaction Tx(LOCTEXT("SetBlend", "Set Blend Mode"));
+    Mat->PreEditChange(nullptr);
+    if (UMaterialEditorOnlyData* EOD = Mat->GetEditorOnlyData()) EOD->Modify();
     Mat->Modify();
     Mat->BlendMode = Mode;
+    Mat->PostEditChange();
     UMaterialEditingLibrary::RecompileMaterial(Mat);
     Mat->MarkPackageDirty();
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("material"),   Mat->GetName());
     R->SetStringField(TEXT("blend_mode"), BlendStr);
+    R->SetStringField(TEXT("_compile_warning"),
+        TEXT("shader compilation runs async; preview may take seconds to update"));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ---- mat.disconnect --------------------------------------------------------
+// Schema: { path, expression?, property? }
+//  - If 'property' set: disconnect the named material output (BaseColor/Metallic/...)
+//    on the base material. Highest-level disconnect.
+//  - If 'expression' set (GUID): disconnect ALL inputs on that expression.
+//  - Both may be set together; both honored.
+// Returns count of inputs cleared.
 
 FSageToolDispatch::FOutcome MatDisconnectImpl(const TSharedPtr<FJsonObject>& Args)
 {
@@ -779,34 +895,87 @@ FSageToolDispatch::FOutcome MatDisconnectImpl(const TSharedPtr<FJsonObject>& Arg
     UMaterial* Mat = ResolveMaterial(Path);
     if (!Mat) return FSageToolDispatch::FOutcome::MakeError(-32602,
         FString::Printf(TEXT("material not found: %s"), *Path));
+    if (!Mat->GetEditorOnlyData())
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("material has no editor data"));
 
-    FString NodeIdStr;
-    if (!Args->TryGetStringField(TEXT("dst_node"), NodeIdStr))
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'dst_node'"));
-
-    int32 NodeId = FCString::Atoi(*NodeIdStr);
-    TArray<UMaterialExpression*> Exprs;
-    for (UMaterialExpression* E : Mat->GetExpressions()) Exprs.Add(E);
-    if (!Exprs.IsValidIndex(NodeId))
+    FString ExprId, PropName;
+    Args->TryGetStringField(TEXT("expression"), ExprId);
+    Args->TryGetStringField(TEXT("property"),   PropName);
+    if (ExprId.IsEmpty() && PropName.IsEmpty())
         return FSageToolDispatch::FOutcome::MakeError(-32602,
-            FString::Printf(TEXT("node index out of range: %d"), NodeId));
+            TEXT("must provide 'expression' (guid) or 'property' (BaseColor/Metallic/...)"));
 
-    FString InputName;
-    Args->TryGetStringField(TEXT("input"), InputName);
-
-    FScopedTransaction Tx(LOCTEXT("DisconnectExpr", "Disconnect Expression"));
+    FScopedTransaction Tx(LOCTEXT("DisconnectExpr", "Sage: Disconnect Material"));
+    Mat->PreEditChange(nullptr);
+    if (UMaterialEditorOnlyData* EOD = Mat->GetEditorOnlyData()) EOD->Modify();
     Mat->Modify();
 
-    UMaterialExpression* Expr = Exprs[NodeId];
-    Expr->Modify();
-    // Disconnect via UMaterialEditingLibrary (GetInputs removed in UE 5.7)
+    int32 InputsCleared = 0;
+    bool PropertyCleared = false;
+
+    // 1) Disconnect a top-level material property (BaseColor, Metallic, etc.)
+    if (!PropName.IsEmpty())
+    {
+        UMaterialEditorOnlyData* EOD = Mat->GetEditorOnlyData();
+        FExpressionInput* Input = nullptr;
+        if      (PropName == TEXT("BaseColor"))            Input = &EOD->BaseColor;
+        else if (PropName == TEXT("Metallic"))             Input = &EOD->Metallic;
+        else if (PropName == TEXT("Roughness"))            Input = &EOD->Roughness;
+        else if (PropName == TEXT("Specular"))             Input = &EOD->Specular;
+        else if (PropName == TEXT("Emissive") ||
+                 PropName == TEXT("EmissiveColor"))        Input = &EOD->EmissiveColor;
+        else if (PropName == TEXT("Normal"))               Input = &EOD->Normal;
+        else if (PropName == TEXT("Opacity"))              Input = &EOD->Opacity;
+        else if (PropName == TEXT("OpacityMask"))          Input = &EOD->OpacityMask;
+        else if (PropName == TEXT("WorldPositionOffset"))  Input = &EOD->WorldPositionOffset;
+        else if (PropName == TEXT("AmbientOcclusion"))     Input = &EOD->AmbientOcclusion;
+        else if (PropName == TEXT("Refraction"))           Input = &EOD->Refraction;
+        else
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("unknown material property: %s"), *PropName));
+        }
+        if (Input && Input->Expression != nullptr)
+        {
+            Input->Expression  = nullptr;
+            Input->OutputIndex = 0;
+            Input->Mask = Input->MaskR = Input->MaskG = Input->MaskB = Input->MaskA = 0;
+            PropertyCleared = true;
+        }
+    }
+
+    // 2) Disconnect all inputs on a specific expression node (by GUID).
+    if (!ExprId.IsEmpty())
+    {
+        UMaterialExpression* Expr = FindExpressionByGuid(Mat, ExprId);
+        if (!Expr)
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("expression not found: %s"), *ExprId));
+        Expr->Modify();
+        // FExpressionInputIterator (UE 5.5+ canonical traversal API).
+        for (FExpressionInputIterator It{Expr}; It; ++It)
+        {
+            if (It.Input && It.Input->Expression != nullptr)
+            {
+                It.Input->Expression  = nullptr;
+                It.Input->OutputIndex = 0;
+                It.Input->Mask = It.Input->MaskR = It.Input->MaskG = It.Input->MaskB = It.Input->MaskA = 0;
+                ++InputsCleared;
+            }
+        }
+        Expr->PostEditChange();
+    }
+
+    Mat->PostEditChange();
     UMaterialEditingLibrary::RecompileMaterial(Mat);
     Mat->MarkPackageDirty();
 
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("material"),     Mat->GetName());
-    R->SetNumberField(TEXT("node_index"),   NodeId);
-    R->SetBoolField  (TEXT("disconnected"), true);
+    R->SetStringField(TEXT("material"),         Mat->GetName());
+    R->SetBoolField  (TEXT("property_cleared"), PropertyCleared);
+    R->SetNumberField(TEXT("inputs_cleared"),   InputsCleared);
+    R->SetStringField(TEXT("_compile_warning"),
+        TEXT("shader compilation runs async; preview may take seconds to update"));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -853,6 +1022,8 @@ FSageToolDispatch::FOutcome MatRecompileImpl(const TSharedPtr<FJsonObject>& Args
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("material"),   Mat->GetName());
     R->SetBoolField  (TEXT("recompiled"), true);
+    R->SetStringField(TEXT("_compile_warning"),
+        TEXT("shader compilation runs async; preview may take seconds to update"));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1081,25 +1252,80 @@ FSageToolDispatch::FOutcome MatRenderPreviewImpl(const TSharedPtr<FJsonObject>& 
 }
 
 // ---- mat.begin_transaction / mat.end_transaction ---------------------------
+//
+// Per-material scoped transactions keyed by UMaterial*. Multi-editor + concurrent
+// authoring on different materials (or two clients hitting the same editor)
+// previously stomped a single process-global TOptional<FScopedTransaction>,
+// causing one client's commit to silently swallow the other's edits.
+//
+// Lookup by Material* on commit; if the caller only passes a description (legacy
+// single-active path) the most-recent transaction is used. Reset() must run on
+// GameThread (FScopedTransaction dtor touches GUndo) — already guaranteed by
+// the GT(...) wrapper at registration.
 
-static TOptional<FScopedTransaction> GMatTransaction;
+static TMap<TWeakObjectPtr<UMaterial>, TUniquePtr<FScopedTransaction>>& MatTransactions()
+{
+    static TMap<TWeakObjectPtr<UMaterial>, TUniquePtr<FScopedTransaction>> Map;
+    return Map;
+}
 
 FSageToolDispatch::FOutcome MatBeginTransactionImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString Desc = TEXT("Material Graph Edit");
-    if (Args.IsValid()) Args->TryGetStringField(TEXT("description"), Desc);
-    GMatTransaction.Emplace(FText::FromString(Desc));
+    FString Path;
+    if (Args.IsValid())
+    {
+        Args->TryGetStringField(TEXT("description"), Desc);
+        Args->TryGetStringField(TEXT("path"),        Path);
+    }
+
+    UMaterial* Mat = Path.IsEmpty() ? nullptr : ResolveMaterial(Path);
+    if (!Path.IsEmpty() && !Mat)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("material not found: %s"), *Path));
+
+    auto& Map = MatTransactions();
+    // Garbage-collect dead WeakObjectPtrs so the map doesn't leak across editor
+    // sessions / GC sweeps.
+    for (auto It = Map.CreateIterator(); It; ++It)
+    {
+        if (!It.Key().IsValid()) It.RemoveCurrent();
+    }
+
+    TWeakObjectPtr<UMaterial> Key = Mat;  // null is a valid "global" key
+    if (Map.Contains(Key))
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("transaction already active for this material; commit or rollback first"));
+
+    Map.Add(Key, MakeUnique<FScopedTransaction>(FText::FromString(Desc)));
+
     auto R = MakeShared<FJsonObject>();
-    R->SetBoolField(TEXT("started"), true);
+    R->SetBoolField  (TEXT("started"),     true);
     R->SetStringField(TEXT("description"), Desc);
+    if (Mat) R->SetStringField(TEXT("material"), Mat->GetName());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
-FSageToolDispatch::FOutcome MatEndTransactionImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+FSageToolDispatch::FOutcome MatEndTransactionImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    GMatTransaction.Reset();
+    FString Path;
+    if (Args.IsValid()) Args->TryGetStringField(TEXT("path"), Path);
+
+    UMaterial* Mat = Path.IsEmpty() ? nullptr : ResolveMaterial(Path);
+    if (!Path.IsEmpty() && !Mat)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("material not found: %s"), *Path));
+
+    auto& Map = MatTransactions();
+    TWeakObjectPtr<UMaterial> Key = Mat;
+    int32 Removed = Map.Remove(Key);
+
     auto R = MakeShared<FJsonObject>();
-    R->SetBoolField(TEXT("committed"), true);
+    R->SetBoolField  (TEXT("committed"), Removed > 0);
+    R->SetNumberField(TEXT("removed"),   Removed);
+    if (Removed == 0)
+        R->SetStringField(TEXT("_warn"),
+            TEXT("no active transaction for this material/key; nothing committed"));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 

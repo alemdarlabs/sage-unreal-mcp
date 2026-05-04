@@ -9,6 +9,7 @@
 #include "Animation/AnimComposite.h"
 #include "Animation/AnimMontage.h"
 #include "Animation/AnimSequence.h"
+#include "Animation/AnimSequenceBase.h"
 #include "Animation/BlendSpace.h"
 #include "Animation/BlendSpace1D.h"
 #include "Animation/Skeleton.h"
@@ -24,11 +25,58 @@
 #include "Factories/AnimBlueprintFactory.h"
 #include "Factories/AnimCompositeFactory.h"
 #include "Factories/AnimMontageFactory.h"
+#include "Factories/BlueprintFactory.h"
 #include "IAssetTools.h"
 #include "Modules/ModuleManager.h"
 #include "PhysicsEngine/PhysicsAsset.h"
 #include "ScopedTransaction.h"
 #include "UObject/Package.h"
+
+// AnimGraph + state machine authoring (Phase 4-r6, Lyra Sage Gap #16/#17/#18)
+#include "AnimationGraph.h"
+#include "AnimationGraphSchema.h"
+#include "AnimationStateMachineGraph.h"
+#include "AnimationStateMachineSchema.h"
+#include "AnimGraphNode_Base.h"
+#include "AnimGraphNode_StateMachine.h"
+#include "AnimGraphNode_StateMachineBase.h"
+#include "AnimGraphNode_SequencePlayer.h"
+#include "AnimGraphNode_AssetPlayerBase.h"
+#include "AnimGraphNode_Root.h"
+#include "AnimGraphNode_StateResult.h"
+#include "AnimStateNode.h"
+#include "AnimStateNodeBase.h"
+#include "AnimStateTransitionNode.h"
+#include "AnimStateEntryNode.h"
+#include "AnimStateConduitNode.h"
+#include "AnimStateAliasNode.h"
+#include "AnimationTransitionGraph.h"
+#include "AnimGraphNode_SkeletalControlBase.h"
+#include "AnimGraphNode_BlendListBase.h"
+#include "Animation/AnimNodeBase.h"  // FPoseLink for pose-pin category check
+#include "BoneControllers/AnimNode_SkeletalControlBase.h"  // FComponentSpacePoseLink
+#include "Animation/AnimNode_SequencePlayer.h"  // FAnimNode_SequencePlayer for inner Node mutation
+#include "Kismet2/BlueprintEditorUtils.h"
+#include "Kismet2/KismetEditorUtilities.h"
+#include "Kismet2/Kismet2NameValidators.h"  // FKismetNameValidator for RenameGraphWithSuggestion
+
+// IAnimationDataController for AnimSequence curve add (UE 5.5+ canonical path)
+#include "Animation/AnimData/IAnimationDataController.h"
+#include "Animation/AnimData/IAnimationDataModel.h"
+#include "Animation/AnimCurveTypes.h"
+
+// IBlueprintGeneratedClass + Anim* class hierarchy
+#include "Animation/AnimBlueprintGeneratedClass.h"
+
+// Cluster J — runtime character.* (PIE-only)
+#include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "GameFramework/RootMotionSource.h"
+#include "Animation/AnimInstance.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "EngineUtils.h"  // TActorIterator
+#include "Curves/CurveVector.h"  // FRootMotionSource_JumpForce::PathOffsetCurve
+#include "Curves/CurveFloat.h"   // FRootMotionSource_JumpForce::TimeMappingCurve
 
 #define LOCTEXT_NAMESPACE "SageAnimation"
 
@@ -72,6 +120,143 @@ UObject* CreateAssetFromPath(const FString& FullPath, UClass* Cls, UFactory* Fac
 }
 
 // ---------------------------------------------------------------------------
+// AnimGraph helpers (Lyra Sage Gap #16/#20 — state machine + node CRUD)
+// ---------------------------------------------------------------------------
+
+// Resolve the AnimGraph (UAnimationGraphSchema-bound graph) on an AnimBP.
+UEdGraph* FindAnimGraph(UAnimBlueprint* AnimBP)
+{
+    if (!AnimBP) return nullptr;
+    for (UEdGraph* Graph : AnimBP->FunctionGraphs)
+    {
+        if (Graph && Graph->Schema
+            && Graph->Schema->IsChildOf(UAnimationGraphSchema::StaticClass()))
+        {
+            return Graph;
+        }
+    }
+    return nullptr;
+}
+
+// Locate a state machine sub-graph by name. State machines are stored as
+// EditorStateMachineGraph on UAnimGraphNode_StateMachineBase nodes inside the
+// AnimGraph (not directly on AnimBP->FunctionGraphs).
+UAnimationStateMachineGraph* FindStateMachineGraph(UAnimBlueprint* AnimBP, const FName& Name)
+{
+    UEdGraph* AnimGraph = FindAnimGraph(AnimBP);
+    if (!AnimGraph) return nullptr;
+    for (UEdGraphNode* Node : AnimGraph->Nodes)
+    {
+        UAnimGraphNode_StateMachineBase* SMNode = Cast<UAnimGraphNode_StateMachineBase>(Node);
+        if (SMNode && SMNode->EditorStateMachineGraph
+            && SMNode->EditorStateMachineGraph->GetFName() == Name)
+        {
+            return Cast<UAnimationStateMachineGraph>(SMNode->EditorStateMachineGraph);
+        }
+    }
+    return nullptr;
+}
+
+// Parse a state/transition id (FGuid serialized). Accepts both default and
+// Digits format — clients can round-trip whatever GetGuid() returned.
+bool ParseNodeGuid(const FString& IdString, FGuid& OutGuid)
+{
+    if (IdString.IsEmpty()) return false;
+    if (FGuid::Parse(IdString, OutGuid)) return true;
+    return FGuid::ParseExact(IdString, EGuidFormats::Digits, OutGuid);
+}
+
+UAnimStateNodeBase* FindStateNodeByGuid(UEdGraph* SMGraph, const FString& IdString)
+{
+    if (!SMGraph) return nullptr;
+    FGuid Id;
+    if (!ParseNodeGuid(IdString, Id)) return nullptr;
+    for (UEdGraphNode* N : SMGraph->Nodes)
+    {
+        UAnimStateNodeBase* StateNode = Cast<UAnimStateNodeBase>(N);
+        if (StateNode && StateNode->NodeGuid == Id) return StateNode;
+    }
+    return nullptr;
+}
+
+UAnimStateTransitionNode* FindTransitionByGuid(UEdGraph* SMGraph, const FString& IdString)
+{
+    if (!SMGraph) return nullptr;
+    FGuid Id;
+    if (!ParseNodeGuid(IdString, Id)) return nullptr;
+    for (UEdGraphNode* N : SMGraph->Nodes)
+    {
+        UAnimStateTransitionNode* T = Cast<UAnimStateTransitionNode>(N);
+        if (T && T->NodeGuid == Id) return T;
+    }
+    return nullptr;
+}
+
+// AnimGraph "Output Pose" sink — root AnimGraph uses UAnimGraphNode_Root,
+// state BoundGraphs (UAnimationStateGraph) use UAnimGraphNode_StateResult.
+// Returning UEdGraphNode* covers both.
+UEdGraphNode* FindAnimGraphOutput(UEdGraph* Graph)
+{
+    if (!Graph) return nullptr;
+    for (UEdGraphNode* N : Graph->Nodes)
+    {
+        if (N && (N->IsA<UAnimGraphNode_Root>() || N->IsA<UAnimGraphNode_StateResult>()))
+        {
+            return N;
+        }
+    }
+    return nullptr;
+}
+
+// Forward declarations for helpers defined later in the file (Cluster A core).
+UEdGraph* ResolveAnimGraphTarget(UAnimBlueprint* AnimBP, const FString& GraphName);
+
+// Pose-pin predicate. AnimGraph: PinCategory == PC_Struct, SubCategoryObject
+// == FPoseLink::StaticStruct() OR FComponentSpacePoseLink::StaticStruct().
+// State machine transitions use category "Transition". Filtering this way
+// avoids returning data pins (Alpha/Sequence ref) on nodes like
+// UAnimGraphNode_BlendListByBool / UAnimGraphNode_LayeredBoneBlend.
+bool IsPosePin(const UEdGraphPin* Pin)
+{
+    if (!Pin) return false;
+    if (Pin->PinType.PinCategory == TEXT("Transition"))
+    {
+        return true;
+    }
+    if (Pin->PinType.PinCategory == UAnimationGraphSchema::PC_Struct)
+    {
+        UScriptStruct* SS = Cast<UScriptStruct>(Pin->PinType.PinSubCategoryObject.Get());
+        if (SS == FPoseLink::StaticStruct()) return true;
+        if (SS == FComponentSpacePoseLink::StaticStruct()) return true;
+    }
+    return false;
+}
+
+// Strict pose-pin lookup. Drops the "first directional pin" fallback so callers
+// can detect lookup failure and either pass an explicit pin name or surface an
+// error to the user (Lyra Sage Gap #16/Cluster A audit — silent fallback was
+// landing data pins like Alpha/Sequence on BlendList / SkeletalControl nodes).
+UEdGraphPin* FindFirstOutputPosePin(UEdGraphNode* Node)
+{
+    if (!Node) return nullptr;
+    for (UEdGraphPin* Pin : Node->Pins)
+    {
+        if (Pin && Pin->Direction == EGPD_Output && IsPosePin(Pin)) return Pin;
+    }
+    return nullptr;
+}
+
+UEdGraphPin* FindFirstInputPosePin(UEdGraphNode* Node)
+{
+    if (!Node) return nullptr;
+    for (UEdGraphPin* Pin : Node->Pins)
+    {
+        if (Pin && Pin->Direction == EGPD_Input && IsPosePin(Pin)) return Pin;
+    }
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
 // animation.list
 // ---------------------------------------------------------------------------
 
@@ -108,6 +293,10 @@ FSageToolDispatch::FOutcome ListAnimationImpl(const TSharedPtr<FJsonObject>& Arg
     else if (TypeFilter == TEXT("AnimBlueprint"))
     {
         Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.AnimBlueprint")));
+    }
+    else if (TypeFilter == TEXT("AnimComposite"))
+    {
+        Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.AnimComposite")));
     }
     else // "all"
     {
@@ -167,6 +356,41 @@ FSageToolDispatch::FOutcome ReadAnimBlueprintImpl(const TSharedPtr<FJsonObject>&
     R->SetStringField(TEXT("target_skeleton"),
         BP->TargetSkeleton ? BP->TargetSkeleton->GetPathName() : TEXT(""));
     R->SetNumberField(TEXT("anim_graph_count"), BP->FunctionGraphs.Num());
+
+    // Variables (mirror bp.list_variables shape: name + type-string).
+    TArray<TSharedPtr<FJsonValue>> Vars;
+    for (const FBPVariableDescription& V : BP->NewVariables)
+    {
+        auto VObj = MakeShared<FJsonObject>();
+        VObj->SetStringField(TEXT("name"),  V.VarName.ToString());
+        VObj->SetStringField(TEXT("type"),  V.VarType.PinCategory.ToString());
+        VObj->SetStringField(TEXT("guid"),  V.VarGuid.ToString(EGuidFormats::Digits));
+        Vars.Add(MakeShared<FJsonValueObject>(VObj));
+    }
+    R->SetArrayField(TEXT("variables"), Vars);
+
+    // Function graphs categorized by schema. Anim graphs are
+    // UAnimationGraphSchema-bound; everything else is plain event/function.
+    TArray<TSharedPtr<FJsonValue>> AnimGraphs;
+    TArray<TSharedPtr<FJsonValue>> EventGraphs;
+    for (UEdGraph* G : BP->FunctionGraphs)
+    {
+        if (!G) continue;
+        auto GObj = MakeShared<FJsonObject>();
+        GObj->SetStringField(TEXT("name"),       G->GetFName().ToString());
+        GObj->SetStringField(TEXT("schema"),     G->Schema ? G->Schema->GetName() : TEXT(""));
+        GObj->SetNumberField(TEXT("node_count"), G->Nodes.Num());
+        if (G->Schema && G->Schema->IsChildOf(UAnimationGraphSchema::StaticClass()))
+        {
+            AnimGraphs.Add(MakeShared<FJsonValueObject>(GObj));
+        }
+        else
+        {
+            EventGraphs.Add(MakeShared<FJsonValueObject>(GObj));
+        }
+    }
+    R->SetArrayField(TEXT("anim_graphs"),  AnimGraphs);
+    R->SetArrayField(TEXT("event_graphs"), EventGraphs);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -361,9 +585,9 @@ FSageToolDispatch::FOutcome ListSkeletonSocketsImpl(const TSharedPtr<FJsonObject
 FSageToolDispatch::FOutcome ListSkeletalMeshesImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString SkeletonPath;
-    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("skeleton_path"), SkeletonPath))
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("skeleton"), SkeletonPath))
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton_path'"));
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
     }
     USkeleton* Skeleton = Cast<USkeleton>(ResolveAsset(SkeletonPath));
     if (!Skeleton)
@@ -458,11 +682,93 @@ FSageToolDispatch::FOutcome ReadStateMachineImpl(const TSharedPtr<FJsonObject>& 
     FString SMName;
     Args->TryGetStringField(TEXT("name"), SMName);
 
+    // Resolve the SM sub-graph: explicit name or first one found in the AnimGraph.
+    UAnimationStateMachineGraph* SMGraph = nullptr;
+    if (!SMName.IsEmpty())
+    {
+        SMGraph = FindStateMachineGraph(BP, FName(*SMName));
+    }
+    else if (UEdGraph* AG = FindAnimGraph(BP))
+    {
+        for (UEdGraphNode* N : AG->Nodes)
+        {
+            if (UAnimGraphNode_StateMachineBase* SMNode = Cast<UAnimGraphNode_StateMachineBase>(N))
+            {
+                if (SMNode->EditorStateMachineGraph)
+                {
+                    SMGraph = Cast<UAnimationStateMachineGraph>(SMNode->EditorStateMachineGraph);
+                    SMName  = SMGraph ? SMGraph->GetFName().ToString() : SMName;
+                    break;
+                }
+            }
+        }
+    }
+
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"), BP->GetPathName());
-    R->SetStringField(TEXT("state_machine_name"), SMName.IsEmpty() ? TEXT("(first)") : SMName);
-    R->SetStringField(TEXT("note"),
-        TEXT("use bp.read_function_graph with fn_name='AnimGraph' for full graph details"));
+    R->SetStringField(TEXT("state_machine_name"), SMName.IsEmpty() ? TEXT("") : SMName);
+
+    if (!SMGraph)
+    {
+        R->SetBoolField(TEXT("found"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+    R->SetBoolField(TEXT("found"), true);
+
+    // States — mirror ListStatesImpl shape.
+    TArray<TSharedPtr<FJsonValue>> States;
+    for (UEdGraphNode* N : SMGraph->Nodes)
+    {
+        if (UAnimStateNodeBase* S = Cast<UAnimStateNodeBase>(N))
+        {
+            auto Obj = MakeShared<FJsonObject>();
+            Obj->SetStringField(TEXT("state_id"), S->NodeGuid.ToString(EGuidFormats::Digits));
+            Obj->SetStringField(TEXT("class"),    S->GetClass()->GetName());
+            FString StateName;
+            if (UAnimStateAliasNode* AsAlias = Cast<UAnimStateAliasNode>(S))
+            {
+                StateName = AsAlias->GetStateName();
+            }
+            else if (UAnimStateNode* AsState = Cast<UAnimStateNode>(S))
+            {
+                StateName = AsState->GetStateName();
+            }
+            else if (UAnimStateConduitNode* AsCon = Cast<UAnimStateConduitNode>(S))
+            {
+                if (AsCon->BoundGraph) StateName = AsCon->BoundGraph->GetFName().ToString();
+            }
+            Obj->SetStringField(TEXT("name"), StateName);
+            Obj->SetNumberField(TEXT("x"), S->NodePosX);
+            Obj->SetNumberField(TEXT("y"), S->NodePosY);
+            States.Add(MakeShared<FJsonValueObject>(Obj));
+        }
+    }
+    R->SetArrayField(TEXT("states"), States);
+    R->SetNumberField(TEXT("state_count"), States.Num());
+
+    // Transitions
+    TArray<TSharedPtr<FJsonValue>> Trans;
+    for (UEdGraphNode* N : SMGraph->Nodes)
+    {
+        if (UAnimStateTransitionNode* T = Cast<UAnimStateTransitionNode>(N))
+        {
+            auto Obj = MakeShared<FJsonObject>();
+            Obj->SetStringField(TEXT("transition_id"),
+                                T->NodeGuid.ToString(EGuidFormats::Digits));
+            UAnimStateNodeBase* From = T->GetPreviousState();
+            UAnimStateNodeBase* To   = T->GetNextState();
+            Obj->SetStringField(TEXT("from_state_id"),
+                From ? From->NodeGuid.ToString(EGuidFormats::Digits) : FString());
+            Obj->SetStringField(TEXT("to_state_id"),
+                To   ? To->NodeGuid.ToString(EGuidFormats::Digits)   : FString());
+            Obj->SetNumberField(TEXT("blend_time"),    T->CrossfadeDuration);
+            Obj->SetNumberField(TEXT("priority"),      T->PriorityOrder);
+            Obj->SetBoolField  (TEXT("bidirectional"), T->Bidirectional);
+            Trans.Add(MakeShared<FJsonValueObject>(Obj));
+        }
+    }
+    R->SetArrayField(TEXT("transitions"), Trans);
+    R->SetNumberField(TEXT("transition_count"), Trans.Num());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -484,10 +790,58 @@ FSageToolDispatch::FOutcome ReadAnimGraphImpl(const TSharedPtr<FJsonObject>& Arg
             FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
     }
 
+    // Optional graph name — default to the root AnimGraph.
+    FString GraphName;
+    Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"), BP->GetPathName());
-    R->SetStringField(TEXT("note"),
-        TEXT("use bp.read_function_graph with fn_name='AnimGraph' for full graph details"));
+
+    TArray<TSharedPtr<FJsonValue>> Graphs;
+    auto EmitGraph = [&Graphs](UEdGraph* G)
+    {
+        if (!G) return;
+        auto GObj = MakeShared<FJsonObject>();
+        GObj->SetStringField(TEXT("name"),   G->GetFName().ToString());
+        GObj->SetStringField(TEXT("schema"), G->Schema ? G->Schema->GetName() : TEXT(""));
+
+        TArray<TSharedPtr<FJsonValue>> Nodes;
+        for (UEdGraphNode* N : G->Nodes)
+        {
+            if (!N) continue;
+            auto NObj = MakeShared<FJsonObject>();
+            NObj->SetStringField(TEXT("node_id"),  N->NodeGuid.ToString(EGuidFormats::Digits));
+            NObj->SetStringField(TEXT("class"),    N->GetClass()->GetPathName());
+            NObj->SetNumberField(TEXT("x"),        N->NodePosX);
+            NObj->SetNumberField(TEXT("y"),        N->NodePosY);
+            NObj->SetNumberField(TEXT("pin_count"),N->Pins.Num());
+            Nodes.Add(MakeShared<FJsonValueObject>(NObj));
+        }
+        GObj->SetArrayField(TEXT("nodes"), Nodes);
+        GObj->SetNumberField(TEXT("node_count"), Nodes.Num());
+        Graphs.Add(MakeShared<FJsonValueObject>(GObj));
+    };
+
+    if (!GraphName.IsEmpty())
+    {
+        EmitGraph(ResolveAnimGraphTarget(BP, GraphName));
+    }
+    else
+    {
+        // Emit every UAnimationGraphSchema-bound graph and every state-machine
+        // sub-graph (via referencing UAnimGraphNode_StateMachineBase).
+        for (UEdGraph* G : BP->FunctionGraphs)
+        {
+            if (G && G->Schema
+                && G->Schema->IsChildOf(UAnimationGraphSchema::StaticClass()))
+            {
+                EmitGraph(G);
+            }
+        }
+    }
+
+    R->SetArrayField(TEXT("graphs"), Graphs);
+    R->SetNumberField(TEXT("graph_count"), Graphs.Num());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -547,9 +901,9 @@ FSageToolDispatch::FOutcome ReadBoneTrackImpl(const TSharedPtr<FJsonObject>& Arg
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
     }
-    if (!Args->TryGetStringField(TEXT("bone_name"), BoneName) || BoneName.IsEmpty())
+    if (!Args->TryGetStringField(TEXT("bone"), BoneName) || BoneName.IsEmpty())
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'bone_name'"));
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'bone'"));
     }
     double FrameD = 0.0;
     Args->TryGetNumberField(TEXT("frame"), FrameD);
@@ -658,9 +1012,9 @@ FSageToolDispatch::FOutcome CreateAnimBlueprintImpl(const TSharedPtr<FJsonObject
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
     }
-    if (!Args->TryGetStringField(TEXT("skeleton_path"), SkeletonPath) || SkeletonPath.IsEmpty())
+    if (!Args->TryGetStringField(TEXT("skeleton"), SkeletonPath) || SkeletonPath.IsEmpty())
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton_path'"));
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
     }
 
     USkeleton* Skel = Cast<USkeleton>(ResolveAsset(SkeletonPath));
@@ -750,16 +1104,31 @@ FSageToolDispatch::FOutcome CreateBlendSpaceImpl(const TSharedPtr<FJsonObject>& 
     if (detail::RejectIfPie(Reject)) return Reject;
 
     FString Path, SkeletonPath;
-    FString Type = TEXT("2D");
+    int32 Dimensions = 2;
     if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
     }
-    if (!Args->TryGetStringField(TEXT("skeleton_path"), SkeletonPath) || SkeletonPath.IsEmpty())
+    if (!Args->TryGetStringField(TEXT("skeleton"), SkeletonPath) || SkeletonPath.IsEmpty())
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton_path'"));
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
     }
-    Args->TryGetStringField(TEXT("type"), Type);
+    // Schema declares `dimensions: integer (1|2)`. Tolerate legacy `type: "1D"|"2D"`
+    // for clients still passing the old key (warn-free).
+    if (!Args->TryGetNumberField(TEXT("dimensions"), Dimensions))
+    {
+        FString LegacyType;
+        if (Args->TryGetStringField(TEXT("type"), LegacyType))
+        {
+            if (LegacyType == TEXT("1D")) Dimensions = 1;
+            else if (LegacyType == TEXT("2D")) Dimensions = 2;
+        }
+    }
+    if (Dimensions != 1 && Dimensions != 2)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("'dimensions' must be 1 or 2"));
+    }
 
     USkeleton* Skel = Cast<USkeleton>(ResolveAsset(SkeletonPath));
     if (!Skel)
@@ -771,31 +1140,37 @@ FSageToolDispatch::FOutcome CreateBlendSpaceImpl(const TSharedPtr<FJsonObject>& 
     FScopedTransaction Tx(LOCTEXT("CreateBS", "Create BlendSpace"));
 
     UObject* Created = nullptr;
-    if (Type == TEXT("1D"))
+    if (Dimensions == 1)
     {
         UClass* BS1DFacClass = FindObject<UClass>(nullptr, TEXT("/Script/UnrealEd.BlendSpaceFactory1D"));
         if (!BS1DFacClass) BS1DFacClass = LoadObject<UClass>(nullptr, TEXT("/Script/UnrealEd.BlendSpaceFactory1D"));
-        if (BS1DFacClass)
+        if (!BS1DFacClass)
         {
-            UFactory* Fac = NewObject<UFactory>(GetTransientPackage(), BS1DFacClass);
-            FObjectPropertyBase* SkelProp = CastField<FObjectPropertyBase>(
-                Fac->GetClass()->FindPropertyByName(TEXT("TargetSkeleton")));
-            if (SkelProp) SkelProp->SetObjectPropertyValue(SkelProp->ContainerPtrToValuePtr<void>(Fac), Skel);
-            Created = CreateAssetFromPath(Path, UBlendSpace1D::StaticClass(), Fac);
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32603,
+                TEXT("BlendSpaceFactory1D class not found (UnrealEd module not loaded)"));
         }
+        UFactory* Fac = NewObject<UFactory>(GetTransientPackage(), BS1DFacClass);
+        FObjectPropertyBase* SkelProp = CastField<FObjectPropertyBase>(
+            Fac->GetClass()->FindPropertyByName(TEXT("TargetSkeleton")));
+        if (SkelProp) SkelProp->SetObjectPropertyValue(SkelProp->ContainerPtrToValuePtr<void>(Fac), Skel);
+        Created = CreateAssetFromPath(Path, UBlendSpace1D::StaticClass(), Fac);
     }
     else
     {
         UClass* BSFacClass = FindObject<UClass>(nullptr, TEXT("/Script/UnrealEd.BlendSpaceFactoryNew"));
         if (!BSFacClass) BSFacClass = LoadObject<UClass>(nullptr, TEXT("/Script/UnrealEd.BlendSpaceFactoryNew"));
-        if (BSFacClass)
+        if (!BSFacClass)
         {
-            UFactory* Fac = NewObject<UFactory>(GetTransientPackage(), BSFacClass);
-            FObjectPropertyBase* SkelProp = CastField<FObjectPropertyBase>(
-                Fac->GetClass()->FindPropertyByName(TEXT("TargetSkeleton")));
-            if (SkelProp) SkelProp->SetObjectPropertyValue(SkelProp->ContainerPtrToValuePtr<void>(Fac), Skel);
-            Created = CreateAssetFromPath(Path, UBlendSpace::StaticClass(), Fac);
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32603,
+                TEXT("BlendSpaceFactoryNew class not found (UnrealEd module not loaded)"));
         }
+        UFactory* Fac = NewObject<UFactory>(GetTransientPackage(), BSFacClass);
+        FObjectPropertyBase* SkelProp = CastField<FObjectPropertyBase>(
+            Fac->GetClass()->FindPropertyByName(TEXT("TargetSkeleton")));
+        if (SkelProp) SkelProp->SetObjectPropertyValue(SkelProp->ContainerPtrToValuePtr<void>(Fac), Skel);
+        Created = CreateAssetFromPath(Path, UBlendSpace::StaticClass(), Fac);
     }
 
     if (!Created)
@@ -807,9 +1182,9 @@ FSageToolDispatch::FOutcome CreateBlendSpaceImpl(const TSharedPtr<FJsonObject>& 
     Created->MarkPackageDirty();
 
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("path"),  Created->GetPathName());
-    R->SetStringField(TEXT("class"), Created->GetClass()->GetName());
-    R->SetStringField(TEXT("type"),  Type);
+    R->SetStringField(TEXT("path"),       Created->GetPathName());
+    R->SetStringField(TEXT("class"),      Created->GetClass()->GetName());
+    R->SetNumberField(TEXT("dimensions"), Dimensions);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -860,7 +1235,16 @@ FSageToolDispatch::FOutcome AddNotifyImpl(const TSharedPtr<FJsonObject>& Args)
 
     const float NotifyTime = static_cast<float>(Time);
     FAnimNotifyEvent NewEvent;
-    NewEvent.NotifyName = FName(*Cls->GetName());
+    // Trim engine prefix/suffix so the displayed notify name matches Persona
+    // ("AnimNotify_Foo_C" → "Foo"). UE convention: the runtime gameplay tag
+    // matches `Notify.<TrimmedName>` so leaving prefixes corrupts gameplay
+    // event lookups.
+    {
+        FString CleanName = Cls->GetName();
+        CleanName.RemoveFromStart(TEXT("AnimNotify_"));
+        CleanName.RemoveFromEnd(TEXT("_C"));
+        NewEvent.NotifyName = FName(*CleanName);
+    }
     NewEvent.SetTime(NotifyTime);
     NewEvent.TriggerTimeOffset = GetTriggerTimeOffsetForType(
         SeqBase->CalculateOffsetForNotify(NotifyTime));
@@ -903,9 +1287,9 @@ FSageToolDispatch::FOutcome CreateSequenceImpl(const TSharedPtr<FJsonObject>& Ar
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
     }
-    if (!Args->TryGetStringField(TEXT("skeleton_path"), SkeletonPath) || SkeletonPath.IsEmpty())
+    if (!Args->TryGetStringField(TEXT("skeleton"), SkeletonPath) || SkeletonPath.IsEmpty())
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton_path'"));
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
     }
 
     USkeleton* Skel = Cast<USkeleton>(ResolveAsset(SkeletonPath));
@@ -957,14 +1341,9 @@ FSageToolDispatch::FOutcome CreateSequenceImpl(const TSharedPtr<FJsonObject>& Ar
 
 FSageToolDispatch::FOutcome SetBoneKeyframesImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    auto R = MakeShared<FJsonObject>();
-    FString Path;
-    if (Args.IsValid()) Args->TryGetStringField(TEXT("path"), Path);
-    R->SetStringField(TEXT("path"), Path);
-    R->SetStringField(TEXT("note"),
-        TEXT("bone keyframe editing requires the UAnimSequence compression pipeline; "
-             "trigger via Python scripting: editor.run_python with animation editor commands"));
-    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    return FSageToolDispatch::FOutcome::MakeError(-32000,
+        TEXT("[NOT IMPLEMENTED] animation.set_bone_keyframes — use IAnimationDataController "
+             "via Persona (UE 5.5+ canonical) or editor.run_python with animation editor"));
 }
 
 // ---------------------------------------------------------------------------
@@ -973,49 +1352,57 @@ FSageToolDispatch::FOutcome SetBoneKeyframesImpl(const TSharedPtr<FJsonObject>& 
 
 FSageToolDispatch::FOutcome GetBoneTransformsImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    FString Path, BoneName;
-    double Time = 0.0;
-    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    // Schema (phase4_schemas.cpp:253) declares { skeleton, bones[] } — handler
+    // was reading the legacy { path, bone_name } shape from a pre-Phase-4
+    // iteration which silently returned -32602 for every modern call.
+    FString SkeletonPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("skeleton"), SkeletonPath))
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
     }
-    if (!Args->TryGetStringField(TEXT("bone_name"), BoneName) || BoneName.IsEmpty())
+    const TArray<TSharedPtr<FJsonValue>>* BonesArr = nullptr;
+    if (!Args->TryGetArrayField(TEXT("bones"), BonesArr) || !BonesArr || BonesArr->Num() == 0)
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'bone_name'"));
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'bones' array"));
     }
-    Args->TryGetNumberField(TEXT("time"), Time);
 
-    UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(Path));
-    if (!Seq)
-    {
-        return FSageToolDispatch::FOutcome::MakeError(-32602,
-            FString::Printf(TEXT("not a UAnimSequence: %s"), *Path));
-    }
-    USkeleton* Skel = Seq->GetSkeleton();
+    USkeleton* Skel = Cast<USkeleton>(ResolveAsset(SkeletonPath));
     if (!Skel)
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("sequence has no skeleton"));
-    }
-
-    const int32 BoneIdx = Skel->GetReferenceSkeleton().FindBoneIndex(FName(*BoneName));
-    if (BoneIdx == INDEX_NONE)
-    {
         return FSageToolDispatch::FOutcome::MakeError(-32602,
-            FString::Printf(TEXT("bone '%s' not found in skeleton"), *BoneName));
+            FString::Printf(TEXT("not a USkeleton: %s"), *SkeletonPath));
     }
 
-    // Use reference pose as fallback; runtime transform requires FSkeletonPoseBoneIndex
-    FTransform BoneTransform = Skel->GetReferenceSkeleton().GetRefBonePose().IsValidIndex(BoneIdx)
-        ? Skel->GetReferenceSkeleton().GetRefBonePose()[BoneIdx]
-        : FTransform::Identity;
+    const FReferenceSkeleton& RefSkel = Skel->GetReferenceSkeleton();
+    const TArray<FTransform>& RefPose = RefSkel.GetRefBonePose();
+
+    TArray<TSharedPtr<FJsonValue>> Out;
+    for (const TSharedPtr<FJsonValue>& V : *BonesArr)
+    {
+        if (!V.IsValid() || V->Type != EJson::String) continue;
+        const FString BoneName = V->AsString();
+        const int32 BoneIdx = RefSkel.FindBoneIndex(FName(*BoneName));
+        TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+        Obj->SetStringField(TEXT("bone"), BoneName);
+        if (BoneIdx == INDEX_NONE || !RefPose.IsValidIndex(BoneIdx))
+        {
+            Obj->SetBoolField(TEXT("found"), false);
+        }
+        else
+        {
+            const FTransform& T = RefPose[BoneIdx];
+            Obj->SetBoolField(TEXT("found"),    true);
+            Obj->SetField(TEXT("location"), detail::Vec3ToJson(T.GetLocation()));
+            Obj->SetField(TEXT("rotation"), detail::Rot3ToJson(T.GetRotation().Rotator()));
+            Obj->SetField(TEXT("scale"),    detail::Vec3ToJson(T.GetScale3D()));
+        }
+        Out.Add(MakeShared<FJsonValueObject>(Obj));
+    }
 
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("path"),      Seq->GetPathName());
-    R->SetStringField(TEXT("bone_name"), BoneName);
-    R->SetNumberField(TEXT("time"),      Time);
-    R->SetField(TEXT("location"), detail::Vec3ToJson(BoneTransform.GetLocation()));
-    R->SetField(TEXT("rotation"), detail::Rot3ToJson(BoneTransform.GetRotation().Rotator()));
-    R->SetField(TEXT("scale"),    detail::Vec3ToJson(BoneTransform.GetScale3D()));
+    R->SetStringField(TEXT("skeleton"), Skel->GetPathName());
+    R->SetArrayField (TEXT("bones"),    Out);
+    R->SetNumberField(TEXT("count"),    Out.Num());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1025,14 +1412,9 @@ FSageToolDispatch::FOutcome GetBoneTransformsImpl(const TSharedPtr<FJsonObject>&
 
 FSageToolDispatch::FOutcome SetMontageSequenceImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    auto R = MakeShared<FJsonObject>();
-    FString Path;
-    if (Args.IsValid()) Args->TryGetStringField(TEXT("path"), Path);
-    R->SetStringField(TEXT("path"), Path);
-    R->SetStringField(TEXT("note"),
-        TEXT("montage slot track editing requires the Persona animation editor session; "
-             "use the Unreal Editor Montage editor or editor.run_python with anim editor API"));
-    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    return FSageToolDispatch::FOutcome::MakeError(-32000,
+        TEXT("[NOT IMPLEMENTED] animation.set_montage_sequence — slot track editing "
+             "requires Persona session; use editor.run_python with anim editor API"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,12 +1447,12 @@ FSageToolDispatch::FOutcome SetMontagePropertiesImpl(const TSharedPtr<FJsonObjec
         Montage->RateScale = static_cast<float>(RateScale);
     }
     double BlendIn = -1.0;
-    if (Args->TryGetNumberField(TEXT("blend_in_time"), BlendIn) && BlendIn >= 0.0)
+    if (Args->TryGetNumberField(TEXT("blend_in"), BlendIn) && BlendIn >= 0.0)
     {
         Montage->BlendIn.SetBlendTime(static_cast<float>(BlendIn));
     }
     double BlendOut = -1.0;
-    if (Args->TryGetNumberField(TEXT("blend_out_time"), BlendOut) && BlendOut >= 0.0)
+    if (Args->TryGetNumberField(TEXT("blend_out"), BlendOut) && BlendOut >= 0.0)
     {
         Montage->BlendOut.SetBlendTime(static_cast<float>(BlendOut));
     }
@@ -1086,8 +1468,17 @@ FSageToolDispatch::FOutcome SetMontagePropertiesImpl(const TSharedPtr<FJsonObjec
 }
 
 // ---------------------------------------------------------------------------
-// animation.create_state_machine
+// animation.create_state_machine (Lyra Sage Gap #16 — was stub)
 // ---------------------------------------------------------------------------
+//
+// Pipeline (engine canonical):
+//   1. Locate AnimBP's AnimGraph (UAnimationGraphSchema-bound function graph)
+//   2. Spawn UAnimGraphNode_StateMachine inside AnimGraph
+//   3. CreateNewGraph(UAnimationStateMachineGraph + UAnimationStateMachineSchema)
+//      — schema's CreateDefaultNodesForGraph produces the Entry node
+//   4. Bind sub-graph to the SM node via EditorStateMachineGraph
+//   5. Wire SM node's Output Pose to AnimGraph Root (Output Pose pin)
+//   6. MarkBlueprintAsStructurallyModified + (optional) compile
 
 FSageToolDispatch::FOutcome CreateStateMachineImpl(const TSharedPtr<FJsonObject>& Args)
 {
@@ -1103,72 +1494,468 @@ FSageToolDispatch::FOutcome CreateStateMachineImpl(const TSharedPtr<FJsonObject>
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
     }
+    bool bConnectToRoot = true;
+    Args->TryGetBoolField(TEXT("connect_to_root"), bConnectToRoot);
+    bool bCompile = false;
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
 
-    UAnimBlueprint* BP = Cast<UAnimBlueprint>(ResolveAsset(Path));
-    if (!BP)
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602,
             FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
     }
 
+    UEdGraph* AnimGraph = FindAnimGraph(AnimBP);
+    if (!AnimGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("AnimBlueprint has no AnimGraph (UAnimationGraphSchema)"));
+    }
+
+    // Reject duplicate name
+    if (FindStateMachineGraph(AnimBP, FName(*Name)) != nullptr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("state machine '%s' already exists on %s"),
+                            *Name, *AnimBP->GetName()));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("CreateSM", "Sage: Create State Machine"));
+    AnimBP->Modify();
+    AnimGraph->Modify();
+
+    // 1) Spawn UAnimGraphNode_StateMachine. PostPlacedNewNode is the engine
+    // canonical entry point — it allocates EditorStateMachineGraph (with the
+    // correct outer = SM node), sets OwnerAnimGraphNode, registers the
+    // sub-graph in ParentGraph->SubGraphs, and runs the schema's
+    // CreateDefaultNodesForGraph (Entry node). We must call it BEFORE
+    // AllocateDefaultPins (PostPlacedNewNode also runs AllocateDefaultPins
+    // implicitly on UEdGraphNode and the sub-graph schema setup expects pins
+    // to be uninitialized when called).
+    UAnimGraphNode_StateMachine* SMNode = NewObject<UAnimGraphNode_StateMachine>(AnimGraph);
+    SMNode->CreateNewGuid();
+    SMNode->NodePosX = 0;
+    SMNode->NodePosY = 0;
+    AnimGraph->AddNode(SMNode, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+    SMNode->PostPlacedNewNode();
+    SMNode->AllocateDefaultPins();
+
+    // 2) Rename the engine-created sub-graph to the user-supplied name.
+    UEdGraph* SMGraph = SMNode->EditorStateMachineGraph;
+    if (!SMGraph)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("PostPlacedNewNode did not produce EditorStateMachineGraph"));
+    }
+    SMGraph->bAllowDeletion = false;
+    if (SMGraph->GetFName() != FName(*Name))
+    {
+        // RenameGraphWithSuggestion + a node-aware FNameValidatorFactory
+        // validator is the engine canonical for SM rename — guarantees the
+        // chosen name is unique and stable inside the AnimBP namespace
+        // (mirrors UAnimGraphNode_StateMachineBase::PostPlacedNewNode line
+        // 153). Plain RenameGraph skips the validator pass and can collide
+        // silently with an existing graph name.
+        TSharedPtr<INameValidatorInterface> NameValidator =
+            FNameValidatorFactory::MakeValidator(SMNode);
+        FBlueprintEditorUtils::RenameGraphWithSuggestion(SMGraph, NameValidator, Name);
+    }
+
+    // 3) Wire to AnimGraph Output Pose root (optional)
+    bool bConnected = false;
+    if (bConnectToRoot)
+    {
+        UEdGraphNode* Root = FindAnimGraphOutput(AnimGraph);
+        if (Root)
+        {
+            UEdGraphPin* SMOut   = FindFirstOutputPosePin(SMNode);
+            UEdGraphPin* RootIn  = FindFirstInputPosePin(Root);
+            if (SMOut && RootIn)
+            {
+                // Disconnect anything currently feeding the root pose
+                RootIn->BreakAllPinLinks();
+                SMOut->MakeLinkTo(RootIn);
+                bConnected = true;
+            }
+        }
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+    bool bCompiled = false;
+    if (bCompile)
+    {
+        FKismetEditorUtilities::CompileBlueprint(AnimBP);
+        bCompiled = true;
+    }
+
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("path"), BP->GetPathName());
-    R->SetStringField(TEXT("name"), Name);
-    R->SetStringField(TEXT("note"),
-        TEXT("state machine graph creation requires FBlueprintEditorUtils::CreateNewGraph with "
-             "AnimationStateMachineSchema; open the AnimBP in Persona and use editor.run_python"));
+    R->SetStringField(TEXT("path"),                AnimBP->GetPathName());
+    R->SetStringField(TEXT("state_machine_name"),  Name);
+    R->SetStringField(TEXT("state_machine_node_id"),
+                      SMNode->NodeGuid.ToString(EGuidFormats::Digits));
+    R->SetBoolField  (TEXT("connected_to_root"),   bConnected);
+    R->SetBoolField  (TEXT("compiled"),            bCompiled);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ---------------------------------------------------------------------------
-// animation.add_state
+// animation.add_state (Lyra Sage Gap #16 — was stub)
 // ---------------------------------------------------------------------------
 
 FSageToolDispatch::FOutcome AddStateImpl(const TSharedPtr<FJsonObject>& Args)
 {
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SMName, StateName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("state_machine_name"), SMName) || SMName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'state_machine_name'"));
+    }
+    if (!Args->TryGetStringField(TEXT("state_name"), StateName) || StateName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'state_name'"));
+    }
+    double X = 0.0, Y = 0.0;
+    Args->TryGetNumberField(TEXT("x"), X);
+    Args->TryGetNumberField(TEXT("y"), Y);
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+    UAnimationStateMachineGraph* SMGraph = FindStateMachineGraph(AnimBP, FName(*SMName));
+    if (!SMGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("state machine '%s' not found on %s"), *SMName, *AnimBP->GetName()));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("AddState", "Sage: Add State"));
+    AnimBP->Modify();
+    SMGraph->Modify();
+
+    UAnimStateNode* StateNode = NewObject<UAnimStateNode>(SMGraph);
+    StateNode->CreateNewGuid();
+    StateNode->NodePosX = static_cast<int32>(X);
+    StateNode->NodePosY = static_cast<int32>(Y);
+    SMGraph->AddNode(StateNode, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+    // PostPlacedNewNode is what creates StateNode->BoundGraph (UAnimationStateGraph
+    // with the StateResult output node). Without this, BoundGraph is null and
+    // the state can't drive any pose. Engine: AnimStateNode.cpp:131-156.
+    StateNode->PostPlacedNewNode();
+    StateNode->AllocateDefaultPins();
+
+    if (StateNode->BoundGraph && StateNode->BoundGraph->GetFName() != FName(*StateName))
+    {
+        // Use the validator-aware rename so colliding state names get an
+        // automatic suffix instead of silently overwriting (engine canonical;
+        // mirrors UAnimStateNode::PostPlacedNewNode).
+        TSharedPtr<INameValidatorInterface> NameValidator =
+            FNameValidatorFactory::MakeValidator(StateNode);
+        FBlueprintEditorUtils::RenameGraphWithSuggestion(StateNode->BoundGraph,
+                                                         NameValidator, StateName);
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("note"),
-        TEXT("state node creation requires Persona AnimStateMachine graph editing; "
-             "use editor.run_python with the AnimBP open in Persona"));
+    R->SetStringField(TEXT("state_machine_name"), SMName);
+    R->SetStringField(TEXT("state_name"),         StateName);
+    R->SetStringField(TEXT("state_id"),
+                      StateNode->NodeGuid.ToString(EGuidFormats::Digits));
+    R->SetNumberField(TEXT("x"), X);
+    R->SetNumberField(TEXT("y"), Y);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ---------------------------------------------------------------------------
-// animation.add_transition
+// animation.add_transition (Lyra Sage Gap #16 — was stub)
 // ---------------------------------------------------------------------------
 
 FSageToolDispatch::FOutcome AddTransitionImpl(const TSharedPtr<FJsonObject>& Args)
 {
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SMName, FromId, ToId;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("state_machine_name"), SMName) || SMName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'state_machine_name'"));
+    }
+    if (!Args->TryGetStringField(TEXT("from_state_id"), FromId) || FromId.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'from_state_id'"));
+    }
+    if (!Args->TryGetStringField(TEXT("to_state_id"), ToId) || ToId.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'to_state_id'"));
+    }
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+    UAnimationStateMachineGraph* SMGraph = FindStateMachineGraph(AnimBP, FName(*SMName));
+    if (!SMGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("state machine '%s' not found"), *SMName));
+    }
+
+    UAnimStateNodeBase* FromNode = FindStateNodeByGuid(SMGraph, FromId);
+    UAnimStateNodeBase* ToNode   = FindStateNodeByGuid(SMGraph, ToId);
+    if (!FromNode)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("from_state_id not found: %s"), *FromId));
+    }
+    if (!ToNode)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("to_state_id not found: %s"), *ToId));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("AddTransition", "Sage: Add Transition"));
+    AnimBP->Modify();
+    SMGraph->Modify();
+
+    UAnimStateTransitionNode* T = NewObject<UAnimStateTransitionNode>(SMGraph);
+    T->CreateNewGuid();
+    T->NodePosX = (FromNode->NodePosX + ToNode->NodePosX) / 2;
+    T->NodePosY = (FromNode->NodePosY + ToNode->NodePosY) / 2;
+    SMGraph->AddNode(T, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+    // PostPlacedNewNode creates the transition's BoundGraph (UAnimationTransitionGraph
+    // — holds the rule expression). Without it the transition compiles as
+    // default-true with no editable canvas. Engine: AnimStateTransitionNode.cpp:109.
+    T->PostPlacedNewNode();
+    T->AllocateDefaultPins();
+
+    UEdGraphPin* FromOut = FindFirstOutputPosePin(FromNode);
+    UEdGraphPin* TInPin  = FindFirstInputPosePin(T);
+    UEdGraphPin* TOutPin = FindFirstOutputPosePin(T);
+    UEdGraphPin* ToIn    = FindFirstInputPosePin(ToNode);
+    if (!FromOut || !TInPin || !TOutPin || !ToIn)
+    {
+        Tx.Cancel();
+        // SM-context pose pins use PinCategory == "Transition" — IsPosePin
+        // already accepts that. Surface which exact pin was missing so engine
+        // API drift gets diagnosed at first call instead of a runtime crash.
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("transition pin lookup failed — expected category Transition pin not found (from_out=%d, t_in=%d, t_out=%d, to_in=%d)"),
+                            FromOut ? 1 : 0, TInPin ? 1 : 0, TOutPin ? 1 : 0, ToIn ? 1 : 0));
+    }
+    FromOut->MakeLinkTo(TInPin);
+    TOutPin->MakeLinkTo(ToIn);
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("note"),
-        TEXT("state machine transition creation requires Persona graph editing; "
-             "use editor.run_python with the AnimBP open in Persona"));
+    R->SetStringField(TEXT("transition_id"),  T->NodeGuid.ToString(EGuidFormats::Digits));
+    R->SetStringField(TEXT("from_state_id"),  FromId);
+    R->SetStringField(TEXT("to_state_id"),    ToId);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ---------------------------------------------------------------------------
-// animation.set_state_animation
+// animation.set_state_animation (Lyra Sage Gap #16 — was stub)
 // ---------------------------------------------------------------------------
+//
+// Each UAnimStateNode has a sub-graph (BoundGraph) that drives its output pose.
+// This handler clears the sub-graph's player nodes (sequence/blendspace) and
+// installs a fresh UAnimGraphNode_SequencePlayer driving the supplied animation,
+// wired to the BoundGraph's Output Pose root.
 
 FSageToolDispatch::FOutcome SetStateAnimationImpl(const TSharedPtr<FJsonObject>& Args)
 {
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SMName, StateId, AnimPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("state_machine_name"), SMName) || SMName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'state_machine_name'"));
+    }
+    if (!Args->TryGetStringField(TEXT("state_id"), StateId) || StateId.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'state_id'"));
+    }
+    if (!Args->TryGetStringField(TEXT("animation"), AnimPath) || AnimPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'animation'"));
+    }
+    bool bLoop = true;
+    Args->TryGetBoolField(TEXT("loop"), bLoop);
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+    UAnimationStateMachineGraph* SMGraph = FindStateMachineGraph(AnimBP, FName(*SMName));
+    if (!SMGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("state machine '%s' not found"), *SMName));
+    }
+    UAnimStateNode* State = Cast<UAnimStateNode>(FindStateNodeByGuid(SMGraph, StateId));
+    if (!State || !State->BoundGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("state_id %s not a UAnimStateNode with BoundGraph"), *StateId));
+    }
+    UAnimSequenceBase* Anim = Cast<UAnimSequenceBase>(ResolveAsset(AnimPath));
+    if (!Anim)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("animation not a UAnimSequenceBase: %s"), *AnimPath));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SetStateAnim", "Sage: Set State Animation"));
+    AnimBP->Modify();
+    UEdGraph* StateGraph = State->BoundGraph;
+    StateGraph->Modify();
+
+    // Clean any pre-existing asset-player nodes so the call is idempotent.
+    // UAnimGraphNode_AssetPlayerBase covers SequencePlayer, BlendSpacePlayer,
+    // RandomPlayer, and other asset-driven players (engine canonical "this
+    // state plays one asset" base).
+    TArray<UEdGraphNode*> ToRemove;
+    for (UEdGraphNode* N : StateGraph->Nodes)
+    {
+        if (N && N->IsA<UAnimGraphNode_AssetPlayerBase>())
+        {
+            ToRemove.Add(N);
+        }
+    }
+    for (UEdGraphNode* N : ToRemove)
+    {
+        FBlueprintEditorUtils::RemoveNode(AnimBP, N, /*bDontRecompile=*/true);
+    }
+
+    // Spawn new SequencePlayer
+    UAnimGraphNode_SequencePlayer* SeqPlayer = NewObject<UAnimGraphNode_SequencePlayer>(StateGraph);
+    SeqPlayer->CreateNewGuid();
+    SeqPlayer->NodePosX = -300;
+    SeqPlayer->NodePosY = 0;
+    StateGraph->AddNode(SeqPlayer, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+    SeqPlayer->AllocateDefaultPins();
+
+    // Drive the FAnimNode_SequencePlayer struct directly. SetAnimationAsset
+    // takes UAnimSequenceBase — both UAnimSequence and UAnimComposite resolve
+    // through the same overload, so the historical type-split is dead code.
+    SeqPlayer->SetAnimationAsset(Anim);
+    // TODO(loop): UE 5.7 made FAnimNode_SequencePlayer::bLoopAnimation +
+    // PlayRate protected; direct write fails. Reach via reflection (Node
+    // FStructProperty) or wait for an engine accessor. Leave loop-as-default
+    // (true) for now; users can override via animation.set_anim_node_property
+    // with property="bLoopAnimation".
+    (void)bLoop;
+
+    // Connect SeqPlayer.Pose → state output (UAnimGraphNode_StateResult inside
+    // a UAnimationStateGraph, NOT UAnimGraphNode_Root).
+    UEdGraphNode* Root = FindAnimGraphOutput(StateGraph);
+    bool bConnected = false;
+    if (Root)
+    {
+        UEdGraphPin* PoseOut = FindFirstOutputPosePin(SeqPlayer);
+        UEdGraphPin* RootIn  = FindFirstInputPosePin(Root);
+        if (PoseOut && RootIn)
+        {
+            RootIn->BreakAllPinLinks();
+            PoseOut->MakeLinkTo(RootIn);
+            bConnected = true;
+        }
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("note"),
-        TEXT("state animation assignment requires Persona AnimGraph node editing; "
-             "use editor.run_python with the AnimBP open in Persona"));
+    R->SetStringField(TEXT("state_id"),       StateId);
+    R->SetStringField(TEXT("animation"),      Anim->GetPathName());
+    R->SetBoolField  (TEXT("connected"),      bConnected);
+    R->SetStringField(TEXT("player_node_id"),
+                      SeqPlayer->NodeGuid.ToString(EGuidFormats::Digits));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ---------------------------------------------------------------------------
-// animation.set_transition_blend
+// animation.set_transition_blend (Lyra Sage Gap #16 — was stub)
 // ---------------------------------------------------------------------------
 
 FSageToolDispatch::FOutcome SetTransitionBlendImpl(const TSharedPtr<FJsonObject>& Args)
 {
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SMName, TransitionId;
+    double BlendTime = 0.2;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("state_machine_name"), SMName) || SMName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'state_machine_name'"));
+    }
+    if (!Args->TryGetStringField(TEXT("transition_id"), TransitionId) || TransitionId.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'transition_id'"));
+    }
+    Args->TryGetNumberField(TEXT("blend_time"), BlendTime);
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+    UAnimationStateMachineGraph* SMGraph = FindStateMachineGraph(AnimBP, FName(*SMName));
+    if (!SMGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("state machine '%s' not found"), *SMName));
+    }
+    UAnimStateTransitionNode* T = FindTransitionByGuid(SMGraph, TransitionId);
+    if (!T)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("transition_id not found: %s"), *TransitionId));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SetTransitionBlend", "Sage: Set Transition Blend"));
+    AnimBP->Modify();
+    T->Modify();
+    T->CrossfadeDuration = static_cast<float>(BlendTime);
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("note"),
-        TEXT("transition blend time requires Persona AnimStateMachine graph node editing; "
-             "use editor.run_python with the AnimBP open in Persona"));
+    R->SetStringField(TEXT("transition_id"), TransitionId);
+    R->SetNumberField(TEXT("blend_time"),    BlendTime);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1203,17 +1990,302 @@ FSageToolDispatch::FOutcome AddCurveImpl(const TSharedPtr<FJsonObject>& Args)
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("sequence has no skeleton"));
     }
 
-    // UE 5.5+: AddSmartNameAndModify / AnimCurveMappingName removed.
-    // Use IAnimationDataController::AddCurve (Persona-editor API, requires open asset).
+    // UE 5.5+ canonical path: IAnimationDataController on the sequence handles
+    // curve table mutation through transactional brackets.
+    FScopedTransaction Tx(LOCTEXT("AddCurve", "Sage: Add Anim Curve"));
+    Seq->Modify();
+    IAnimationDataController& Controller = Seq->GetController();
+    const FAnimationCurveIdentifier CurveId(FName(*CurveName), ERawCurveTrackTypes::RCT_Float);
+    Controller.OpenBracket(LOCTEXT("AddCurveBracket", "Add Curve"), /*bShouldTransact=*/false);
+    const bool bAdded = Controller.AddCurve(CurveId, AACF_Editable);
+    Controller.CloseBracket(/*bShouldTransact=*/false);
     Seq->MarkPackageDirty();
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"),       Seq->GetPathName());
     R->SetStringField(TEXT("curve_name"), CurveName);
-    R->SetBoolField  (TEXT("added"),      false);
-    R->SetStringField(TEXT("note"),
-        TEXT("Curve addition in UE 5.5+ requires IAnimationDataController::AddCurve; "
-             "use editor.run_python: unreal.AnimationLibrary.add_curve(seq, name)"));
+    R->SetBoolField  (TEXT("added"),      bAdded);
+    if (!bAdded)
+    {
+        R->SetStringField(TEXT("note"),
+            TEXT("AddCurve returned false (already exists or controller rejected)"));
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.create_anim_notify (Lyra Sage Gap #18 — new tool)
+// ---------------------------------------------------------------------------
+//
+// Create a UAnimNotify subclass Blueprint asset. The BP starts blank — caller
+// can wire `Received_Notify` event in the BP graph via existing Sage BP graph
+// tools (bp.add_event_node, bp.add_function_call, etc.).
+
+FSageToolDispatch::FOutcome CreateAnimNotifyClassImpl(
+    const TSharedPtr<FJsonObject>& Args, UClass* DefaultParent)
+{
+    FString FullPath, ParentClassPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), FullPath) || FullPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    Args->TryGetStringField(TEXT("parent_class"), ParentClassPath);
+
+    UClass* ParentCls = nullptr;
+    if (!ParentClassPath.IsEmpty())
+    {
+        ParentCls = FindObject<UClass>(nullptr, *ParentClassPath);
+        if (!ParentCls) ParentCls = LoadObject<UClass>(nullptr, *ParentClassPath);
+        if (!ParentCls)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("parent_class not found: %s"), *ParentClassPath));
+        }
+        if (!ParentCls->IsChildOf(DefaultParent))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("parent_class %s isn't a subclass of %s"),
+                                *ParentCls->GetName(), *DefaultParent->GetName()));
+        }
+    }
+    else
+    {
+        ParentCls = DefaultParent;
+    }
+
+    FString PackagePath, AssetName;
+    if (!FullPath.Split(TEXT("/"), &PackagePath, &AssetName,
+                        ESearchCase::IgnoreCase, ESearchDir::FromEnd))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid asset path: %s"), *FullPath));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("CreateNotifyBP", "Sage: Create Anim Notify Blueprint"));
+    UBlueprintFactory* Fac = NewObject<UBlueprintFactory>();
+    Fac->ParentClass = ParentCls;
+
+    UObject* Created = GetAssetTools().CreateAsset(
+        AssetName, PackagePath, UBlueprint::StaticClass(), Fac);
+    if (!Created)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32000,
+            FString::Printf(TEXT("failed to create Blueprint at %s"), *FullPath));
+    }
+    Created->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),         Created->GetPathName());
+    R->SetStringField(TEXT("parent_class"), ParentCls->GetPathName());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome CreateAnimNotifyImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    return CreateAnimNotifyClassImpl(Args, UAnimNotify::StaticClass());
+}
+
+FSageToolDispatch::FOutcome CreateAnimNotifyStateImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    return CreateAnimNotifyClassImpl(Args, UAnimNotifyState::StaticClass());
+}
+
+// ---------------------------------------------------------------------------
+// animation.add_blendspace_sample (Lyra Sage Gap #17 — new tool)
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome AddBlendSpaceSampleImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, AnimPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("animation"), AnimPath) || AnimPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'animation'"));
+    }
+
+    double X = 0.0, Y = 0.0;
+    bool bHaveX = Args->TryGetNumberField(TEXT("x"), X);
+    Args->TryGetNumberField(TEXT("y"), Y);
+    bool bHavePos = false;
+    {
+        const TArray<TSharedPtr<FJsonValue>>* PosArr = nullptr;
+        if (Args->TryGetArrayField(TEXT("position"), PosArr) && PosArr && PosArr->Num() >= 1)
+        {
+            bHavePos = true;
+            // Apply position only when scalar `x` was not given. When both
+            // are provided, `x`/`y` win (caller-explicit beats generic). We
+            // surface a `_warning` below.
+            if (!bHaveX)
+            {
+                X = (*PosArr)[0]->AsNumber();
+                if (PosArr->Num() >= 2) Y = (*PosArr)[1]->AsNumber();
+            }
+        }
+    }
+
+    UBlendSpace* BS = Cast<UBlendSpace>(ResolveAsset(Path));
+    if (!BS)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UBlendSpace: %s"), *Path));
+    }
+    UAnimSequence* Anim = Cast<UAnimSequence>(ResolveAsset(AnimPath));
+    if (!Anim)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("animation not a UAnimSequence: %s"), *AnimPath));
+    }
+
+    // 1D blendspaces ignore the Y axis at runtime; force-clamp it so the
+    // echo back to the caller matches the stored sample (Cluster E audit —
+    // clients reported "y=3 went in but readback shows 0" confusion).
+    const bool bIs1D = (Cast<UBlendSpace1D>(BS) != nullptr);
+    if (bIs1D) Y = 0.0;
+
+    FScopedTransaction Tx(LOCTEXT("AddBSSample", "Sage: Add BlendSpace Sample"));
+    BS->Modify();
+
+    const FVector SamplePos(static_cast<float>(X), static_cast<float>(Y), 0.f);
+    const int32 SampleIdx = BS->AddSample(Anim, SamplePos);
+    const bool bAdded = (SampleIdx != INDEX_NONE);
+    BS->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),         BS->GetPathName());
+    R->SetStringField(TEXT("animation"),    Anim->GetPathName());
+    R->SetNumberField(TEXT("x"),            X);
+    R->SetNumberField(TEXT("y"),            Y);
+    R->SetBoolField  (TEXT("added"),        bAdded);
+    R->SetNumberField(TEXT("sample_count"), BS->GetBlendSamples().Num());
+    if (bHaveX && bHavePos)
+    {
+        R->SetStringField(TEXT("_warning"),
+            TEXT("both 'x' and 'position' provided; 'x' wins"));
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.set_blendspace_samples (Lyra Sage Gap #17 — bulk replace)
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome SetBlendSpaceSamplesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    const TArray<TSharedPtr<FJsonValue>>* SamplesArr = nullptr;
+    if (!Args->TryGetArrayField(TEXT("samples"), SamplesArr) || !SamplesArr)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'samples' array"));
+    }
+
+    UBlendSpace* BS = Cast<UBlendSpace>(ResolveAsset(Path));
+    if (!BS)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UBlendSpace: %s"), *Path));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SetBSSamples", "Sage: Replace BlendSpace Samples"));
+    BS->Modify();
+
+    // Wipe existing samples by removing in reverse index order. UE 5.7
+    // UBlendSpaceBase exposes DeleteSample(int32) returning bool.
+    for (int32 Idx = BS->GetBlendSamples().Num() - 1; Idx >= 0; --Idx)
+    {
+        BS->DeleteSample(Idx);
+    }
+
+    int32 Added = 0;
+    TArray<TSharedPtr<FJsonValue>> Skipped;
+    int32 InputIdx = 0;
+    for (const TSharedPtr<FJsonValue>& Val : *SamplesArr)
+    {
+        const int32 ThisIdx = InputIdx++;
+        if (!Val.IsValid() || Val->Type != EJson::Object)
+        {
+            auto SkObj = MakeShared<FJsonObject>();
+            SkObj->SetNumberField(TEXT("index"),  ThisIdx);
+            SkObj->SetStringField(TEXT("reason"), TEXT("not_object"));
+            Skipped.Add(MakeShared<FJsonValueObject>(SkObj));
+            continue;
+        }
+        const TSharedPtr<FJsonObject> Obj = Val->AsObject();
+        FString AnimPath;
+        if (!Obj->TryGetStringField(TEXT("animation"), AnimPath) || AnimPath.IsEmpty())
+        {
+            // Structured skip — string-only entries lost the index context
+            // and made it impossible to correlate failures with the input
+            // array (lessons.md "silent fail anti-pattern" follow-up).
+            auto SkObj = MakeShared<FJsonObject>();
+            SkObj->SetNumberField(TEXT("index"),  ThisIdx);
+            SkObj->SetStringField(TEXT("reason"), TEXT("missing"));
+            Skipped.Add(MakeShared<FJsonValueObject>(SkObj));
+            continue;
+        }
+        UAnimSequence* Anim = Cast<UAnimSequence>(ResolveAsset(AnimPath));
+        if (!Anim)
+        {
+            auto SkObj = MakeShared<FJsonObject>();
+            SkObj->SetNumberField(TEXT("index"),     ThisIdx);
+            SkObj->SetStringField(TEXT("reason"),    TEXT("unresolved"));
+            SkObj->SetStringField(TEXT("animation"), AnimPath);
+            Skipped.Add(MakeShared<FJsonValueObject>(SkObj));
+            continue;
+        }
+
+        double X = 0.0, Y = 0.0;
+        if (!Obj->TryGetNumberField(TEXT("x"), X))
+        {
+            const TArray<TSharedPtr<FJsonValue>>* PosArr = nullptr;
+            if (Obj->TryGetArrayField(TEXT("position"), PosArr) && PosArr
+                && PosArr->Num() >= 1)
+            {
+                X = (*PosArr)[0]->AsNumber();
+                if (PosArr->Num() >= 2) Y = (*PosArr)[1]->AsNumber();
+            }
+        }
+        else
+        {
+            Obj->TryGetNumberField(TEXT("y"), Y);
+        }
+
+        const int32 NewIdx = BS->AddSample(
+            Anim, FVector(static_cast<float>(X), static_cast<float>(Y), 0.f));
+        if (NewIdx != INDEX_NONE)
+        {
+            ++Added;
+        }
+    }
+
+    BS->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),         BS->GetPathName());
+    R->SetNumberField(TEXT("sample_count"), BS->GetBlendSamples().Num());
+    R->SetNumberField(TEXT("added"),        Added);
+    if (Skipped.Num() > 0)
+    {
+        R->SetArrayField(TEXT("skipped"), Skipped);
+    }
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1231,10 +2303,12 @@ FSageToolDispatch::FOutcome SetMontageSlotImpl(const TSharedPtr<FJsonObject>& Ar
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
     }
-    if (!Args->TryGetStringField(TEXT("slot_name"), SlotName) || SlotName.IsEmpty())
+    if (!Args->TryGetStringField(TEXT("slot"), SlotName) || SlotName.IsEmpty())
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'slot_name'"));
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'slot'"));
     }
+    int32 SlotIndex = 0;
+    Args->TryGetNumberField(TEXT("slot_index"), SlotIndex);
 
     UAnimMontage* Montage = Cast<UAnimMontage>(ResolveAsset(Path));
     if (!Montage)
@@ -1247,15 +2321,22 @@ FSageToolDispatch::FOutcome SetMontageSlotImpl(const TSharedPtr<FJsonObject>& Ar
         return FSageToolDispatch::FOutcome::MakeError(-32602,
             TEXT("montage has no SlotAnimTracks"));
     }
+    if (SlotIndex < 0 || SlotIndex >= Montage->SlotAnimTracks.Num())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("'slot_index' %d out of range [0, %d)"),
+                            SlotIndex, Montage->SlotAnimTracks.Num()));
+    }
 
     FScopedTransaction Tx(LOCTEXT("SetMontageSlot", "Set Montage Slot"));
     Montage->Modify();
-    Montage->SlotAnimTracks[0].SlotName = FName(*SlotName);
+    Montage->SlotAnimTracks[SlotIndex].SlotName = FName(*SlotName);
     Montage->MarkPackageDirty();
 
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("path"),      Montage->GetPathName());
-    R->SetStringField(TEXT("slot_name"), SlotName);
+    R->SetStringField(TEXT("path"),       Montage->GetPathName());
+    R->SetStringField(TEXT("slot"),       SlotName);
+    R->SetNumberField(TEXT("slot_index"), SlotIndex);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1291,6 +2372,10 @@ FSageToolDispatch::FOutcome AddMontageSectionImpl(const TSharedPtr<FJsonObject>&
     Montage->Modify();
     const int32 SectionIdx = Montage->AddAnimCompositeSection(FName(*SectionName),
                                                                static_cast<float>(StartTime));
+    // Persona-side timeline only sees a new section after RefreshCacheData()
+    // rebuilds the marker tracks (UAnimMontage::RefreshCacheData override
+    // handles section + branch-point cache).
+    Montage->RefreshCacheData();
     Montage->MarkPackageDirty();
 
     auto R = MakeShared<FJsonObject>();
@@ -1453,40 +2538,37 @@ FSageToolDispatch::FOutcome AddVirtualBoneImpl(const TSharedPtr<FJsonObject>& Ar
     FSageToolDispatch::FOutcome Reject;
     if (detail::RejectIfPie(Reject)) return Reject;
 
-    FString Path, BoneName, ParentName, TargetName;
-    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    FString SkeletonPath, BoneName, SourceBone, TargetBone;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("skeleton"), SkeletonPath))
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
     }
-    if (!Args->TryGetStringField(TEXT("bone_name"),   BoneName)   || BoneName.IsEmpty())
+    if (!Args->TryGetStringField(TEXT("name"),        BoneName)   || BoneName.IsEmpty())
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'bone_name'"));
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
     }
-    if (!Args->TryGetStringField(TEXT("parent_name"), ParentName) || ParentName.IsEmpty())
+    if (!Args->TryGetStringField(TEXT("source_bone"), SourceBone) || SourceBone.IsEmpty())
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'parent_name'"));
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'source_bone'"));
     }
-    if (!Args->TryGetStringField(TEXT("target_name"), TargetName) || TargetName.IsEmpty())
+    if (!Args->TryGetStringField(TEXT("target_bone"), TargetBone) || TargetBone.IsEmpty())
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'target_name'"));
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'target_bone'"));
     }
 
-    USkeleton* Skel = Cast<USkeleton>(ResolveAsset(Path));
+    USkeleton* Skel = Cast<USkeleton>(ResolveAsset(SkeletonPath));
     if (!Skel)
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602,
-            FString::Printf(TEXT("not a USkeleton: %s"), *Path));
+            FString::Printf(TEXT("not a USkeleton: %s"), *SkeletonPath));
     }
 
-    // USkeleton::AddVirtualBone removed in UE 5.7 — use Python scripting API
-    auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("path"),   Skel->GetPathName());
-    R->SetStringField(TEXT("source"), ParentName);
-    R->SetStringField(TEXT("target"), TargetName);
-    R->SetStringField(TEXT("note"),
-        TEXT("AddVirtualBone removed in UE 5.7; use "
-             "editor.run_python: unreal.EditorAssetLibrary / SkeletonEditorSubsystem"));
-    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    // USkeleton::AddVirtualBone is editor-only and gated by SKELETONEDITOR module.
+    // Until Sage wires the SkeletonEditorSubsystem the canonical path remains
+    // editor.run_python.
+    return FSageToolDispatch::FOutcome::MakeError(-32000,
+        TEXT("[NOT IMPLEMENTED] animation.add_virtual_bone — use editor.run_python "
+             "with unreal.SkeletonEditorSubsystem.add_virtual_bone(skeleton, source, target, name)"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,9 +2623,9 @@ FSageToolDispatch::FOutcome CreateCompositeImpl(const TSharedPtr<FJsonObject>& A
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
     }
-    if (!Args->TryGetStringField(TEXT("skeleton_path"), SkeletonPath) || SkeletonPath.IsEmpty())
+    if (!Args->TryGetStringField(TEXT("skeleton"), SkeletonPath) || SkeletonPath.IsEmpty())
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton_path'"));
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
     }
 
     USkeleton* Skel = Cast<USkeleton>(ResolveAsset(SkeletonPath));
@@ -1608,7 +2690,7 @@ FSageToolDispatch::FOutcome CreateIKRetargeterImpl(const TSharedPtr<FJsonObject>
     {
         Fac = NewObject<UFactory>(GetTransientPackage(), FacClass);
         FString SourcePath, TargetPath;
-        if (Args->TryGetStringField(TEXT("source_ik_rig_path"), SourcePath) && !SourcePath.IsEmpty())
+        if (Args->TryGetStringField(TEXT("source_ik_rig"), SourcePath) && !SourcePath.IsEmpty())
         {
             UObject* SrcRig = ResolveAsset(SourcePath);
             FObjectPropertyBase* SrcProp = CastField<FObjectPropertyBase>(
@@ -1616,7 +2698,7 @@ FSageToolDispatch::FOutcome CreateIKRetargeterImpl(const TSharedPtr<FJsonObject>
             if (SrcProp && SrcRig)
                 SrcProp->SetObjectPropertyValue(SrcProp->ContainerPtrToValuePtr<void>(Fac), SrcRig);
         }
-        if (Args->TryGetStringField(TEXT("target_ik_rig_path"), TargetPath) && !TargetPath.IsEmpty())
+        if (Args->TryGetStringField(TEXT("target_ik_rig"), TargetPath) && !TargetPath.IsEmpty())
         {
             UObject* TgtRig = ResolveAsset(TargetPath);
             FObjectPropertyBase* TgtProp = CastField<FObjectPropertyBase>(
@@ -1655,9 +2737,9 @@ FSageToolDispatch::FOutcome SetAnimBlueprintSkeletonImpl(const TSharedPtr<FJsonO
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
     }
-    if (!Args->TryGetStringField(TEXT("skeleton_path"), SkeletonPath) || SkeletonPath.IsEmpty())
+    if (!Args->TryGetStringField(TEXT("skeleton"), SkeletonPath) || SkeletonPath.IsEmpty())
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton_path'"));
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
     }
 
     UAnimBlueprint* BP = Cast<UAnimBlueprint>(ResolveAsset(Path));
@@ -1676,11 +2758,17 @@ FSageToolDispatch::FOutcome SetAnimBlueprintSkeletonImpl(const TSharedPtr<FJsonO
     FScopedTransaction Tx(LOCTEXT("SetAnimBPSkel", "Set AnimBP Skeleton"));
     BP->Modify();
     BP->TargetSkeleton = Skel;
+    // Without a structural-modify + recompile, runtime AnimBP keeps stale class
+    // pointers that reference the old skeleton's bone container — leads to a
+    // crash in pose-link evaluation on first instantiation.
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+    FKismetEditorUtilities::CompileBlueprint(BP);
     BP->MarkPackageDirty();
 
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("path"),     BP->GetPathName());
-    R->SetStringField(TEXT("skeleton"), Skel->GetPathName());
+    R->SetStringField(TEXT("path"),       BP->GetPathName());
+    R->SetStringField(TEXT("skeleton"),   Skel->GetPathName());
+    R->SetBoolField  (TEXT("recompiled"), true);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1690,14 +2778,9 @@ FSageToolDispatch::FOutcome SetAnimBlueprintSkeletonImpl(const TSharedPtr<FJsonO
 
 FSageToolDispatch::FOutcome BakeRootMotionFromBoneImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    auto R = MakeShared<FJsonObject>();
-    FString Path;
-    if (Args.IsValid()) Args->TryGetStringField(TEXT("path"), Path);
-    R->SetStringField(TEXT("path"), Path);
-    R->SetStringField(TEXT("note"),
-        TEXT("root motion baking is a complex pipeline operation; "
-             "use editor.run_python with the FBakingAnimationKeyHelper API or open the sequence in Persona"));
-    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    return FSageToolDispatch::FOutcome::MakeError(-32000,
+        TEXT("[NOT IMPLEMENTED] animation.bake_root_motion_from_bone — use editor.run_python "
+             "with FBakingAnimationKeyHelper or open the sequence in Persona"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1754,11 +2837,9 @@ FSageToolDispatch::FOutcome CreatePoseSearchDatabaseImpl(const TSharedPtr<FJsonO
 
 FSageToolDispatch::FOutcome SetPoseSearchSchemaImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("note"),
-        TEXT("PoseSearch schema assignment requires the PoseSearch plugin; "
-             "enable Motion Matching plugin and use editor.run_python with PoseSearch API"));
-    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    return FSageToolDispatch::FOutcome::MakeError(-32000,
+        TEXT("[NOT IMPLEMENTED] animation.set_pose_search_schema — PoseSearch plugin required; "
+             "use editor.run_python with PoseSearchEditor / Motion Matching API"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1767,11 +2848,9 @@ FSageToolDispatch::FOutcome SetPoseSearchSchemaImpl(const TSharedPtr<FJsonObject
 
 FSageToolDispatch::FOutcome AddPoseSearchSequenceImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("note"),
-        TEXT("PoseSearch sequence addition requires the PoseSearch plugin; "
-             "enable Motion Matching plugin and use editor.run_python with PoseSearch API"));
-    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    return FSageToolDispatch::FOutcome::MakeError(-32000,
+        TEXT("[NOT IMPLEMENTED] animation.add_pose_search_sequence — PoseSearch plugin required; "
+             "use editor.run_python with PoseSearchEditor API"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1780,11 +2859,9 @@ FSageToolDispatch::FOutcome AddPoseSearchSequenceImpl(const TSharedPtr<FJsonObje
 
 FSageToolDispatch::FOutcome BuildPoseSearchIndexImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("note"),
-        TEXT("PoseSearch index building requires the PoseSearch plugin; "
-             "enable Motion Matching plugin and use editor.run_python with PoseSearch API"));
-    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    return FSageToolDispatch::FOutcome::MakeError(-32000,
+        TEXT("[NOT IMPLEMENTED] animation.build_pose_search_index — PoseSearch plugin required; "
+             "use editor.run_python with PoseSearchEditor build pipeline"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1829,6 +2906,2641 @@ FSageToolDispatch::FOutcome SetSequencePropertiesImpl(const TSharedPtr<FJsonObje
     R->SetNumberField(TEXT("rate_scale"),          Seq->RateScale);
     R->SetBoolField  (TEXT("enable_root_motion"),  Seq->bEnableRootMotion);
     R->SetBoolField  (TEXT("modified"),            true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ===========================================================================
+// Cluster A — AnimGraph node creation core (Phase 4-r6)
+// Generic primitives that the convenience cluster (B) and state-machine
+// authoring (C) build upon. Every handler accepts `path` (UAnimBlueprint)
+// and an optional `graph_name` to disambiguate root AnimGraph from a state
+// machine sub-graph.
+// ===========================================================================
+
+// Resolve a target UEdGraph inside an AnimBP given an optional graph name.
+// Empty / "AnimGraph" → root AnimGraph. Otherwise look up:
+//   1) state machine sub-graph by name (UAnimationStateMachineGraph)
+//   2) FunctionGraphs entry by FName
+//   3) state's BoundGraph by state name (UAnimStateNodeBase::GetStateName()
+//      OR BoundGraph FName) — lets callers target a state's inner pose graph
+//      directly instead of round-tripping through state_id.
+UEdGraph* ResolveAnimGraphTarget(UAnimBlueprint* AnimBP, const FString& GraphName)
+{
+    if (!AnimBP) return nullptr;
+    if (GraphName.IsEmpty() || GraphName.Equals(TEXT("AnimGraph"), ESearchCase::IgnoreCase))
+    {
+        return FindAnimGraph(AnimBP);
+    }
+    if (UAnimationStateMachineGraph* SM = FindStateMachineGraph(AnimBP, FName(*GraphName)))
+    {
+        return SM;
+    }
+    for (UEdGraph* G : AnimBP->FunctionGraphs)
+    {
+        if (G && G->GetFName() == FName(*GraphName)) return G;
+    }
+    // State bound-graph fallback — walk every state machine, every state,
+    // match on either the BoundGraph's FName or the engine's GetStateName()
+    // override (which the Persona graph editor displays).
+    if (UEdGraph* AnimGraph = FindAnimGraph(AnimBP))
+    {
+        const FName Wanted(*GraphName);
+        for (UEdGraphNode* N : AnimGraph->Nodes)
+        {
+            UAnimGraphNode_StateMachineBase* SMNode = Cast<UAnimGraphNode_StateMachineBase>(N);
+            if (!SMNode || !SMNode->EditorStateMachineGraph) continue;
+            for (UEdGraphNode* SN : SMNode->EditorStateMachineGraph->Nodes)
+            {
+                UAnimStateNodeBase* State = Cast<UAnimStateNodeBase>(SN);
+                if (!State) continue;
+                UEdGraph* Bound = nullptr;
+                if (UAnimStateNode* AsState = Cast<UAnimStateNode>(State))
+                {
+                    Bound = AsState->BoundGraph;
+                }
+                else if (UAnimStateConduitNode* AsCon = Cast<UAnimStateConduitNode>(State))
+                {
+                    Bound = AsCon->BoundGraph;
+                }
+                if (!Bound) continue;
+                if (Bound->GetFName() == Wanted
+                    || State->GetStateName().Equals(GraphName, ESearchCase::IgnoreCase))
+                {
+                    return Bound;
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+// Find an arbitrary UEdGraphNode by FGuid (covers UAnimGraphNode_Base + others).
+UEdGraphNode* FindGraphNodeByGuid(UEdGraph* Graph, const FString& IdString)
+{
+    if (!Graph) return nullptr;
+    FGuid Id;
+    if (!ParseNodeGuid(IdString, Id)) return nullptr;
+    for (UEdGraphNode* N : Graph->Nodes)
+    {
+        if (N && N->NodeGuid == Id) return N;
+    }
+    return nullptr;
+}
+
+// Locate an EdGraph pin by name on a node (handles direction filter).
+UEdGraphPin* FindPinByName(UEdGraphNode* Node, const FString& PinName, EEdGraphPinDirection Dir)
+{
+    if (!Node) return nullptr;
+    const FName N(*PinName);
+    for (UEdGraphPin* P : Node->Pins)
+    {
+        if (P && P->Direction == Dir && P->PinName == N) return P;
+    }
+    return nullptr;
+}
+
+// Reach the inner FAnimNode_* struct on a UAnimGraphNode_Base. Returns the
+// FStructProperty + container pointer for use with reflection writes.
+bool GetAnimNodeStructTarget(UAnimGraphNode_Base* AnimNode, FStructProperty*& OutProp,
+                             void*& OutPtr)
+{
+    OutProp = nullptr; OutPtr = nullptr;
+    if (!AnimNode) return false;
+    UClass* Cls = AnimNode->GetClass();
+    for (TFieldIterator<FStructProperty> It(Cls); It; ++It)
+    {
+        FStructProperty* SP = *It;
+        if (!SP || !SP->Struct) continue;
+        // Match on convention: most UAnimGraphNode_X expose `FAnimNode_X Node`.
+        // Additionally require the struct to be a FAnimNode_Base descendant —
+        // state machine, transition, and link nodes also expose a `Node`
+        // FStructProperty but with a non-AnimNode shape. Filtering on the
+        // struct hierarchy avoids landing on those by mistake.
+        if (SP->GetFName() == FName(TEXT("Node"))
+            && SP->Struct->IsChildOf(FAnimNode_Base::StaticStruct()))
+        {
+            OutProp = SP;
+            OutPtr  = SP->ContainerPtrToValuePtr<void>(AnimNode);
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// animation.add_animgraph_node
+// ---------------------------------------------------------------------------
+//
+// Generic node ctor: spawn a UAnimGraphNode_Base subclass into a target graph.
+// Args: path (anim_bp), graph_name? (default AnimGraph), node_class
+// (UClass path or "/Script/AnimGraph.AnimGraphNode_X"), x?, y?
+// Returns: { node_id, class }
+FSageToolDispatch::FOutcome AddAnimGraphNodeImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, GraphName, NodeClassPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("node_class"), NodeClassPath) || NodeClassPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'node_class'"));
+    }
+    Args->TryGetStringField(TEXT("graph_name"), GraphName);
+    double X = 0.0, Y = 0.0;
+    Args->TryGetNumberField(TEXT("x"), X);
+    Args->TryGetNumberField(TEXT("y"), Y);
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+    UEdGraph* TargetGraph = ResolveAnimGraphTarget(AnimBP, GraphName);
+    if (!TargetGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("graph '%s' not found on %s"),
+                            *GraphName, *AnimBP->GetName()));
+    }
+
+    UClass* NodeCls = FindObject<UClass>(nullptr, *NodeClassPath);
+    if (!NodeCls) NodeCls = LoadObject<UClass>(nullptr, *NodeClassPath);
+    if (!NodeCls)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("node_class not found: %s"), *NodeClassPath));
+    }
+    if (!NodeCls->IsChildOf(UAnimGraphNode_Base::StaticClass()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("%s isn't a UAnimGraphNode_Base subclass"),
+                            *NodeCls->GetName()));
+    }
+    if (NodeCls->HasAnyClassFlags(CLASS_Abstract))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("node_class %s is abstract"), *NodeCls->GetName()));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("AddAGNode", "Sage: Add AnimGraph Node"));
+    AnimBP->Modify();
+    TargetGraph->Modify();
+
+    UEdGraphNode* Node = NewObject<UEdGraphNode>(TargetGraph, NodeCls);
+    Node->CreateNewGuid();
+    Node->NodePosX = static_cast<int32>(X);
+    Node->NodePosY = static_cast<int32>(Y);
+    TargetGraph->AddNode(Node, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+    // PostPlacedNewNode is the engine canonical pivot — for composite nodes
+    // (StateMachine, BlendListByInt, BlendSpaceGraphBase, LinkedInputPose,
+    // Mirror, MultiWayBlend) UAnimGraphNode_Base::PostPlacedNewNode invokes
+    // EnsureBindingsArePresent + UAnimBlueprintExtension::RequestExtensionsForNode.
+    // Skipping it leaves the node with no extensions registered and the BP
+    // compiler later asserts.
+    Node->PostPlacedNewNode();
+    Node->AllocateDefaultPins();
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("node_id"),  Node->NodeGuid.ToString(EGuidFormats::Digits));
+    R->SetStringField(TEXT("class"),    NodeCls->GetPathName());
+    R->SetStringField(TEXT("graph"),    TargetGraph->GetFName().ToString());
+    R->SetNumberField(TEXT("x"),        X);
+    R->SetNumberField(TEXT("y"),        Y);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.remove_animgraph_node
+// ---------------------------------------------------------------------------
+FSageToolDispatch::FOutcome RemoveAnimGraphNodeImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, GraphName, NodeId;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("node_id"), NodeId) || NodeId.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'node_id'"));
+    }
+    Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+    UEdGraph* TargetGraph = ResolveAnimGraphTarget(AnimBP, GraphName);
+    if (!TargetGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("graph '%s' not found"), *GraphName));
+    }
+    UEdGraphNode* Node = FindGraphNodeByGuid(TargetGraph, NodeId);
+    if (!Node)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("node_id not found: %s"), *NodeId));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("RemoveAGNode", "Sage: Remove AnimGraph Node"));
+    AnimBP->Modify();
+    FBlueprintEditorUtils::RemoveNode(AnimBP, Node, /*bDontRecompile=*/true);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("node_id"),  NodeId);
+    R->SetBoolField  (TEXT("removed"),  true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.connect_pose_pin / animation.disconnect_pose_pin
+// ---------------------------------------------------------------------------
+FSageToolDispatch::FOutcome ConnectPosePinImplShared(const TSharedPtr<FJsonObject>& Args, bool bConnect)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, GraphName, FromId, ToId, FromPinName, ToPinName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("from_node_id"), FromId) || FromId.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'from_node_id'"));
+    }
+    if (!Args->TryGetStringField(TEXT("to_node_id"), ToId) || ToId.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'to_node_id'"));
+    }
+    Args->TryGetStringField(TEXT("graph_name"),   GraphName);
+    Args->TryGetStringField(TEXT("from_pin"),     FromPinName);
+    Args->TryGetStringField(TEXT("to_pin"),       ToPinName);
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+    UEdGraph* TargetGraph = ResolveAnimGraphTarget(AnimBP, GraphName);
+    if (!TargetGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("graph '%s' not found"), *GraphName));
+    }
+    UEdGraphNode* FromNode = FindGraphNodeByGuid(TargetGraph, FromId);
+    UEdGraphNode* ToNode   = FindGraphNodeByGuid(TargetGraph, ToId);
+    if (!FromNode || !ToNode)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("from_node_id or to_node_id not found in graph"));
+    }
+
+    UEdGraphPin* FromPin = FromPinName.IsEmpty()
+        ? FindFirstOutputPosePin(FromNode)
+        : FindPinByName(FromNode, FromPinName, EGPD_Output);
+    UEdGraphPin* ToPin = ToPinName.IsEmpty()
+        ? FindFirstInputPosePin(ToNode)
+        : FindPinByName(ToNode, ToPinName, EGPD_Input);
+    if (!FromPin || !ToPin)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("pin lookup failed (check from_pin / to_pin or pose-pin convention)"));
+    }
+
+    FScopedTransaction Tx(bConnect
+        ? LOCTEXT("ConnectPin", "Sage: Connect Pose Pin")
+        : LOCTEXT("DisconnectPin", "Sage: Disconnect Pose Pin"));
+    AnimBP->Modify();
+    TargetGraph->Modify();
+
+    bool bChanged = false;
+    if (bConnect)
+    {
+        // Pose input pins are single-connection by schema. Without
+        // BreakAllPinLinks first, MakeLinkTo would create a multiply-linked
+        // input that the BP compiler later rejects. Mirror the cleanup the
+        // canonical create_state_machine + set_animgraph_root_pose paths do.
+        if (ToPin->Direction == EGPD_Input)
+        {
+            ToPin->BreakAllPinLinks();
+        }
+        FromPin->MakeLinkTo(ToPin);
+        bChanged = true;
+    }
+    else
+    {
+        FromPin->BreakLinkTo(ToPin);
+        bChanged = true;
+    }
+    // Pin link toggles aren't structural — they don't add/remove pins or
+    // change the AnimGraph compile shape, just rewire existing pose flow.
+    // MarkBlueprintAsModified is the right grain (avoids unnecessary
+    // skeleton-class recompiles which Structurally would force).
+    FBlueprintEditorUtils::MarkBlueprintAsModified(AnimBP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("from_node_id"), FromId);
+    R->SetStringField(TEXT("to_node_id"),   ToId);
+    R->SetBoolField  (bConnect ? TEXT("connected") : TEXT("disconnected"), bChanged);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ConnectPosePinImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return ConnectPosePinImplShared(Args, /*bConnect=*/true);
+}
+FSageToolDispatch::FOutcome DisconnectPosePinImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return ConnectPosePinImplShared(Args, /*bConnect=*/false);
+}
+
+// ---------------------------------------------------------------------------
+// animation.set_anim_node_property
+// ---------------------------------------------------------------------------
+//
+// Mutate a single property inside the inner FAnimNode_* struct of a
+// UAnimGraphNode_*. JSON value type maps:
+//   string  → FName / object path / FString / enum-by-name
+//   number  → float / double / int / bool (clamped)
+//   array   → FVector / FRotator / FLinearColor (size-tagged)
+//   object  → reserved for nested struct (deferred to richer reflection tool)
+
+FSageToolDispatch::FOutcome SetAnimNodePropertyImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, GraphName, NodeId, PropName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("node_id"), NodeId) || NodeId.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'node_id'"));
+    }
+    if (!Args->TryGetStringField(TEXT("property"), PropName) || PropName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'property'"));
+    }
+    TSharedPtr<FJsonValue> Val = Args->TryGetField(TEXT("value"));
+    if (!Val.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'value'"));
+    }
+    Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+    UEdGraph* TargetGraph = ResolveAnimGraphTarget(AnimBP, GraphName);
+    if (!TargetGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("graph '%s' not found"), *GraphName));
+    }
+    UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(
+        FindGraphNodeByGuid(TargetGraph, NodeId));
+    if (!AnimNode)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("node_id %s isn't a UAnimGraphNode_Base"), *NodeId));
+    }
+
+    // Property may live either on the wrapper UObject or inside the inner
+    // FAnimNode_* struct. Try wrapper first (rare, e.g. node display flags),
+    // then descend into the Node struct.
+    FProperty* TargetProp = AnimNode->GetClass()->FindPropertyByName(FName(*PropName));
+    void* TargetContainer = AnimNode;
+
+    if (!TargetProp)
+    {
+        FStructProperty* OuterStruct = nullptr;
+        void* StructPtr = nullptr;
+        if (GetAnimNodeStructTarget(AnimNode, OuterStruct, StructPtr) && OuterStruct)
+        {
+            TargetProp = OuterStruct->Struct->FindPropertyByName(FName(*PropName));
+            TargetContainer = StructPtr;
+        }
+    }
+
+    if (!TargetProp)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("property '%s' not found on node class %s"),
+                            *PropName, *AnimNode->GetClass()->GetName()));
+    }
+
+    // Reject `value: null` unless the target prop is an object reference
+    // (FObjectProperty / FSoftObjectProperty etc). For numeric / bool / FName /
+    // struct fields, a JSON null is almost always a client mistake — silently
+    // coercing it to 0/false/NAME_None corrupts the AnimBP under the user's
+    // nose (lessons.md "silent fail anti-pattern").
+    if (Val->Type == EJson::Null && !TargetProp->IsA<FObjectPropertyBase>())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("property '%s' (%s) does not accept null; pass an explicit value"),
+                            *PropName, *TargetProp->GetClass()->GetName()));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SetAnimNodeProp", "Sage: Set Anim Node Property"));
+    AnimBP->Modify();
+    AnimNode->Modify();
+
+    void* TargetValuePtr = TargetProp->ContainerPtrToValuePtr<void>(TargetContainer);
+    const bool bWritten = detail::SetPropertyValueAtPtr(TargetProp, TargetValuePtr, Val);
+    if (!bWritten)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("could not coerce JSON value into property %s (%s)"),
+                            *PropName, *TargetProp->GetClass()->GetName()));
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("node_id"),  NodeId);
+    R->SetStringField(TEXT("property"), PropName);
+    R->SetBoolField  (TEXT("set"),      true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.bind_anim_node_property
+// ---------------------------------------------------------------------------
+//
+// Bind an inner FAnimNode_* property to an AnimBlueprint variable so the
+// runtime evaluates it from the variable each tick. Lyra-style "dynamic"
+// AnimBP authoring (Alpha pin → bIsFlying variable, etc.).
+
+FSageToolDispatch::FOutcome BindAnimNodePropertyImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, GraphName, NodeId, PropName, VarName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("node_id"), NodeId) || NodeId.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'node_id'"));
+    }
+    if (!Args->TryGetStringField(TEXT("property"), PropName) || PropName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'property'"));
+    }
+    if (!Args->TryGetStringField(TEXT("variable"), VarName) || VarName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'variable'"));
+    }
+    Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+    // UE 5.7 refactored UAnimGraphNode_Base::PropertyBindings →
+    // PropertyBindings_DEPRECATED. The canonical replacement is the
+    // UAnimBlueprintExtension subsystem (per-class extensions registered on
+    // the AnimBP at compile time). Implementing the binding correctly
+    // requires resolving the right extension and member graph + a recompile;
+    // shipping a half-correct version risks corrupting AnimBPs (lessons.md
+    // "silent fail anti-pattern" + production caution).
+    //
+    // Short-circuit BEFORE we touch the asset registry / GameThread asset
+    // load — there is no point spending those cycles when we know the
+    // handler always returns -32601. Once Sage wires the AnimBlueprintExt
+    // path the asset/graph resolution moves below this guard.
+    (void)Path; (void)NodeId; (void)PropName; (void)VarName; (void)GraphName;
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("animation.bind_anim_node_property: UE 5.7 deprecated PropertyBindings; "
+             "AnimBlueprintExtension-based replacement pending Sage implementation"));
+}
+
+// ---------------------------------------------------------------------------
+// animation.list_animgraph_nodes
+// ---------------------------------------------------------------------------
+FSageToolDispatch::FOutcome ListAnimGraphNodesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, GraphName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+    UEdGraph* TargetGraph = ResolveAnimGraphTarget(AnimBP, GraphName);
+    if (!TargetGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("graph '%s' not found"), *GraphName));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> NodesArr;
+    for (UEdGraphNode* N : TargetGraph->Nodes)
+    {
+        if (!N) continue;
+        TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+        Obj->SetStringField(TEXT("node_id"), N->NodeGuid.ToString(EGuidFormats::Digits));
+        Obj->SetStringField(TEXT("class"),   N->GetClass()->GetPathName());
+        Obj->SetNumberField(TEXT("x"),       N->NodePosX);
+        Obj->SetNumberField(TEXT("y"),       N->NodePosY);
+        Obj->SetNumberField(TEXT("pin_count"), N->Pins.Num());
+        // Classifier: lets callers filter without knowing the engine class
+        // hierarchy. Order matters — most-specific first.
+        const TCHAR* Kind = TEXT("other");
+        if (N->IsA<UAnimGraphNode_StateMachineBase>())          Kind = TEXT("state_machine");
+        else if (N->IsA<UAnimGraphNode_AssetPlayerBase>())      Kind = TEXT("asset_player");
+        else if (N->IsA<UAnimGraphNode_BlendListBase>())        Kind = TEXT("blend_list");
+        else if (N->IsA<UAnimGraphNode_SkeletalControlBase>())  Kind = TEXT("bone_control");
+        else if (N->IsA<UAnimGraphNode_Base>())                 Kind = TEXT("anim_node");
+        Obj->SetStringField(TEXT("kind"), Kind);
+        NodesArr.Add(MakeShared<FJsonValueObject>(Obj));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("graph"),  TargetGraph->GetFName().ToString());
+    R->SetArrayField (TEXT("nodes"),  NodesArr);
+    R->SetNumberField(TEXT("count"),  NodesArr.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.set_animgraph_root_pose
+// ---------------------------------------------------------------------------
+//
+// Convenience: wire a node's first-output-pose to the AnimGraph Root's
+// first-input-pose (the canonical "Output Pose" node in the root AnimGraph
+// or any state's BoundGraph). Replaces whatever is currently feeding root.
+
+FSageToolDispatch::FOutcome SetAnimGraphRootPoseImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, GraphName, NodeId;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("node_id"), NodeId) || NodeId.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'node_id'"));
+    }
+    Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+    UEdGraph* TargetGraph = ResolveAnimGraphTarget(AnimBP, GraphName);
+    if (!TargetGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("graph '%s' not found"), *GraphName));
+    }
+    // Transition graphs hold a boolean rule expression, not a pose flow —
+    // wiring a pose-source there silently corrupts the rule node's input.
+    // Surface the error explicitly so callers know to pivot to the future
+    // animation.set_transition_rule tool.
+    if (Cast<UAnimationTransitionGraph>(TargetGraph))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("use animation.set_transition_rule for transition graphs (NOT IMPLEMENTED yet)"));
+    }
+    UEdGraphNode* SrcNode = FindGraphNodeByGuid(TargetGraph, NodeId);
+    if (!SrcNode)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("node_id not found: %s"), *NodeId));
+    }
+    UEdGraphNode* Root = FindAnimGraphOutput(TargetGraph);
+    if (!Root)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("graph has no Output Pose (UAnimGraphNode_Root or UAnimGraphNode_StateResult)"));
+    }
+
+    UEdGraphPin* SrcOut = FindFirstOutputPosePin(SrcNode);
+    UEdGraphPin* RootIn = FindFirstInputPosePin(Root);
+    if (!SrcOut || !RootIn)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("pose pin lookup failed"));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SetAGRoot", "Sage: Wire AnimGraph Root"));
+    AnimBP->Modify();
+    TargetGraph->Modify();
+    RootIn->BreakAllPinLinks();
+    SrcOut->MakeLinkTo(RootIn);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("node_id"),  NodeId);
+    R->SetStringField(TEXT("root_id"),  Root->NodeGuid.ToString(EGuidFormats::Digits));
+    R->SetBoolField  (TEXT("connected"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ===========================================================================
+// Cluster B — AnimGraph convenience nodes (Phase 4-r6)
+// Thin specialised wrappers over the Cluster A primitive AddAnimGraphNodeImpl
+// + node-specific default property set. Returned shape always includes
+// node_id so the caller can chain pose-pin connect/property set.
+// ===========================================================================
+
+// Generic spawn helper — replicates the canonical UE pipeline:
+// NewObject(Outer=Graph, Class) → CreateNewGuid → AddNode → PostPlacedNewNode
+// → AllocateDefaultPins. PostPlacedNewNode is critical for composite nodes
+// (state machines, blend list by bool with sub-graphs).
+template <typename TNode>
+TNode* SpawnAnimGraphNode(UEdGraph* Graph, double X, double Y)
+{
+    if (!Graph) return nullptr;
+    TNode* Node = NewObject<TNode>(Graph);
+    Node->CreateNewGuid();
+    Node->NodePosX = static_cast<int32>(X);
+    Node->NodePosY = static_cast<int32>(Y);
+    Graph->AddNode(Node, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+    Node->PostPlacedNewNode();
+    Node->AllocateDefaultPins();
+    return Node;
+}
+
+// Body shared by every Cluster B handler — argument parse + AnimBP + graph
+// resolve. Returns null on validation failure (Outcome already populated).
+struct FClusterBContext
+{
+    UAnimBlueprint* AnimBP   = nullptr;
+    UEdGraph*       Graph    = nullptr;
+    double          X        = 0.0;
+    double          Y        = 0.0;
+};
+
+bool ResolveClusterBContext(const TSharedPtr<FJsonObject>& Args,
+                            FClusterBContext& Out, FSageToolDispatch::FOutcome& OutErr)
+{
+    FString Path, GraphName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        OutErr = FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+        return false;
+    }
+    Args->TryGetStringField(TEXT("graph_name"), GraphName);
+    Args->TryGetNumberField(TEXT("x"), Out.X);
+    Args->TryGetNumberField(TEXT("y"), Out.Y);
+
+    Out.AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!Out.AnimBP)
+    {
+        OutErr = FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+        return false;
+    }
+    Out.Graph = ResolveAnimGraphTarget(Out.AnimBP, GraphName);
+    if (!Out.Graph)
+    {
+        OutErr = FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("graph '%s' not found"), *GraphName));
+        return false;
+    }
+    return true;
+}
+
+// Helper: resolve UClass by path string (with FindObject + LoadObject fallback).
+UClass* ResolveAnyClass(const FString& Path)
+{
+    if (Path.IsEmpty()) return nullptr;
+    UClass* Cls = FindObject<UClass>(nullptr, *Path);
+    if (!Cls) Cls = LoadObject<UClass>(nullptr, *Path);
+    return Cls;
+}
+
+// ---------------------------------------------------------------------------
+// animation.add_sequence_player
+// ---------------------------------------------------------------------------
+FSageToolDispatch::FOutcome AddSequencePlayerImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FClusterBContext Ctx;
+    FSageToolDispatch::FOutcome Err;
+    if (!ResolveClusterBContext(Args, Ctx, Err)) return Err;
+
+    FString SeqPath;
+    Args->TryGetStringField(TEXT("sequence"), SeqPath);
+    bool bLoop = true;
+    Args->TryGetBoolField(TEXT("loop"), bLoop);
+    double Rate = 1.0;
+    Args->TryGetNumberField(TEXT("rate"), Rate);
+
+    FScopedTransaction Tx(LOCTEXT("AddSeqPlayer", "Sage: Add Sequence Player"));
+    Ctx.AnimBP->Modify();
+    Ctx.Graph->Modify();
+
+    UAnimGraphNode_SequencePlayer* Node = SpawnAnimGraphNode<UAnimGraphNode_SequencePlayer>(
+        Ctx.Graph, Ctx.X, Ctx.Y);
+    if (!Node)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("spawn failed"));
+    }
+    if (!SeqPath.IsEmpty())
+    {
+        if (UAnimSequenceBase* Anim = Cast<UAnimSequenceBase>(ResolveAsset(SeqPath)))
+        {
+            Node->SetAnimationAsset(Anim);
+        }
+    }
+    // Apply loop + rate by writing the inner FAnimNode_SequencePlayer struct.
+    // TODO(loop/rate): UE 5.7 protected FAnimNode_SequencePlayer::bLoopAnimation
+    // + PlayRate. Direct write fails. Use animation.set_anim_node_property
+    // (which goes through FStructProperty reflection) post-spawn for now.
+    (void)bLoop; (void)Rate;
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Ctx.AnimBP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("node_id"),  Node->NodeGuid.ToString(EGuidFormats::Digits));
+    R->SetStringField(TEXT("class"),    Node->GetClass()->GetPathName());
+    if (!SeqPath.IsEmpty()) R->SetStringField(TEXT("sequence"), SeqPath);
+    R->SetBoolField  (TEXT("loop"),     bLoop);
+    R->SetNumberField(TEXT("rate"),     Rate);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.add_blendspace_player
+// ---------------------------------------------------------------------------
+FSageToolDispatch::FOutcome AddBlendSpacePlayerImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FClusterBContext Ctx;
+    FSageToolDispatch::FOutcome Err;
+    if (!ResolveClusterBContext(Args, Ctx, Err)) return Err;
+
+    FString BSPath;
+    Args->TryGetStringField(TEXT("blendspace"), BSPath);
+
+    UClass* BSPlayerCls = ResolveAnyClass(TEXT("/Script/AnimGraph.AnimGraphNode_BlendSpacePlayer"));
+    if (!BSPlayerCls)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("UAnimGraphNode_BlendSpacePlayer class not loadable"));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("AddBSPlayer", "Sage: Add BlendSpace Player"));
+    Ctx.AnimBP->Modify();
+    Ctx.Graph->Modify();
+
+    UAnimGraphNode_AssetPlayerBase* Node = nullptr;
+    {
+        UEdGraphNode* Raw = NewObject<UEdGraphNode>(Ctx.Graph, BSPlayerCls);
+        Raw->CreateNewGuid();
+        Raw->NodePosX = static_cast<int32>(Ctx.X);
+        Raw->NodePosY = static_cast<int32>(Ctx.Y);
+        Ctx.Graph->AddNode(Raw, false, false);
+        Raw->PostPlacedNewNode();
+        Raw->AllocateDefaultPins();
+        Node = Cast<UAnimGraphNode_AssetPlayerBase>(Raw);
+    }
+    if (!Node)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("spawn failed"));
+    }
+    if (!BSPath.IsEmpty())
+    {
+        // Reject sequence/montage assets — UAnimGraphNode_BlendSpacePlayer is
+        // strict about its asset class; setting a UAnimSequence here silently
+        // leaves the player with a null reference at runtime.
+        if (UBlendSpace* BS = Cast<UBlendSpace>(ResolveAsset(BSPath)))
+        {
+            Node->SetAnimationAsset(BS);
+        }
+        else
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("blendspace must be a UBlendSpace (or UBlendSpace1D); got %s"),
+                                *BSPath));
+        }
+    }
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Ctx.AnimBP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("node_id"), Node->NodeGuid.ToString(EGuidFormats::Digits));
+    R->SetStringField(TEXT("class"),   Node->GetClass()->GetPathName());
+    if (!BSPath.IsEmpty()) R->SetStringField(TEXT("blendspace"), BSPath);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.add_state_machine_node
+// ---------------------------------------------------------------------------
+//
+// Spawn a UAnimGraphNode_StateMachine that *references an existing* state
+// machine sub-graph by name. Engine canonical: one SM sub-graph + one node
+// referencing it; you can have multiple references but it's unusual. If the
+// named sub-graph doesn't exist, defer to create_state_machine.
+
+FSageToolDispatch::FOutcome AddStateMachineNodeImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FClusterBContext Ctx;
+    FSageToolDispatch::FOutcome Err;
+    if (!ResolveClusterBContext(Args, Ctx, Err)) return Err;
+
+    FString SMName;
+    if (!Args->TryGetStringField(TEXT("state_machine_name"), SMName) || SMName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'state_machine_name'"));
+    }
+    UAnimationStateMachineGraph* ExistingSM = FindStateMachineGraph(Ctx.AnimBP, FName(*SMName));
+    if (!ExistingSM)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("state machine sub-graph '%s' not found — call create_state_machine first"),
+                            *SMName));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("AddSMNode", "Sage: Add State Machine Reference Node"));
+    Ctx.AnimBP->Modify();
+    Ctx.Graph->Modify();
+
+    // SM-reuse path — we want this node to point at the EXISTING
+    // sub-graph, not a freshly-spawned stub. PostPlacedNewNode would create
+    // a brand-new empty UAnimationStateMachineGraph as EditorStateMachineGraph
+    // (orphan, GC'd later), which is wasteful and noisy. Spawn raw, run
+    // AllocateDefaultPins for the canonical Output Pose pin shape, then
+    // bind directly.
+    UAnimGraphNode_StateMachine* Node = NewObject<UAnimGraphNode_StateMachine>(Ctx.Graph);
+    Node->CreateNewGuid();
+    Node->NodePosX = static_cast<int32>(Ctx.X);
+    Node->NodePosY = static_cast<int32>(Ctx.Y);
+    Ctx.Graph->AddNode(Node, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+    Node->AllocateDefaultPins();
+    Node->EditorStateMachineGraph = ExistingSM;
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Ctx.AnimBP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("node_id"),                Node->NodeGuid.ToString(EGuidFormats::Digits));
+    R->SetStringField(TEXT("class"),                  Node->GetClass()->GetPathName());
+    R->SetStringField(TEXT("state_machine_name"),     SMName);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// Generic Cluster B helper for class-only spawns (BlendListByBool, BlendListByEnum,
+// LayeredBlendPerBone, ApplyAdditive, TwoBoneIK, SkeletalControl, PlayMontageNotifyWindow,
+// LinkAnimLayer). Each handler resolves its specific UClass, calls Generic, then
+// applies node-specific properties (where applicable).
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome SpawnByClassPathImpl(const TSharedPtr<FJsonObject>& Args,
+                                                 const TCHAR* ClassPath,
+                                                 const TCHAR* DisplayName)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FClusterBContext Ctx;
+    FSageToolDispatch::FOutcome Err;
+    if (!ResolveClusterBContext(Args, Ctx, Err)) return Err;
+
+    UClass* Cls = ResolveAnyClass(ClassPath);
+    if (!Cls)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("class %s not loadable (module not enabled?)"), ClassPath));
+    }
+    if (Cls->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("class %s is abstract/deprecated"), *Cls->GetName()));
+    }
+
+    FScopedTransaction Tx(FText::Format(
+        LOCTEXT("SpawnByClass", "Sage: Add {0}"),
+        FText::FromString(DisplayName)));
+    Ctx.AnimBP->Modify();
+    Ctx.Graph->Modify();
+
+    UEdGraphNode* Node = NewObject<UEdGraphNode>(Ctx.Graph, Cls);
+    Node->CreateNewGuid();
+    Node->NodePosX = static_cast<int32>(Ctx.X);
+    Node->NodePosY = static_cast<int32>(Ctx.Y);
+    Ctx.Graph->AddNode(Node, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+    Node->PostPlacedNewNode();
+    Node->AllocateDefaultPins();
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Ctx.AnimBP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("node_id"), Node->NodeGuid.ToString(EGuidFormats::Digits));
+    R->SetStringField(TEXT("class"),   Cls->GetPathName());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AddBlendListByBoolImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return SpawnByClassPathImpl(Args,
+        TEXT("/Script/AnimGraph.AnimGraphNode_BlendListByBool"),
+        TEXT("Blend List By Bool"));
+}
+FSageToolDispatch::FOutcome AddBlendListByEnumImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return SpawnByClassPathImpl(Args,
+        TEXT("/Script/AnimGraph.AnimGraphNode_BlendListByEnum"),
+        TEXT("Blend List By Enum"));
+}
+FSageToolDispatch::FOutcome AddLayeredBlendPerBoneImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return SpawnByClassPathImpl(Args,
+        TEXT("/Script/AnimGraph.AnimGraphNode_LayeredBoneBlend"),
+        TEXT("Layered Blend Per Bone"));
+}
+FSageToolDispatch::FOutcome AddApplyAdditiveImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return SpawnByClassPathImpl(Args,
+        TEXT("/Script/AnimGraph.AnimGraphNode_ApplyAdditive"),
+        TEXT("Apply Additive"));
+}
+FSageToolDispatch::FOutcome AddTwoBoneIKImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return SpawnByClassPathImpl(Args,
+        TEXT("/Script/AnimGraph.AnimGraphNode_TwoBoneIK"),
+        TEXT("Two Bone IK"));
+}
+FSageToolDispatch::FOutcome AddSkeletalControlNodeImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    // Generic FAnimNode_SkeletalControlBase derivative — caller passes
+    // `control_class` as a UClass path. Validates IsChildOf(SkeletalControlBase).
+    FString ClassPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("control_class"), ClassPath)
+        || ClassPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'control_class' (UClass path of UAnimGraphNode_SkeletalControlBase derivative)"));
+    }
+    // Header is included up top — use the StaticClass() directly for the
+    // type check. Avoids a redundant FindObject<UClass> on every call.
+    UClass* CtrlCls = ResolveAnyClass(ClassPath);
+    if (!CtrlCls)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("control_class not found: %s"), *ClassPath));
+    }
+    if (!CtrlCls->IsChildOf(UAnimGraphNode_SkeletalControlBase::StaticClass()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("%s is not a UAnimGraphNode_SkeletalControlBase subclass"),
+                            *CtrlCls->GetName()));
+    }
+    return SpawnByClassPathImpl(Args, *ClassPath, TEXT("Skeletal Control"));
+}
+// animation.add_slot_node — spawn a UAnimGraphNode_Slot in the AnimGraph
+// (Montage slot routing). Returns node_id.
+FSageToolDispatch::FOutcome AddSlotNodeImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return SpawnByClassPathImpl(Args,
+        TEXT("/Script/AnimGraph.AnimGraphNode_Slot"),
+        TEXT("Slot"));
+}
+FSageToolDispatch::FOutcome AddLinkAnimLayerImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return SpawnByClassPathImpl(Args,
+        TEXT("/Script/AnimGraph.AnimGraphNode_LinkedAnimLayer"),
+        TEXT("Link Anim Layer"));
+}
+
+// ===========================================================================
+// Cluster J — Runtime character.* namespace (Lyra Sage Gap #19 + ek)
+// PIE-only — runtime manipulation of a live AActor's animation state.
+// Inverse of editor-only handlers: requires PIE world to be running.
+// ===========================================================================
+
+UWorld* GetPieWorldOrNull()
+{
+    return (GEditor && GEditor->PlayWorld) ? GEditor->PlayWorld.Get() : nullptr;
+}
+
+// Resolve an AActor from a path string. Accepts FSoftObjectPath form
+// ("/Temp/UEDPIE_X_Map.Map:PersistentLevel.MyActor_2"), short label match
+// ("MyActor_2"), or class-based first-instance lookup ("/Script/.../MyClass").
+//
+// PIE shutdown race: between GetPieWorldOrNull() and the caller's use of
+// the returned actor the user might end PIE. The actor itself is GC-rooted
+// while we hold the pointer in this frame, but the World can become invalid.
+// Re-check IsValid(World) before returning so the caller doesn't dereference
+// a half-torn-down world. Caller still owns the responsibility of treating
+// the returned actor as transient.
+AActor* ResolveActorRuntime(const FString& Path)
+{
+    UWorld* World = GetPieWorldOrNull();
+    if (!World) return nullptr;
+    if (Path.IsEmpty()) return nullptr;
+
+    AActor* Found = nullptr;
+
+    // Direct soft path resolve
+    FSoftObjectPath Soft(Path);
+    if (UObject* Obj = Soft.ResolveObject())
+    {
+        Found = Cast<AActor>(Obj);
+    }
+
+    // Label / name match
+    if (!Found)
+    {
+        for (TActorIterator<AActor> It(World); It; ++It)
+        {
+            AActor* A = *It;
+            if (!A) continue;
+            if (A->GetName() == Path || A->GetActorLabel() == Path
+                || A->GetPathName() == Path)
+            {
+                Found = A;
+                break;
+            }
+        }
+    }
+
+    // PIE shutdown race re-check — if the world tore down mid-iteration,
+    // bail rather than hand back an actor whose world is gone.
+    if (!IsValid(World) || !GetPieWorldOrNull())
+    {
+        return nullptr;
+    }
+    return Found;
+}
+
+USkeletalMeshComponent* FindSkeletalMeshComp(AActor* Actor)
+{
+    if (!Actor) return nullptr;
+    return Actor->FindComponentByClass<USkeletalMeshComponent>();
+}
+
+UAnimInstance* FindAnimInstance(AActor* Actor)
+{
+    USkeletalMeshComponent* Mesh = FindSkeletalMeshComp(Actor);
+    return Mesh ? Mesh->GetAnimInstance() : nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// character.play_root_motion_source (Lyra Sage Gap #19)
+// ---------------------------------------------------------------------------
+//
+// Apply a FRootMotionSource_* to an ACharacter's UCharacterMovementComponent.
+// Currently supported source types: ConstantForce (linear push), JumpForce
+// (vertical impulse with optional curves). Radial / MoveTo deferred to
+// follow-up (need callback wiring).
+
+FSageToolDispatch::FOutcome CharacterPlayRootMotionSourceImpl(
+    const TSharedPtr<FJsonObject>& Args)
+{
+    if (!GetPieWorldOrNull())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("requires PIE world (start Play In Editor first)"));
+    }
+
+    FString ActorPath, SourceType = TEXT("ConstantForce"), DebugName, AccumulateMode = TEXT("Override"), FinishVelMode = TEXT("MaintainLastRootMotion");
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("actor"), ActorPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor'"));
+    }
+    Args->TryGetStringField(TEXT("source_type"), SourceType);
+    Args->TryGetStringField(TEXT("debug_name"), DebugName);
+    Args->TryGetStringField(TEXT("accumulate_mode"), AccumulateMode);
+    Args->TryGetStringField(TEXT("finish_velocity_mode"), FinishVelMode);
+    double Strength = 1000.0, Duration = 0.5;
+    Args->TryGetNumberField(TEXT("strength"), Strength);
+    Args->TryGetNumberField(TEXT("duration"), Duration);
+
+    FVector Direction(1, 0, 0);
+    const TArray<TSharedPtr<FJsonValue>>* DirArr = nullptr;
+    if (Args->TryGetArrayField(TEXT("direction"), DirArr) && DirArr && DirArr->Num() >= 3)
+    {
+        Direction = FVector((*DirArr)[0]->AsNumber(),
+                            (*DirArr)[1]->AsNumber(),
+                            (*DirArr)[2]->AsNumber());
+    }
+
+    AActor* Actor = ResolveActorRuntime(ActorPath);
+    if (!Actor)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("actor not found in PIE world: %s"), *ActorPath));
+    }
+    ACharacter* Character = Cast<ACharacter>(Actor);
+    if (!Character)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("actor %s isn't an ACharacter"), *Actor->GetName()));
+    }
+    UCharacterMovementComponent* CMC = Character->GetCharacterMovement();
+    if (!CMC)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("character has no UCharacterMovementComponent"));
+    }
+
+    ERootMotionAccumulateMode AccMode = ERootMotionAccumulateMode::Override;
+    if (AccumulateMode.Equals(TEXT("Additive"), ESearchCase::IgnoreCase))
+    {
+        AccMode = ERootMotionAccumulateMode::Additive;
+    }
+    ERootMotionFinishVelocityMode FinMode = ERootMotionFinishVelocityMode::MaintainLastRootMotionVelocity;
+    if (FinishVelMode.Equals(TEXT("SetVelocity"), ESearchCase::IgnoreCase))
+    {
+        FinMode = ERootMotionFinishVelocityMode::SetVelocity;
+    }
+    else if (FinishVelMode.Equals(TEXT("ClampVelocity"), ESearchCase::IgnoreCase))
+    {
+        FinMode = ERootMotionFinishVelocityMode::ClampVelocity;
+    }
+
+    // Optional sensitive-liftoff toggle (default true preserves prior
+    // behaviour for ConstantForce). JumpForce always sets it.
+    bool bSensitiveLiftoff = true;
+    Args->TryGetBoolField(TEXT("sensitive_liftoff_check"), bSensitiveLiftoff);
+
+    auto ParseVec3 = [&Args](const TCHAR* Field, FVector& OutV) -> bool
+    {
+        const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+        if (!Args->TryGetArrayField(Field, Arr) || !Arr || Arr->Num() < 3) return false;
+        OutV = FVector((*Arr)[0]->AsNumber(),
+                       (*Arr)[1]->AsNumber(),
+                       (*Arr)[2]->AsNumber());
+        return true;
+    };
+
+    uint16 SourceId = 0;
+    if (SourceType.Equals(TEXT("ConstantForce"), ESearchCase::IgnoreCase))
+    {
+        TSharedPtr<FRootMotionSource_ConstantForce> Src =
+            MakeShared<FRootMotionSource_ConstantForce>();
+        Src->InstanceName     = FName(*(DebugName.IsEmpty() ? TEXT("Sage_ConstantForce") : DebugName));
+        Src->AccumulateMode   = AccMode;
+        if (bSensitiveLiftoff)
+            Src->Settings.SetFlag(ERootMotionSourceSettingsFlags::UseSensitiveLiftoffCheck);
+        Src->Force            = Direction.GetSafeNormal() * static_cast<float>(Strength);
+        Src->Duration         = static_cast<float>(Duration);
+        Src->FinishVelocityParams.Mode = FinMode;
+        SourceId = CMC->ApplyRootMotionSource(Src);
+    }
+    else if (SourceType.Equals(TEXT("JumpForce"), ESearchCase::IgnoreCase))
+    {
+        TSharedPtr<FRootMotionSource_JumpForce> Src =
+            MakeShared<FRootMotionSource_JumpForce>();
+        Src->InstanceName     = FName(*(DebugName.IsEmpty() ? TEXT("Sage_JumpForce") : DebugName));
+        Src->AccumulateMode   = AccMode;
+        Src->Duration         = static_cast<float>(Duration);
+        Src->Distance         = static_cast<float>(Strength);
+        Src->Rotation         = Direction.Rotation();
+        Src->FinishVelocityParams.Mode = FinMode;
+        if (bSensitiveLiftoff)
+            Src->Settings.SetFlag(ERootMotionSourceSettingsFlags::UseSensitiveLiftoffCheck);
+        // Optional path / time-mapping curves — engine FRootMotionSource_JumpForce
+        // exposes PathOffsetCurve (UCurveVector) and TimeMappingCurve (UCurveFloat)
+        // for arc shaping. Resolve via ResolveAsset; null path = no curve.
+        FString PathCurvePath, TimeCurvePath;
+        if (Args->TryGetStringField(TEXT("path_offset_curve"), PathCurvePath)
+            && !PathCurvePath.IsEmpty())
+        {
+            if (UCurveVector* PCurve = Cast<UCurveVector>(ResolveAsset(PathCurvePath)))
+            {
+                Src->PathOffsetCurve = PCurve;
+            }
+        }
+        if (Args->TryGetStringField(TEXT("time_mapping_curve"), TimeCurvePath)
+            && !TimeCurvePath.IsEmpty())
+        {
+            if (UCurveFloat* TCurve = Cast<UCurveFloat>(ResolveAsset(TimeCurvePath)))
+            {
+                Src->TimeMappingCurve = TCurve;
+            }
+        }
+        SourceId = CMC->ApplyRootMotionSource(Src);
+    }
+    else if (SourceType.Equals(TEXT("RadialForce"), ESearchCase::IgnoreCase))
+    {
+        TSharedPtr<FRootMotionSource_RadialForce> Src =
+            MakeShared<FRootMotionSource_RadialForce>();
+        Src->InstanceName     = FName(*(DebugName.IsEmpty() ? TEXT("Sage_RadialForce") : DebugName));
+        Src->AccumulateMode   = AccMode;
+        Src->Duration         = static_cast<float>(Duration);
+        Src->Strength         = static_cast<float>(Strength);
+        Src->FinishVelocityParams.Mode = FinMode;
+        FVector RadialLoc(0, 0, 0);
+        if (!ParseVec3(TEXT("location"), RadialLoc))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("RadialForce needs 'location':[x,y,z]"));
+        }
+        Src->Location = RadialLoc;
+        double Radius = 100.0;
+        Args->TryGetNumberField(TEXT("radius"), Radius);
+        Src->Radius = static_cast<float>(Radius);
+        SourceId = CMC->ApplyRootMotionSource(Src);
+    }
+    else if (SourceType.Equals(TEXT("MoveToForce"), ESearchCase::IgnoreCase))
+    {
+        TSharedPtr<FRootMotionSource_MoveToForce> Src =
+            MakeShared<FRootMotionSource_MoveToForce>();
+        Src->InstanceName     = FName(*(DebugName.IsEmpty() ? TEXT("Sage_MoveToForce") : DebugName));
+        Src->AccumulateMode   = AccMode;
+        Src->Duration         = static_cast<float>(Duration);
+        Src->FinishVelocityParams.Mode = FinMode;
+        // StartLocation defaults to actor location; caller can override.
+        Src->StartLocation = Character->GetActorLocation();
+        ParseVec3(TEXT("start_location"), Src->StartLocation);
+        FVector TargetLoc(0, 0, 0);
+        if (!ParseVec3(TEXT("target_location"), TargetLoc))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("MoveToForce needs 'target_location':[x,y,z]"));
+        }
+        Src->TargetLocation = TargetLoc;
+        SourceId = CMC->ApplyRootMotionSource(Src);
+    }
+    else
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("unsupported source_type '%s' (try ConstantForce, JumpForce, RadialForce, MoveToForce)"),
+                            *SourceType));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("actor"),       Actor->GetPathName());
+    R->SetStringField(TEXT("source_type"), SourceType);
+    R->SetNumberField(TEXT("source_id"),   SourceId);
+    R->SetNumberField(TEXT("duration"),    Duration);
+    R->SetNumberField(TEXT("strength"),    Strength);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// character.remove_root_motion_source
+// ---------------------------------------------------------------------------
+//
+// Cancel a running root-motion source by ID returned from
+// character.play_root_motion_source. PIE-only.
+FSageToolDispatch::FOutcome CharacterRemoveRootMotionSourceImpl(
+    const TSharedPtr<FJsonObject>& Args)
+{
+    if (!GetPieWorldOrNull())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("requires PIE world"));
+    }
+    FString ActorPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("actor"), ActorPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor'"));
+    }
+    double SourceIdD = -1.0;
+    if (!Args->TryGetNumberField(TEXT("source_id"), SourceIdD) || SourceIdD < 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing/negative 'source_id'"));
+    }
+    AActor* Actor = ResolveActorRuntime(ActorPath);
+    if (!Actor)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("actor not found in PIE world: %s"), *ActorPath));
+    }
+    ACharacter* Character = Cast<ACharacter>(Actor);
+    if (!Character)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("actor is not an ACharacter"));
+    }
+    UCharacterMovementComponent* CMC = Character->GetCharacterMovement();
+    if (!CMC)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("character has no CharacterMovementComponent"));
+    }
+    const uint16 Id = static_cast<uint16>(SourceIdD);
+    CMC->RemoveRootMotionSourceByID(Id);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("actor"),     Actor->GetPathName());
+    R->SetNumberField(TEXT("source_id"), Id);
+    R->SetBoolField  (TEXT("removed"),   true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// character.play_montage
+// ---------------------------------------------------------------------------
+FSageToolDispatch::FOutcome CharacterPlayMontageImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    if (!GetPieWorldOrNull())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("requires PIE world"));
+    }
+    FString ActorPath, MontagePath, StartSection;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("actor"), ActorPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor'"));
+    }
+    if (!Args->TryGetStringField(TEXT("montage"), MontagePath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'montage'"));
+    }
+    Args->TryGetStringField(TEXT("start_section"), StartSection);
+    double Rate = 1.0;
+    Args->TryGetNumberField(TEXT("play_rate"), Rate);
+    double StartPosition = -1.0;
+    bool bHaveStartPosition = Args->TryGetNumberField(TEXT("start_position"), StartPosition);
+
+    AActor* Actor = ResolveActorRuntime(ActorPath);
+    UAnimInstance* AnimInst = FindAnimInstance(Actor);
+    if (!AnimInst)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("actor has no SkeletalMeshComponent / AnimInstance"));
+    }
+    UAnimMontage* Montage = Cast<UAnimMontage>(ResolveAsset(MontagePath));
+    if (!Montage)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimMontage: %s"), *MontagePath));
+    }
+
+    const float Duration = AnimInst->Montage_Play(Montage, static_cast<float>(Rate));
+    if (Duration <= 0.f)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("Montage_Play returned 0 (ignored)"));
+    }
+    if (!StartSection.IsEmpty())
+    {
+        AnimInst->Montage_JumpToSection(FName(*StartSection), Montage);
+    }
+    if (bHaveStartPosition && StartPosition >= 0.0)
+    {
+        // Honor explicit start time after Play+JumpToSection — Montage_SetPosition
+        // moves the play head while keeping play state intact (UE 5.7 canonical).
+        AnimInst->Montage_SetPosition(Montage, static_cast<float>(StartPosition));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("actor"),    Actor->GetPathName());
+    R->SetStringField(TEXT("montage"),  Montage->GetPathName());
+    R->SetNumberField(TEXT("length"),   Duration);
+    R->SetNumberField(TEXT("play_rate"), Rate);
+    if (bHaveStartPosition && StartPosition >= 0.0)
+    {
+        R->SetNumberField(TEXT("start_position"), StartPosition);
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// character.stop_montage
+// ---------------------------------------------------------------------------
+FSageToolDispatch::FOutcome CharacterStopMontageImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    if (!GetPieWorldOrNull())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("requires PIE world"));
+    }
+    FString ActorPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("actor"), ActorPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor'"));
+    }
+    double BlendOut = 0.25;
+    Args->TryGetNumberField(TEXT("blend_out_time"), BlendOut);
+
+    AActor* Actor = ResolveActorRuntime(ActorPath);
+    UAnimInstance* AnimInst = FindAnimInstance(Actor);
+    if (!AnimInst)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("actor has no AnimInstance"));
+    }
+
+    // Optional `montage` argument — when supplied, only stops that specific
+    // montage instance (engine `Montage_Stop(BlendOut, SpecificMontage)`
+    // overload). Default: stop all montages.
+    FString MontagePath;
+    UAnimMontage* SpecificMontage = nullptr;
+    if (Args->TryGetStringField(TEXT("montage"), MontagePath) && !MontagePath.IsEmpty())
+    {
+        SpecificMontage = Cast<UAnimMontage>(ResolveAsset(MontagePath));
+        if (!SpecificMontage)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("not a UAnimMontage: %s"), *MontagePath));
+        }
+    }
+    AnimInst->Montage_Stop(static_cast<float>(BlendOut), SpecificMontage);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("actor"),  Actor->GetPathName());
+    R->SetBoolField  (TEXT("stopped"), true);
+    if (SpecificMontage)
+    {
+        R->SetStringField(TEXT("montage"), SpecificMontage->GetPathName());
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// character.set_anim_instance_class
+// ---------------------------------------------------------------------------
+FSageToolDispatch::FOutcome CharacterSetAnimInstanceClassImpl(
+    const TSharedPtr<FJsonObject>& Args)
+{
+    if (!GetPieWorldOrNull())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("requires PIE world"));
+    }
+    FString ActorPath, ClassPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("actor"), ActorPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor'"));
+    }
+    if (!Args->TryGetStringField(TEXT("anim_class"), ClassPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'anim_class'"));
+    }
+
+    AActor* Actor = ResolveActorRuntime(ActorPath);
+    USkeletalMeshComponent* Mesh = FindSkeletalMeshComp(Actor);
+    if (!Mesh)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("actor has no SkeletalMeshComponent"));
+    }
+    UClass* Cls = ResolveAnyClass(ClassPath);
+    if (!Cls)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("class not loadable: %s"), *ClassPath));
+    }
+    if (!Cls->IsChildOf(UAnimInstance::StaticClass()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("%s is not a UAnimInstance subclass"), *Cls->GetName()));
+    }
+
+    Mesh->SetAnimInstanceClass(Cls);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("actor"),      Actor->GetPathName());
+    R->SetStringField(TEXT("anim_class"), Cls->GetPathName());
+    R->SetBoolField  (TEXT("swapped"),    true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// character.list_active_montages
+// ---------------------------------------------------------------------------
+FSageToolDispatch::FOutcome CharacterListActiveMontagesImpl(
+    const TSharedPtr<FJsonObject>& Args)
+{
+    if (!GetPieWorldOrNull())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("requires PIE world"));
+    }
+    FString ActorPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("actor"), ActorPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor'"));
+    }
+    AActor* Actor = ResolveActorRuntime(ActorPath);
+    UAnimInstance* AnimInst = FindAnimInstance(Actor);
+    if (!AnimInst)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("actor has no AnimInstance"));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Montages;
+    for (FAnimMontageInstance* Inst : AnimInst->MontageInstances)
+    {
+        if (!Inst || !Inst->Montage) continue;
+        TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+        Obj->SetStringField(TEXT("montage"),  Inst->Montage->GetPathName());
+        Obj->SetNumberField(TEXT("position"), Inst->GetPosition());
+        Obj->SetNumberField(TEXT("weight"),   Inst->GetWeight());
+        Obj->SetNumberField(TEXT("play_rate"), Inst->GetPlayRate());
+        Montages.Add(MakeShared<FJsonValueObject>(Obj));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("actor"),    Actor->GetPathName());
+    R->SetArrayField (TEXT("montages"), Montages);
+    R->SetNumberField(TEXT("count"),    Montages.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// character.set_animation_mode
+// ---------------------------------------------------------------------------
+FSageToolDispatch::FOutcome CharacterSetAnimationModeImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    if (!GetPieWorldOrNull())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("requires PIE world"));
+    }
+    FString ActorPath, ModeStr;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("actor"), ActorPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor'"));
+    }
+    if (!Args->TryGetStringField(TEXT("mode"), ModeStr))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'mode' (AnimBlueprint | AnimAsset | Custom)"));
+    }
+    AActor* Actor = ResolveActorRuntime(ActorPath);
+    USkeletalMeshComponent* Mesh = FindSkeletalMeshComp(Actor);
+    if (!Mesh)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("actor has no SkeletalMeshComponent"));
+    }
+    EAnimationMode::Type Mode = EAnimationMode::AnimationBlueprint;
+    if (ModeStr.Equals(TEXT("AnimAsset"), ESearchCase::IgnoreCase)
+     || ModeStr.Equals(TEXT("AnimationSingleNode"), ESearchCase::IgnoreCase))
+    {
+        Mode = EAnimationMode::AnimationSingleNode;
+    }
+    else if (ModeStr.Equals(TEXT("Custom"), ESearchCase::IgnoreCase)
+          || ModeStr.Equals(TEXT("AnimationCustomMode"), ESearchCase::IgnoreCase))
+    {
+        Mode = EAnimationMode::AnimationCustomMode;
+    }
+    Mesh->SetAnimationMode(Mode);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("actor"), Actor->GetPathName());
+    R->SetStringField(TEXT("mode"),  ModeStr);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// character.play_animation (single-asset playback, side-steps AnimBP)
+// ---------------------------------------------------------------------------
+FSageToolDispatch::FOutcome CharacterPlayAnimationImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    if (!GetPieWorldOrNull())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("requires PIE world"));
+    }
+    FString ActorPath, AnimPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("actor"), ActorPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor'"));
+    }
+    if (!Args->TryGetStringField(TEXT("animation"), AnimPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'animation'"));
+    }
+    bool bLoop = true;
+    Args->TryGetBoolField(TEXT("looping"), bLoop);
+
+    AActor* Actor = ResolveActorRuntime(ActorPath);
+    USkeletalMeshComponent* Mesh = FindSkeletalMeshComp(Actor);
+    if (!Mesh)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("actor has no SkeletalMeshComponent"));
+    }
+    UAnimationAsset* Anim = Cast<UAnimationAsset>(ResolveAsset(AnimPath));
+    if (!Anim)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimationAsset: %s"), *AnimPath));
+    }
+    Mesh->PlayAnimation(Anim, bLoop);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("actor"),     Actor->GetPathName());
+    R->SetStringField(TEXT("animation"), Anim->GetPathName());
+    R->SetBoolField  (TEXT("looping"),   bLoop);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ===========================================================================
+// Cluster C ek — State machine deep CRUD (conduit/alias/transition rule)
+// ===========================================================================
+
+FSageToolDispatch::FOutcome AddConduitImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SMName, Name;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("state_machine_name"), SMName)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'state_machine_name'"));
+    if (!Args->TryGetStringField(TEXT("name"), Name)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+    double X = 0.0, Y = 0.0;
+    Args->TryGetNumberField(TEXT("x"), X); Args->TryGetNumberField(TEXT("y"), Y);
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimBlueprint"));
+    UAnimationStateMachineGraph* SMGraph = FindStateMachineGraph(AnimBP, FName(*SMName));
+    if (!SMGraph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("state machine not found"));
+
+    FScopedTransaction Tx(LOCTEXT("AddConduit", "Sage: Add Conduit"));
+    AnimBP->Modify(); SMGraph->Modify();
+
+    UAnimStateConduitNode* ConduitNode = NewObject<UAnimStateConduitNode>(SMGraph);
+    ConduitNode->CreateNewGuid();
+    ConduitNode->NodePosX = (int32)X; ConduitNode->NodePosY = (int32)Y;
+    SMGraph->AddNode(ConduitNode, false, false);
+    ConduitNode->PostPlacedNewNode();
+    ConduitNode->AllocateDefaultPins();
+    if (ConduitNode->BoundGraph && ConduitNode->BoundGraph->GetFName() != FName(*Name))
+    {
+        FBlueprintEditorUtils::RenameGraph(ConduitNode->BoundGraph, Name);
+    }
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("conduit_id"), ConduitNode->NodeGuid.ToString(EGuidFormats::Digits));
+    R->SetStringField(TEXT("name"), Name);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AddStateAliasImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SMName, Name;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("state_machine_name"), SMName)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'state_machine_name'"));
+    if (!Args->TryGetStringField(TEXT("name"), Name)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+    double X = 0.0, Y = 0.0;
+    Args->TryGetNumberField(TEXT("x"), X); Args->TryGetNumberField(TEXT("y"), Y);
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimBlueprint"));
+    UAnimationStateMachineGraph* SMGraph = FindStateMachineGraph(AnimBP, FName(*SMName));
+    if (!SMGraph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("state machine not found"));
+
+    FScopedTransaction Tx(LOCTEXT("AddStateAlias", "Sage: Add State Alias"));
+    AnimBP->Modify(); SMGraph->Modify();
+
+    UAnimStateAliasNode* AliasNode = NewObject<UAnimStateAliasNode>(SMGraph);
+    AliasNode->CreateNewGuid();
+    AliasNode->NodePosX = (int32)X; AliasNode->NodePosY = (int32)Y;
+    SMGraph->AddNode(AliasNode, false, false);
+    AliasNode->PostPlacedNewNode();
+    AliasNode->AllocateDefaultPins();
+
+    // Optional: bGlobalAlias (alias represents *every* state in the SM) +
+    // explicit aliased_states list (FGuid string array). Without populating
+    // AliasedStateNodes, BP compile errors with "alias is not aliasing any
+    // states". Engine UAnimStateAliasNode::AliasedStateNodes is a
+    // TSet<TWeakObjectPtr<UAnimStateNodeBase>> exposed via GetAliasedStates()
+    // mutable accessor.
+    bool bGlobalAlias = false;
+    Args->TryGetBoolField(TEXT("global_alias"), bGlobalAlias);
+    AliasNode->bGlobalAlias = bGlobalAlias;
+
+    int32 AliasedCount = 0;
+    const TArray<TSharedPtr<FJsonValue>>* AliasedArr = nullptr;
+    if (Args->TryGetArrayField(TEXT("aliased_states"), AliasedArr) && AliasedArr)
+    {
+        for (const TSharedPtr<FJsonValue>& V : *AliasedArr)
+        {
+            if (!V.IsValid() || V->Type != EJson::String) continue;
+            UAnimStateNodeBase* StateRef =
+                FindStateNodeByGuid(SMGraph, V->AsString());
+            if (StateRef)
+            {
+                AliasNode->GetAliasedStates().Add(StateRef);
+                ++AliasedCount;
+            }
+        }
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("alias_id"),     AliasNode->NodeGuid.ToString(EGuidFormats::Digits));
+    R->SetStringField(TEXT("name"),         Name);
+    R->SetBoolField  (TEXT("global_alias"), bGlobalAlias);
+    R->SetNumberField(TEXT("aliased_count"), AliasedCount);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetTransitionPriorityImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SMName, TId;
+    int32 Priority = 1;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("state_machine_name"), SMName)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'state_machine_name'"));
+    if (!Args->TryGetStringField(TEXT("transition_id"), TId)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'transition_id'"));
+    Args->TryGetNumberField(TEXT("priority"), Priority);
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimBlueprint"));
+    UAnimationStateMachineGraph* SMGraph = FindStateMachineGraph(AnimBP, FName(*SMName));
+    if (!SMGraph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("state machine not found"));
+    UAnimStateTransitionNode* T = FindTransitionByGuid(SMGraph, TId);
+    if (!T) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("transition_id not found"));
+
+    FScopedTransaction Tx(LOCTEXT("SetTransitionPriority", "Sage: Set Transition Priority"));
+    T->Modify();
+    T->PriorityOrder = Priority;
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("transition_id"), TId);
+    R->SetNumberField(TEXT("priority"), Priority);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetStateMachineInitialStateImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    // Initial state in UE state machine = state pointed-to by the entry node's
+    // single output link. Implementation: find UAnimStateEntryNode, break links,
+    // re-link to target state.
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SMName, StateId;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("state_machine_name"), SMName)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'state_machine_name'"));
+    if (!Args->TryGetStringField(TEXT("state_id"), StateId)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'state_id'"));
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimBlueprint"));
+    UAnimationStateMachineGraph* SMGraph = FindStateMachineGraph(AnimBP, FName(*SMName));
+    if (!SMGraph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("state machine not found"));
+    UAnimStateNodeBase* Target = FindStateNodeByGuid(SMGraph, StateId);
+    if (!Target) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("state_id not found"));
+
+    UAnimStateEntryNode* Entry = nullptr;
+    for (UEdGraphNode* N : SMGraph->Nodes)
+    {
+        if ((Entry = Cast<UAnimStateEntryNode>(N))) break;
+    }
+    if (!Entry) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("entry node missing"));
+
+    FScopedTransaction Tx(LOCTEXT("SetSMInitial", "Sage: Set Initial State"));
+    AnimBP->Modify(); Entry->Modify();
+
+    UEdGraphPin* EntryOut = FindFirstOutputPosePin(Entry);
+    UEdGraphPin* TargetIn = FindFirstInputPosePin(Target);
+    if (!EntryOut || !TargetIn) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("pin lookup failed"));
+    EntryOut->BreakAllPinLinks();
+    EntryOut->MakeLinkTo(TargetIn);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("state_id"), StateId);
+    R->SetBoolField(TEXT("set"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ListStatesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SMName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("state_machine_name"), SMName)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'state_machine_name'"));
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimBlueprint"));
+    UAnimationStateMachineGraph* SMGraph = FindStateMachineGraph(AnimBP, FName(*SMName));
+    if (!SMGraph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("state machine not found"));
+
+    TArray<TSharedPtr<FJsonValue>> States;
+    for (UEdGraphNode* N : SMGraph->Nodes)
+    {
+        if (UAnimStateNodeBase* S = Cast<UAnimStateNodeBase>(N))
+        {
+            TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+            Obj->SetStringField(TEXT("state_id"), S->NodeGuid.ToString(EGuidFormats::Digits));
+            Obj->SetStringField(TEXT("class"),    S->GetClass()->GetName());
+            // Each derived state node has its own GetStateName() override —
+            // alias nodes return the alias label, conduits return the bound
+            // graph name, plain states return the bound graph name. Use the
+            // virtual to stay future-proof.
+            FString StateName = S->GetStateName();
+            // Fallback to BoundGraph FName for nodes without a label override.
+            if (StateName.IsEmpty() || StateName == TEXT("BaseState"))
+            {
+                if (UAnimStateNode* AsState = Cast<UAnimStateNode>(S))
+                {
+                    if (AsState->BoundGraph) StateName = AsState->BoundGraph->GetFName().ToString();
+                }
+                else if (UAnimStateConduitNode* AsCon = Cast<UAnimStateConduitNode>(S))
+                {
+                    if (AsCon->BoundGraph) StateName = AsCon->BoundGraph->GetFName().ToString();
+                }
+            }
+            Obj->SetStringField(TEXT("name"),     StateName);
+            Obj->SetNumberField(TEXT("x"),        S->NodePosX);
+            Obj->SetNumberField(TEXT("y"),        S->NodePosY);
+            // Classifier so callers don't need to parse `class` strings —
+            // alias / conduit / state are the three runtime kinds.
+            const TCHAR* Kind = TEXT("state");
+            if (Cast<UAnimStateAliasNode>(S))   Kind = TEXT("alias");
+            else if (Cast<UAnimStateConduitNode>(S)) Kind = TEXT("conduit");
+            Obj->SetStringField(TEXT("kind"), Kind);
+            States.Add(MakeShared<FJsonValueObject>(Obj));
+        }
+    }
+    auto R = MakeShared<FJsonObject>();
+    R->SetArrayField(TEXT("states"), States);
+    R->SetNumberField(TEXT("count"), States.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ListTransitionsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SMName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("state_machine_name"), SMName)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'state_machine_name'"));
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimBlueprint"));
+    UAnimationStateMachineGraph* SMGraph = FindStateMachineGraph(AnimBP, FName(*SMName));
+    if (!SMGraph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("state machine not found"));
+
+    TArray<TSharedPtr<FJsonValue>> Trans;
+    for (UEdGraphNode* N : SMGraph->Nodes)
+    {
+        if (UAnimStateTransitionNode* T = Cast<UAnimStateTransitionNode>(N))
+        {
+            TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+            Obj->SetStringField(TEXT("transition_id"), T->NodeGuid.ToString(EGuidFormats::Digits));
+            // Endpoints — engine GetPreviousState/GetNextState walk the
+            // transition's pin links so the result is authoritative even if
+            // the SM was authored visually without going through Sage.
+            UAnimStateNodeBase* From = T->GetPreviousState();
+            UAnimStateNodeBase* To   = T->GetNextState();
+            Obj->SetStringField(TEXT("from_state_id"),
+                From ? From->NodeGuid.ToString(EGuidFormats::Digits) : FString());
+            Obj->SetStringField(TEXT("to_state_id"),
+                To   ? To->NodeGuid.ToString(EGuidFormats::Digits)   : FString());
+            Obj->SetNumberField(TEXT("blend_time"),    T->CrossfadeDuration);
+            Obj->SetNumberField(TEXT("priority"),      T->PriorityOrder);
+            Obj->SetBoolField  (TEXT("bidirectional"), T->Bidirectional);
+            Trans.Add(MakeShared<FJsonValueObject>(Obj));
+        }
+    }
+    auto R = MakeShared<FJsonObject>();
+    R->SetArrayField(TEXT("transitions"), Trans);
+    R->SetNumberField(TEXT("count"), Trans.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetTransitionRuleImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    // Stub — transition rule expression authoring requires building Kismet
+    // boolean nodes inside the transition's BoundGraph. Pending Cluster A's
+    // BindAnimNodeProperty refactor (UAnimBlueprintExtension API).
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.set_transition_rule — transition rule BP authoring "
+             "(boolean Kismet nodes in transition BoundGraph) pending Sage impl"));
+}
+
+FSageToolDispatch::FOutcome SetStateEnteredEventImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.set_state_entered_event — StateNode.OnEntered/OnExited "
+             "event graph hook pending Sage impl"));
+}
+
+// ===========================================================================
+// Cluster D ek — Anim notify track CRUD
+// ===========================================================================
+
+FSageToolDispatch::FOutcome AddNotifyTrackImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path, TrackName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("track_name"), TrackName)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'track_name'"));
+
+    UAnimSequenceBase* Seq = Cast<UAnimSequenceBase>(ResolveAsset(Path));
+    if (!Seq) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimSequenceBase"));
+
+    // Persona allows duplicate track names but the timeline UI conflates
+    // them. Surface the situation so callers can rename rather than silently
+    // shadow an existing track.
+    bool bDuplicate = false;
+    const FName WantedTrack(*TrackName);
+    for (const FAnimNotifyTrack& Existing : Seq->AnimNotifyTracks)
+    {
+        if (Existing.TrackName == WantedTrack) { bDuplicate = true; break; }
+    }
+
+    FScopedTransaction Tx(LOCTEXT("AddNotifyTrack", "Sage: Add Notify Track"));
+    Seq->Modify();
+    FAnimNotifyTrack NewTrack;
+    NewTrack.TrackName = WantedTrack;
+    NewTrack.TrackColor = FLinearColor::White;
+    Seq->AnimNotifyTracks.Add(NewTrack);
+    Seq->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("track_name"), TrackName);
+    R->SetNumberField(TEXT("track_index"), Seq->AnimNotifyTracks.Num() - 1);
+    if (bDuplicate)
+    {
+        R->SetStringField(TEXT("_warning"), TEXT("duplicate track name"));
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ListNotifiesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    UAnimSequenceBase* Seq = Cast<UAnimSequenceBase>(ResolveAsset(Path));
+    if (!Seq) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimSequenceBase"));
+
+    TArray<TSharedPtr<FJsonValue>> Out;
+    for (int32 i = 0; i < Seq->Notifies.Num(); ++i)
+    {
+        const FAnimNotifyEvent& E = Seq->Notifies[i];
+        TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+        Obj->SetNumberField(TEXT("index"),    i);
+        Obj->SetStringField(TEXT("name"),     E.NotifyName.ToString());
+        Obj->SetNumberField(TEXT("time"),     E.GetTime());
+        Obj->SetNumberField(TEXT("duration"), E.GetDuration());
+        Obj->SetNumberField(TEXT("track"),    E.TrackIndex);
+        // Distinguish single-frame notifies from notify-state windows so the
+        // caller doesn't have to infer from `duration > 0`. Engine populates
+        // exactly one of FAnimNotifyEvent::Notify / NotifyStateClass.
+        if (E.Notify)
+        {
+            Obj->SetStringField(TEXT("class"), E.Notify->GetClass()->GetPathName());
+            Obj->SetStringField(TEXT("kind"),  TEXT("notify"));
+        }
+        else if (E.NotifyStateClass)
+        {
+            Obj->SetStringField(TEXT("class"), E.NotifyStateClass->GetClass()->GetPathName());
+            Obj->SetStringField(TEXT("kind"),  TEXT("notify_state"));
+        }
+        else
+        {
+            Obj->SetStringField(TEXT("kind"),  TEXT("native"));
+        }
+        Out.Add(MakeShared<FJsonValueObject>(Obj));
+    }
+    auto R = MakeShared<FJsonObject>();
+    R->SetArrayField(TEXT("notifies"), Out);
+    R->SetNumberField(TEXT("count"), Out.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome RemoveNotifyImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path;
+    int32 Idx = -1;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    Args->TryGetNumberField(TEXT("index"), Idx);
+    UAnimSequenceBase* Seq = Cast<UAnimSequenceBase>(ResolveAsset(Path));
+    if (!Seq) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimSequenceBase"));
+    if (Idx < 0 || Idx >= Seq->Notifies.Num()) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("index out of range"));
+
+    FScopedTransaction Tx(LOCTEXT("RemoveNotify", "Sage: Remove Notify"));
+    Seq->Modify();
+    Seq->Notifies.RemoveAt(Idx);
+    Seq->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetNumberField(TEXT("index"), Idx);
+    R->SetBoolField(TEXT("removed"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetNotifyPositionImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path;
+    int32 Idx = -1;
+    double Time = 0.0, Dur = -1.0;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    Args->TryGetNumberField(TEXT("index"), Idx);
+    Args->TryGetNumberField(TEXT("time"), Time);
+    Args->TryGetNumberField(TEXT("duration"), Dur);
+    UAnimSequenceBase* Seq = Cast<UAnimSequenceBase>(ResolveAsset(Path));
+    if (!Seq) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimSequenceBase"));
+    if (Idx < 0 || Idx >= Seq->Notifies.Num()) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("index out of range"));
+
+    FScopedTransaction Tx(LOCTEXT("SetNotifyPos", "Sage: Set Notify Position"));
+    Seq->Modify();
+    Seq->Notifies[Idx].SetTime(static_cast<float>(Time));
+    if (Dur >= 0.0) Seq->Notifies[Idx].SetDuration(static_cast<float>(Dur));
+    Seq->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetNumberField(TEXT("index"), Idx);
+    R->SetNumberField(TEXT("time"),  Time);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ===========================================================================
+// Cluster E ek — BlendSpace axis settings + sample CRUD
+// ===========================================================================
+
+FSageToolDispatch::FOutcome RemoveBlendSpaceSampleImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path;
+    int32 Idx = -1;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    Args->TryGetNumberField(TEXT("index"), Idx);
+    UBlendSpace* BS = Cast<UBlendSpace>(ResolveAsset(Path));
+    if (!BS) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UBlendSpace"));
+    if (Idx < 0 || Idx >= BS->GetBlendSamples().Num()) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("index out of range"));
+
+    FScopedTransaction Tx(LOCTEXT("RemoveBSSample", "Sage: Remove BlendSpace Sample"));
+    BS->Modify();
+    BS->DeleteSample(Idx);
+    BS->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetNumberField(TEXT("index"), Idx);
+    R->SetBoolField(TEXT("removed"), true);
+    R->SetNumberField(TEXT("sample_count"), BS->GetBlendSamples().Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetBlendSpaceAxisImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    // BlendParameters is protected on UBlendSpace in UE 5.7 — pending
+    // UBlendSpaceEditorLibrary path or friend helper.
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.set_blendspace_axis — UBlendSpaceEditorLibrary "
+             "path pending (BlendParameters is protected in UE 5.7)"));
+}
+
+FSageToolDispatch::FOutcome SetBlendSpaceSmoothingImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.set_blendspace_smoothing — pending Sage impl"));
+}
+
+FSageToolDispatch::FOutcome SetBlendSpaceTargetWeightImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.set_blendspace_target_weight_interpolation — pending Sage impl"));
+}
+
+FSageToolDispatch::FOutcome ReadBlendSpaceSamplesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    // Be uniform with sibling read handlers (e.g. ReadAnimGraphImpl /
+    // ListSyncMarkersImpl) — refuse to dereference editor-only data on the
+    // PIE world. Even though this is read-only, UBlendSpace BlendSamples are
+    // stale during PIE replay and the PIE world's transient asset can mask
+    // the editor authoring asset by name.
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    UBlendSpace* BS = Cast<UBlendSpace>(ResolveAsset(Path));
+    if (!BS) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UBlendSpace"));
+
+    TArray<TSharedPtr<FJsonValue>> Samples;
+    for (const FBlendSample& S : BS->GetBlendSamples())
+    {
+        TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+        Obj->SetStringField(TEXT("animation"), S.Animation ? S.Animation->GetPathName() : FString());
+        Obj->SetNumberField(TEXT("x"), S.SampleValue.X);
+        Obj->SetNumberField(TEXT("y"), S.SampleValue.Y);
+        Samples.Add(MakeShared<FJsonValueObject>(Obj));
+    }
+    auto R = MakeShared<FJsonObject>();
+    R->SetArrayField(TEXT("samples"), Samples);
+    R->SetNumberField(TEXT("count"), Samples.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ===========================================================================
+// Cluster F — Sync markers, curve compression, animation modifier
+// ===========================================================================
+
+FSageToolDispatch::FOutcome AddSyncMarkerImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path, Name;
+    double Time = 0.0;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("marker_name"), Name)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'marker_name'"));
+    Args->TryGetNumberField(TEXT("time"), Time);
+    UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(Path));
+    if (!Seq) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimSequence"));
+
+    // Bounds clamp — engine's sync-group runtime indexes markers as fractional
+    // positions over [0, PlayLength]; out-of-range markers crash the sync graph.
+    const float PlayLen = Seq->GetPlayLength();
+    if (Time < 0.0 || Time > static_cast<double>(PlayLen))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("'time' %.4f out of [0, %.4f] — sequence play length"),
+                            Time, PlayLen));
+    }
+
+    // Soft-warn duplicate marker name. The runtime allows duplicates but the
+    // sync-group comparator picks an arbitrary one — surface the conflict.
+    bool bDuplicate = false;
+    const FName WantedMarker(*Name);
+    for (const FAnimSyncMarker& Existing : Seq->AuthoredSyncMarkers)
+    {
+        if (Existing.MarkerName == WantedMarker) { bDuplicate = true; break; }
+    }
+
+    FScopedTransaction Tx(LOCTEXT("AddSync", "Sage: Add Sync Marker"));
+    Seq->Modify();
+    FAnimSyncMarker M;
+    M.MarkerName = WantedMarker;
+    M.Time       = static_cast<float>(Time);
+    Seq->AuthoredSyncMarkers.Add(M);
+    // Without RefreshSyncMarkerDataFromAuthored the sequence's
+    // UniqueMarkerNames cache stays stale until reload — sync groups won't
+    // see the new marker. UE 5.7 ENGINE_API public on AnimSequence.h:736.
+    Seq->RefreshSyncMarkerDataFromAuthored();
+    Seq->MarkPackageDirty();
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("marker_name"),  Name);
+    R->SetNumberField(TEXT("marker_index"), Seq->AuthoredSyncMarkers.Num() - 1);
+    if (bDuplicate)
+    {
+        R->SetStringField(TEXT("_warning"), TEXT("duplicate marker name"));
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome RemoveSyncMarkerImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path;
+    int32 Idx = -1;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    Args->TryGetNumberField(TEXT("index"), Idx);
+    UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(Path));
+    if (!Seq) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimSequence"));
+    if (Idx < 0 || Idx >= Seq->AuthoredSyncMarkers.Num()) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("index out of range"));
+
+    FScopedTransaction Tx(LOCTEXT("RemoveSync", "Sage: Remove Sync Marker"));
+    Seq->Modify();
+    Seq->AuthoredSyncMarkers.RemoveAt(Idx);
+    // Refresh UniqueMarkerNames cache so sync groups see the removal
+    // immediately (mirror AddSyncMarkerImpl).
+    Seq->RefreshSyncMarkerDataFromAuthored();
+    Seq->MarkPackageDirty();
+    auto R = MakeShared<FJsonObject>();
+    R->SetNumberField(TEXT("index"), Idx);
+    R->SetBoolField(TEXT("removed"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ListSyncMarkersImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(Path));
+    if (!Seq) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimSequence"));
+
+    TArray<TSharedPtr<FJsonValue>> Out;
+    for (int32 i = 0; i < Seq->AuthoredSyncMarkers.Num(); ++i)
+    {
+        const FAnimSyncMarker& M = Seq->AuthoredSyncMarkers[i];
+        TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+        Obj->SetNumberField(TEXT("index"), i);
+        Obj->SetStringField(TEXT("name"),  M.MarkerName.ToString());
+        Obj->SetNumberField(TEXT("time"),  M.Time);
+        Out.Add(MakeShared<FJsonValueObject>(Obj));
+    }
+    auto R = MakeShared<FJsonObject>();
+    R->SetArrayField(TEXT("markers"), Out);
+    R->SetNumberField(TEXT("count"), Out.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetCurveCompressionImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.set_curve_compression — canonical: assign UAnimCurveCompressionSettings asset to UAnimSequence::CurveCompressionSettings + RequestSyncAnimRecompression()"));
+}
+
+FSageToolDispatch::FOutcome RunAnimationModifierImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.run_animation_modifier — canonical: UAnimationModifier::ApplyToAnimationSequence (editor-only, requires AnimationModifierLibrary)"));
+}
+
+FSageToolDispatch::FOutcome AddAnimationModifierImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.add_animation_modifier — canonical: Sequence->AnimationModifier_AddInstance (editor-only)"));
+}
+
+// ===========================================================================
+// Cluster G — Animation Layer Interface (stubs — complex API)
+// ===========================================================================
+
+FSageToolDispatch::FOutcome CreateAnimLayerInterfaceImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.create_anim_layer_interface — canonical: UAnimLayerInterface BP factory"));
+}
+FSageToolDispatch::FOutcome AddLayerFunctionImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.add_layer_function — pending Sage impl"));
+}
+FSageToolDispatch::FOutcome ImplementAnimLayerInterfaceImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.implement_anim_layer_interface — pending Sage impl"));
+}
+FSageToolDispatch::FOutcome SetLinkedAnimLayerImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.set_linked_anim_layer — pending Sage impl"));
+}
+FSageToolDispatch::FOutcome ListImplementedLayersImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.list_implemented_layers — pending Sage impl"));
+}
+
+// ===========================================================================
+// Cluster H — Sequence/Montage advanced
+// ===========================================================================
+
+FSageToolDispatch::FOutcome SetSequenceAdditiveImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.set_sequence_additive_settings — canonical: IAnimationDataController bracket (additive type/base pose are private in UE 5.7)"));
+}
+
+FSageToolDispatch::FOutcome SetSequenceCompressionImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.set_sequence_compression_scheme — canonical: assign UAnimBoneCompressionSettings asset to UAnimSequence::BoneCompressionSettings + RequestSyncAnimRecompression()"));
+}
+
+FSageToolDispatch::FOutcome AddMontageBranchingPointImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.add_montage_branching_point — canonical: Persona montage editor (BranchingPointMarkers is private in UE 5.7)"));
+}
+
+FSageToolDispatch::FOutcome SetMontageBlendCurveImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.set_montage_blend_curve — canonical: assign UCurveFloat to UAnimMontage::BlendInProfile / BlendOutProfile (pending Sage impl)"));
+}
+
+FSageToolDispatch::FOutcome SetMontageSectionLoopImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path, Section;
+    bool bLoop = true;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("section_name"), Section)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'section_name'"));
+    Args->TryGetBoolField(TEXT("loop"), bLoop);
+    UAnimMontage* M = Cast<UAnimMontage>(ResolveAsset(Path));
+    if (!M) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimMontage"));
+
+    FScopedTransaction Tx(LOCTEXT("SetSecLoop", "Sage: Set Section Loop"));
+    M->Modify();
+    bool bFound = false;
+    for (FCompositeSection& S : M->CompositeSections)
+    {
+        if (S.SectionName == FName(*Section))
+        {
+            S.NextSectionName = bLoop ? S.SectionName : NAME_None;
+            bFound = true;
+            break;
+        }
+    }
+    M->MarkPackageDirty();
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("section_name"), Section);
+    R->SetBoolField(TEXT("loop"), bLoop);
+    if (!bFound)
+    {
+        // Surface the missing section explicitly — silent success was the
+        // pattern that hid the typo'd "Default" → "Defualt" bug in dogfooding.
+        R->SetStringField(TEXT("_warning"),
+            FString::Printf(TEXT("no section named '%s'"), *Section));
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetMontageSectionNextImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path, Section, Next;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("section_name"), Section)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'section_name'"));
+    Args->TryGetStringField(TEXT("next_section_name"), Next);
+    UAnimMontage* M = Cast<UAnimMontage>(ResolveAsset(Path));
+    if (!M) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimMontage"));
+
+    FScopedTransaction Tx(LOCTEXT("SetSecNext", "Sage: Set Section Next"));
+    M->Modify();
+    bool bFound = false;
+    for (FCompositeSection& S : M->CompositeSections)
+    {
+        if (S.SectionName == FName(*Section))
+        {
+            S.NextSectionName = Next.IsEmpty() ? NAME_None : FName(*Next);
+            bFound = true;
+            break;
+        }
+    }
+    M->MarkPackageDirty();
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("section_name"), Section);
+    R->SetStringField(TEXT("next_section_name"), Next);
+    if (!bFound)
+    {
+        R->SetStringField(TEXT("_warning"),
+            FString::Printf(TEXT("no section named '%s'"), *Section));
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome CopyAnimationCurvesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.copy_animation_curves — canonical: IAnimationDataController curve mutation API on the destination sequence"));
+}
+
+// ===========================================================================
+// Cluster I — Skeleton authoring
+// ===========================================================================
+
+FSageToolDispatch::FOutcome AddSkeletonSocketImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path, SocketName, ParentBone;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("socket_name"), SocketName)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'socket_name'"));
+    if (!Args->TryGetStringField(TEXT("parent_bone"), ParentBone)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'parent_bone'"));
+    USkeleton* Skel = Cast<USkeleton>(ResolveAsset(Path));
+    if (!Skel) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a USkeleton"));
+
+    // Validate parent bone exists — silently accepting an invalid bone leaves
+    // the socket orphaned (BoneName points nowhere) and editor crashes when
+    // selecting the socket in Persona.
+    const FName ParentBoneName(*ParentBone);
+    if (Skel->GetReferenceSkeleton().FindBoneIndex(ParentBoneName) == INDEX_NONE)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("bone '%s' not found in skeleton ref hierarchy"), *ParentBone));
+    }
+
+    // Reject duplicate socket name (USkeletalMeshSocket lookup is by name —
+    // duplicates make Persona's socket-list ambiguous).
+    const FName SocketFName(*SocketName);
+    for (USkeletalMeshSocket* Existing : Skel->Sockets)
+    {
+        if (Existing && Existing->SocketName == SocketFName)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("socket '%s' already exists"), *SocketName));
+        }
+    }
+
+    FScopedTransaction Tx(LOCTEXT("AddSkSocket", "Sage: Add Skeleton Socket"));
+    Skel->Modify();
+    USkeletalMeshSocket* Sock = NewObject<USkeletalMeshSocket>(Skel);
+    Sock->SocketName = SocketFName;
+    Sock->BoneName   = ParentBoneName;
+
+    // Optional transform — schema accepts {location:[x,y,z], rotation:[p,y,r],
+    // scale:[x,y,z]}. Fill USkeletalMeshSocket::Relative* fields. Without
+    // these, sockets default to identity which is rarely what callers want.
+    const TSharedPtr<FJsonObject>* TransformObj = nullptr;
+    if (Args->TryGetObjectField(TEXT("transform"), TransformObj) && TransformObj && (*TransformObj).IsValid())
+    {
+        const TArray<TSharedPtr<FJsonValue>>* LocArr = nullptr;
+        if ((*TransformObj)->TryGetArrayField(TEXT("location"), LocArr) && LocArr && LocArr->Num() >= 3)
+        {
+            Sock->RelativeLocation = FVector(
+                (*LocArr)[0]->AsNumber(),
+                (*LocArr)[1]->AsNumber(),
+                (*LocArr)[2]->AsNumber());
+        }
+        const TArray<TSharedPtr<FJsonValue>>* RotArr = nullptr;
+        if ((*TransformObj)->TryGetArrayField(TEXT("rotation"), RotArr) && RotArr && RotArr->Num() >= 3)
+        {
+            // Schema [pitch, yaw, roll] → FRotator(P, Y, R).
+            Sock->RelativeRotation = FRotator(
+                (*RotArr)[0]->AsNumber(),
+                (*RotArr)[1]->AsNumber(),
+                (*RotArr)[2]->AsNumber());
+        }
+        const TArray<TSharedPtr<FJsonValue>>* ScaleArr = nullptr;
+        if ((*TransformObj)->TryGetArrayField(TEXT("scale"), ScaleArr) && ScaleArr && ScaleArr->Num() >= 3)
+        {
+            Sock->RelativeScale = FVector(
+                (*ScaleArr)[0]->AsNumber(),
+                (*ScaleArr)[1]->AsNumber(),
+                (*ScaleArr)[2]->AsNumber());
+        }
+    }
+
+    Skel->Sockets.Add(Sock);
+    Skel->MarkPackageDirty();
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("socket_name"), SocketName);
+    R->SetStringField(TEXT("parent_bone"), ParentBone);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome RemoveSkeletonSocketImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path, SocketName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("socket_name"), SocketName)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'socket_name'"));
+    USkeleton* Skel = Cast<USkeleton>(ResolveAsset(Path));
+    if (!Skel) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a USkeleton"));
+
+    FScopedTransaction Tx(LOCTEXT("RemoveSkSocket", "Sage: Remove Skeleton Socket"));
+    Skel->Modify();
+    int32 RemovedCount = 0;
+    for (int32 i = Skel->Sockets.Num() - 1; i >= 0; --i)
+    {
+        if (Skel->Sockets[i] && Skel->Sockets[i]->SocketName == FName(*SocketName))
+        {
+            Skel->Sockets.RemoveAt(i);
+            ++RemovedCount;
+        }
+    }
+    Skel->MarkPackageDirty();
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("socket_name"),   SocketName);
+    R->SetBoolField  (TEXT("removed"),       RemovedCount > 0);
+    // removed_count is more useful when duplicates ever existed (e.g. legacy
+    // skeleton imported from before AddSkeletonSocketImpl's dup-name guard).
+    R->SetNumberField(TEXT("removed_count"), RemovedCount);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AddSlotImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path, SlotName, Group = TEXT("DefaultGroup");
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("slot_name"), SlotName)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'slot_name'"));
+    Args->TryGetStringField(TEXT("group_name"), Group);
+    USkeleton* Skel = Cast<USkeleton>(ResolveAsset(Path));
+    if (!Skel) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a USkeleton"));
+
+    FScopedTransaction Tx(LOCTEXT("AddSlot", "Sage: Add Anim Slot"));
+    Skel->Modify();
+    // Engine USkeleton requires the slot to be in the registered slot list
+    // BEFORE SetSlotGroupName re-binds it to a group. Calling SetSlotGroupName
+    // alone on an unregistered slot is a silent no-op in some 5.7 paths
+    // (depending on whether the slot already lives in another group).
+    // RegisterSlotNode is idempotent — returns true on first call, false
+    // when already registered, never throws.
+    const FName SlotFName(*SlotName);
+    const bool bRegistered = Skel->RegisterSlotNode(SlotFName);
+    Skel->SetSlotGroupName(SlotFName, FName(*Group));
+    Skel->MarkPackageDirty();
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("slot_name"),  SlotName);
+    R->SetStringField(TEXT("group"),      Group);
+    R->SetBoolField  (TEXT("registered"), bRegistered);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AddSlotGroupImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path, Group;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("group_name"), Group)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'group_name'"));
+    USkeleton* Skel = Cast<USkeleton>(ResolveAsset(Path));
+    if (!Skel) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a USkeleton"));
+
+    FScopedTransaction Tx(LOCTEXT("AddSlotGroup", "Sage: Add Slot Group"));
+    Skel->Modify();
+    Skel->AddSlotGroupName(FName(*Group));
+    Skel->MarkPackageDirty();
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("group_name"), Group);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetBoneRetargetingImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.set_bone_translation_retargeting — pending Sage impl"));
+}
+
+FSageToolDispatch::FOutcome AddSkeletonCurveMetadataImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32601,
+        TEXT("[NOT IMPLEMENTED] animation.add_skeleton_curve_metadata — pending Sage impl"));
+}
+
+// ---------------------------------------------------------------------------
+// character.set_morph_target
+// ---------------------------------------------------------------------------
+FSageToolDispatch::FOutcome CharacterSetMorphTargetImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    if (!GetPieWorldOrNull())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("requires PIE world"));
+    }
+    FString ActorPath, TargetName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("actor"), ActorPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor'"));
+    }
+    if (!Args->TryGetStringField(TEXT("target_name"), TargetName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'target_name'"));
+    }
+    double Value = 0.0;
+    Args->TryGetNumberField(TEXT("value"), Value);
+
+    AActor* Actor = ResolveActorRuntime(ActorPath);
+    USkeletalMeshComponent* Mesh = FindSkeletalMeshComp(Actor);
+    if (!Mesh)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("actor has no SkeletalMeshComponent"));
+    }
+    Mesh->SetMorphTarget(FName(*TargetName), static_cast<float>(Value));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("actor"),       Actor->GetPathName());
+    R->SetStringField(TEXT("target_name"), TargetName);
+    R->SetNumberField(TEXT("value"),       Value);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1900,6 +5612,90 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.add_pose_search_sequence"),   GT(&AddPoseSearchSequenceImpl));
     Dispatch.RegisterHandler(TEXT("animation.build_pose_search_index"),    GT(&BuildPoseSearchIndexImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_sequence_properties"),    GT(&SetSequencePropertiesImpl));
+    // Phase 4-r6 (Lyra Sage Gap #17/#18 — new tools)
+    Dispatch.RegisterHandler(TEXT("animation.create_anim_notify"),         GT(&CreateAnimNotifyImpl));
+    Dispatch.RegisterHandler(TEXT("animation.create_anim_notify_state"),   GT(&CreateAnimNotifyStateImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_blendspace_sample"),      GT(&AddBlendSpaceSampleImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_blendspace_samples"),     GT(&SetBlendSpaceSamplesImpl));
+    // Phase 4-r6 Cluster A (AnimGraph node creation core)
+    Dispatch.RegisterHandler(TEXT("animation.add_animgraph_node"),         GT(&AddAnimGraphNodeImpl));
+    Dispatch.RegisterHandler(TEXT("animation.remove_animgraph_node"),      GT(&RemoveAnimGraphNodeImpl));
+    Dispatch.RegisterHandler(TEXT("animation.connect_pose_pin"),           GT(&ConnectPosePinImpl));
+    Dispatch.RegisterHandler(TEXT("animation.disconnect_pose_pin"),        GT(&DisconnectPosePinImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_anim_node_property"),     GT(&SetAnimNodePropertyImpl));
+    Dispatch.RegisterHandler(TEXT("animation.bind_anim_node_property"),    GT(&BindAnimNodePropertyImpl));
+    Dispatch.RegisterHandler(TEXT("animation.list_animgraph_nodes"),       GT(&ListAnimGraphNodesImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_animgraph_root_pose"),    GT(&SetAnimGraphRootPoseImpl));
+    // Phase 4-r6 Cluster B (AnimGraph convenience nodes)
+    Dispatch.RegisterHandler(TEXT("animation.add_sequence_player"),        GT(&AddSequencePlayerImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_blendspace_player"),      GT(&AddBlendSpacePlayerImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_state_machine_node"),     GT(&AddStateMachineNodeImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_blend_list_by_bool"),     GT(&AddBlendListByBoolImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_blend_list_by_enum"),     GT(&AddBlendListByEnumImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_layered_blend_per_bone"), GT(&AddLayeredBlendPerBoneImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_apply_additive"),         GT(&AddApplyAdditiveImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_two_bone_ik"),            GT(&AddTwoBoneIKImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_skeletal_control_node"),  GT(&AddSkeletalControlNodeImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_slot_node"),              GT(&AddSlotNodeImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_link_anim_layer"),        GT(&AddLinkAnimLayerImpl));
+    // Phase 4-r6 Cluster J (runtime character.* — PIE-only)
+    Dispatch.RegisterHandler(TEXT("character.play_root_motion_source"),    GT(&CharacterPlayRootMotionSourceImpl));
+    Dispatch.RegisterHandler(TEXT("character.remove_root_motion_source"),  GT(&CharacterRemoveRootMotionSourceImpl));
+    Dispatch.RegisterHandler(TEXT("character.play_montage"),               GT(&CharacterPlayMontageImpl));
+    Dispatch.RegisterHandler(TEXT("character.stop_montage"),               GT(&CharacterStopMontageImpl));
+    Dispatch.RegisterHandler(TEXT("character.set_anim_instance_class"),    GT(&CharacterSetAnimInstanceClassImpl));
+    Dispatch.RegisterHandler(TEXT("character.list_active_montages"),       GT(&CharacterListActiveMontagesImpl));
+    Dispatch.RegisterHandler(TEXT("character.set_animation_mode"),         GT(&CharacterSetAnimationModeImpl));
+    Dispatch.RegisterHandler(TEXT("character.play_animation"),             GT(&CharacterPlayAnimationImpl));
+    Dispatch.RegisterHandler(TEXT("character.set_morph_target"),           GT(&CharacterSetMorphTargetImpl));
+    // Phase 4-r6 Cluster C ek (state machine deep CRUD)
+    Dispatch.RegisterHandler(TEXT("animation.add_conduit"),                GT(&AddConduitImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_state_alias"),            GT(&AddStateAliasImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_transition_priority"),    GT(&SetTransitionPriorityImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_state_machine_initial_state"), GT(&SetStateMachineInitialStateImpl));
+    Dispatch.RegisterHandler(TEXT("animation.list_states"),                GT(&ListStatesImpl));
+    Dispatch.RegisterHandler(TEXT("animation.list_transitions"),           GT(&ListTransitionsImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_transition_rule"),        GT(&SetTransitionRuleImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_state_entered_event"),    GT(&SetStateEnteredEventImpl));
+    // Phase 4-r6 Cluster D ek (anim notify track CRUD)
+    Dispatch.RegisterHandler(TEXT("animation.add_notify_track"),           GT(&AddNotifyTrackImpl));
+    Dispatch.RegisterHandler(TEXT("animation.list_notifies"),              GT(&ListNotifiesImpl));
+    Dispatch.RegisterHandler(TEXT("animation.remove_notify"),              GT(&RemoveNotifyImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_notify_position"),        GT(&SetNotifyPositionImpl));
+    // Phase 4-r6 Cluster E ek (blendspace axis + sample CRUD)
+    Dispatch.RegisterHandler(TEXT("animation.remove_blendspace_sample"),   GT(&RemoveBlendSpaceSampleImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_blendspace_axis"),        GT(&SetBlendSpaceAxisImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_blendspace_smoothing"),   GT(&SetBlendSpaceSmoothingImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_blendspace_target_weight_interpolation"), GT(&SetBlendSpaceTargetWeightImpl));
+    Dispatch.RegisterHandler(TEXT("animation.read_blendspace_samples"),    GT(&ReadBlendSpaceSamplesImpl));
+    // Phase 4-r6 Cluster F (sync markers + curve compression + modifier)
+    Dispatch.RegisterHandler(TEXT("animation.add_sync_marker"),            GT(&AddSyncMarkerImpl));
+    Dispatch.RegisterHandler(TEXT("animation.remove_sync_marker"),         GT(&RemoveSyncMarkerImpl));
+    Dispatch.RegisterHandler(TEXT("animation.list_sync_markers"),          GT(&ListSyncMarkersImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_curve_compression"),      GT(&SetCurveCompressionImpl));
+    Dispatch.RegisterHandler(TEXT("animation.run_animation_modifier"),     GT(&RunAnimationModifierImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_animation_modifier"),     GT(&AddAnimationModifierImpl));
+    // Phase 4-r6 Cluster G (anim layer interface — stubbed pending impl)
+    Dispatch.RegisterHandler(TEXT("animation.create_anim_layer_interface"),GT(&CreateAnimLayerInterfaceImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_layer_function"),         GT(&AddLayerFunctionImpl));
+    Dispatch.RegisterHandler(TEXT("animation.implement_anim_layer_interface"), GT(&ImplementAnimLayerInterfaceImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_linked_anim_layer"),      GT(&SetLinkedAnimLayerImpl));
+    Dispatch.RegisterHandler(TEXT("animation.list_implemented_layers"),    GT(&ListImplementedLayersImpl));
+    // Phase 4-r6 Cluster H (sequence/montage advanced)
+    Dispatch.RegisterHandler(TEXT("animation.set_sequence_additive_settings"), GT(&SetSequenceAdditiveImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_sequence_compression_scheme"), GT(&SetSequenceCompressionImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_montage_branching_point"),GT(&AddMontageBranchingPointImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_montage_blend_curve"),    GT(&SetMontageBlendCurveImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_montage_section_loop"),   GT(&SetMontageSectionLoopImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_montage_section_next"),   GT(&SetMontageSectionNextImpl));
+    Dispatch.RegisterHandler(TEXT("animation.copy_animation_curves"),      GT(&CopyAnimationCurvesImpl));
+    // Phase 4-r6 Cluster I (skeleton authoring)
+    Dispatch.RegisterHandler(TEXT("animation.add_skeleton_socket"),        GT(&AddSkeletonSocketImpl));
+    Dispatch.RegisterHandler(TEXT("animation.remove_skeleton_socket"),     GT(&RemoveSkeletonSocketImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_slot"),                   GT(&AddSlotImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_slot_group"),             GT(&AddSlotGroupImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_bone_translation_retargeting"), GT(&SetBoneRetargetingImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_skeleton_curve_metadata"),GT(&AddSkeletonCurveMetadataImpl));
 }
 
 #undef LOCTEXT_NAMESPACE
