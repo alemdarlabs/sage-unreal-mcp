@@ -31,6 +31,7 @@
 #include "PhysicsEngine/PhysicsAsset.h"
 #include "ScopedTransaction.h"
 #include "UObject/Package.h"
+#include "UObject/UnrealType.h"
 
 // AnimGraph + state machine authoring (Phase 4-r6, Lyra Sage Gap #16/#17/#18)
 #include "AnimationGraph.h"
@@ -38,6 +39,7 @@
 #include "AnimationStateMachineGraph.h"
 #include "AnimationStateMachineSchema.h"
 #include "AnimGraphNode_Base.h"
+#include "AnimGraphNode_TransitionResult.h"
 #include "AnimGraphNode_StateMachine.h"
 #include "AnimGraphNode_StateMachineBase.h"
 #include "AnimGraphNode_SequencePlayer.h"
@@ -56,6 +58,11 @@
 #include "Animation/AnimNodeBase.h"  // FPoseLink for pose-pin category check
 #include "BoneControllers/AnimNode_SkeletalControlBase.h"  // FComponentSpacePoseLink
 #include "Animation/AnimNode_SequencePlayer.h"  // FAnimNode_SequencePlayer for inner Node mutation
+#include "EdGraphSchema_K2.h"
+#include "K2Node_CallFunction.h"
+#include "K2Node_VariableGet.h"
+#include "Kismet/KismetMathLibrary.h"
+#include "Kismet/KismetStringLibrary.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Kismet2/Kismet2NameValidators.h"  // FKismetNameValidator for RenameGraphWithSuggestion
@@ -254,6 +261,1252 @@ UEdGraphPin* FindFirstInputPosePin(UEdGraphNode* Node)
         if (Pin && Pin->Direction == EGPD_Input && IsPosePin(Pin)) return Pin;
     }
     return nullptr;
+}
+
+UEdGraphPin* FindFirstInputPinByCategory(UEdGraphNode* Node, const FName& Category)
+{
+    if (!Node) return nullptr;
+    for (UEdGraphPin* Pin : Node->Pins)
+    {
+        if (Pin && Pin->Direction == EGPD_Input
+            && Pin->PinType.PinCategory == Category)
+        {
+            return Pin;
+        }
+    }
+    return nullptr;
+}
+
+UEdGraphPin* FindFirstOutputPinByCategory(UEdGraphNode* Node, const FName& Category)
+{
+    if (!Node) return nullptr;
+    for (UEdGraphPin* Pin : Node->Pins)
+    {
+        if (Pin && Pin->Direction == EGPD_Output
+            && Pin->PinType.PinCategory == Category)
+        {
+            return Pin;
+        }
+    }
+    return nullptr;
+}
+
+FString DescribePinsForError(const UEdGraphNode* Node)
+{
+    if (!Node) return TEXT("<null node>");
+    FString Out = FString::Printf(TEXT("%s pins=["), *Node->GetClass()->GetName());
+    bool bFirst = true;
+    for (const UEdGraphPin* Pin : Node->Pins)
+    {
+        if (!Pin) continue;
+        if (!bFirst) Out += TEXT("; ");
+        bFirst = false;
+        Out += FString::Printf(TEXT("%s dir=%s cat=%s sub=%s links=%d"),
+            *Pin->PinName.ToString(),
+            Pin->Direction == EGPD_Input ? TEXT("in") : TEXT("out"),
+            *Pin->PinType.PinCategory.ToString(),
+            *Pin->PinType.PinSubCategory.ToString(),
+            Pin->LinkedTo.Num());
+    }
+    Out += TEXT("]");
+    return Out;
+}
+
+TSharedPtr<FJsonObject> PinSummaryJson(const UEdGraphPin* Pin)
+{
+    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+    if (!Pin)
+    {
+        Obj->SetBoolField(TEXT("found"), false);
+        return Obj;
+    }
+    Obj->SetBoolField(TEXT("found"), true);
+    Obj->SetStringField(TEXT("name"), Pin->PinName.ToString());
+    Obj->SetStringField(TEXT("direction"), Pin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
+    Obj->SetStringField(TEXT("category"), Pin->PinType.PinCategory.ToString());
+    Obj->SetStringField(TEXT("subcategory"), Pin->PinType.PinSubCategory.ToString());
+    Obj->SetStringField(TEXT("default_value"), Pin->DefaultValue);
+    Obj->SetNumberField(TEXT("link_count"), Pin->LinkedTo.Num());
+    TArray<TSharedPtr<FJsonValue>> Links;
+    for (const UEdGraphPin* Linked : Pin->LinkedTo)
+    {
+        if (!Linked) continue;
+        TSharedPtr<FJsonObject> Link = MakeShared<FJsonObject>();
+        Link->SetStringField(TEXT("pin"), Linked->PinName.ToString());
+        if (const UEdGraphNode* Owner = Linked->GetOwningNode())
+        {
+            Link->SetStringField(TEXT("node_id"), Owner->NodeGuid.ToString(EGuidFormats::Digits));
+            Link->SetStringField(TEXT("node_class"), Owner->GetClass()->GetName());
+        }
+        Links.Add(MakeShared<FJsonValueObject>(Link));
+    }
+    Obj->SetArrayField(TEXT("linked_nodes"), Links);
+    return Obj;
+}
+
+UAnimGraphNode_TransitionResult* FindTransitionResultNode(UAnimationTransitionGraph* Graph)
+{
+    if (!Graph) return nullptr;
+    if (UAnimGraphNode_TransitionResult* Result = Graph->GetResultNode())
+    {
+        return Result;
+    }
+    for (UEdGraphNode* Node : Graph->Nodes)
+    {
+        if (UAnimGraphNode_TransitionResult* Result = Cast<UAnimGraphNode_TransitionResult>(Node))
+        {
+            return Result;
+        }
+    }
+    return nullptr;
+}
+
+UEdGraphPin* FindCanEnterTransitionPin(UAnimGraphNode_TransitionResult* ResultNode)
+{
+    if (!ResultNode) return nullptr;
+    if (UEdGraphPin* Pin = ResultNode->FindPin(TEXT("bCanEnterTransition"), EGPD_Input))
+    {
+        return Pin;
+    }
+    return FindFirstInputPinByCategory(ResultNode, UEdGraphSchema_K2::PC_Boolean);
+}
+
+UEdGraphPin* FindBoolReturnPin(UEdGraphNode* Node)
+{
+    if (!Node) return nullptr;
+    if (UEdGraphPin* Pin = Node->FindPin(UEdGraphSchema_K2::PN_ReturnValue, EGPD_Output))
+    {
+        return Pin;
+    }
+    return FindFirstOutputPinByCategory(Node, UEdGraphSchema_K2::PC_Boolean);
+}
+
+bool ParseLiteralBoolExpression(FString Expression, bool& OutValue)
+{
+    Expression.TrimStartAndEndInline();
+    if (Expression.Equals(TEXT("true"), ESearchCase::IgnoreCase)
+        || Expression == TEXT("1"))
+    {
+        OutValue = true;
+        return true;
+    }
+    if (Expression.Equals(TEXT("false"), ESearchCase::IgnoreCase)
+        || Expression == TEXT("0"))
+    {
+        OutValue = false;
+        return true;
+    }
+    return false;
+}
+
+enum class ETransitionRuleValueKind
+{
+    Unknown,
+    Bool,
+    Int,
+    Int64,
+    Real,
+    String,
+    Name,
+    Byte
+};
+
+FString RuleValueKindName(ETransitionRuleValueKind Kind)
+{
+    switch (Kind)
+    {
+    case ETransitionRuleValueKind::Bool:   return TEXT("bool");
+    case ETransitionRuleValueKind::Int:    return TEXT("int");
+    case ETransitionRuleValueKind::Int64:  return TEXT("int64");
+    case ETransitionRuleValueKind::Real:   return TEXT("real");
+    case ETransitionRuleValueKind::String: return TEXT("string");
+    case ETransitionRuleValueKind::Name:   return TEXT("name");
+    case ETransitionRuleValueKind::Byte:   return TEXT("byte");
+    default:                               return TEXT("unknown");
+    }
+}
+
+bool IsNumericRuleKind(ETransitionRuleValueKind Kind)
+{
+    return Kind == ETransitionRuleValueKind::Int
+        || Kind == ETransitionRuleValueKind::Int64
+        || Kind == ETransitionRuleValueKind::Real
+        || Kind == ETransitionRuleValueKind::Byte;
+}
+
+ETransitionRuleValueKind RuleKindFromPinType(const FEdGraphPinType& PinType)
+{
+    const FName& Category = PinType.PinCategory;
+    if (Category == UEdGraphSchema_K2::PC_Boolean) return ETransitionRuleValueKind::Bool;
+    if (Category == UEdGraphSchema_K2::PC_Int)     return ETransitionRuleValueKind::Int;
+    if (Category == UEdGraphSchema_K2::PC_Int64)   return ETransitionRuleValueKind::Int64;
+    if (Category == UEdGraphSchema_K2::PC_Real
+        || Category == UEdGraphSchema_K2::PC_Float
+        || Category == UEdGraphSchema_K2::PC_Double)
+    {
+        return ETransitionRuleValueKind::Real;
+    }
+    if (Category == UEdGraphSchema_K2::PC_String) return ETransitionRuleValueKind::String;
+    if (Category == UEdGraphSchema_K2::PC_Name)   return ETransitionRuleValueKind::Name;
+    if (Category == UEdGraphSchema_K2::PC_Byte)   return ETransitionRuleValueKind::Byte;
+    return ETransitionRuleValueKind::Unknown;
+}
+
+struct FTransitionRuleValue
+{
+    ETransitionRuleValueKind Kind = ETransitionRuleValueKind::Unknown;
+    UEdGraphPin* Pin = nullptr;
+    FString DefaultValue;
+    bool bLiteral = false;
+    bool bIntegralNumber = false;
+    FString Debug;
+};
+
+struct FTransitionRuleBuildContext
+{
+    UAnimBlueprint* AnimBP = nullptr;
+    UAnimationTransitionGraph* RuleGraph = nullptr;
+    const UEdGraphSchema* Schema = nullptr;
+    const UEdGraphSchema_K2* K2Schema = nullptr;
+    int32 BaseX = 0;
+    int32 BaseY = 0;
+    int32 NodeIndex = 0;
+    FString Error;
+    TArray<TSharedPtr<FJsonValue>> AuthoredNodes;
+};
+
+FTransitionRuleValue BuildTransitionRuleExpression(FTransitionRuleBuildContext& Ctx, const TSharedPtr<FJsonValue>& Expr);
+FTransitionRuleValue BuildTransitionRuleStringExpression(FTransitionRuleBuildContext& Ctx, FString Expression);
+
+bool HasTransitionRuleVariable(UAnimBlueprint* AnimBP, const FName& VarName)
+{
+    if (!AnimBP || VarName.IsNone()) return false;
+    if (FBlueprintEditorUtils::FindNewVariableIndex(AnimBP, VarName) != INDEX_NONE)
+    {
+        return true;
+    }
+    UClass* Classes[] = {
+        AnimBP->SkeletonGeneratedClass,
+        AnimBP->GeneratedClass,
+        AnimBP->ParentClass
+    };
+    for (UClass* Cls : Classes)
+    {
+        if (Cls && FindFProperty<FProperty>(Cls, VarName))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void PositionTransitionRuleNode(FTransitionRuleBuildContext& Ctx, UEdGraphNode* Node)
+{
+    if (!Node) return;
+    const int32 Column = Ctx.NodeIndex % 4;
+    const int32 Row = Ctx.NodeIndex / 4;
+    Node->NodePosX = Ctx.BaseX - (Column * 300);
+    Node->NodePosY = Ctx.BaseY + (Row * 140);
+    ++Ctx.NodeIndex;
+}
+
+void AddAuthoredRuleNode(FTransitionRuleBuildContext& Ctx, const UEdGraphNode* Node, const FString& Kind)
+{
+    if (!Node) return;
+    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+    Obj->SetStringField(TEXT("node_id"), Node->NodeGuid.ToString(EGuidFormats::Digits));
+    Obj->SetStringField(TEXT("kind"), Kind);
+    Obj->SetStringField(TEXT("class"), Node->GetClass()->GetName());
+    Obj->SetNumberField(TEXT("x"), Node->NodePosX);
+    Obj->SetNumberField(TEXT("y"), Node->NodePosY);
+    Ctx.AuthoredNodes.Add(MakeShared<FJsonValueObject>(Obj));
+}
+
+UK2Node_CallFunction* CreateTransitionRuleFunctionNode(
+    FTransitionRuleBuildContext& Ctx,
+    UClass* FunctionOwner,
+    const FName& FunctionName,
+    const FString& Kind)
+{
+    if (!Ctx.RuleGraph)
+    {
+        Ctx.Error = TEXT("rule graph missing");
+        return nullptr;
+    }
+    if (!FunctionOwner)
+    {
+        Ctx.Error = FString::Printf(TEXT("function owner missing for %s"), *FunctionName.ToString());
+        return nullptr;
+    }
+    UFunction* Fn = FunctionOwner->FindFunctionByName(FunctionName);
+    if (!Fn)
+    {
+        Ctx.Error = FString::Printf(TEXT("function not found: %s.%s"),
+            *FunctionOwner->GetName(), *FunctionName.ToString());
+        return nullptr;
+    }
+
+    UK2Node_CallFunction* Node = NewObject<UK2Node_CallFunction>(Ctx.RuleGraph);
+    Node->CreateNewGuid();
+    PositionTransitionRuleNode(Ctx, Node);
+    Node->SetFromFunction(Fn);
+    Ctx.RuleGraph->AddNode(Node, /*bSelectNewNode=*/false, /*bFromUI=*/true);
+    Node->AllocateDefaultPins();
+    Node->PostPlacedNewNode();
+    AddAuthoredRuleNode(Ctx, Node, Kind);
+    return Node;
+}
+
+UEdGraphPin* FindVariableGetOutputPin(UK2Node_VariableGet* Node, const FName& VarName)
+{
+    if (!Node) return nullptr;
+    if (UEdGraphPin* Pin = Node->FindPin(VarName, EGPD_Output))
+    {
+        return Pin;
+    }
+    for (UEdGraphPin* Pin : Node->Pins)
+    {
+        if (Pin && Pin->Direction == EGPD_Output
+            && Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+        {
+            return Pin;
+        }
+    }
+    return nullptr;
+}
+
+FTransitionRuleValue BuildTransitionRuleVariable(FTransitionRuleBuildContext& Ctx, const FString& VarName)
+{
+    FTransitionRuleValue Out;
+    const FName VarFName(*VarName);
+    if (!HasTransitionRuleVariable(Ctx.AnimBP, VarFName))
+    {
+        Ctx.Error = FString::Printf(TEXT("transition rule variable not found on AnimBlueprint/self: %s"), *VarName);
+        return Out;
+    }
+
+    UK2Node_VariableGet* Node = NewObject<UK2Node_VariableGet>(Ctx.RuleGraph);
+    Node->CreateNewGuid();
+    PositionTransitionRuleNode(Ctx, Node);
+    Node->VariableReference.SetSelfMember(VarFName);
+    Ctx.RuleGraph->AddNode(Node, /*bSelectNewNode=*/false, /*bFromUI=*/true);
+    Node->AllocateDefaultPins();
+    Node->PostPlacedNewNode();
+    AddAuthoredRuleNode(Ctx, Node, FString::Printf(TEXT("var:%s"), *VarName));
+
+    UEdGraphPin* OutputPin = FindVariableGetOutputPin(Node, VarFName);
+    if (!OutputPin)
+    {
+        Ctx.Error = FString::Printf(TEXT("variable get output pin lookup failed for '%s': node=%s"),
+            *VarName, *DescribePinsForError(Node));
+        return Out;
+    }
+
+    Out.Kind = RuleKindFromPinType(OutputPin->PinType);
+    Out.Pin = OutputPin;
+    Out.bLiteral = false;
+    Out.Debug = FString::Printf(TEXT("var:%s"), *VarName);
+    if (Out.Kind == ETransitionRuleValueKind::Unknown)
+    {
+        Ctx.Error = FString::Printf(TEXT("unsupported variable pin type for '%s': category=%s subcategory=%s"),
+            *VarName,
+            *OutputPin->PinType.PinCategory.ToString(),
+            *OutputPin->PinType.PinSubCategory.ToString());
+    }
+    return Out;
+}
+
+FString DefaultStringFromNumber(double Number, bool bIntegral)
+{
+    if (bIntegral)
+    {
+        return FString::Printf(TEXT("%lld"), static_cast<long long>(FMath::RoundToDouble(Number)));
+    }
+    return FString::SanitizeFloat(Number);
+}
+
+FTransitionRuleValue MakeBoolLiteralRuleValue(bool bValue)
+{
+    FTransitionRuleValue Out;
+    Out.Kind = ETransitionRuleValueKind::Bool;
+    Out.DefaultValue = bValue ? TEXT("true") : TEXT("false");
+    Out.bLiteral = true;
+    Out.Debug = Out.DefaultValue;
+    return Out;
+}
+
+FTransitionRuleValue MakeNumberLiteralRuleValue(double Number)
+{
+    FTransitionRuleValue Out;
+    const double Rounded = FMath::RoundToDouble(Number);
+    Out.bIntegralNumber = FMath::IsNearlyEqual(Number, Rounded);
+    Out.Kind = Out.bIntegralNumber ? ETransitionRuleValueKind::Int : ETransitionRuleValueKind::Real;
+    Out.DefaultValue = DefaultStringFromNumber(Number, Out.bIntegralNumber);
+    Out.bLiteral = true;
+    Out.Debug = Out.DefaultValue;
+    return Out;
+}
+
+FTransitionRuleValue MakeStringLiteralRuleValue(const FString& Value, ETransitionRuleValueKind Kind = ETransitionRuleValueKind::String)
+{
+    FTransitionRuleValue Out;
+    Out.Kind = Kind;
+    Out.DefaultValue = Value;
+    Out.bLiteral = true;
+    Out.Debug = FString::Printf(TEXT("%s:%s"), *RuleValueKindName(Kind), *Value);
+    return Out;
+}
+
+bool IsNumericToken(const FString& Token, double& OutNumber)
+{
+    if (Token.IsEmpty()) return false;
+    bool bHasDigit = false;
+    bool bHasDot = false;
+    for (int32 Index = 0; Index < Token.Len(); ++Index)
+    {
+        const TCHAR Ch = Token[Index];
+        if ((Ch == TEXT('-') || Ch == TEXT('+')) && Index == 0)
+        {
+            continue;
+        }
+        if (Ch == TEXT('.'))
+        {
+            if (bHasDot) return false;
+            bHasDot = true;
+            continue;
+        }
+        if (!FChar::IsDigit(Ch))
+        {
+            return false;
+        }
+        bHasDigit = true;
+    }
+    if (!bHasDigit) return false;
+    OutNumber = FCString::Atod(*Token);
+    return true;
+}
+
+bool IsQuotedToken(const FString& Token)
+{
+    return Token.Len() >= 2
+        && ((Token[0] == TEXT('"') && Token[Token.Len() - 1] == TEXT('"'))
+            || (Token[0] == TEXT('\'') && Token[Token.Len() - 1] == TEXT('\'')));
+}
+
+FString UnquoteToken(FString Token)
+{
+    Token.TrimStartAndEndInline();
+    if (IsQuotedToken(Token))
+    {
+        Token = Token.Mid(1, Token.Len() - 2);
+        Token.ReplaceInline(TEXT("\\\""), TEXT("\""));
+        Token.ReplaceInline(TEXT("\\'"), TEXT("'"));
+    }
+    return Token;
+}
+
+FTransitionRuleValue BuildLiteralJsonValue(const TSharedPtr<FJsonValue>& Value)
+{
+    if (!Value.IsValid())
+    {
+        return FTransitionRuleValue();
+    }
+    switch (Value->Type)
+    {
+    case EJson::Boolean:
+        return MakeBoolLiteralRuleValue(Value->AsBool());
+    case EJson::Number:
+        return MakeNumberLiteralRuleValue(Value->AsNumber());
+    case EJson::String:
+        return MakeStringLiteralRuleValue(Value->AsString());
+    default:
+        return FTransitionRuleValue();
+    }
+}
+
+bool CoerceLiteralForPin(const FTransitionRuleValue& InValue, const UEdGraphPin* TargetPin, FTransitionRuleValue& OutValue, FString& OutError)
+{
+    OutValue = InValue;
+    if (!InValue.bLiteral || !TargetPin)
+    {
+        return true;
+    }
+
+    const ETransitionRuleValueKind TargetKind = RuleKindFromPinType(TargetPin->PinType);
+    if (TargetKind == ETransitionRuleValueKind::Unknown)
+    {
+        return true;
+    }
+
+    if (TargetKind == InValue.Kind)
+    {
+        return true;
+    }
+
+    if (TargetKind == ETransitionRuleValueKind::Real && IsNumericRuleKind(InValue.Kind))
+    {
+        OutValue.Kind = ETransitionRuleValueKind::Real;
+        return true;
+    }
+
+    if ((TargetKind == ETransitionRuleValueKind::Int
+            || TargetKind == ETransitionRuleValueKind::Int64
+            || TargetKind == ETransitionRuleValueKind::Byte)
+        && IsNumericRuleKind(InValue.Kind))
+    {
+        if (!InValue.bIntegralNumber && InValue.Kind == ETransitionRuleValueKind::Real)
+        {
+            OutError = FString::Printf(TEXT("cannot set non-integral literal '%s' on %s pin '%s'"),
+                *InValue.DefaultValue,
+                *RuleValueKindName(TargetKind),
+                *TargetPin->PinName.ToString());
+            return false;
+        }
+        OutValue.Kind = TargetKind;
+        return true;
+    }
+
+    if (TargetKind == ETransitionRuleValueKind::Name && InValue.Kind == ETransitionRuleValueKind::String)
+    {
+        OutValue.Kind = ETransitionRuleValueKind::Name;
+        return true;
+    }
+
+    OutError = FString::Printf(TEXT("literal type mismatch for pin '%s': value=%s target=%s"),
+        *TargetPin->PinName.ToString(),
+        *RuleValueKindName(InValue.Kind),
+        *RuleValueKindName(TargetKind));
+    return false;
+}
+
+bool ConnectOrSetTransitionRuleInput(
+    FTransitionRuleBuildContext& Ctx,
+    const FTransitionRuleValue& Value,
+    UEdGraphPin* InputPin)
+{
+    if (!InputPin)
+    {
+        Ctx.Error = TEXT("target input pin missing");
+        return false;
+    }
+    InputPin->Modify();
+    InputPin->BreakAllPinLinks();
+
+    if (Value.Pin)
+    {
+        if (!Ctx.Schema || !Ctx.Schema->TryCreateConnection(Value.Pin, InputPin))
+        {
+            Ctx.Error = FString::Printf(TEXT("failed to connect %s to pin '%s': source=%s"),
+                *Value.Debug,
+                *InputPin->PinName.ToString(),
+                *DescribePinsForError(Value.Pin ? Value.Pin->GetOwningNode() : nullptr));
+            return false;
+        }
+        return true;
+    }
+
+    if (!Value.bLiteral)
+    {
+        Ctx.Error = FString::Printf(TEXT("expression '%s' produced neither pin nor literal"), *Value.Debug);
+        return false;
+    }
+    if (!Ctx.K2Schema)
+    {
+        Ctx.Error = TEXT("transition rule graph schema is not UEdGraphSchema_K2; cannot set literal default");
+        return false;
+    }
+
+    FTransitionRuleValue Coerced;
+    FString CoerceError;
+    if (!CoerceLiteralForPin(Value, InputPin, Coerced, CoerceError))
+    {
+        Ctx.Error = CoerceError;
+        return false;
+    }
+    Ctx.K2Schema->TrySetDefaultValue(*InputPin, Coerced.DefaultValue, false);
+    return true;
+}
+
+bool EnsureBoolRuleValue(FTransitionRuleBuildContext& Ctx, const FTransitionRuleValue& Value, const FString& Context)
+{
+    if (Value.Kind == ETransitionRuleValueKind::Bool)
+    {
+        return true;
+    }
+    Ctx.Error = FString::Printf(TEXT("%s must produce bool, got %s (%s)"),
+        *Context, *RuleValueKindName(Value.Kind), *Value.Debug);
+    return false;
+}
+
+FTransitionRuleValue BuildBoolLiteralProducer(FTransitionRuleBuildContext& Ctx, bool bValue)
+{
+    FTransitionRuleValue Literal = MakeBoolLiteralRuleValue(bValue);
+    UK2Node_CallFunction* Node = CreateTransitionRuleFunctionNode(
+        Ctx,
+        UKismetMathLibrary::StaticClass(),
+        GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, EqualEqual_BoolBool),
+        TEXT("literal:bool"));
+    FTransitionRuleValue Out;
+    if (!Node) return Out;
+
+    UEdGraphPin* APin = Node->FindPin(TEXT("A"), EGPD_Input);
+    UEdGraphPin* BPin = Node->FindPin(TEXT("B"), EGPD_Input);
+    UEdGraphPin* ReturnPin = FindBoolReturnPin(Node);
+    if (!APin || !BPin || !ReturnPin)
+    {
+        Ctx.Error = FString::Printf(TEXT("literal bool node pin lookup failed: node=%s"),
+            *DescribePinsForError(Node));
+        return Out;
+    }
+
+    ConnectOrSetTransitionRuleInput(Ctx, Literal, APin);
+    ConnectOrSetTransitionRuleInput(Ctx, MakeBoolLiteralRuleValue(true), BPin);
+    if (!Ctx.Error.IsEmpty()) return Out;
+
+    Out.Kind = ETransitionRuleValueKind::Bool;
+    Out.Pin = ReturnPin;
+    Out.Debug = Literal.Debug;
+    return Out;
+}
+
+FName BoolFunctionNameForOp(const FString& Op)
+{
+    if (Op == TEXT("and") || Op == TEXT("&&")) return GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, BooleanAND);
+    if (Op == TEXT("or")  || Op == TEXT("||")) return GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, BooleanOR);
+    return NAME_None;
+}
+
+FTransitionRuleValue BuildBoolChain(FTransitionRuleBuildContext& Ctx, const FString& Op, const TArray<FTransitionRuleValue>& Values)
+{
+    FTransitionRuleValue Out;
+    if (Values.Num() == 0)
+    {
+        Ctx.Error = FString::Printf(TEXT("'%s' expression requires at least one operand"), *Op);
+        return Out;
+    }
+    if (!EnsureBoolRuleValue(Ctx, Values[0], Op)) return Out;
+    Out = Values[0];
+    if (Values.Num() == 1)
+    {
+        return Out;
+    }
+
+    const FName FunctionName = BoolFunctionNameForOp(Op);
+    if (FunctionName.IsNone())
+    {
+        Ctx.Error = FString::Printf(TEXT("unsupported bool op: %s"), *Op);
+        return FTransitionRuleValue();
+    }
+
+    for (int32 Index = 1; Index < Values.Num(); ++Index)
+    {
+        if (!EnsureBoolRuleValue(Ctx, Values[Index], Op)) return FTransitionRuleValue();
+        UK2Node_CallFunction* Node = CreateTransitionRuleFunctionNode(
+            Ctx,
+            UKismetMathLibrary::StaticClass(),
+            FunctionName,
+            FString::Printf(TEXT("bool:%s"), *Op));
+        if (!Node) return FTransitionRuleValue();
+
+        UEdGraphPin* APin = Node->FindPin(TEXT("A"), EGPD_Input);
+        UEdGraphPin* BPin = Node->FindPin(TEXT("B"), EGPD_Input);
+        UEdGraphPin* ReturnPin = FindBoolReturnPin(Node);
+        if (!APin || !BPin || !ReturnPin)
+        {
+            Ctx.Error = FString::Printf(TEXT("bool op node pin lookup failed: node=%s"), *DescribePinsForError(Node));
+            return FTransitionRuleValue();
+        }
+        if (!ConnectOrSetTransitionRuleInput(Ctx, Out, APin)) return FTransitionRuleValue();
+        if (!ConnectOrSetTransitionRuleInput(Ctx, Values[Index], BPin)) return FTransitionRuleValue();
+
+        Out = FTransitionRuleValue();
+        Out.Kind = ETransitionRuleValueKind::Bool;
+        Out.Pin = ReturnPin;
+        Out.Debug = FString::Printf(TEXT("(%s %s ...)"), *Out.Debug, *Op);
+    }
+    return Out;
+}
+
+FTransitionRuleValue BuildBoolNot(FTransitionRuleBuildContext& Ctx, const FTransitionRuleValue& Value)
+{
+    FTransitionRuleValue Out;
+    if (!EnsureBoolRuleValue(Ctx, Value, TEXT("not"))) return Out;
+    UK2Node_CallFunction* Node = CreateTransitionRuleFunctionNode(
+        Ctx,
+        UKismetMathLibrary::StaticClass(),
+        GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, Not_PreBool),
+        TEXT("bool:not"));
+    if (!Node) return Out;
+
+    UEdGraphPin* APin = Node->FindPin(TEXT("A"), EGPD_Input);
+    UEdGraphPin* ReturnPin = FindBoolReturnPin(Node);
+    if (!APin || !ReturnPin)
+    {
+        Ctx.Error = FString::Printf(TEXT("not node pin lookup failed: node=%s"), *DescribePinsForError(Node));
+        return Out;
+    }
+    if (!ConnectOrSetTransitionRuleInput(Ctx, Value, APin)) return FTransitionRuleValue();
+
+    Out.Kind = ETransitionRuleValueKind::Bool;
+    Out.Pin = ReturnPin;
+    Out.Debug = FString::Printf(TEXT("not(%s)"), *Value.Debug);
+    return Out;
+}
+
+FString NormalizeCompareOp(FString Op)
+{
+    Op.TrimStartAndEndInline();
+    Op.ToLowerInline();
+    if (Op == TEXT("=")) return TEXT("==");
+    if (Op == TEXT("eq")) return TEXT("==");
+    if (Op == TEXT("ne")) return TEXT("!=");
+    if (Op == TEXT("gt")) return TEXT(">");
+    if (Op == TEXT("gte")) return TEXT(">=");
+    if (Op == TEXT("ge")) return TEXT(">=");
+    if (Op == TEXT("lt")) return TEXT("<");
+    if (Op == TEXT("lte")) return TEXT("<=");
+    if (Op == TEXT("le")) return TEXT("<=");
+    return Op;
+}
+
+FName CompareFunctionName(ETransitionRuleValueKind Kind, const FString& Op, UClass*& OutOwner)
+{
+    OutOwner = UKismetMathLibrary::StaticClass();
+    if (Kind == ETransitionRuleValueKind::Bool)
+    {
+        if (Op == TEXT("==")) return GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, EqualEqual_BoolBool);
+        if (Op == TEXT("!=")) return GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, NotEqual_BoolBool);
+        return NAME_None;
+    }
+    if (Kind == ETransitionRuleValueKind::String)
+    {
+        OutOwner = UKismetStringLibrary::StaticClass();
+        if (Op == TEXT("==")) return GET_FUNCTION_NAME_CHECKED(UKismetStringLibrary, EqualEqual_StrStr);
+        if (Op == TEXT("!=")) return GET_FUNCTION_NAME_CHECKED(UKismetStringLibrary, NotEqual_StrStr);
+        return NAME_None;
+    }
+    if (Kind == ETransitionRuleValueKind::Name)
+    {
+        if (Op == TEXT("==")) return GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, EqualEqual_NameName);
+        if (Op == TEXT("!=")) return GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, NotEqual_NameName);
+        return NAME_None;
+    }
+
+    auto NumericName = [&Op](const TCHAR* Prefix, const TCHAR* Suffix) -> FName
+    {
+        if (Op == TEXT("<"))  return FName(FString::Printf(TEXT("Less_%s%s"), Prefix, Suffix));
+        if (Op == TEXT(">"))  return FName(FString::Printf(TEXT("Greater_%s%s"), Prefix, Suffix));
+        if (Op == TEXT("<=")) return FName(FString::Printf(TEXT("LessEqual_%s%s"), Prefix, Suffix));
+        if (Op == TEXT(">=")) return FName(FString::Printf(TEXT("GreaterEqual_%s%s"), Prefix, Suffix));
+        if (Op == TEXT("==")) return FName(FString::Printf(TEXT("EqualEqual_%s%s"), Prefix, Suffix));
+        if (Op == TEXT("!=")) return FName(FString::Printf(TEXT("NotEqual_%s%s"), Prefix, Suffix));
+        return NAME_None;
+    };
+
+    if (Kind == ETransitionRuleValueKind::Real)  return NumericName(TEXT("Double"), TEXT("Double"));
+    if (Kind == ETransitionRuleValueKind::Int64) return NumericName(TEXT("Int64"), TEXT("Int64"));
+    if (Kind == ETransitionRuleValueKind::Byte)  return NumericName(TEXT("Byte"), TEXT("Byte"));
+    return NumericName(TEXT("Int"), TEXT("Int"));
+}
+
+ETransitionRuleValueKind ComparisonKindForValues(
+    FTransitionRuleBuildContext& Ctx,
+    FTransitionRuleValue& Left,
+    FTransitionRuleValue& Right,
+    const FString& Op)
+{
+    const FString NormalizedOp = NormalizeCompareOp(Op);
+    const bool bEqualityOnly = NormalizedOp == TEXT("==") || NormalizedOp == TEXT("!=");
+
+    if (Left.Kind == ETransitionRuleValueKind::String && Right.Kind == ETransitionRuleValueKind::Name && Right.bLiteral)
+    {
+        Right.Kind = ETransitionRuleValueKind::String;
+    }
+    if (Left.Kind == ETransitionRuleValueKind::Name && Right.Kind == ETransitionRuleValueKind::String && Right.bLiteral)
+    {
+        Right.Kind = ETransitionRuleValueKind::Name;
+    }
+
+    if (Left.Kind == ETransitionRuleValueKind::Bool || Right.Kind == ETransitionRuleValueKind::Bool)
+    {
+        if (Left.Kind != ETransitionRuleValueKind::Bool || Right.Kind != ETransitionRuleValueKind::Bool || !bEqualityOnly)
+        {
+            Ctx.Error = FString::Printf(TEXT("bool comparison supports only bool ==/!= bool; got %s %s %s"),
+                *RuleValueKindName(Left.Kind), *Op, *RuleValueKindName(Right.Kind));
+            return ETransitionRuleValueKind::Unknown;
+        }
+        return ETransitionRuleValueKind::Bool;
+    }
+
+    if (Left.Kind == ETransitionRuleValueKind::String || Right.Kind == ETransitionRuleValueKind::String)
+    {
+        if (Left.Kind != ETransitionRuleValueKind::String || Right.Kind != ETransitionRuleValueKind::String || !bEqualityOnly)
+        {
+            Ctx.Error = FString::Printf(TEXT("string comparison supports only string ==/!= string; got %s %s %s"),
+                *RuleValueKindName(Left.Kind), *Op, *RuleValueKindName(Right.Kind));
+            return ETransitionRuleValueKind::Unknown;
+        }
+        return ETransitionRuleValueKind::String;
+    }
+
+    if (Left.Kind == ETransitionRuleValueKind::Name || Right.Kind == ETransitionRuleValueKind::Name)
+    {
+        if (Left.Kind != ETransitionRuleValueKind::Name || Right.Kind != ETransitionRuleValueKind::Name || !bEqualityOnly)
+        {
+            Ctx.Error = FString::Printf(TEXT("name comparison supports only name ==/!= name; got %s %s %s"),
+                *RuleValueKindName(Left.Kind), *Op, *RuleValueKindName(Right.Kind));
+            return ETransitionRuleValueKind::Unknown;
+        }
+        return ETransitionRuleValueKind::Name;
+    }
+
+    if (!IsNumericRuleKind(Left.Kind) || !IsNumericRuleKind(Right.Kind))
+    {
+        Ctx.Error = FString::Printf(TEXT("comparison operands must be compatible bool/string/name/numeric values; got %s %s %s"),
+            *RuleValueKindName(Left.Kind), *Op, *RuleValueKindName(Right.Kind));
+        return ETransitionRuleValueKind::Unknown;
+    }
+
+    if (Left.Kind == ETransitionRuleValueKind::Real || Right.Kind == ETransitionRuleValueKind::Real)
+    {
+        return ETransitionRuleValueKind::Real;
+    }
+    if (Left.Kind == ETransitionRuleValueKind::Int64 || Right.Kind == ETransitionRuleValueKind::Int64)
+    {
+        return ETransitionRuleValueKind::Int64;
+    }
+    if (Left.Kind == ETransitionRuleValueKind::Byte && Right.Kind == ETransitionRuleValueKind::Byte)
+    {
+        return ETransitionRuleValueKind::Byte;
+    }
+    return ETransitionRuleValueKind::Int;
+}
+
+FTransitionRuleValue BuildCompareRuleValue(
+    FTransitionRuleBuildContext& Ctx,
+    FTransitionRuleValue Left,
+    FTransitionRuleValue Right,
+    FString Op)
+{
+    FTransitionRuleValue Out;
+    Op = NormalizeCompareOp(Op);
+    const ETransitionRuleValueKind CompareKind = ComparisonKindForValues(Ctx, Left, Right, Op);
+    if (!Ctx.Error.IsEmpty() || CompareKind == ETransitionRuleValueKind::Unknown)
+    {
+        return Out;
+    }
+
+    UClass* FunctionOwner = nullptr;
+    const FName FunctionName = CompareFunctionName(CompareKind, Op, FunctionOwner);
+    if (FunctionName.IsNone())
+    {
+        Ctx.Error = FString::Printf(TEXT("unsupported comparison op '%s' for %s"),
+            *Op, *RuleValueKindName(CompareKind));
+        return Out;
+    }
+
+    UK2Node_CallFunction* Node = CreateTransitionRuleFunctionNode(
+        Ctx,
+        FunctionOwner,
+        FunctionName,
+        FString::Printf(TEXT("compare:%s"), *Op));
+    if (!Node) return Out;
+
+    UEdGraphPin* APin = Node->FindPin(TEXT("A"), EGPD_Input);
+    UEdGraphPin* BPin = Node->FindPin(TEXT("B"), EGPD_Input);
+    UEdGraphPin* ReturnPin = FindBoolReturnPin(Node);
+    if (!APin || !BPin || !ReturnPin)
+    {
+        Ctx.Error = FString::Printf(TEXT("compare node pin lookup failed: node=%s"), *DescribePinsForError(Node));
+        return Out;
+    }
+    if (!ConnectOrSetTransitionRuleInput(Ctx, Left, APin)) return FTransitionRuleValue();
+    if (!ConnectOrSetTransitionRuleInput(Ctx, Right, BPin)) return FTransitionRuleValue();
+
+    Out.Kind = ETransitionRuleValueKind::Bool;
+    Out.Pin = ReturnPin;
+    Out.Debug = FString::Printf(TEXT("compare(%s %s %s)"), *Left.Debug, *Op, *Right.Debug);
+    return Out;
+}
+
+bool IsOuterParenthesized(const FString& Expression)
+{
+    if (Expression.Len() < 2 || Expression[0] != TEXT('(') || Expression[Expression.Len() - 1] != TEXT(')'))
+    {
+        return false;
+    }
+    int32 Depth = 0;
+    bool bInSingleQuote = false;
+    bool bInDoubleQuote = false;
+    for (int32 Index = 0; Index < Expression.Len(); ++Index)
+    {
+        const TCHAR Ch = Expression[Index];
+        if (Ch == TEXT('"') && !bInSingleQuote) bInDoubleQuote = !bInDoubleQuote;
+        else if (Ch == TEXT('\'') && !bInDoubleQuote) bInSingleQuote = !bInSingleQuote;
+        if (bInSingleQuote || bInDoubleQuote) continue;
+
+        if (Ch == TEXT('(')) ++Depth;
+        else if (Ch == TEXT(')'))
+        {
+            --Depth;
+            if (Depth == 0 && Index != Expression.Len() - 1)
+            {
+                return false;
+            }
+        }
+    }
+    return Depth == 0;
+}
+
+FString StripOuterParens(FString Expression)
+{
+    Expression.TrimStartAndEndInline();
+    while (IsOuterParenthesized(Expression))
+    {
+        Expression = Expression.Mid(1, Expression.Len() - 2);
+        Expression.TrimStartAndEndInline();
+    }
+    return Expression;
+}
+
+TArray<FString> SplitTopLevelByOperator(const FString& Expression, const FString& Operator)
+{
+    TArray<FString> Parts;
+    int32 Depth = 0;
+    bool bInSingleQuote = false;
+    bool bInDoubleQuote = false;
+    int32 Start = 0;
+
+    for (int32 Index = 0; Index < Expression.Len(); ++Index)
+    {
+        const TCHAR Ch = Expression[Index];
+        if (Ch == TEXT('"') && !bInSingleQuote) bInDoubleQuote = !bInDoubleQuote;
+        else if (Ch == TEXT('\'') && !bInDoubleQuote) bInSingleQuote = !bInSingleQuote;
+        if (bInSingleQuote || bInDoubleQuote) continue;
+
+        if (Ch == TEXT('(')) ++Depth;
+        else if (Ch == TEXT(')')) --Depth;
+
+        if (Depth == 0 && Expression.Mid(Index, Operator.Len()) == Operator)
+        {
+            Parts.Add(Expression.Mid(Start, Index - Start).TrimStartAndEnd());
+            Index += Operator.Len() - 1;
+            Start = Index + 1;
+        }
+    }
+    if (Parts.Num() > 0)
+    {
+        Parts.Add(Expression.Mid(Start).TrimStartAndEnd());
+    }
+    return Parts;
+}
+
+bool FindTopLevelCompare(const FString& Expression, FString& OutLeft, FString& OutOp, FString& OutRight)
+{
+    static const TCHAR* Operators[] = { TEXT(">="), TEXT("<="), TEXT("=="), TEXT("!="), TEXT(">"), TEXT("<") };
+    int32 Depth = 0;
+    bool bInSingleQuote = false;
+    bool bInDoubleQuote = false;
+
+    for (int32 Index = 0; Index < Expression.Len(); ++Index)
+    {
+        const TCHAR Ch = Expression[Index];
+        if (Ch == TEXT('"') && !bInSingleQuote) bInDoubleQuote = !bInDoubleQuote;
+        else if (Ch == TEXT('\'') && !bInDoubleQuote) bInSingleQuote = !bInSingleQuote;
+        if (bInSingleQuote || bInDoubleQuote) continue;
+
+        if (Ch == TEXT('(')) ++Depth;
+        else if (Ch == TEXT(')')) --Depth;
+        if (Depth != 0) continue;
+
+        for (const TCHAR* Operator : Operators)
+        {
+            const FString Op(Operator);
+            if (Expression.Mid(Index, Op.Len()) == Op)
+            {
+                OutLeft = Expression.Mid(0, Index).TrimStartAndEnd();
+                OutOp = Op;
+                OutRight = Expression.Mid(Index + Op.Len()).TrimStartAndEnd();
+                return !OutLeft.IsEmpty() && !OutRight.IsEmpty();
+            }
+        }
+    }
+    return false;
+}
+
+FTransitionRuleValue BuildStringAtom(FTransitionRuleBuildContext& Ctx, FString Token, bool bMissingVariableAsStringLiteral)
+{
+    Token.TrimStartAndEndInline();
+    bool bBool = false;
+    if (ParseLiteralBoolExpression(Token, bBool))
+    {
+        return MakeBoolLiteralRuleValue(bBool);
+    }
+    double Number = 0.0;
+    if (IsNumericToken(Token, Number))
+    {
+        return MakeNumberLiteralRuleValue(Number);
+    }
+    if (IsQuotedToken(Token))
+    {
+        return MakeStringLiteralRuleValue(UnquoteToken(Token));
+    }
+    if (HasTransitionRuleVariable(Ctx.AnimBP, FName(*Token)))
+    {
+        return BuildTransitionRuleVariable(Ctx, Token);
+    }
+    if (bMissingVariableAsStringLiteral)
+    {
+        return MakeStringLiteralRuleValue(Token);
+    }
+
+    Ctx.Error = FString::Printf(TEXT("unsupported bare transition rule atom '%s'; expected bool literal, number, quoted string, or AnimBP variable"), *Token);
+    return FTransitionRuleValue();
+}
+
+FTransitionRuleValue BuildTransitionRuleStringExpression(FTransitionRuleBuildContext& Ctx, FString Expression)
+{
+    Expression = StripOuterParens(Expression);
+    if (Expression.IsEmpty())
+    {
+        Ctx.Error = TEXT("transition rule expression string is empty");
+        return FTransitionRuleValue();
+    }
+
+    TArray<FString> OrParts = SplitTopLevelByOperator(Expression, TEXT("||"));
+    if (OrParts.Num() > 0)
+    {
+        TArray<FTransitionRuleValue> Values;
+        for (const FString& Part : OrParts)
+        {
+            Values.Add(BuildTransitionRuleStringExpression(Ctx, Part));
+            if (!Ctx.Error.IsEmpty()) return FTransitionRuleValue();
+        }
+        return BuildBoolChain(Ctx, TEXT("or"), Values);
+    }
+
+    TArray<FString> AndParts = SplitTopLevelByOperator(Expression, TEXT("&&"));
+    if (AndParts.Num() > 0)
+    {
+        TArray<FTransitionRuleValue> Values;
+        for (const FString& Part : AndParts)
+        {
+            Values.Add(BuildTransitionRuleStringExpression(Ctx, Part));
+            if (!Ctx.Error.IsEmpty()) return FTransitionRuleValue();
+        }
+        return BuildBoolChain(Ctx, TEXT("and"), Values);
+    }
+
+    if (Expression.StartsWith(TEXT("!")))
+    {
+        return BuildBoolNot(Ctx, BuildTransitionRuleStringExpression(Ctx, Expression.Mid(1)));
+    }
+
+    FString LeftText, Op, RightText;
+    if (FindTopLevelCompare(Expression, LeftText, Op, RightText))
+    {
+        FTransitionRuleValue Left = BuildStringAtom(Ctx, LeftText, /*bMissingVariableAsStringLiteral=*/false);
+        if (!Ctx.Error.IsEmpty()) return FTransitionRuleValue();
+        FTransitionRuleValue Right = BuildStringAtom(Ctx, RightText, /*bMissingVariableAsStringLiteral=*/true);
+        if (!Ctx.Error.IsEmpty()) return FTransitionRuleValue();
+        return BuildCompareRuleValue(Ctx, Left, Right, Op);
+    }
+
+    return BuildStringAtom(Ctx, Expression, /*bMissingVariableAsStringLiteral=*/false);
+}
+
+FTransitionRuleValue BuildJsonObjectRuleExpression(FTransitionRuleBuildContext& Ctx, const TSharedPtr<FJsonObject>& Obj)
+{
+    if (!Obj.IsValid())
+    {
+        Ctx.Error = TEXT("transition rule expression object is null");
+        return FTransitionRuleValue();
+    }
+
+    const TSharedPtr<FJsonValue>* LiteralPtr = Obj->Values.Find(TEXT("literal"));
+    if (LiteralPtr)
+    {
+        FTransitionRuleValue Literal = BuildLiteralJsonValue(*LiteralPtr);
+        if (Literal.Kind == ETransitionRuleValueKind::Unknown)
+        {
+            Ctx.Error = TEXT("'literal' supports only boolean, number, or string values");
+        }
+        return Literal;
+    }
+
+    bool bBoolValue = false;
+    if (Obj->TryGetBoolField(TEXT("bool"), bBoolValue))
+    {
+        return MakeBoolLiteralRuleValue(bBoolValue);
+    }
+
+    double Number = 0.0;
+    if (Obj->TryGetNumberField(TEXT("number"), Number) || Obj->TryGetNumberField(TEXT("float"), Number))
+    {
+        return MakeNumberLiteralRuleValue(Number);
+    }
+
+    int32 IntValue = 0;
+    if (Obj->TryGetNumberField(TEXT("int"), Number))
+    {
+        IntValue = static_cast<int32>(Number);
+        FTransitionRuleValue Out = MakeNumberLiteralRuleValue(IntValue);
+        Out.Kind = ETransitionRuleValueKind::Int;
+        Out.bIntegralNumber = true;
+        return Out;
+    }
+
+    FString StringValue;
+    if (Obj->TryGetStringField(TEXT("string"), StringValue))
+    {
+        return MakeStringLiteralRuleValue(StringValue);
+    }
+    if (Obj->TryGetStringField(TEXT("name"), StringValue))
+    {
+        return MakeStringLiteralRuleValue(StringValue, ETransitionRuleValueKind::Name);
+    }
+
+    FString VarName;
+    FString Op;
+    const bool bHasVar = Obj->TryGetStringField(TEXT("var"), VarName);
+    const bool bHasOp = Obj->TryGetStringField(TEXT("op"), Op) || Obj->TryGetStringField(TEXT("compare"), Op);
+    if (bHasVar && !bHasOp && !Obj->Values.Contains(TEXT("value")) && !Obj->Values.Contains(TEXT("right")))
+    {
+        return BuildTransitionRuleVariable(Ctx, VarName);
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* Parts = nullptr;
+    if (Obj->TryGetArrayField(TEXT("and"), Parts))
+    {
+        TArray<FTransitionRuleValue> Values;
+        for (const TSharedPtr<FJsonValue>& Part : *Parts)
+        {
+            Values.Add(BuildTransitionRuleExpression(Ctx, Part));
+            if (!Ctx.Error.IsEmpty()) return FTransitionRuleValue();
+        }
+        return BuildBoolChain(Ctx, TEXT("and"), Values);
+    }
+    if (Obj->TryGetArrayField(TEXT("or"), Parts))
+    {
+        TArray<FTransitionRuleValue> Values;
+        for (const TSharedPtr<FJsonValue>& Part : *Parts)
+        {
+            Values.Add(BuildTransitionRuleExpression(Ctx, Part));
+            if (!Ctx.Error.IsEmpty()) return FTransitionRuleValue();
+        }
+        return BuildBoolChain(Ctx, TEXT("or"), Values);
+    }
+
+    const TSharedPtr<FJsonValue>* NotPtr = Obj->Values.Find(TEXT("not"));
+    if (NotPtr)
+    {
+        return BuildBoolNot(Ctx, BuildTransitionRuleExpression(Ctx, *NotPtr));
+    }
+
+    if (bHasOp)
+    {
+        Op = NormalizeCompareOp(Op);
+        if (Op == TEXT("and") || Op == TEXT("&&") || Op == TEXT("or") || Op == TEXT("||"))
+        {
+            const TArray<TSharedPtr<FJsonValue>>* Args = nullptr;
+            if (!Obj->TryGetArrayField(TEXT("args"), Args))
+            {
+                Ctx.Error = FString::Printf(TEXT("bool op '%s' requires args array"), *Op);
+                return FTransitionRuleValue();
+            }
+            TArray<FTransitionRuleValue> Values;
+            for (const TSharedPtr<FJsonValue>& Arg : *Args)
+            {
+                Values.Add(BuildTransitionRuleExpression(Ctx, Arg));
+                if (!Ctx.Error.IsEmpty()) return FTransitionRuleValue();
+            }
+            return BuildBoolChain(Ctx, Op == TEXT("||") ? TEXT("or") : Op, Values);
+        }
+        if (Op == TEXT("not") || Op == TEXT("!"))
+        {
+            const TSharedPtr<FJsonValue>* ValuePtr = Obj->Values.Find(TEXT("value"));
+            if (!ValuePtr)
+            {
+                Ctx.Error = TEXT("'not' op requires value");
+                return FTransitionRuleValue();
+            }
+            return BuildBoolNot(Ctx, BuildTransitionRuleExpression(Ctx, *ValuePtr));
+        }
+
+        FTransitionRuleValue Left;
+        const TSharedPtr<FJsonValue>* LeftPtr = Obj->Values.Find(TEXT("left"));
+        if (LeftPtr)
+        {
+            Left = BuildTransitionRuleExpression(Ctx, *LeftPtr);
+        }
+        else if (bHasVar)
+        {
+            Left = BuildTransitionRuleVariable(Ctx, VarName);
+        }
+        else
+        {
+            Ctx.Error = TEXT("comparison requires either 'left' expression or 'var'");
+            return FTransitionRuleValue();
+        }
+        if (!Ctx.Error.IsEmpty()) return FTransitionRuleValue();
+
+        FTransitionRuleValue Right;
+        const TSharedPtr<FJsonValue>* RightPtr = Obj->Values.Find(TEXT("right"));
+        const TSharedPtr<FJsonValue>* ValuePtr = Obj->Values.Find(TEXT("value"));
+        if (RightPtr)
+        {
+            Right = BuildTransitionRuleExpression(Ctx, *RightPtr);
+        }
+        else if (ValuePtr)
+        {
+            Right = BuildLiteralJsonValue(*ValuePtr);
+            if (Right.Kind == ETransitionRuleValueKind::Unknown)
+            {
+                Ctx.Error = TEXT("'value' supports only boolean, number, or string literals");
+                return FTransitionRuleValue();
+            }
+        }
+        else
+        {
+            Ctx.Error = TEXT("comparison requires either 'right' expression or literal 'value'");
+            return FTransitionRuleValue();
+        }
+        if (!Ctx.Error.IsEmpty()) return FTransitionRuleValue();
+
+        return BuildCompareRuleValue(Ctx, Left, Right, Op);
+    }
+
+    Ctx.Error = TEXT("unsupported transition rule expression object; expected var/literal/bool/number/string/name, and/or/or/not, or op+left/right");
+    return FTransitionRuleValue();
+}
+
+FTransitionRuleValue BuildTransitionRuleExpression(FTransitionRuleBuildContext& Ctx, const TSharedPtr<FJsonValue>& Expr)
+{
+    if (!Expr.IsValid())
+    {
+        Ctx.Error = TEXT("missing transition rule expression");
+        return FTransitionRuleValue();
+    }
+
+    if (Expr->Type == EJson::Boolean)
+    {
+        return MakeBoolLiteralRuleValue(Expr->AsBool());
+    }
+    if (Expr->Type == EJson::Number)
+    {
+        return MakeNumberLiteralRuleValue(Expr->AsNumber());
+    }
+    if (Expr->Type == EJson::String)
+    {
+        return BuildTransitionRuleStringExpression(Ctx, Expr->AsString());
+    }
+    if (Expr->Type == EJson::Object)
+    {
+        return BuildJsonObjectRuleExpression(Ctx, Expr->AsObject());
+    }
+
+    Ctx.Error = TEXT("transition rule expression must be string, bool, number, or object");
+    return FTransitionRuleValue();
 }
 
 // ---------------------------------------------------------------------------
@@ -3534,7 +4787,7 @@ FSageToolDispatch::FOutcome SetAnimGraphRootPoseImpl(const TSharedPtr<FJsonObjec
     if (Cast<UAnimationTransitionGraph>(TargetGraph))
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602,
-            TEXT("use animation.set_transition_rule for transition graphs (NOT IMPLEMENTED yet)"));
+            TEXT("use animation.set_transition_rule for transition graphs"));
     }
     UEdGraphNode* SrcNode = FindGraphNodeByGuid(TargetGraph, NodeId);
     if (!SrcNode)
@@ -4700,8 +5953,9 @@ FSageToolDispatch::FOutcome SetTransitionPriorityImpl(const TSharedPtr<FJsonObje
 FSageToolDispatch::FOutcome SetStateMachineInitialStateImpl(const TSharedPtr<FJsonObject>& Args)
 {
     // Initial state in UE state machine = state pointed-to by the entry node's
-    // single output link. Implementation: find UAnimStateEntryNode, break links,
-    // re-link to target state.
+    // single output link. UE 5.7's entry pin is PC_Exec/"Entry", while state
+    // nodes use hidden PC_Transition pins, so the generic pose-pin helper is
+    // intentionally not used here.
     FSageToolDispatch::FOutcome Reject;
     if (detail::RejectIfPie(Reject)) return Reject;
 
@@ -4725,18 +5979,40 @@ FSageToolDispatch::FOutcome SetStateMachineInitialStateImpl(const TSharedPtr<FJs
     if (!Entry) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("entry node missing"));
 
     FScopedTransaction Tx(LOCTEXT("SetSMInitial", "Sage: Set Initial State"));
-    AnimBP->Modify(); Entry->Modify();
+    AnimBP->Modify(); SMGraph->Modify(); Entry->Modify(); Target->Modify();
 
-    UEdGraphPin* EntryOut = FindFirstOutputPosePin(Entry);
-    UEdGraphPin* TargetIn = FindFirstInputPosePin(Target);
-    if (!EntryOut || !TargetIn) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("pin lookup failed"));
+    UEdGraphPin* EntryOut = Entry->GetOutputPin();
+    UEdGraphPin* TargetIn = Target->GetInputPin();
+    if (!EntryOut || !TargetIn)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("pin lookup failed: entry=%s target=%s"),
+                *DescribePinsForError(Entry), *DescribePinsForError(Target)));
+    }
+
+    const UEdGraphSchema* Schema = SMGraph->GetSchema();
+    if (!Schema)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("state machine schema missing"));
+    }
     EntryOut->BreakAllPinLinks();
-    EntryOut->MakeLinkTo(TargetIn);
+    const bool bConnected = Schema->TryCreateConnection(EntryOut, TargetIn);
+    if (!bConnected || EntryOut->LinkedTo.Num() == 0)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("schema connection failed: entry=%s target=%s"),
+                *DescribePinsForError(Entry), *DescribePinsForError(Target)));
+    }
     FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("state_id"), StateId);
     R->SetBoolField(TEXT("set"), true);
+    R->SetStringField(TEXT("entry_pin"), EntryOut->PinName.ToString());
+    R->SetStringField(TEXT("target_pin"), TargetIn->PinName.ToString());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -4841,12 +6117,180 @@ FSageToolDispatch::FOutcome ListTransitionsImpl(const TSharedPtr<FJsonObject>& A
 
 FSageToolDispatch::FOutcome SetTransitionRuleImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    // Stub — transition rule expression authoring requires building Kismet
-    // boolean nodes inside the transition's BoundGraph. Pending Cluster A's
-    // BindAnimNodeProperty refactor (UAnimBlueprintExtension API).
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.set_transition_rule — transition rule BP authoring "
-             "(boolean Kismet nodes in transition BoundGraph) pending Sage impl"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SMName, TId;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("state_machine_name"), SMName)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'state_machine_name'"));
+    if (!Args->TryGetStringField(TEXT("transition_id"), TId)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'transition_id'"));
+    const TSharedPtr<FJsonValue>* ExpressionPtr = Args->Values.Find(TEXT("expression"));
+    if (!ExpressionPtr || !ExpressionPtr->IsValid()) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'expression'"));
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimBlueprint"));
+    UAnimationStateMachineGraph* SMGraph = FindStateMachineGraph(AnimBP, FName(*SMName));
+    if (!SMGraph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("state machine not found"));
+    UAnimStateTransitionNode* T = FindTransitionByGuid(SMGraph, TId);
+    if (!T) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("transition_id not found"));
+
+    if (!T->BoundGraph)
+    {
+        T->PostPlacedNewNode();
+    }
+    UAnimationTransitionGraph* RuleGraph = Cast<UAnimationTransitionGraph>(T->BoundGraph);
+    if (!RuleGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("transition BoundGraph is not UAnimationTransitionGraph"));
+    }
+    UAnimGraphNode_TransitionResult* ResultNode = FindTransitionResultNode(RuleGraph);
+    UEdGraphPin* CanEnterPin = FindCanEnterTransitionPin(ResultNode);
+    if (!ResultNode || !CanEnterPin)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("transition result pin lookup failed: result=%s"),
+                *DescribePinsForError(ResultNode)));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SetTransitionRule", "Sage: Set Transition Rule"));
+    AnimBP->Modify();
+    SMGraph->Modify();
+    T->Modify();
+    RuleGraph->Modify();
+    ResultNode->Modify();
+
+    T->bAutomaticRuleBasedOnSequencePlayerInState = false;
+
+    TArray<UEdGraphNode*> ToRemove;
+    for (UEdGraphNode* Node : RuleGraph->Nodes)
+    {
+        if (Node && Node != ResultNode)
+        {
+            ToRemove.Add(Node);
+        }
+    }
+    for (UEdGraphNode* Node : ToRemove)
+    {
+        FBlueprintEditorUtils::RemoveNode(AnimBP, Node, /*bDontRecompile=*/true);
+    }
+
+    const UEdGraphSchema_K2* K2Schema = Cast<UEdGraphSchema_K2>(RuleGraph->GetSchema());
+    const UEdGraphSchema* Schema = RuleGraph->GetSchema();
+    if (!K2Schema || !Schema)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("transition rule graph schema is not K2-compatible"));
+    }
+
+    FTransitionRuleBuildContext BuildCtx;
+    BuildCtx.AnimBP = AnimBP;
+    BuildCtx.RuleGraph = RuleGraph;
+    BuildCtx.Schema = Schema;
+    BuildCtx.K2Schema = K2Schema;
+    BuildCtx.BaseX = ResultNode->NodePosX - 320;
+    BuildCtx.BaseY = ResultNode->NodePosY;
+
+    FTransitionRuleValue RootValue = BuildTransitionRuleExpression(BuildCtx, *ExpressionPtr);
+    if (!BuildCtx.Error.IsEmpty())
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602, BuildCtx.Error);
+    }
+    if (!EnsureBoolRuleValue(BuildCtx, RootValue, TEXT("transition rule root")))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602, BuildCtx.Error);
+    }
+    if (!RootValue.Pin && RootValue.bLiteral)
+    {
+        bool bRootLiteral = false;
+        if (!ParseLiteralBoolExpression(RootValue.DefaultValue, bRootLiteral))
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("root literal must be boolean"));
+        }
+        RootValue = BuildBoolLiteralProducer(BuildCtx, bRootLiteral);
+        if (!BuildCtx.Error.IsEmpty())
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32603, BuildCtx.Error);
+        }
+    }
+    if (!RootValue.Pin)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("transition rule root did not produce a pin"));
+    }
+
+    CanEnterPin->Modify();
+    CanEnterPin->BreakAllPinLinks();
+    const bool bConnected = Schema->TryCreateConnection(RootValue.Pin, CanEnterPin);
+    if (!bConnected || CanEnterPin->LinkedTo.Num() == 0)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("failed to connect rule root to CanEnterTransition: source=%s result=%s"),
+                *DescribePinsForError(RootValue.Pin ? RootValue.Pin->GetOwningNode() : nullptr),
+                *DescribePinsForError(ResultNode)));
+    }
+
+    RuleGraph->NotifyGraphChanged();
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("transition_id"), TId);
+    if ((*ExpressionPtr)->Type == EJson::String)
+    {
+        R->SetStringField(TEXT("expression"), (*ExpressionPtr)->AsString());
+    }
+    else
+    {
+        R->SetStringField(TEXT("expression"), TEXT("<json>"));
+    }
+    R->SetStringField(TEXT("rule_graph"), RuleGraph->GetName());
+    R->SetStringField(TEXT("result_node_id"), ResultNode->NodeGuid.ToString(EGuidFormats::Digits));
+    R->SetStringField(TEXT("root_kind"), RuleValueKindName(RootValue.Kind));
+    R->SetStringField(TEXT("root_pin"), RootValue.Pin->PinName.ToString());
+    R->SetArrayField(TEXT("authored_nodes"), BuildCtx.AuthoredNodes);
+    R->SetObjectField(TEXT("can_enter_pin"), PinSummaryJson(CanEnterPin));
+    R->SetBoolField(TEXT("connected"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ReadTransitionRuleImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, SMName, TId;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("state_machine_name"), SMName)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'state_machine_name'"));
+    if (!Args->TryGetStringField(TEXT("transition_id"), TId)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'transition_id'"));
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimBlueprint"));
+    UAnimationStateMachineGraph* SMGraph = FindStateMachineGraph(AnimBP, FName(*SMName));
+    if (!SMGraph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("state machine not found"));
+    UAnimStateTransitionNode* T = FindTransitionByGuid(SMGraph, TId);
+    if (!T) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("transition_id not found"));
+
+    UAnimationTransitionGraph* RuleGraph = Cast<UAnimationTransitionGraph>(T->BoundGraph);
+    UAnimGraphNode_TransitionResult* ResultNode = FindTransitionResultNode(RuleGraph);
+    UEdGraphPin* CanEnterPin = FindCanEnterTransitionPin(ResultNode);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("transition_id"), TId);
+    R->SetBoolField(TEXT("has_rule_graph"), RuleGraph != nullptr);
+    R->SetBoolField(TEXT("automatic_rule"), T->bAutomaticRuleBasedOnSequencePlayerInState);
+    if (RuleGraph)
+    {
+        R->SetStringField(TEXT("rule_graph"), RuleGraph->GetName());
+        R->SetNumberField(TEXT("node_count"), RuleGraph->Nodes.Num());
+    }
+    if (ResultNode)
+    {
+        R->SetStringField(TEXT("result_node_id"), ResultNode->NodeGuid.ToString(EGuidFormats::Digits));
+    }
+    R->SetObjectField(TEXT("can_enter_pin"), PinSummaryJson(CanEnterPin));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 FSageToolDispatch::FOutcome SetStateEnteredEventImpl(const TSharedPtr<FJsonObject>& Args)
@@ -5656,6 +7100,7 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.list_states"),                GT(&ListStatesImpl));
     Dispatch.RegisterHandler(TEXT("animation.list_transitions"),           GT(&ListTransitionsImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_transition_rule"),        GT(&SetTransitionRuleImpl));
+    Dispatch.RegisterHandler(TEXT("animation.read_transition_rule"),       GT(&ReadTransitionRuleImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_state_entered_event"),    GT(&SetStateEnteredEventImpl));
     // Phase 4-r6 Cluster D ek (anim notify track CRUD)
     Dispatch.RegisterHandler(TEXT("animation.add_notify_track"),           GT(&AddNotifyTrackImpl));

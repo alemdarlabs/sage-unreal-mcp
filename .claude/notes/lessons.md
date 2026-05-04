@@ -919,3 +919,37 @@ tüm projeler paylaşır. Ama bu engine version başına ayrı kurulum gerektiri
 (5.4/5.5/5.6/5.7) — `sage init` per-project install'ı default tuttuğumuz
 için (ADR-016) Engine kurulumu opsiyonel "advanced install" path'i olarak
 ileride eklenir.
+
+## Sage build: raw PowerShell değil wrapper kullan
+
+**Symptom**: Codex ham PowerShell session'ında `cmake --build` çalıştırınca Ninja sessiz/idle kaldı; `cl.exe` spawn/output görünmedi ve build dakikalarca ilerlemedi.
+
+**Root**: MSVC toolchain yalnız `cl.exe` path'inden ibaret değil. `INCLUDE`, `LIB`, `LIBPATH` vcvars64.bat ile parent PowerShell session'ına yüklenmezse CMake/Ninja cached compiler path'i görse bile compile/link ortamı eksik kalır. `$env:VCPKG_ROOT` tek başına yeterli değil.
+
+**Rule**:
+- Server build için raw `cmake --build` çağırma; `scripts\build-server.ps1` kullan.
+- Server + plugin için `scripts\build-all.ps1` kullan.
+- Direkt `ninja` veya `cl.exe` çağırma; yalnız build-system debug istenirse istisna.
+- Wrapper'lar `scripts\dev-shell.ps1` dot-source ederek vcvars ortamını aynı process'te yükler.
+- Hedef executable `sage-server`; `sage-tools` sadece static lib.
+
+**Apply**:
+```powershell
+.\scripts\build-server.ps1
+.\scripts\build-all.ps1
+.\scripts\build-all.ps1 -SkipServer
+```
+
+## AnimBlueprint transition rule: string değil K2 graph yaz
+
+**Symptom**: `animation.set_transition_rule` sadece açıklamada vardı; transition `BoundGraph` içinde `bCanEnterTransition` pin'i gerçek producer node'a bağlı olmadığı için state-machine transition'ları compile/runtime açısından güvenilir değildi.
+
+**Root**: AnimBlueprint transition rule bir string/default-value alanı değil. UE compiler `UAnimationTransitionGraph` içindeki `UAnimGraphNode_TransitionResult::bCanEnterTransition` input'unun K2 node graph ile beslenmesini bekler.
+
+**Rule**:
+- Literal bile olsa `bCanEnterTransition` default value set edilmemeli; gerçek bool output pin'i bağlanmalı.
+- Complex expression önce typed/structured AST olarak modellenmeli; string shorthand bunun üstüne convenience parser olmalı.
+- Desteklenen expression subset'i güvenli K2 node üretimiyle sınırlı tutulmalı: variable get, numeric compare, bool equality, string/name equality, AND/OR/NOT.
+- Rule graph rewrite transaction içinde yapılmalı, eski non-result node'lar temizlenmeli ve Blueprint structurally modified işaretlenmeli.
+
+**Apply**: `animation.set_transition_rule` artık string shorthand (`Speed > 10 && bGrounded`) ve JSON AST (`{ "and": [...] }`) kabul eder; `animation.read_transition_rule` ile `bCanEnterTransition.linked_nodes[]` doğrulanır.

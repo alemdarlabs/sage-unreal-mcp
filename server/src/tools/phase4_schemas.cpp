@@ -44,6 +44,13 @@ static nlohmann::json i32()  { return {{"type","integer"}}; }
 static nlohmann::json bln()  { return {{"type","boolean"}}; }
 static nlohmann::json arr()  { return {{"type","array"}}; }
 static nlohmann::json vec3() { return {{"type","array"},{"items",{{"type","number"}}},{"minItems",3},{"maxItems",3}}; }
+static nlohmann::json anyObj() { return {{"type","object"},{"additionalProperties",true}}; }
+static nlohmann::json ruleExpr() {
+    return {
+        {"description","Transition rule expression. Accepts legacy strings ('true', 'Speed > 10', '!bFalling', 'Speed > 10 && bGrounded') or a structured JSON AST with var/literal/op/left/right/value/and/or/not."},
+        {"oneOf", nlohmann::json::array({str(), bln(), num(), anyObj()})}
+    };
+}
 
 }  // anonymous namespace
 
@@ -480,8 +487,12 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .inputSchema=obj({{"path",str()},{"state_machine_name",str()}},{"path","state_machine_name"}),
         .handler=nullptr,.remote=true});
     reg(registry, Tool{.name="animation.set_transition_rule",
-        .description="[NOT IMPLEMENTED] Boolean expression authoring inside transition's BoundGraph.",
-        .inputSchema=obj({{"path",str()},{"state_machine_name",str()},{"transition_id",str()},{"expression",str()},{"source_blueprint_path",str()}},{"path","state_machine_name","transition_id"}),
+        .description="Author a transition rule inside a UAnimStateTransitionNode BoundGraph. Supports literal bools, AnimBP variable getters, numeric comparisons, bool equality, string/name equality, and bool AND/OR/NOT as real K2 nodes linked to bCanEnterTransition.",
+        .inputSchema=obj({{"path",str()},{"state_machine_name",str()},{"transition_id",str()},{"expression",ruleExpr()}},{"path","state_machine_name","transition_id","expression"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="animation.read_transition_rule",
+        .description="Inspect a transition rule graph: result node id, bCanEnterTransition pin defaults, and linked producer nodes. Use for diagnostics after animation.set_transition_rule.",
+        .inputSchema=obj({{"path",str()},{"state_machine_name",str()},{"transition_id",str()}},{"path","state_machine_name","transition_id"}),
         .handler=nullptr,.remote=true});
     reg(registry, Tool{.name="animation.set_state_entered_event",
         .description="[NOT IMPLEMENTED] State OnEntered/OnExited custom event hook.",
