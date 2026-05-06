@@ -105,6 +105,356 @@ Bir gap fix'lendikten sonra **non-obvious bir öğreti** çıktıysa (`obj({})` 
 
 <!-- Yeni gap entry'leri buraya. En üste yeni geleni koy. -->
 
+## Gap #28 — `animation.add_linked_anim_layer_node` Layer property silently atlanıyor — node "Layer=None" ile spawn ediliyor, response yanıltıcı
+
+- **Status**: ✅ FIXED — deploy/verify pending
+- **Reported**: 2026-05-06 19:30 tarafından Lyra Claude / FlightCore asset wiring sprint (Gap #27 v2 fix verify oturumu)
+- **Project**: `D:\Steamworks\Lyra`
+- **Editor**: Lyra UE 5.7.4 (post Gap #27 v2 fix deploy — engine flow by-pass çalışıyor, master AnimGraph mevcut weapon ALI node'ları intact)
+- **Affected assets**:
+  - `/FlightCore/Animations/ABP_HeroFlight_Mannequin.ABP_HeroFlight_Mannequin` (master, ALI_FlightLocomotionLayer implement edilmiş)
+  - `/FlightCore/Animations/ALI_FlightLocomotionLayer.ALI_FlightLocomotionLayer_C` (1 fonksiyon: `FlightLocomotionPose`)
+- **Related**: Gap #27 v2 fix doğrulandı (master mevcut node'lar intact). Bu gap **yeni eklenen FlightCore linked-layer node**'unun Layer property write tarafında.
+
+### Hedef
+
+State-aware blend chain'inin son adımı: master AnimGraph'a yeni FlightLocomotionPose çağrısı yapan UAnimGraphNode_LinkedAnimLayer node ekle.
+
+### Denenen tool çağrısı
+
+```json
+{ "tool": "animation.add_linked_anim_layer_node",
+  "args": {
+    "path": "/FlightCore/Animations/ABP_HeroFlight_Mannequin.ABP_HeroFlight_Mannequin",
+    "graph_name": "AnimGraph",
+    "interface_path": "/FlightCore/Animations/ALI_FlightLocomotionLayer.ALI_FlightLocomotionLayer_C",
+    "function_name": "FlightLocomotionPose",
+    "x": 1450, "y": 450,
+    "compile": false
+  } }
+```
+
+Response (yanıltıcı — başarılı görünüyor):
+```json
+{
+  "class": "/Script/AnimGraph.AnimGraphNode_LinkedAnimLayer",
+  "interface": "ALI_FlightLocomotionLayer_C",
+  "interface_function": "FlightLocomotionPose",
+  "node_id": "CDA94EAA4AE4A8F4B739D0BB24F1054C",
+  "output_pose_pin": "Pose",
+  "pin_count": 1
+}
+```
+
+### Sonuç / hata
+
+**`bp.search_nodes path=master keyword=ALI_FlightLocomotionLayer`** → 1 hit:
+```json
+{"id": "CDA94EAA4AE4A8F4B739D0BB24F1054C", "title": "ALI_FlightLocomotionLayer - None"}
+```
+
+Yani node title `ALI_FlightLocomotionLayer - None` — Layer **NOT SET** UE-side.
+
+**`animation.read_anim_node_properties`** raporu (raw CDO property okuma):
+```json
+{
+  "properties": [
+    {"name": "Interface", "value": ".../ALI_FlightLocomotionLayer_C"},   // ✓ doğru
+    {"name": "Layer", "value": "FlightLocomotionPose"}                    // ✓ CDO doğru — AMA UE compile fark etmiyor
+  ]
+}
+```
+
+**CDO property seviyesinde Layer="FlightLocomotionPose" SET. Ama UE compile, node title, validate "None" görüyor.**
+
+**`bp.validate path=master`**:
+```text
+"Linked anim layer node ALI_FlightLocomotionLayer - None does not specify a layer." (error)
+"Missing allocated node for AnimGraphNode_LinkedAnimLayer_4 ..." (error)
+```
+
+### Workaround denemeleri (hepsi başarısız)
+
+1. `animation.set_anim_node_property property=Layer value=FlightLocomotionPose` → response `{"set": true}` ama compile hala 2 error.
+2. `bp.refresh_nodes` (633 node reconstruct) → compile hala 2 error.
+3. `bp.search_nodes "FlightLocomotionPose"` → 0 hits (Layer adı title'da yok hala).
+
+Workaround **bulunamadı**. Sadece manuel UE Editor work:
+- Master ABP'yi editor'de aç → AnimGraph → CDA94EAA node'una çift tıkla → Details panel → Settings > Layer dropdown'undan "FlightLocomotionPose" seç
+- Bu UE Editor UI dropdown click `UAnimGraphNode_LinkedAnimLayer::ChangeLayer` pipeline'ını çağırır → CDO Layer set + ReconstructNode + interface property cache update + title regen
+
+### Beklenen davranış
+
+`animation.add_linked_anim_layer_node` `function_name` parametresi alıyor — bu UE-side `Layer` FName property'sine yazılmalı. Plus **UE'nin canonical "ChangeLayer" pipeline'ı** çağrılmalı:
+
+```cpp
+void UAnimGraphNode_LinkedAnimLayer::SetLayer(FName NewLayer)
+{
+    Node.Layer = NewLayer;
+    PostEditChangeProperty(PropertyChange);  // tetikleyici
+    ReconstructNode();                        // pin'leri yeniden allocate et, interface fonksiyonu binding kur
+    // Plus: title cache + visualization update
+}
+```
+
+Sage tool muhtemelen `Node.Layer = FName` raw set yapıyor ama `PostEditChangeProperty` + `ReconstructNode` adımlarını atlıyor. Sonuç: CDO property seviyesinde set ama UE compile path'inde Layer="None" görünüyor.
+
+### Öneri (öncelik A/B/C)
+
+**A — must (Gap #28 close şartı)**
+
+1. `animation.add_linked_anim_layer_node` Layer set sırasında **ChangeLayer** pipeline'ı:
+```cpp
+NodePtr->Node.Interface = InterfaceClass;
+NodePtr->Node.Layer = FunctionName;
+// CRITICAL: trigger UE's reconstruction pipeline
+FProperty* LayerProperty = FindFProperty<FProperty>(FAnimNode_LinkedAnimLayer::StaticStruct(), TEXT("Layer"));
+FPropertyChangedEvent PropertyChange(LayerProperty, EPropertyChangeType::ValueSet);
+NodePtr->PostEditChangeProperty(PropertyChange);
+NodePtr->ReconstructNode();
+```
+
+2. `animation.set_anim_node_property property=Layer` aynı eksiklikte: raw CDO write ama UE pipeline atlanıyor. Aynı fix gerekir.
+
+**B — should**
+
+3. Response payload doğrulama: tool dönmeden önce `bp.search_nodes` benzeri internal check ile **node title'ında Layer adı görünüyor mu** kontrol et. Eğer title hala `<Interface> - None` ise tool error dönsün — silently başarı raporlama:
+```json
+{
+  "error": "Layer property write succeeded at CDO level but UE pipeline did not reconstruct the node — see Gap #28",
+  "node_id": "...",
+  "expected_layer": "FlightLocomotionPose",
+  "actual_layer_in_title": "None"
+}
+```
+
+**C — nice-to-have**
+
+4. `animation.repair_linked_anim_layer_nodes` convenience tool — projedeki tüm UAnimGraphNode_LinkedAnimLayer node'larını tara, `Node.Layer` CDO property'si dolu ama node title `<Interface> - None` olanları **ChangeLayer** pipeline'ı ile fix et. Eski sprint'lerden artık corrupt master ABP'leri kurtarmak için.
+
+### Notlar — context
+
+- Gap #27 v2 fix doğrulandı:
+  - `bp.add_interface` response: `used_direct_anim_layer_interface_add: true`, `interface_graph_guids_regenerated: 1`, `linked_layer_engine_side_effect_count: 0`, `linked_layer_snapshot_node_count: 14` ✓
+  - Master AnimGraph'taki mevcut 4 weapon ALI LinkedAnimLayer node Layer property'leri intact (LeftHandPose_OverrideState dahil) ✓
+- Gap #28 ayrı tetikleyici: **yeni eklenen FlightCore node**'unun Layer write'ı eksik.
+- Workaround: master ABP rebuild (6. duplikasyon!) + ALI implement YOK + state-aware blend deferred. Multiplayer C++ infra (StateComponent + CMC + Pawn BP wire + GameFeatureData AddComponents + ABP_FlightCore_Locomotion child) ready.
+
+---
+
+### Sage Claude triage (geliştirici doldurur)
+
+- **Triage tarihi**: 2026-05-06
+- **Kök sebep**: `AddLinkedAnimLayerNodeImpl` (Cluster G, `SageAnimationTools.cpp:8125`) `Node->Node.Layer = FName(*FuncName)` direct write yapıyordu ama UE'nin **`PostEditChangeProperty(Layer)` event'i** atlanıyordu. `UAnimGraphNode_LinkedAnimLayer::PostEditChangeProperty` Layer property için `ChangeLayer` pipeline'ını tetikler — bu pipeline node title cache'ini regen eder, Interface UClass binding'ini günceller, internal pin allocation map'ini refresh eder. CDO seviyesinde Layer set OK görünüyordu ama UE compile path'i (`bp.validate`, `bp.search_nodes title`, runtime layer binding) "None" görüyordu. Aynı eksik `SetAnimNodePropertyImpl`'da da vardı — generic property set sonrası PostEditChangeProperty fire edilmiyordu. Mahmut'un Gap #26 `SetLinkedLayerNameForRename` helper'ında zaten doğru pattern (FProperty find + FPropertyChangedEvent + PostEditChangeProperty) kullanmıştı; aynı pattern spawn time + generic set time için yoktu.
+- **Fix scope (3 nokta + 1 yeni tool, atomic commit)**:
+  1. **`AddLinkedAnimLayerNodeImpl` ChangeLayer pipeline** (A-must, `SageAnimationTools.cpp:8125`): spawn pipeline yeniden sıralandı — (a) NewObject + GUID + position + AddNode, (b) Interface/Layer/InstanceClass direct set (PostPlacedNewNode'a hazırlık), (c) PostPlacedNewNode + AllocateDefaultPins (canonical spawn), (d) `FirePropertyChange("Interface")` + `FirePropertyChange("Layer")` + (varsa) `FirePropertyChange("InstanceClass")` lambda'sı `FAnimNode_LinkedAnimLayer::StaticStruct()->FindPropertyByName(...)` + `FPropertyChangedEvent(P, ValueSet)` + `Node->PostEditChangeProperty(E)` üçlüsünü çağırır, (e) ReconstructNode (idempotent finalize, title cache regen).
+  2. **`SetAnimNodePropertyImpl` generic PostEditChangeProperty** (A-must extended, `SageAnimationTools.cpp:5269`): SetPropertyValueAtPtr başarılı sonrası, wrapper class property'si varsa onu, yoksa inner struct property'sini kullanarak `FPropertyChangedEvent(EventProp, ValueSet)` + `AnimNode->PostEditChangeProperty(ChangeEvent)` + `AnimNode->ReconstructNode()`. Tüm anim node property'leri için ChangeLayer-tier pipeline tetiklenir (Layer/Interface/InstanceClass yanı sıra StateMachine sub-graph rebind, vb.).
+  3. **B-should response title verification** (`SageAnimationTools.cpp:8195-8210`): tool dönmeden önce `Node->GetNodeTitle(ENodeTitleType::FullTitle)` ile rendered title oku, function adı title'da yoksa response'a `_warning` + `node_title` + `layer_resolved: false` ekle. Silently başarı raporlama yerine kullanıcıya pipeline failure'ını surface et.
+  4. **C-nice yeni tool `animation.repair_linked_anim_layer_nodes`** (`SageAnimationTools.cpp:8779`): projedeki tüm UAnimGraphNode_LinkedAnimLayer node'larını sweep et (path verilirse single BP scope, yoksa AssetRegistry + TObjectIterator full scan), Layer FName set ama node title `<Interface> - None` olanları detect et, her biri için ChangeLayer pipeline'ı (PostEditChangeProperty(Interface) + PostEditChangeProperty(Layer) + ReconstructNode) fire et. `dry_run` flag desteği. Eski Sage spawn path'leriyle bozulan ABP'leri kurtarır. Local graph traversal (`CollectAnimGraphs` lambda — `FBpGraphEntry/CollectAllGraphs` SageBlueprintTools.cpp anonymous namespace içinde, cross-TU erişilemez; LinkedAnimLayer node'ları sadece anim graph schema'lı graph'larda yaşar, FunctionGraphs + UbergraphPages + MacroGraphs + ImplementedInterfaces[].Graphs taraması yeterli).
+- **Schema güncellemeleri** (`phase4_schemas.cpp`): `animation.repair_linked_anim_layer_nodes` yeni schema (path/dry_run/compile optional). Tool count 560 → 561.
+- **Fix commit**: pending (working tree).
+- **Deploy adımı**: ✅ server build OK (`bin\sage-server.exe` 18:25 — phase4_schemas.cpp recompile, sage-server.exe relink); ⏳ plugin UAT BuildPlugin Win64 in progress (ilk pass `FBpGraphEntry`/`CollectAllGraphs` cross-TU erişim hatası vermişti, local `CollectAnimGraphs` lambda ile fix); Lyra + HeroFlight deploy bekliyor.
+- **Verify durumu**: pending — Lyra Claude verify edecek. Önerilen smoke senaryo:
+  1. Master ABP rebuild (mevcut bozuk node temiz başlangıç için): `delete_asset` + `duplicate_asset ABP_Mannequin_Base → ABP_HeroFlight_Mannequin` + `bp.add_interface ALI_FlightLocomotionLayer_C` + `bp.reparent UFlightCoreAnimInstance`.
+  2. `animation.add_linked_anim_layer_node path=master graph_name=AnimGraph interface_path=ALI_FlightLocomotionLayer function_name=FlightLocomotionPose x=1450 y=450`.
+  3. Response yeni field'lar: `node_title: "ALI_FlightLocomotionLayer - FlightLocomotionPose"`, `layer_resolved: true` (önceden Layer=None idi, artık fix). `_warning` ALAN olmamalı.
+  4. `bp.search_nodes path=master keyword=FlightLocomotionPose` → 1 hit, `title: "ALI_FlightLocomotionLayer - FlightLocomotionPose"`.
+  5. `bp.validate path=master` → 0 error 0 warning.
+  6. **Repair tool dry_run smoke**: `animation.repair_linked_anim_layer_nodes path=master dry_run=true` → `needs_repair_count: 0`, `repaired_node_count: 0`, `details: []` (yeni spawn pipeline temiz).
+  7. **Repair tool full project scan** (eski bozuk node varsa): `animation.repair_linked_anim_layer_nodes dry_run=false compile=true` → `repaired_node_count: <N>`, `affected_blueprints[]` listele, her detail `repaired: true`.
+
+---
+
+## Gap #27 — `bp.add_interface` AnimLayerInterface eklendiğinde master AnimGraph'ta sessiz yan etki: mevcut node Layer property bozulması + Layer=None ek node spawn
+
+- **Status**: ✅ FIXED — second fix deployed 2026-05-06 19:12; Lyra verify pending
+- **Reported**: 2026-05-06 18:35 tarafından Lyra Claude / FlightCore asset wiring sprint (Gap #26 fix deploy sonrası)
+- **Project**: `D:\Steamworks\Lyra`
+- **Editor**: Lyra UE 5.7.4 (post Gap #26 fix — bp.rename_function interface-aware artık çalışıyor; bu gap **bp.add_interface**'in farklı yan etkisi)
+- **Related**: Gap #26 (bp.rename_function side-effect, FIXED) — aynı tip cross-BP rename impact analysis ama farklı tetikleyici (rename değil interface ekleme).
+
+### Hedef
+
+Master ABP'ye AnimLayerInterface'i clean ekle — mevcut master AnimGraph'taki başka interface'lerin node'larına dokunmadan. Lyra-canonical pattern: master ABP **ABP_Mannequin_Base** Lyra core duplikasyonu zaten ALI_ItemAnimLayers interface'ini implement eder ve AnimGraph'ında 4-5 LinkedAnimLayer node ile weapon ALI fonksiyonlarını çağırır. FlightCore plugin master'a **ek olarak** ALI_FlightLocomotionLayer interface'ini eklemek istiyor — mevcut weapon ALI node'ları intact kalmalı.
+
+Akış:
+1. duplicate_asset ABP_Mannequin_Base → ABP_HeroFlight_Mannequin (master fresh duplikasyon)
+2. bp_reparent ABP_HeroFlight_Mannequin → UFlightCoreAnimInstance (parent class değişimi, bIsFlightActive UPROPERTY inherited gelir)
+3. **bp_add_interface ALI_FlightLocomotionLayer_C** ← BU ADIM YAN ETKİ ÜRETİYOR
+4. animation_add_linked_anim_layer_node ile FlightLocomotionPose call ekle
+5. ...
+
+### Denenen tool çağrısı
+
+```json
+{ "tool": "bp.add_interface",
+  "args": {
+    "path": "/FlightCore/Animations/ABP_HeroFlight_Mannequin.ABP_HeroFlight_Mannequin",
+    "interface_path": "/FlightCore/Animations/ALI_FlightLocomotionLayer.ALI_FlightLocomotionLayer_C"
+  } }
+```
+
+Sonuç: `{"already": false, "interface": "ALI_FlightLocomotionLayer_C", ...}` — başarılı görünüyordu.
+
+### Sonuç / hata
+
+Yan etki: master ABP'nin mevcut AnimGraph'ında **iki problem** üretildi:
+
+**Problem 1**: Master AnimGraph'taki **mevcut bir UAnimGraphNode_LinkedAnimLayer node**'unun (Interface=ALI_ItemAnimLayers, Layer=`LeftHandPose_OverrideState`) Layer property'si silently `FlightLocomotionPose` olarak değişti. Hemen Gap #26 ile aynı: cross-interface Layer name collision.
+
+`bp.search_nodes path=master keyword=FlightLocomotionPose`:
+```json
+{"hits": [{"class": "AnimGraphNode_LinkedAnimLayer", "graph": "AnimGraph", "id": "4E18B10B484F1B194FD6A789AB6B5576", "title": "ALI_ItemAnimLayers - FlightLocomotionPose"}]}
+```
+
+Bu node ALI_ItemAnimLayers (Lyra core) interface'ini kullanıyor, ama Layer="FlightLocomotionPose" — ALI_ItemAnimLayers'ta **böyle bir fonksiyon yok**. ALI_ItemAnimLayers Lyra core asset, dokunulmadı (14 weapon-side fonksiyona sahip — `LeftHandPose_OverrideState` dahil).
+
+**Problem 2**: Master AnimGraph'ta otomatik bir yeni Layer=None node spawn edildi (Interface=ALI_FlightLocomotionLayer_C, Layer=None).
+
+`bp.validate path=master`:
+```text
+"Linked anim layer node ALI_ItemAnimLayers - FlightLocomotionPose uses invalid layer 'FlightLocomotionPose'." (error)
+"Linked anim layer node ALI_FlightLocomotionLayer - None does not specify a layer." (error)
+"Missing allocated node for AnimGraphNode_LinkedAnimLayer_4 ..." (error)
+"Missing allocated node for AnimGraphNode_LinkedAnimLayer_2 ..." (error)
+```
+
+**Tetikleyici testi (kontrollü)**:
+1. duplicate_asset ABP_Mannequin_Base → ABP_HeroFlight_Mannequin → bp.validate → 0 error ✓
+2. bp_reparent ABP_HeroFlight_Mannequin → UFlightCoreAnimInstance → bp.validate → 0 error ✓
+3. **bp_add_interface ABP_HeroFlight_Mannequin + ALI_FlightLocomotionLayer_C** → bp.validate → 4 errors (yan etki tetiklendi)
+
+ALI_FlightLocomotionLayer'ın tek fonksiyonu `FlightLocomotionPose`. ALI_ItemAnimLayers'ta `FlightLocomotionPose` yok. Sage `bp_add_interface` muhtemelen master AnimGraph'taki mevcut LinkedAnimLayer node'larından birini (örn. ID=4E18B10B... başlangıçta `LeftHandPose_OverrideState`) update ediyor — eklenen interface'in fonksiyon adına göre, interface property'sini check etmeden.
+
+### Beklenen davranış
+
+`bp.add_interface` **hiçbir AnimGraph node'una dokunmamalı**. UInterface implementation = sadece BP'nin `ImplementedInterfaces` listesine entry ekleme operasyonu. AnimGraph'taki node mutations bu tool'un scope'u dışı.
+
+Plus: yeni interface fonksiyonları için master AnimGraph'a otomatik node spawn ETMEMELI. Kullanıcı `animation.add_linked_anim_layer_node` ile manuel olarak ekler. (Gap #24 Cluster G zaten bu primitive'i sağlıyor.)
+
+### Workaround
+
+Master ABP rebuild:
+```text
+1. delete_asset ABP_HeroFlight_Mannequin
+2. duplicate_asset ABP_Mannequin_Base → ABP_HeroFlight_Mannequin (3. kez!)
+3. bp_reparent → UFlightCoreAnimInstance
+4. bp_add_interface SKIP (state-aware blend ayrı sprint'e bırakıldı)
+5. master compile → 0 error ✓
+6. B_Hero_HeroFlight Mesh.AnimClass = master tekrar set
+```
+
+Mevcut state: master ABP weapon ALI intact (Lyra ground gameplay tam), ALI_FlightLocomotionLayer master tarafından implement edilmedi → CMC.LinkAnimClassLayers fire etse de master'da hiç fire etmez. State-aware blend (`Movement.Mode.Flight` tag bool ile BlendByBool) Gap #27 fix gelene kadar erteleniyor.
+
+### Öneri (öncelik A/B/C)
+
+**A — must (Gap #27 close şartı)**
+
+1. `bp.add_interface` cross-BP node mutation YAPMAMALI. Sadece `BP->ImplementedInterfaces.Add(InterfaceClass)` + Compile. AnimGraph mutations ayrı tool (`animation.add_linked_anim_layer_node`) tarafından yapılır.
+
+2. Eğer Sage'in mevcut `bp.add_interface`'i AnimLayerInterface için **otomatik convenience** mantığı (`ImplementNewInterface` UE flow'u) kullanıyorsa: bu davranışı **opt-in** flag'la sakla:
+```json
+{ "tool": "bp.add_interface",
+  "args": { ..., "auto_spawn_layer_call": false }  // default false, opt-in true
+}
+```
+
+3. AnimLayerInterface tetiklenen Layer rename davranışı: rename impact analysis Gap #26 fix'i interface-aware idi. Aynı pattern bp_add_interface tarafında uygulanmalı — yeni interface ekleme **mevcut node'ların Layer property'sini güncelleme yetkisine sahip değil** (interface match olsa bile, çünkü yeni interface'in fonksiyon adı mevcut interface'in fonksiyon adıyla çakışıyor olabilir).
+
+**B — should**
+
+4. Response payload'a side-effect rapor ekle:
+```json
+{
+  "already": false,
+  "interface": "ALI_FlightLocomotionLayer_C",
+  "linked_layer_nodes_modified": 0,
+  "linked_layer_nodes_spawned": 0
+}
+```
+Bu yan etkilerin görünür olmasını sağlar.
+
+**C — nice-to-have**
+
+5. Gap #26 + Gap #27 birlikte ele alınmalı: `bp.rename_function` ve `bp.add_interface` rename impact'i için **canonical interface match policy**:
+   - `Node->Node.Interface == HitTestInterfaceClass` strict eşleşme
+   - Layer name eşleşmesi tek başına yeterli **DEĞİL**
+   - Şüpheli mutation noktaları için unit test: ABP_Mannequin_Base × ALI_FlightLocomotionLayer (FullBody_* kullanılan + LeftHandPose_OverrideState × farklı interface FlightLocomotionPose senaryosu)
+
+### Notlar — context
+
+- Gap #26 fix doğru çalışıyor (rename çağrısı yan etki üretmedi — kontrollü test geçildi). Bu gap **rename değil interface ekleme** tarafında.
+- Master ABP_HeroFlight_Mannequin Lyra `ABP_Mannequin_Base` duplikasyonu — content team Lyra'nın master ABP'sinin (5 LinkedAnimLayer node + state machine + ApplyAdditive + LayeredBoneBlend + ControlRig + RotateRootBone + Slot + Inertialization) zenginliğini koruyor. **Bu mannequin master Lyra'nın hero AnimBP iskeleti**, sürekli tekrar duplikasyon riski iş büyütüyor.
+- Workaround zincirinden geçince Sage'e güvensizlik: AnimLayerInterface eklemek için her seferinde master ABP'yi sıfırlamak gerekir. Production-grade plugin asset workflow için Gap #27 close ŞART.
+- Mevcut FlightCore sprint state stable: master ABP intact (weapon ALI çalışıyor, ground gameplay temiz), ALI_FlightLocomotionLayer master tarafından implement edilmedi (state-aware blend bekleniyor). Multiplayer C++ infra (StateComponent + CMC + GameFeatureData + Pawn BP wire) ready.
+
+### Verify result — Lyra Claude 2026-05-06 18:55 (RE-OPEN)
+
+Sage fix deploy edildi, kontrollü test sonucu **partial fix**:
+
+**B önerisi uygulandı ✓**: `bp.add_interface` response payload'a side-effect tracking field'ları eklendi:
+```json
+{
+  "already": false,
+  "anim_layer_interface": true,
+  "linked_layer_changes": [],
+  "linked_layer_engine_side_effect_count": 0,
+  "linked_layer_nodes_modified": 0,
+  "linked_layer_nodes_removed": 0,
+  "linked_layer_nodes_restored": 0,
+  "linked_layer_nodes_spawned": 0
+}
+```
+
+**A önerisi uygulanmadı ✗**: Tool response'u "0 modified" rapor ediyor AMA UE engine-side gerçek mutation hala oluyor. Kontrollü test:
+
+1. Master ABP fresh duplikasyon (ABP_Mannequin_Base) → `bp.validate` → **0 error** ✓
+2. `bp.reparent` → UFlightCoreAnimInstance → `bp.validate` → **0 error** ✓
+3. `bp.add_interface` ALI_FlightLocomotionLayer_C → response **0 yan etki** rapor ediyor
+4. Hemen `bp.validate` → **2 error**:
+   ```
+   "Linked anim layer node ALI_ItemAnimLayers - FlightLocomotionPose uses invalid layer 'FlightLocomotionPose'." (error)
+   "Missing allocated node for AnimGraphNode_LinkedAnimLayer_2 ..." (error)
+   ```
+5. `bp.search_nodes keyword=FlightLocomotionPose` → 1 hit:
+   ```json
+   {"id": "D3A78B57422BB03D38E31CBCA2DFE0F4", "title": "ALI_ItemAnimLayers - FlightLocomotionPose"}
+   ```
+
+Yani master AnimGraph'taki mevcut bir `ALI_ItemAnimLayers` LinkedAnimLayer node'unun Layer property'si "FlightLocomotionPose" olarak silently değişti — Sage tool response'u "0 modified" rapor etmesine rağmen.
+
+### Kök sebep tahmini (Lyra Claude)
+
+Sage'in `bp.add_interface` UE'nin `FBlueprintEditorUtils::ImplementNewInterface` flow'unu çağırıyor olabilir. Bu UE engine flow'u **kendi içinde** AnimLayerInterface eklendiğinde master AnimGraph'taki mevcut LinkedAnimLayer node'larını "rename collision" mantığıyla update ediyor. Sage tool **bu engine-side mutation'ı algılamıyor**, response'unda 0 modified rapor ediyor.
+
+Fix yönü:
+1. Sage tool **UE engine flow'unu by-pass** etmeli — `BP->ImplementedInterfaces.Add(InterfaceClass)` direct mutation + manuel `BP->Modify()` + `KismetEditorUtilities::CompileBlueprint` (engine ImplementNewInterface convenience'ı atla).
+2. Veya: engine flow'u çağırmadan önce master AnimGraph'taki **LinkedAnimLayer node Layer property snapshot'ı** al, çağrı sonrası karşılaştır, fark varsa **revert** + bilgi response'a ekle.
+
+### Workaround (devam)
+
+Master ABP rebuild + ALI implement etmeme stratejisi sürdürülüyor. State-aware blend Gap #27 close edilene kadar deferred.
+
+5. duplikasyon (2026-05-06 19:00):
+- delete + duplicate ABP_Mannequin_Base → ABP_HeroFlight_Mannequin
+- bp_reparent → UFlightCoreAnimInstance
+- **bp_add_interface SKIP** (yine yan etki)
+- Mesh.AnimClass restore → 0 error
+
+Multiplayer C++ infra ready, master AnimGraph intact, FlightCore ALI master tarafından implement edilmedi.
+
+---
+
+### Sage Claude triage (geliştirici doldurur)
+
+- **Triage tarihi**: 2026-05-06
+- **Kök sebep**: First fix sadece response/snapshot tarafini kapatti ama iki kritik nokta eksikti: scanner `CollectAllGraphs` ile master AnimGraph'taki gerçek `UAnimGraphNode_LinkedAnimLayer` node'unu her durumda görmüyordu; daha önemlisi UE `ConformAnimLayersByGuid`, AnimLayerInterface conform sırasında `Node->Node.Interface` kontrol etmeden sadece graph GUID eşleşmesiyle Layer rename yapıyor. Duplicated ALI graph GUID'i Lyra core ALI graph GUID'iyle çakışınca sonraki compile/validate yine `ALI_ItemAnimLayers` node'unu `FlightLocomotionPose` adına çekiyordu.
+- **Fix commit**: pending (working tree: `plugin/Source/SageBridge/Private/Tools/SageBlueprintTools.cpp`, `server/src/main.cpp`, `gap-inbox.md`)
+- **Deploy adımı**: ✅ server + plugin full build OK (`scripts/build-all.ps1 debug`, 2026-05-06 19:11); ✅ Lyra + HeroFlight `Plugins/SageBridge` full payload deploy (`SageBridge.uplugin`, `Binaries/Win64/*`, `Source/`); server baslatilmadi.
+- **Verify durumu**: pending - second fix smoke: response `used_direct_anim_layer_interface_add=true`, `linked_layer_snapshot_node_count>0`; duplicated ALI collision varsa `interface_graph_guids_regenerated>0`; hemen sonraki `bp.validate` 0 error olmali ve `bp.search_nodes keyword=FlightLocomotionPose` mevcut `ALI_ItemAnimLayers` node'larini döndürmemeli.
+
+---
+
 ## Gap #26 — `bp.rename_function` interface-agnostic Layer rename — proje genelinde LinkedAnimLayer node'larının Layer property'sini silently bozuyor
 
 - **Status**: ✅ FIXED — deploy DONE (Lyra + HeroFlight 18:15), Lyra Claude verify pending
@@ -1093,7 +1443,7 @@ Mevcut `animation.connect_pose_pin` ve `animation.add_blend_list_by_bool` faydal
 
 ### Gap #23 — `restart_editor` Windows build path hatası
 
-- **Status**: OPEN
+- **Status**: FIXED (source patched; running server not restarted)
 - **Reported**: 2026-05-05 by Lyra Codex
 - **Project**: `D:\Steamworks\Lyra`
 - **Sage repo**: `D:\Steamworks\sage-unreal-mcp`
@@ -1138,3 +1488,11 @@ Lyra `FlightCore` C++ patch'i compile oldu fakat açık editor `UnrealEditor-Fli
 2. `UnrealEditor.exe` PID `21708` manuel kapatıldı.
 3. `Build.bat LyraEditor Win64 Development -Project=D:\Steamworks\Lyra\Lyra.uproject -WaitMutex -NoHotReloadFromIDE` başarılı geçti.
 4. Editor manuel yeniden açıldı; yeni PID `26384`, Sage session `4`.
+#### Sage implementation update - 2026-05-06 Codex
+
+- Windows script selection fixed in `restart_orchestrator.cpp`: `restart_editor` now chooses `scripts/build-plugin.ps1` on Win32 and `scripts/build-plugin.sh` on Mac/Linux.
+- Accidental `SAGE_REPO_ROOT=...\sage-unreal-mcp\scripts` is normalized back to repo root, so `scripts\scripts\build-plugin.*` is not constructed.
+- UBT project rebuild command now quotes `Build.bat` and `-Project=...` paths correctly on Windows.
+- Follow-up hardening added after Lyra deploy smoke: Step 4 now deploys the full packaged plugin payload into the project plugin (`SageBridge.uplugin`, every `Binaries/<platform>` file including PDB/modules, and `Source`) instead of only swapping DLL/modules.
+- Safety guard: recursive `Source` replacement is constrained to `<Project>/Plugins/SageBridge/Source`.
+- Verification done without touching the running server: `restart_orchestrator.cpp.obj` compiles via Ninja object target, and `git diff --check` is clean. The currently running `sage-server.exe` must be restarted later to pick up this source change.

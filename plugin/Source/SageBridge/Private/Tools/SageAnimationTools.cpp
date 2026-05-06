@@ -3855,12 +3855,72 @@ FSageToolDispatch::FOutcome AddVirtualBoneImpl(const TSharedPtr<FJsonObject>& Ar
             FString::Printf(TEXT("not a USkeleton: %s"), *SkeletonPath));
     }
 
-    // USkeleton::AddVirtualBone is editor-only and gated by SKELETONEDITOR module.
-    // Until Sage wires the SkeletonEditorSubsystem the canonical path remains
-    // editor.run_python.
-    return FSageToolDispatch::FOutcome::MakeError(-32000,
-        TEXT("[NOT IMPLEMENTED] animation.add_virtual_bone — use editor.run_python "
-             "with unreal.SkeletonEditorSubsystem.add_virtual_bone(skeleton, source, target, name)"));
+    const FName SourceF(*SourceBone);
+    const FName TargetF(*TargetBone);
+    FName VirtualF(*BoneName);
+    if (!BoneName.StartsWith(TEXT("VB ")))
+    {
+        VirtualF = FName(*(TEXT("VB ") + BoneName));
+    }
+
+    const FReferenceSkeleton& RefSkel = Skel->GetReferenceSkeleton();
+    if (RefSkel.FindBoneIndex(SourceF) == INDEX_NONE)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("source_bone not found on skeleton: %s"), *SourceBone));
+    }
+    if (RefSkel.FindBoneIndex(TargetF) == INDEX_NONE)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("target_bone not found on skeleton: %s"), *TargetBone));
+    }
+
+    for (const FVirtualBone& VB : Skel->GetVirtualBones())
+    {
+        const bool bSameName = (VB.VirtualBoneName == VirtualF);
+        const bool bSamePair = (VB.SourceBoneName == SourceF && VB.TargetBoneName == TargetF);
+        if (bSameName && bSamePair)
+        {
+            auto R = MakeShared<FJsonObject>();
+            R->SetStringField(TEXT("path"),        Skel->GetPathName());
+            R->SetStringField(TEXT("bone_name"),   VirtualF.ToString());
+            R->SetStringField(TEXT("source_bone"), SourceBone);
+            R->SetStringField(TEXT("target_bone"), TargetBone);
+            R->SetBoolField  (TEXT("added"),       false);
+            R->SetBoolField  (TEXT("already"),     true);
+            return FSageToolDispatch::FOutcome::MakeSuccess(R);
+        }
+        if (bSameName)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("virtual bone name already exists: %s"), *VirtualF.ToString()));
+        }
+        if (bSamePair)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("virtual bone already exists for %s -> %s as %s"),
+                    *SourceBone, *TargetBone, *VB.VirtualBoneName.ToString()));
+        }
+    }
+
+    FScopedTransaction Tx(LOCTEXT("AddVirtualBone", "Add Virtual Bone"));
+    Skel->Modify();
+    if (!Skel->AddNewNamedVirtualBone(SourceF, TargetF, VirtualF))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("AddNewNamedVirtualBone failed: %s"), *VirtualF.ToString()));
+    }
+    Skel->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"),        Skel->GetPathName());
+    R->SetStringField(TEXT("bone_name"),   VirtualF.ToString());
+    R->SetStringField(TEXT("source_bone"), SourceBone);
+    R->SetStringField(TEXT("target_bone"), TargetBone);
+    R->SetBoolField  (TEXT("added"),       true);
+    R->SetBoolField  (TEXT("already"),     false);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ---------------------------------------------------------------------------
@@ -5216,12 +5276,29 @@ FSageToolDispatch::FOutcome SetAnimNodePropertyImpl(const TSharedPtr<FJsonObject
                             *PropName, *TargetProp->GetClass()->GetName()));
     }
 
+    // Fire UE's PostEditChangeProperty pipeline so node-class hooks
+    // (e.g. UAnimGraphNode_LinkedAnimLayer's ChangeLayer for Layer FName,
+    // UAnimGraphNode_StateMachine's sub-graph rebind, etc.) run. Without
+    // this, raw CDO writes are invisible to the compile path even when the
+    // value is present at the property level (Lyra Sage Gap #28). Use the
+    // wrapper-class property name when available so the event reflects what
+    // the AnimGraphNode actually saw.
+    {
+        FProperty* EventProp = AnimNode->GetClass()->FindPropertyByName(FName(*PropName));
+        if (!EventProp) EventProp = TargetProp;  // inner-struct fallback
+        FPropertyChangedEvent ChangeEvent(EventProp, EPropertyChangeType::ValueSet);
+        AnimNode->PostEditChangeProperty(ChangeEvent);
+    }
+    AnimNode->ReconstructNode();
+
     FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("node_id"),  NodeId);
     R->SetStringField(TEXT("property"), PropName);
     R->SetBoolField  (TEXT("set"),      true);
+    R->SetStringField(TEXT("node_title"),
+        AnimNode->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -8072,9 +8149,8 @@ FSageToolDispatch::FOutcome AddLinkedAnimLayerNodeImpl(const TSharedPtr<FJsonObj
     Node->NodePosY = static_cast<int32>(Y);
     AnimGraph->AddNode(Node, /*bUserAction=*/false, /*bSelectNewNode=*/false);
 
-    // Set Interface (UClass) + Layer (FName) on the inner FAnimNode_LinkedAnimLayer
-    // BEFORE PostPlacedNewNode so ReconstructNode allocates pose pins matching the
-    // layer function's signature.
+    // Step 1: Initial property writes BEFORE PostPlacedNewNode so the spawn
+    // pipeline can read Interface/Layer when allocating default pose pins.
     Node->Node.Interface = IfaceCls;
     Node->Node.Layer = FName(*FuncName);
     if (InstCls)
@@ -8082,8 +8158,35 @@ FSageToolDispatch::FOutcome AddLinkedAnimLayerNodeImpl(const TSharedPtr<FJsonObj
         Node->Node.InstanceClass = InstCls;
     }
 
+    // Step 2: Canonical spawn pipeline.
     Node->PostPlacedNewNode();
     Node->AllocateDefaultPins();
+
+    // Step 3: Fire UE's PostEditChangeProperty pipeline for the inner
+    // FAnimNode_LinkedAnimLayer fields. Without this, Layer/Interface are set
+    // at the CDO level but UE's "ChangeLayer" pipeline never runs — node
+    // title stays "<Interface> - None", bp.validate emits "Linked anim layer
+    // node ... does not specify a layer", and the runtime layer binding is
+    // never wired (Lyra Sage Gap #28). Mirror of SetLinkedLayerNameForRename
+    // (Gap #26) but at spawn time instead of rename time.
+    auto FirePropertyChange = [&](const TCHAR* PropertyName)
+    {
+        if (FProperty* P = FAnimNode_LinkedAnimLayer::StaticStruct()
+                ->FindPropertyByName(FName(PropertyName)))
+        {
+            FPropertyChangedEvent E(P, EPropertyChangeType::ValueSet);
+            Node->PostEditChangeProperty(E);
+        }
+    };
+    FirePropertyChange(TEXT("Interface"));
+    FirePropertyChange(TEXT("Layer"));
+    if (InstCls)
+    {
+        FirePropertyChange(TEXT("InstanceClass"));
+    }
+
+    // Step 4: Final reconstruct — idempotent on top of PostEditChangeProperty
+    // events, guarantees pin reallocation + title cache regeneration.
     Node->ReconstructNode();
 
     FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(MasterBP);
@@ -8098,6 +8201,15 @@ FSageToolDispatch::FOutcome AddLinkedAnimLayerNodeImpl(const TSharedPtr<FJsonObj
     UEdGraphPin* InputPosePin  = FindFirstInputPosePin(Node);
     UEdGraphPin* OutputPosePin = FindFirstOutputPosePin(Node);
 
+    // Step 5: Verify the Layer actually took effect by reading the rendered
+    // node title — the same surface bp.validate/bp.search_nodes use. If the
+    // title still shows "<Interface> - None" the UE pipeline silently failed;
+    // surface that as a _warning so callers don't see a misleading success
+    // (Gap #28 B-should).
+    const FString NodeTitle = Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString();
+    const bool bLayerInTitle =
+        !FuncName.IsEmpty() && NodeTitle.Contains(FuncName, ESearchCase::CaseSensitive);
+
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("node_id"), Node->NodeGuid.ToString(EGuidFormats::Digits));
     R->SetStringField(TEXT("class"), TEXT("/Script/AnimGraph.AnimGraphNode_LinkedAnimLayer"));
@@ -8110,6 +8222,14 @@ FSageToolDispatch::FOutcome AddLinkedAnimLayerNodeImpl(const TSharedPtr<FJsonObj
         InputPosePin ? InputPosePin->PinName.ToString() : FString());
     R->SetStringField(TEXT("output_pose_pin"),
         OutputPosePin ? OutputPosePin->PinName.ToString() : FString());
+    R->SetStringField(TEXT("node_title"), NodeTitle);
+    R->SetBoolField  (TEXT("layer_resolved"), bLayerInTitle);
+    if (!bLayerInTitle)
+    {
+        R->SetStringField(TEXT("_warning"),
+            FString::Printf(TEXT("Layer '%s' set at CDO level but UE 'ChangeLayer' pipeline did not propagate to node title (still shows '%s'); call animation.repair_linked_anim_layer_nodes or compile the BP to force reconstruction"),
+                            *FuncName, *NodeTitle));
+    }
     R->SetBoolField(TEXT("compiled"), bCompiled);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
@@ -8653,6 +8773,210 @@ FSageToolDispatch::FOutcome SetLinkedAnimLayerImpl(const TSharedPtr<FJsonObject>
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// --- (12) animation.repair_linked_anim_layer_nodes ------------------------
+// Lyra Sage Gap #28 C nice-to-have — sweeps every UAnimGraphNode_LinkedAnimLayer
+// in the project (or a single BP if `path` provided), detects nodes whose
+// inner FAnimNode_LinkedAnimLayer::Layer FName is set but whose rendered node
+// title still shows "<Interface> - None" (UE's ChangeLayer pipeline never
+// fired). For each, fires PostEditChangeProperty(Layer) + ReconstructNode to
+// repair. This rescues ABPs corrupted by older Sage spawn paths.
+
+FSageToolDispatch::FOutcome RepairLinkedAnimLayerNodesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString TargetPath;
+    bool bDryRun = false;
+    bool bCompile = false;
+    if (Args.IsValid())
+    {
+        Args->TryGetStringField(TEXT("path"), TargetPath);
+        Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+        Args->TryGetBoolField(TEXT("compile"), bCompile);
+    }
+
+    TArray<UAnimBlueprint*> TargetBPs;
+    if (!TargetPath.IsEmpty())
+    {
+        UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(TargetPath));
+        if (!AnimBP)
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("not a UAnimBlueprint: %s"), *TargetPath));
+        TargetBPs.Add(AnimBP);
+    }
+    else
+    {
+        TargetBPs = LoadAnimLayerInterfacesForCollisionScan();  // ALI filter
+        // Plus all anim BPs that may host linked-layer nodes — wider scan.
+        FARFilter Filter;
+        Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.AnimBlueprint")));
+        Filter.bRecursiveClasses = true;
+        TArray<FAssetData> Found;
+        GetAssetRegistry().GetAssets(Filter, Found);
+        TSet<UAnimBlueprint*> Seen(TargetBPs);
+        for (const FAssetData& Asset : Found)
+        {
+            const FString Pkg = Asset.PackageName.ToString();
+            if (!ShouldScanAnimLayerPackage(Pkg)) continue;
+            if (UAnimBlueprint* BP = Cast<UAnimBlueprint>(Asset.GetAsset()))
+            {
+                if (!Seen.Contains(BP)) { Seen.Add(BP); TargetBPs.Add(BP); }
+            }
+        }
+        for (TObjectIterator<UAnimBlueprint> It; It; ++It)
+        {
+            UAnimBlueprint* BP = *It;
+            if (!BP) continue;
+            UPackage* Pkg = BP->GetOutermost();
+            if (!Pkg || !ShouldScanAnimLayerPackage(Pkg->GetName())) continue;
+            if (!Seen.Contains(BP)) { Seen.Add(BP); TargetBPs.Add(BP); }
+        }
+    }
+
+    FScopedTransaction Tx(LOCTEXT("RepairLinkedLayer", "Sage: Repair Linked Anim Layer Nodes"));
+
+    int32 ScannedNodeCount = 0;
+    int32 RepairedNodeCount = 0;
+    int32 NeedsRepairCount = 0;
+    TArray<TSharedPtr<FJsonValue>> Details;
+    TSet<FString> AffectedBlueprints;
+    TSet<UBlueprint*> StructurallyChangedBPs;
+
+    auto FirePropertyChange = [](UAnimGraphNode_LinkedAnimLayer* Node, const TCHAR* PropertyName)
+    {
+        if (FProperty* P = FAnimNode_LinkedAnimLayer::StaticStruct()
+                ->FindPropertyByName(FName(PropertyName)))
+        {
+            FPropertyChangedEvent E(P, EPropertyChangeType::ValueSet);
+            Node->PostEditChangeProperty(E);
+        }
+    };
+
+    // Local graph traversal — FBpGraphEntry/CollectAllGraphs is in
+    // SageBlueprintTools.cpp's anonymous namespace and not visible here.
+    // We replicate the relevant subset (function graphs + ubergraph pages +
+    // macro graphs + interface override graphs) inline. LinkedAnimLayer nodes
+    // can only live inside AnimGraph schema graphs, so this coverage is
+    // complete for the repair sweep.
+    auto CollectAnimGraphs = [](UAnimBlueprint* BP) -> TArray<UEdGraph*>
+    {
+        TArray<UEdGraph*> Out;
+        if (!BP) return Out;
+        for (UEdGraph* G : BP->FunctionGraphs)  if (G) Out.Add(G);
+        for (UEdGraph* G : BP->UbergraphPages)  if (G) Out.Add(G);
+        for (UEdGraph* G : BP->MacroGraphs)     if (G) Out.Add(G);
+        for (FBPInterfaceDescription& Impl : BP->ImplementedInterfaces)
+        {
+            for (UEdGraph* G : Impl.Graphs) if (G) Out.Add(G);
+        }
+        return Out;
+    };
+
+    for (UAnimBlueprint* AnimBP : TargetBPs)
+    {
+        if (!AnimBP) continue;
+        const TArray<UEdGraph*> AllGraphs = CollectAnimGraphs(AnimBP);
+        for (UEdGraph* Graph : AllGraphs)
+        {
+            if (!Graph) continue;
+            for (UEdGraphNode* GraphNode : Graph->Nodes)
+            {
+                UAnimGraphNode_LinkedAnimLayer* Node =
+                    Cast<UAnimGraphNode_LinkedAnimLayer>(GraphNode);
+                if (!Node) continue;
+                ++ScannedNodeCount;
+
+                const FName Layer = Node->Node.Layer;
+                if (Layer.IsNone()) continue;  // genuinely empty — not corrupt
+
+                const FString Title = Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString();
+                const bool bTitleResolved =
+                    Title.Contains(Layer.ToString(), ESearchCase::CaseSensitive);
+                if (bTitleResolved) continue;  // healthy
+
+                ++NeedsRepairCount;
+
+                auto D = MakeShared<FJsonObject>();
+                D->SetStringField(TEXT("blueprint"), AnimBP->GetPathName());
+                D->SetStringField(TEXT("graph"), Graph->GetName());
+                D->SetStringField(TEXT("node_id"),
+                    Node->NodeGuid.ToString(EGuidFormats::Digits));
+                D->SetStringField(TEXT("interface"),
+                    Node->Node.Interface.Get()
+                        ? Node->Node.Interface.Get()->GetPathName()
+                        : FString());
+                D->SetStringField(TEXT("layer"), Layer.ToString());
+                D->SetStringField(TEXT("before_title"), Title);
+
+                if (!bDryRun)
+                {
+                    AnimBP->Modify();
+                    Graph->Modify();
+                    Node->Modify();
+                    FirePropertyChange(Node, TEXT("Interface"));
+                    FirePropertyChange(Node, TEXT("Layer"));
+                    Node->ReconstructNode();
+                    StructurallyChangedBPs.Add(AnimBP);
+
+                    const FString After =
+                        Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString();
+                    D->SetStringField(TEXT("after_title"), After);
+                    D->SetBoolField(TEXT("repaired"),
+                        After.Contains(Layer.ToString(), ESearchCase::CaseSensitive));
+                    ++RepairedNodeCount;
+                }
+                else
+                {
+                    D->SetStringField(TEXT("after_title"), TEXT("(dry_run — not modified)"));
+                    D->SetBoolField(TEXT("repaired"), false);
+                }
+
+                AffectedBlueprints.Add(AnimBP->GetPathName());
+                Details.Add(MakeShared<FJsonValueObject>(D));
+            }
+        }
+    }
+
+    if (!bDryRun)
+    {
+        for (UBlueprint* BP : StructurallyChangedBPs)
+        {
+            FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+        }
+    }
+    else
+    {
+        Tx.Cancel();
+    }
+
+    bool bCompiled = false;
+    if (bCompile && !bDryRun)
+    {
+        for (UBlueprint* BP : StructurallyChangedBPs)
+        {
+            FKismetEditorUtilities::CompileBlueprint(BP);
+        }
+        bCompiled = StructurallyChangedBPs.Num() > 0;
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetNumberField(TEXT("scanned_node_count"), ScannedNodeCount);
+    R->SetNumberField(TEXT("needs_repair_count"), NeedsRepairCount);
+    R->SetNumberField(TEXT("repaired_node_count"), RepairedNodeCount);
+    R->SetBoolField  (TEXT("dry_run"), bDryRun);
+    {
+        TArray<FString> Sorted = AffectedBlueprints.Array();
+        Sorted.Sort();
+        TArray<TSharedPtr<FJsonValue>> Arr;
+        for (const FString& S : Sorted) Arr.Add(MakeShared<FJsonValueString>(S));
+        R->SetArrayField(TEXT("affected_blueprints"), Arr);
+    }
+    R->SetArrayField(TEXT("details"), Details);
+    R->SetBoolField  (TEXT("compiled"), bCompiled);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ===========================================================================
 // Cluster H — Sequence/Montage advanced
 // ===========================================================================
@@ -9121,6 +9445,7 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.remove_layer_function"),          GT(&RemoveLayerFunctionImpl));
     Dispatch.RegisterHandler(TEXT("animation.create_linked_layer_pattern"),    GT(&CreateLinkedLayerPatternImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_linked_anim_layer"),          GT(&SetLinkedAnimLayerImpl));
+    Dispatch.RegisterHandler(TEXT("animation.repair_linked_anim_layer_nodes"), GT(&RepairLinkedAnimLayerNodesImpl));
     // Phase 4-r6 Cluster H (sequence/montage advanced)
     Dispatch.RegisterHandler(TEXT("animation.set_sequence_additive_settings"), GT(&SetSequenceAdditiveImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_sequence_compression_scheme"), GT(&SetSequenceCompressionImpl));

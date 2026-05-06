@@ -249,12 +249,12 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.add_virtual_bone",
-        .description="Add a virtual bone to a skeleton. Note: removed in UE 5.7; returns guidance.",
-        .inputSchema=obj({{"skeleton",str()},{"source_bone",str()},{"target_bone",str()},{"name",str()}},{"skeleton","source_bone","target_bone"}),
+        .description="Add a named virtual bone to a USkeleton using USkeleton::AddNewNamedVirtualBone. Accepts `name` with or without the UE `VB ` prefix; returns {path, bone_name, source_bone, target_bone, added, already}.",
+        .inputSchema=obj({{"skeleton",str()},{"source_bone",str()},{"target_bone",str()},{"name",str()}},{"skeleton","source_bone","target_bone","name"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.remove_virtual_bone",
-        .description="Remove a virtual bone from a skeleton. Note: removed in UE 5.7; returns guidance.",
+        .description="Remove a virtual bone from a USkeleton by virtual bone name. Returns {path, bone_name, removed}.",
         .inputSchema=obj({{"skeleton",str()},{"bone_name",str()}},{"skeleton","bone_name"}),
         .handler=nullptr,.remote=true});
 
@@ -663,6 +663,11 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
     reg(registry, Tool{.name="animation.set_linked_anim_layer",
         .description="PIE/editor-preview runtime tool: call USkeletalMeshComponent::LinkAnimClassLayers / UnlinkAnimClassLayers on a live actor. `actor` is a PIE actor path/label/name; `layer_class` is a UAnimInstance subclass UClass path. `mesh_component` optional (defaults to first SkeletalMeshComponent). `mode` ∈ {'link','unlink'} (default 'link'); 'unlink' uses UnlinkAnimClassLayers. PIE world dışında editor preview-only warning döner ve hiçbir package dirty yapmaz. Use this to verify asset authoring drives the linked child class at runtime without packaging. Returns {actor, mesh, layer_class, linked, previous_layers[], mode, errors[], _warning?}.",
         .inputSchema=obj({{"actor",str()},{"layer_class",str()},{"mesh_component",str()},{"mode",str()}},{"actor","layer_class"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.repair_linked_anim_layer_nodes",
+        .description="Sweep UAnimGraphNode_LinkedAnimLayer nodes and repair Layer property writes that bypassed UE's ChangeLayer pipeline (Lyra Sage Gap #28). A node is corrupt when its inner FAnimNode_LinkedAnimLayer::Layer FName is set at the CDO level but the rendered node title still shows '<Interface> - None' (UE's internal title cache + binding never refreshed). For each detected node, fires PostEditChangeProperty(Layer/Interface) + ReconstructNode to apply the canonical reconstruction pipeline. `path` optional (single AnimBP scope; if omitted scans every project/game-feature AnimBP via AssetRegistry + TObjectIterator). `dry_run` (default false) reports detected nodes without modifying. `compile` (default false) compiles every changed BP after repair. Returns {scanned_node_count, needs_repair_count, repaired_node_count, dry_run, affected_blueprints[], details:[{blueprint,graph,node_id,interface,layer,before_title,after_title,repaired}], compiled}.",
+        .inputSchema=obj({{"path",str()},{"dry_run",bln()},{"compile",bln()}}),
         .handler=nullptr,.remote=true});
 
     // ----- Phase 4-r6 Cluster H (sequence/montage advanced) -------------
