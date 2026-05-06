@@ -105,6 +105,159 @@ Bir gap fix'lendikten sonra **non-obvious bir öğreti** çıktıysa (`obj({})` 
 
 <!-- Yeni gap entry'leri buraya. En üste yeni geleni koy. -->
 
+## Gap #26 — `bp.rename_function` interface-agnostic Layer rename — proje genelinde LinkedAnimLayer node'larının Layer property'sini silently bozuyor
+
+- **Status**: ✅ FIXED — deploy DONE (Lyra + HeroFlight 18:15), Lyra Claude verify pending
+- **Reported**: 2026-05-06 17:55 tarafından Lyra Claude / FlightCore asset wiring sprint (Gap #25 verify sonrası)
+- **Project**: `D:\Steamworks\Lyra`
+- **Editor**: Lyra UE 5.7.4 (post Cluster G + Gap #25 fix deploy)
+- **Affected assets**:
+  - `/FlightCore/Animations/ALI_FlightLocomotionLayer.ALI_FlightLocomotionLayer_C` (rename hedefi — `LeftHandPose_OverrideState` → `FlightLocomotionPose`)
+  - `/FlightCore/Animations/ABP_HeroFlight_Mannequin.ABP_HeroFlight_Mannequin` (ABP_Mannequin_Base duplikasyonu — yan etki kurbanı, master AnimGraph'taki LinkedAnimLayer node'unun Layer property'si silently değişti)
+
+### Hedef
+
+ALI_FlightLocomotionLayer (ALI_ItemAnimLayers'tan duplikasyon) içindeki tek fonksiyonu rename etmek — `LeftHandPose_OverrideState` → `FlightLocomotionPose`. Yalnızca **bu interface BP'sinin kendi function graph'ı** etkilensin; **diğer interface'leri (ALI_ItemAnimLayers Lyra core)** kullanan node'lar etkilenmesin.
+
+### Denenen tool çağrısı
+
+```json
+{ "tool": "bp.rename_function",
+  "args": {
+    "path": "/FlightCore/Animations/ALI_FlightLocomotionLayer.ALI_FlightLocomotionLayer",
+    "old_name": "LeftHandPose_OverrideState",
+    "new_name": "FlightLocomotionPose"
+  } }
+```
+
+Sonuç: `{"actual": "FlightLocomotionPose", "blueprint": "ALI_FlightLocomotionLayer", ...}` — başarılı görünüyordu.
+
+### Sonuç / hata
+
+Beklenmeyen yan etki: ABP_HeroFlight_Mannequin'in (master ABP, ABP_Mannequin_Base duplikasyonu) AnimGraph'ında **mevcut bir UAnimGraphNode_LinkedAnimLayer node**'unun Layer property'si `LeftHandPose_OverrideState` → `FlightLocomotionPose` olarak silently değişti. **AMA** o node'un Interface property'si **`ALI_ItemAnimLayers`** (Lyra core, dokunulmadı, hala 14 weapon-side fonksiyona sahip — `LeftHandPose_OverrideState` dahil).
+
+Sonuç: master AnimGraph'ta geçersiz kombinasyon — `Interface=ALI_ItemAnimLayers, Layer=FlightLocomotionPose` (ALI_ItemAnimLayers'ta `FlightLocomotionPose` yok).
+
+`bp.validate` master ABP'yi compile ederken:
+
+```text
+"In use pin Input Pose no longer exists on node ALI_ItemAnimLayers - FlightLocomotionPose. Please refresh node or break links to remove pin." (error)
+"Linked anim layer node ALI_ItemAnimLayers - FlightLocomotionPose uses invalid layer 'FlightLocomotionPose'." (error)
+"Missing allocated node for AnimGraphNode_LinkedAnimLayer_2 while searching for node links — likely due to the node having outstanding errors." (error)
+```
+
+`bp.search_nodes path=ABP_HeroFlight_Mannequin keyword=FlightLocomotionPose`:
+```json
+{"hits": [{"class": "AnimGraphNode_LinkedAnimLayer", "graph": "AnimGraph", "id": "AF97636943A0D319615CFAAE72088F24", "title": "ALI_ItemAnimLayers - FlightLocomotionPose"}]}
+```
+
+Yani master ABP'deki **ALI_ItemAnimLayers** interface'ini kullanan bir node'un Layer property'si rename'in yan etkisiyle değişti. ALI_ItemAnimLayers Lyra core asset, dokunulmadı; master ABP duplikasyon zamanı doğru node yapısıyla geldi (Interface=ALI_ItemAnimLayers, Layer=LeftHandPose_OverrideState). Sage rename projeyi tarayıp aynı adlı **tüm Layer property'lerini** güncellemiş — interface eşleşmesini kontrol etmemiş.
+
+### Beklenen davranış
+
+`bp.rename_function` rename impact analysis cross-BP olmalı, **AMA interface boundaries kullanmalı**:
+
+- Bir UAnimGraphNode_LinkedAnimLayer node'u rename edilecekse: **`Node->Node.Interface == RenamedInterfaceBP->GeneratedClass`** kontrolü zorunlu
+- Aynı isimde fonksiyon farklı interface'lerde olabilir; bu **kasıtlı isim çakışması** (örn. ALI_ItemAnimLayers ve ALI_FlightLocomotionLayer'ın ikisinde de `LeftHandPose_OverrideState` adlı fonksiyon olabilir, farklı amaçlar için)
+- Sage rename sadece **rename hedef interface'i (path)** ile interface property eşleşen node'ların Layer property'sini güncelleme
+
+Pseudo-code:
+```cpp
+void RenameLayerFunction(UAnimBlueprint* InterfaceBP, FName OldName, FName NewName)
+{
+    UAnimBlueprintGeneratedClass* InterfaceClass = InterfaceBP->GeneratedClass;
+    for (UAnimGraphNode_LinkedAnimLayer* Node : ScanAllLinkedAnimLayerNodesInProject())
+    {
+        // GUARD: only update if THIS node's interface matches
+        if (Node->Node.Interface == InterfaceClass && Node->Node.Layer == OldName)
+        {
+            Node->Node.Layer = NewName;
+            Node->ReconstructNode();
+        }
+        // else: don't touch — different interface, name collision is intentional
+    }
+}
+```
+
+Plus minor: rename impact node listesi response'a eklensin (`updated_node_count`, `affected_blueprints[]`) — sessiz yan etki bug'larının fark edilmesini kolaylaştırır.
+
+### Workaround
+
+1. Sage rename öncesi: hedef interface'in fonksiyon adının **proje genelinde başka bir BP'de aynı isimde** olup olmadığını kontrol et. Çakışma varsa rename hedef adını farklı seç (örn. `FlightLocomotion_Pose` veya `FlightCore_LocomotionPose` prefix ile).
+
+2. Sage rename sonrası master ABP bozulmuşsa: master'ı silip ABP_Mannequin_Base'den **yeniden duplike** et. ALI_FlightLocomotionLayer interface implement adımı tekrar yapma — master AnimGraph intact kalsın (state-aware blend ayrı sprint).
+
+Mevcut workaround uygulandı:
+```text
+delete_asset /FlightCore/Animations/ABP_HeroFlight_Mannequin
+duplicate_asset /Game/.../ABP_Mannequin_Base → /FlightCore/Animations/ABP_HeroFlight_Mannequin
+editor_set_property B_Hero_HeroFlight.CharacterMesh0.AnimClass = ABP_HeroFlight_Mannequin_C
+bp.compile master + Pawn → 0 error 0 warning
+```
+
+### Öneri (öncelik A/B/C)
+
+**A — must**
+1. `bp.rename_function` rename impact analysis: UAnimGraphNode_LinkedAnimLayer node'larının Layer property'si interface-aware update edilmeli (yukarıda pseudo-code). Aynı pattern UAnimGraphNode_LinkedAnimGraph için de geçerli.
+
+2. Response payload'ına side-effect rapor ekle:
+```json
+{
+  "actual": "FlightLocomotionPose",
+  "blueprint": "ALI_FlightLocomotionLayer",
+  "updated_node_count": 0,
+  "skipped_node_count": 1,
+  "affected_blueprints": []
+}
+```
+Şu an silently 1 node update edildi, response'ta hiç bilgi yok.
+
+**B — should**
+3. Cluster G `add_layer_function` yeni fonksiyon eklerken proje genelinde aynı adlı fonksiyon olup olmadığını **kontrol et** + warning dön. Aynı adlı fonksiyon farklı interface'te varsa `collision_warning: ["BP1.func", "BP2.func"]` field'ı ile kullanıcı bilinçli karar versin.
+
+**C — nice-to-have**
+4. `animation.rebuild_anim_blueprint_from_master` — yan etki sonrası master ABP'yi temizlemek için convenience tool: silmek + master'ından (parent_class veya ImplementedInterfaces[0]) duplike etmek + intact restore.
+
+### Notlar — context
+
+- Sage Cluster G fix (Gap #24) interface override graph spawn + master AnimGraph'a LinkedAnimLayer node ekleme tool'larını ekledi — verify sırasında Lyra ALI_ItemAnimLayers Lyra-core asset'iyle isim çakışması yan etkisi keşfedildi.
+- Rename öncesi: ALI_FlightLocomotionLayer'da 14 weapon-style fonksiyon vardı (ALI_ItemAnimLayers duplikasyonu sebebiyle). Ben 13'ünü `bp.delete_function` ile sildim, sonra `LeftHandPose_OverrideState`'i rename ettim. Delete cascade master'a yansımadı (silinen fonksiyonlar master'daki node'lar zaten ALI_ItemAnimLayers'ı işaret ediyor, "ALI_FlightLocomotionLayer.<deleted>" bağı yoktu). Ama rename **tek bir interface'i hedefliyor olsa bile** yan etki cross-BP gözlemlendi.
+- ABP_HeroFlight_Mannequin'in kendi `LeftHandPose_OverrideState` override fonksiyonu rename'den etkilenmedi (override fonksiyon graph'ı intact kaldı). Yan etki sadece master AnimGraph'taki **LinkedAnimLayer node'unun Layer property** field'ında. Yani rename impact analysis'in görünmez tarafı.
+- Workaround sonrası FlightCore asset wiring stable: master ABP weapon ALI intact + ABP_FlightCore_Locomotion + ALI_FlightLocomotionLayer + Pawn BP wire + GameFeatureData ekli. Master'da FlightLocomotion linked-layer call'ı ŞUİAN YOK (state-aware blend ayrı sprint).
+
+---
+
+### Sage Claude triage (geliştirici doldurur)
+
+- **Triage tarihi**: 2026-05-06
+- **Kök sebep**: UE built-in `FBlueprintEditorUtils::RenameGraph` interface-agnostic — bir anim layer interface'in fonksiyon adı değişince UE proje genelinde TÜM `UAnimGraphNode_LinkedAnimLayer` node'larının `FAnimNode_LinkedAnimLayer::Layer` FName property'sini eski → yeni isim diye günceller, **`Node->Node.Interface` UClass eşleşmesini kontrol etmez**. Sage'in mevcut `BpRenameFunctionImpl` sadece `RenameGraph` çağırıp UE'nin agnostic davranışını kabul ediyordu; aynı isim farklı interface'lerde yaşıyorsa (örn. ALI_ItemAnimLayers Lyra-core ve ALI_FlightLocomotionLayer duplikasyonu ikisinde de `LeftHandPose_OverrideState`) silently corruption yaratıyordu.
+- **Fix scope (Mahmut tarafından, 4 dosya, snapshot + reconcile pattern)**:
+  1. **`BpRenameFunctionImpl` interface-aware snapshot+reconcile** (`SageBlueprintTools.cpp:3510`):
+     - **Pre-rename**: `CaptureLinkedLayerRenameSnapshot` proje genelinde (`LoadAnimBlueprintsForLinkedLayerRenameScan` AssetRegistry filter + `TObjectIterator<UAnimBlueprint>` loaded-but-unsaved BP'ler için fallback) tüm `UAnimGraphNode_LinkedAnimLayer` node'larını gez, eski layer adına eşleşenleri iki set'e ayır:
+       - `TargetOldLayerNodeKeys` — `Node->Node.Interface == RenamedInterfaceClass` (BPGC reload'a dayanıklı `IsSameGeneratedInterfaceAsset` ile `ClassGeneratedBy` fallback).
+       - `OtherInterfaceOldLayerNodeKeys` — interface farklı ama eski layer adıyla aynı (collision riski).
+     - **Rename**: `FBlueprintEditorUtils::RenameGraph` çağrı.
+     - **Post-rename reconcile**: `ReconcileLinkedLayerRename` snapshot'la kıyas:
+       - Target snapshot'taki node hâlâ OldLayer'da → **manuel** NewLayer set + `PostEditChangeProperty` veya `ReconstructNode` (UE rename onları düzgün update etmediyse).
+       - Target snapshot'taki node NewLayer'da → already_updated, sayım.
+       - Other-interface snapshot'taki node UE rename tarafından silently NewLayer'a çevrildiyse → **revert to OldLayer** + ReconstructNode (Gap #26 ana fix).
+     - **Response payload zenginleştirildi**: `linked_layer_rename_applicable`, `pre_rename_target_node_count`, `pre_rename_other_interface_old_name_count`, `updated_node_count`, `manual_updated_node_count`, `repaired_node_count`, `skipped_node_count`, `affected_blueprints[]`, `linked_layer_changes[]` (her change `action ∈ {updated, already_updated, repaired_other_interface}` + `from_layer/to_layer` + interface).
+     - Helper inventory: `LoadAnimBlueprintsForLinkedLayerRenameScan`, `IsSameGeneratedInterfaceAsset`, `LinkedLayerNodeKey`, `FLinkedLayerRenameSnapshot`/`FLinkedLayerRenameImpact` struct'lar, `ForEachLinkedAnimLayerNodeInProject` callback wrapper, `SetLinkedLayerNameForRename`, `AddLinkedLayerRenameChange`, `StringSetToJsonArray`, `GetAnimLayerInterfaceClassForRename` (sadece BPTYPE_Interface anim BP'ler için class döner; diğer BP türleri için no-op).
+  2. **`add_layer_function` collision_warnings** (`SageAnimationTools.cpp` + `phase4_schemas.cpp`, B-should öneri): `BuildAnimLayerFunctionCollisionWarnings(CurrentBP, FunctionName)` proje genelinde diğer ALI'lerde aynı isimde fonksiyon var mı tara, varsa response'a `collision_warnings: [{type, blueprint, graph_name, interface_class, message}]` + `collision_warning_count` field'ları ekle (creation block etmeden, sadece warn). Helper: `LoadAnimLayerInterfacesForCollisionScan` (engine/script/temp/transient hariç).
+  3. **Schema rename**: `animation.add_play_montage_notify_window` → `animation.add_slot_node` (description zaten "UAnimGraphNode_Slot" diyordu — schema name uyumsuzdu, fix). Plus `animation.add_layer_function` description'da `collision_warnings` + `collision_warning_count` mention.
+  4. **Bonus fix'ler**: `RemoveVirtualBoneImpl` `path` → `skeleton` parameter rename (anim tool param naming convention). `restart_orchestrator.cpp` Windows path quoting (`quoteShellArg`), `normalizeRepoRoot` (yanlış set edilmiş `SAGE_REPO_ROOT=.../scripts` durumunu parent'a normalize), `findBuildPluginScript` + `buildPluginCommand` Windows-aware refactor (`set SAGE_UE_ROOT && powershell.exe -NoProfile ...`).
+- **C nice-to-have (`animation.rebuild_anim_blueprint_from_master`)**: implement edilmedi — Lyra Claude'un workaround'u (`delete_asset` + `duplicate_asset` + `editor_set_property AnimClass`) zaten çalışıyor; convenience tool şimdilik gerekmez.
+- **Fix commit**: pending (working tree). 4 fix dosyası + scripts/audit-tools.ps1 (yeni audit script) + bu triage.
+- **Deploy adımı**: ✅ server build (Mahmut 2026-05-06 18:07, sage-server.exe 7.56 MB); ✅ plugin UAT BuildPlugin Win64 OK (`UnrealEditor-SageBridge.dll` 3037696 bytes 18:15, +28 KB Gap #26 helper'lar); ✅ Lyra + HeroFlight deploy 18:15 (her iki editor kapalı, file lock yok); ✅ tools/list smoke (560 tool, schema rename + add_layer_function collision_warnings description doğrulandı).
+- **Verify durumu**: pending — Lyra Claude verify edecek. Önerilen smoke senaryo:
+  1. Test ALI duplike et: `duplicate_asset /Game/.../ALI_ItemAnimLayers → /Game/Test/ALI_FlightLocomotionLayer_Test`. Master ABP'de mevcut LinkedAnimLayer node'u Interface=ALI_ItemAnimLayers Layer=`LeftHandPose_OverrideState` (Lyra-core, dokunulmamış).
+  2. `bp.rename_function path=ALI_FlightLocomotionLayer_Test old_name=LeftHandPose_OverrideState new_name=FlightTestPose`.
+  3. Response doğrula: `linked_layer_rename_applicable: true`, `pre_rename_target_node_count: 0` (test ALI henüz kullanılmıyor), `pre_rename_other_interface_old_name_count: 1` (master'daki ALI_ItemAnimLayers node'u), `updated_node_count: 0`, `repaired_node_count: 1` (Gap #26 ana fix — UE silently dokundu, Sage geri aldı), `linked_layer_changes[0].action: "repaired_other_interface"`.
+  4. Master ABP `bp.validate` → 0 error 0 warning (ALI_ItemAnimLayers - LeftHandPose_OverrideState intact).
+  5. `animation.add_layer_function path=ALI_FlightLocomotionLayer_Test function_name=LeftHandPose_OverrideState` (ALI_ItemAnimLayers'la collision) → `collision_warnings: [{type:"same_named_anim_layer_function", blueprint:"/Game/.../ALI_ItemAnimLayers", interface_class:"...ALI_ItemAnimLayers_C", message:"linked-layer renames must stay interface-aware"}]`, `collision_warning_count: 1`. Function yine de oluşturulur (block etmez).
+
+---
+
 ## Gap #25 — Anim node spawn tool'ları interface override graph'larını graph_name lookup'ında bulamıyor
 
 - **Status**: ✅ FIXED — deploy/verify pending (Lyra plugin install + Live Coding/restart)

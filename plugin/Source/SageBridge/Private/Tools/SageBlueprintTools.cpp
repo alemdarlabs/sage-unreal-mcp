@@ -13,6 +13,10 @@
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
+#include "Animation/AnimBlueprint.h"
+#include "Animation/AnimNode_LinkedAnimLayer.h"
+#include "AnimGraphNode_LinkedAnimLayer.h"
+#include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
 #include "AssetToolsModule.h"
@@ -3213,6 +3217,296 @@ FSageToolDispatch::FOutcome BpListGraphsImpl(const TSharedPtr<FJsonObject>& Args
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+static bool ShouldScanAnimBlueprintPackage(const FString& PackageName)
+{
+    if (PackageName.IsEmpty()) return false;
+    if (PackageName.StartsWith(TEXT("/Engine/"))) return false;
+    if (PackageName.StartsWith(TEXT("/Script/"))) return false;
+    if (PackageName.StartsWith(TEXT("/Temp/"))) return false;
+    if (PackageName.StartsWith(TEXT("/Transient"))) return false;
+    return true;
+}
+
+static TArray<UAnimBlueprint*> LoadAnimBlueprintsForLinkedLayerRenameScan()
+{
+    TArray<UAnimBlueprint*> Out;
+    TSet<UAnimBlueprint*> Seen;
+
+    auto AddAnimBP = [&](UAnimBlueprint* AnimBP)
+    {
+        if (!AnimBP || Seen.Contains(AnimBP)) return;
+        UPackage* Package = AnimBP->GetOutermost();
+        if (!Package || !ShouldScanAnimBlueprintPackage(Package->GetName())) return;
+        Seen.Add(AnimBP);
+        Out.Add(AnimBP);
+    };
+
+    FAssetRegistryModule& Module =
+        FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+    IAssetRegistry& Registry = Module.Get();
+
+    FARFilter Filter;
+    Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.AnimBlueprint")));
+    Filter.bRecursiveClasses = true;
+
+    TArray<FAssetData> Found;
+    Registry.GetAssets(Filter, Found);
+    for (const FAssetData& Asset : Found)
+    {
+        if (!ShouldScanAnimBlueprintPackage(Asset.PackageName.ToString())) continue;
+        AddAnimBP(Cast<UAnimBlueprint>(Asset.GetAsset()));
+    }
+
+    // Cover loaded, unsaved project/game-feature AnimBlueprints that may not
+    // yet have a complete on-disk asset registry entry.
+    for (TObjectIterator<UAnimBlueprint> It; It; ++It)
+    {
+        AddAnimBP(*It);
+    }
+
+    return Out;
+}
+
+static bool IsSameGeneratedInterfaceAsset(UClass* Candidate, UClass* Target)
+{
+    if (!Candidate || !Target) return false;
+    if (Candidate == Target) return true;
+    return Candidate->ClassGeneratedBy && Candidate->ClassGeneratedBy == Target->ClassGeneratedBy;
+}
+
+static FString LinkedLayerNodeKey(UBlueprint* BP, const UAnimGraphNode_LinkedAnimLayer* Node)
+{
+    const FString BPPath = BP ? BP->GetPathName() : FString();
+    if (!Node) return BPPath;
+    const FString NodeId = Node->NodeGuid.IsValid()
+        ? Node->NodeGuid.ToString(EGuidFormats::Digits)
+        : Node->GetPathName();
+    return BPPath + TEXT("|") + NodeId;
+}
+
+struct FLinkedLayerRenameSnapshot
+{
+    bool bApplicable = false;
+    int32 TargetOldLayerNodeCount = 0;
+    int32 OtherInterfaceOldLayerNodeCount = 0;
+    TSet<FString> TargetOldLayerNodeKeys;
+    TSet<FString> OtherInterfaceOldLayerNodeKeys;
+};
+
+struct FLinkedLayerRenameImpact
+{
+    int32 UpdatedNodeCount = 0;
+    int32 ManualUpdatedNodeCount = 0;
+    int32 RepairedNodeCount = 0;
+    int32 SkippedNodeCount = 0;
+    TSet<FString> AffectedBlueprints;
+    TArray<TSharedPtr<FJsonValue>> Changes;
+    TSet<UBlueprint*> StructurallyChangedBlueprints;
+};
+
+static void ForEachLinkedAnimLayerNodeInProject(
+    TFunctionRef<void(UAnimBlueprint* AnimBP, UEdGraph* Graph, UAnimGraphNode_LinkedAnimLayer* Node)> Fn)
+{
+    for (UAnimBlueprint* AnimBP : LoadAnimBlueprintsForLinkedLayerRenameScan())
+    {
+        const TArray<FBpGraphEntry> Graphs = CollectAllGraphs(AnimBP);
+        for (const FBpGraphEntry& Entry : Graphs)
+        {
+            UEdGraph* Graph = Entry.Graph;
+            if (!Graph) continue;
+            for (UEdGraphNode* GraphNode : Graph->Nodes)
+            {
+                if (UAnimGraphNode_LinkedAnimLayer* LayerNode =
+                        Cast<UAnimGraphNode_LinkedAnimLayer>(GraphNode))
+                {
+                    Fn(AnimBP, Graph, LayerNode);
+                }
+            }
+        }
+    }
+}
+
+static FLinkedLayerRenameSnapshot CaptureLinkedLayerRenameSnapshot(
+    UClass* RenamedInterfaceClass,
+    FName OldLayer)
+{
+    FLinkedLayerRenameSnapshot Snapshot;
+    if (!RenamedInterfaceClass || OldLayer.IsNone()) return Snapshot;
+    Snapshot.bApplicable = true;
+
+    ForEachLinkedAnimLayerNodeInProject(
+        [&](UAnimBlueprint* AnimBP, UEdGraph* /*Graph*/, UAnimGraphNode_LinkedAnimLayer* Node)
+        {
+            if (!Node || Node->Node.Layer != OldLayer) return;
+
+            const FString Key = LinkedLayerNodeKey(AnimBP, Node);
+            if (IsSameGeneratedInterfaceAsset(Node->Node.Interface.Get(), RenamedInterfaceClass))
+            {
+                ++Snapshot.TargetOldLayerNodeCount;
+                Snapshot.TargetOldLayerNodeKeys.Add(Key);
+            }
+            else
+            {
+                ++Snapshot.OtherInterfaceOldLayerNodeCount;
+                Snapshot.OtherInterfaceOldLayerNodeKeys.Add(Key);
+            }
+        });
+
+    return Snapshot;
+}
+
+static void AddLinkedLayerRenameChange(
+    FLinkedLayerRenameImpact& Impact,
+    const TCHAR* Action,
+    UAnimBlueprint* AnimBP,
+    UEdGraph* Graph,
+    UAnimGraphNode_LinkedAnimLayer* Node,
+    FName FromLayer,
+    FName ToLayer)
+{
+    auto O = MakeShared<FJsonObject>();
+    O->SetStringField(TEXT("action"), Action);
+    O->SetStringField(TEXT("blueprint"), AnimBP ? AnimBP->GetPathName() : FString());
+    O->SetStringField(TEXT("graph"), Graph ? Graph->GetName() : FString());
+    O->SetStringField(TEXT("node_id"),
+        Node ? Node->NodeGuid.ToString(EGuidFormats::Digits) : FString());
+    O->SetStringField(TEXT("interface"),
+        (Node && Node->Node.Interface.Get()) ? Node->Node.Interface.Get()->GetPathName() : FString());
+    O->SetStringField(TEXT("from_layer"), FromLayer.ToString());
+    O->SetStringField(TEXT("to_layer"), ToLayer.ToString());
+    Impact.Changes.Add(MakeShared<FJsonValueObject>(O));
+
+    if (AnimBP)
+    {
+        Impact.AffectedBlueprints.Add(AnimBP->GetPathName());
+    }
+}
+
+static void SetLinkedLayerNameForRename(
+    FLinkedLayerRenameImpact& Impact,
+    UAnimBlueprint* AnimBP,
+    UEdGraph* Graph,
+    UAnimGraphNode_LinkedAnimLayer* Node,
+    FName NewLayer)
+{
+    if (!AnimBP || !Graph || !Node) return;
+    AnimBP->Modify();
+    Graph->Modify();
+    Node->Modify();
+    Node->Node.Layer = NewLayer;
+    if (FProperty* LayerProperty =
+            FAnimNode_LinkedAnimLayer::StaticStruct()->FindPropertyByName(
+                GET_MEMBER_NAME_CHECKED(FAnimNode_LinkedAnimLayer, Layer)))
+    {
+        FPropertyChangedEvent ChangeEvent(LayerProperty, EPropertyChangeType::ValueSet);
+        Node->PostEditChangeProperty(ChangeEvent);
+    }
+    else
+    {
+        Node->ReconstructNode();
+    }
+    Impact.StructurallyChangedBlueprints.Add(AnimBP);
+}
+
+static FLinkedLayerRenameImpact ReconcileLinkedLayerRename(
+    UClass* RenamedInterfaceClass,
+    FName OldLayer,
+    FName NewLayer,
+    const FLinkedLayerRenameSnapshot& Snapshot)
+{
+    FLinkedLayerRenameImpact Impact;
+    if (!Snapshot.bApplicable || !RenamedInterfaceClass) return Impact;
+
+    ForEachLinkedAnimLayerNodeInProject(
+        [&](UAnimBlueprint* AnimBP, UEdGraph* Graph, UAnimGraphNode_LinkedAnimLayer* Node)
+        {
+            if (!Node) return;
+
+            const FString Key = LinkedLayerNodeKey(AnimBP, Node);
+            const bool bWasTargetOldLayer = Snapshot.TargetOldLayerNodeKeys.Contains(Key);
+            const bool bWasOtherInterfaceOldLayer =
+                Snapshot.OtherInterfaceOldLayerNodeKeys.Contains(Key);
+            const bool bSameInterface =
+                IsSameGeneratedInterfaceAsset(Node->Node.Interface.Get(), RenamedInterfaceClass);
+
+            if (bWasTargetOldLayer)
+            {
+                if (Node->Node.Layer == OldLayer)
+                {
+                    SetLinkedLayerNameForRename(Impact, AnimBP, Graph, Node, NewLayer);
+                    ++Impact.ManualUpdatedNodeCount;
+                    ++Impact.UpdatedNodeCount;
+                    AddLinkedLayerRenameChange(
+                        Impact, TEXT("updated"), AnimBP, Graph, Node, OldLayer, NewLayer);
+                }
+                else if (Node->Node.Layer == NewLayer)
+                {
+                    ++Impact.UpdatedNodeCount;
+                    AddLinkedLayerRenameChange(
+                        Impact, TEXT("already_updated"), AnimBP, Graph, Node, OldLayer, NewLayer);
+                }
+                else
+                {
+                    ++Impact.SkippedNodeCount;
+                }
+                return;
+            }
+
+            if (bWasOtherInterfaceOldLayer)
+            {
+                if (!bSameInterface && Node->Node.Layer == NewLayer)
+                {
+                    SetLinkedLayerNameForRename(Impact, AnimBP, Graph, Node, OldLayer);
+                    ++Impact.RepairedNodeCount;
+                    AddLinkedLayerRenameChange(
+                        Impact, TEXT("repaired_other_interface"), AnimBP, Graph, Node, NewLayer, OldLayer);
+                }
+                else
+                {
+                    ++Impact.SkippedNodeCount;
+                }
+                return;
+            }
+
+            if (!bSameInterface && (Node->Node.Layer == OldLayer || Node->Node.Layer == NewLayer))
+            {
+                ++Impact.SkippedNodeCount;
+            }
+        });
+
+    for (UBlueprint* ChangedBP : Impact.StructurallyChangedBlueprints)
+    {
+        if (ChangedBP)
+        {
+            FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ChangedBP);
+        }
+    }
+
+    return Impact;
+}
+
+static TArray<TSharedPtr<FJsonValue>> StringSetToJsonArray(const TSet<FString>& Values)
+{
+    TArray<FString> Sorted = Values.Array();
+    Sorted.Sort();
+
+    TArray<TSharedPtr<FJsonValue>> Out;
+    Out.Reserve(Sorted.Num());
+    for (const FString& Value : Sorted)
+    {
+        Out.Add(MakeShared<FJsonValueString>(Value));
+    }
+    return Out;
+}
+
+static UClass* GetAnimLayerInterfaceClassForRename(UBlueprint* BP)
+{
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(BP);
+    if (!AnimBP || AnimBP->BlueprintType != BPTYPE_Interface) return nullptr;
+    if (AnimBP->GeneratedClass) return AnimBP->GeneratedClass;
+    return AnimBP->SkeletonGeneratedClass;
+}
+
 FSageToolDispatch::FOutcome BpRenameFunctionImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString Path, OldName, NewName;
@@ -3247,16 +3541,43 @@ FSageToolDispatch::FOutcome BpRenameFunctionImpl(const TSharedPtr<FJsonObject>& 
             FString::Printf(TEXT("graph already exists with new_name: %s"), *NewName));
     }
 
+    UClass* RenamedInterfaceClass = GetAnimLayerInterfaceClassForRename(BP);
+    const FName OldLayer(*OldName);
+    const FName NewLayer(*NewName);
+    FLinkedLayerRenameSnapshot LinkedLayerSnapshot;
+    if (RenamedInterfaceClass)
+    {
+        LinkedLayerSnapshot = CaptureLinkedLayerRenameSnapshot(RenamedInterfaceClass, OldLayer);
+    }
+
     FScopedTransaction Tx(LOCTEXT("BpRenameFn", "Sage: Rename BP Function"));
     BP->Modify();
     Graph->Modify();
     FBlueprintEditorUtils::RenameGraph(Graph, NewName);
+
+    const FLinkedLayerRenameImpact LinkedLayerImpact = ReconcileLinkedLayerRename(
+        RenamedInterfaceClass,
+        OldLayer,
+        NewLayer,
+        LinkedLayerSnapshot);
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("blueprint"), BP->GetName());
     R->SetStringField(TEXT("old_name"),  OldName);
     R->SetStringField(TEXT("new_name"),  NewName);
     R->SetStringField(TEXT("actual"),    Graph->GetName());
+    R->SetBoolField(TEXT("linked_layer_rename_applicable"), LinkedLayerSnapshot.bApplicable);
+    R->SetNumberField(TEXT("pre_rename_target_node_count"),
+        LinkedLayerSnapshot.TargetOldLayerNodeCount);
+    R->SetNumberField(TEXT("pre_rename_other_interface_old_name_count"),
+        LinkedLayerSnapshot.OtherInterfaceOldLayerNodeCount);
+    R->SetNumberField(TEXT("updated_node_count"), LinkedLayerImpact.UpdatedNodeCount);
+    R->SetNumberField(TEXT("manual_updated_node_count"), LinkedLayerImpact.ManualUpdatedNodeCount);
+    R->SetNumberField(TEXT("repaired_node_count"), LinkedLayerImpact.RepairedNodeCount);
+    R->SetNumberField(TEXT("skipped_node_count"), LinkedLayerImpact.SkippedNodeCount);
+    R->SetArrayField(TEXT("affected_blueprints"),
+        StringSetToJsonArray(LinkedLayerImpact.AffectedBlueprints));
+    R->SetArrayField(TEXT("linked_layer_changes"), LinkedLayerImpact.Changes);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 

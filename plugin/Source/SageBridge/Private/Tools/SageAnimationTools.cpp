@@ -33,6 +33,7 @@
 #include "PhysicsEngine/PhysicsAsset.h"
 #include "ScopedTransaction.h"
 #include "UObject/Package.h"
+#include "UObject/UObjectIterator.h"
 #include "UObject/UnrealType.h"
 
 // AnimGraph + state machine authoring (Phase 4-r6, Lyra Sage Gap #16/#17/#18)
@@ -3871,21 +3872,23 @@ FSageToolDispatch::FOutcome RemoveVirtualBoneImpl(const TSharedPtr<FJsonObject>&
     FSageToolDispatch::FOutcome Reject;
     if (detail::RejectIfPie(Reject)) return Reject;
 
-    FString Path, BoneName;
-    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    FString SkeletonPath, BoneName;
+    if (!Args.IsValid()
+        || (!Args->TryGetStringField(TEXT("skeleton"), SkeletonPath)
+            && !Args->TryGetStringField(TEXT("path"), SkeletonPath)))
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
     }
     if (!Args->TryGetStringField(TEXT("bone_name"), BoneName) || BoneName.IsEmpty())
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'bone_name'"));
     }
 
-    USkeleton* Skel = Cast<USkeleton>(ResolveAsset(Path));
+    USkeleton* Skel = Cast<USkeleton>(ResolveAsset(SkeletonPath));
     if (!Skel)
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602,
-            FString::Printf(TEXT("not a USkeleton: %s"), *Path));
+            FString::Printf(TEXT("not a USkeleton: %s"), *SkeletonPath));
     }
 
     FScopedTransaction Tx(LOCTEXT("RemoveVirtualBone", "Remove Virtual Bone"));
@@ -7485,6 +7488,16 @@ static bool IsAnimLayerInterface(UBlueprint* BP)
     return AnimBP && AnimBP->BlueprintType == BPTYPE_Interface;
 }
 
+static bool ShouldScanAnimLayerPackage(const FString& PackageName)
+{
+    if (PackageName.IsEmpty()) return false;
+    if (PackageName.StartsWith(TEXT("/Engine/"))) return false;
+    if (PackageName.StartsWith(TEXT("/Script/"))) return false;
+    if (PackageName.StartsWith(TEXT("/Temp/"))) return false;
+    if (PackageName.StartsWith(TEXT("/Transient"))) return false;
+    return true;
+}
+
 // Filter UBlueprint::FunctionGraphs to only AnimationGraphSchema-bound graphs
 // (the ones that act as layer functions on an ALI).
 static TArray<UEdGraph*> CollectAnimLayerFunctionGraphs(UAnimBlueprint* AnimBP)
@@ -7500,6 +7513,70 @@ static TArray<UEdGraph*> CollectAnimLayerFunctionGraphs(UAnimBlueprint* AnimBP)
         }
     }
     return Out;
+}
+
+static TArray<UAnimBlueprint*> LoadAnimLayerInterfacesForCollisionScan()
+{
+    TArray<UAnimBlueprint*> Out;
+    TSet<UAnimBlueprint*> Seen;
+
+    auto AddAnimBP = [&](UAnimBlueprint* AnimBP)
+    {
+        if (!AnimBP || Seen.Contains(AnimBP) || !IsAnimLayerInterface(AnimBP)) return;
+        UPackage* Package = AnimBP->GetOutermost();
+        if (!Package || !ShouldScanAnimLayerPackage(Package->GetName())) return;
+        Seen.Add(AnimBP);
+        Out.Add(AnimBP);
+    };
+
+    FARFilter Filter;
+    Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.AnimBlueprint")));
+    Filter.bRecursiveClasses = true;
+
+    TArray<FAssetData> Found;
+    GetAssetRegistry().GetAssets(Filter, Found);
+    for (const FAssetData& Asset : Found)
+    {
+        if (!ShouldScanAnimLayerPackage(Asset.PackageName.ToString())) continue;
+        AddAnimBP(Cast<UAnimBlueprint>(Asset.GetAsset()));
+    }
+
+    for (TObjectIterator<UAnimBlueprint> It; It; ++It)
+    {
+        AddAnimBP(*It);
+    }
+
+    return Out;
+}
+
+static TArray<TSharedPtr<FJsonValue>> BuildAnimLayerFunctionCollisionWarnings(
+    UAnimBlueprint* CurrentBP,
+    FName FunctionName)
+{
+    TArray<TSharedPtr<FJsonValue>> Warnings;
+    if (!CurrentBP || FunctionName.IsNone()) return Warnings;
+
+    for (UAnimBlueprint* OtherBP : LoadAnimLayerInterfacesForCollisionScan())
+    {
+        if (!OtherBP || OtherBP == CurrentBP) continue;
+
+        for (UEdGraph* Graph : CollectAnimLayerFunctionGraphs(OtherBP))
+        {
+            if (!Graph || Graph->GetFName() != FunctionName) continue;
+
+            auto O = MakeShared<FJsonObject>();
+            O->SetStringField(TEXT("type"), TEXT("same_named_anim_layer_function"));
+            O->SetStringField(TEXT("blueprint"), OtherBP->GetPathName());
+            O->SetStringField(TEXT("graph_name"), Graph->GetName());
+            O->SetStringField(TEXT("interface_class"),
+                OtherBP->GeneratedClass ? OtherBP->GeneratedClass->GetPathName() : FString());
+            O->SetStringField(TEXT("message"),
+                TEXT("another AnimLayerInterface already declares this function name; linked-layer renames must stay interface-aware"));
+            Warnings.Add(MakeShared<FJsonValueObject>(O));
+        }
+    }
+
+    return Warnings;
 }
 
 // Resolve a UClass for an anim layer interface from a path. Accepts both
@@ -7685,6 +7762,8 @@ FSageToolDispatch::FOutcome AddLayerFunctionImpl(const TSharedPtr<FJsonObject>& 
             FString::Printf(TEXT("AnimBP is not BPTYPE_Interface: %s"), *Path));
 
     const FName FuncFName(*FuncName);
+    const TArray<TSharedPtr<FJsonValue>> CollisionWarnings =
+        BuildAnimLayerFunctionCollisionWarnings(IfaceBP, FuncFName);
 
     // Idempotency
     for (UEdGraph* Graph : IfaceBP->FunctionGraphs)
@@ -7701,6 +7780,8 @@ FSageToolDispatch::FOutcome AddLayerFunctionImpl(const TSharedPtr<FJsonObject>& 
         R->SetStringField(TEXT("schema"), TEXT("AnimationGraphSchema"));
         R->SetStringField(TEXT("root_node_id"),
             RootNode ? RootNode->NodeGuid.ToString(EGuidFormats::Digits) : FString());
+        R->SetArrayField(TEXT("collision_warnings"), CollisionWarnings);
+        R->SetNumberField(TEXT("collision_warning_count"), CollisionWarnings.Num());
         R->SetBoolField(TEXT("already"), true);
         R->SetBoolField(TEXT("compiled"), false);
         return FSageToolDispatch::FOutcome::MakeSuccess(R);
@@ -7730,6 +7811,8 @@ FSageToolDispatch::FOutcome AddLayerFunctionImpl(const TSharedPtr<FJsonObject>& 
     R->SetStringField(TEXT("schema"), TEXT("AnimationGraphSchema"));
     R->SetStringField(TEXT("root_node_id"),
         Spawn.Root ? Spawn.Root->NodeGuid.ToString(EGuidFormats::Digits) : FString());
+    R->SetArrayField(TEXT("collision_warnings"), CollisionWarnings);
+    R->SetNumberField(TEXT("collision_warning_count"), CollisionWarnings.Num());
     R->SetBoolField(TEXT("already"), false);
     R->SetBoolField(TEXT("compiled"), bCompiled);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);

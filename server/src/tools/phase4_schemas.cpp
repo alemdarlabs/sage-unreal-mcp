@@ -424,7 +424,7 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .inputSchema=obj({{"path",str()},{"graph_name",str()},{"control_class",str()},{"x",num()},{"y",num()}},{"path","control_class"}),
         .handler=nullptr,.remote=true});
 
-    reg(registry, Tool{.name="animation.add_play_montage_notify_window",
+    reg(registry, Tool{.name="animation.add_slot_node",
         .description="Spawn a UAnimGraphNode_Slot (montage slot — anim-graph integration of montage playback). Set SlotName via animation.set_anim_node_property. Returns {node_id, class}.",
         .inputSchema=obj({{"path",str()},{"graph_name",str()},{"x",num()},{"y",num()}},{"path"}),
         .handler=nullptr,.remote=true});
@@ -616,7 +616,7 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.add_layer_function",
-        .description="Declare a new layer function on an anim layer interface BP (BPTYPE_Interface UAnimBlueprint). Spawns an AnimationGraphSchema-bound function graph + UAnimGraphNode_Root output pose node. Idempotent: returns {already:true} if function already declared. Returns {function_name, graph_name, root_node_id, schema, compiled}.",
+        .description="Declare a new layer function on an anim layer interface BP (BPTYPE_Interface UAnimBlueprint). Spawns an AnimationGraphSchema-bound function graph + UAnimGraphNode_Root output pose node. Idempotent: returns {already:true} if function already declared. Scans other project/game-feature ALIs and reports same-named layer collisions as collision_warnings[] without blocking creation. Returns {function_name, graph_name, root_node_id, schema, collision_warnings, collision_warning_count, compiled}.",
         .inputSchema=obj({{"path",str()},{"function_name",str()},{"compile",bln()}},{"path","function_name"}),
         .handler=nullptr,.remote=true});
 

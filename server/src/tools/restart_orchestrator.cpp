@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <expected>
+#include <optional>
 #include <thread>
 
 #if defined(_WIN32)
@@ -56,6 +57,78 @@ struct ScriptResult {
     int         exitCode = -1;
     std::string lastOutput;  // tail of stdout+stderr for error context
 };
+
+std::string quoteShellArg(const std::string& value) {
+#if defined(_WIN32)
+    std::string out = "\"";
+    for (const char c : value) {
+        if (c == '"') out += "\\\"";
+        else         out += c;
+    }
+    out += "\"";
+    return out;
+#else
+    std::string out = "'";
+    for (const char c : value) {
+        if (c == '\'') out += "'\\''";
+        else           out += c;
+    }
+    out += "'";
+    return out;
+#endif
+}
+
+std::string quoteShellArg(const fs::path& value) {
+    return quoteShellArg(value.string());
+}
+
+fs::path normalizeRepoRoot(fs::path root) {
+    root = root.lexically_normal();
+    // Some launch configs accidentally pass .../sage-unreal-mcp/scripts as
+    // SAGE_REPO_ROOT. Accept that shape so restart_editor does not construct
+    // scripts/scripts/build-plugin.*.
+    if (root.filename() == fs::path{"scripts"}
+        && fs::exists(root.parent_path() / "server")
+        && fs::exists(root.parent_path() / "scripts")) {
+        return root.parent_path();
+    }
+    return root;
+}
+
+std::optional<fs::path> findBuildPluginScript(const fs::path& repoRoot) {
+#if defined(_WIN32)
+    constexpr const char* kBuildPluginScript = "build-plugin.ps1";
+#else
+    constexpr const char* kBuildPluginScript = "build-plugin.sh";
+#endif
+    const fs::path candidates[] = {
+        repoRoot / "scripts" / kBuildPluginScript,
+        repoRoot / kBuildPluginScript,
+    };
+    for (const fs::path& candidate : candidates) {
+        if (fs::exists(candidate)) return candidate;
+    }
+    return std::nullopt;
+}
+
+std::string buildPluginCommand(const fs::path& script, const fs::path& ueRoot) {
+#if defined(_WIN32)
+    std::string cmd;
+    if (!ueRoot.empty()) {
+        cmd += "set \"SAGE_UE_ROOT=" + ueRoot.string() + "\" && ";
+    }
+    cmd += "powershell.exe -NoProfile -ExecutionPolicy Bypass -File "
+        + quoteShellArg(script);
+    return cmd;
+#else
+    std::string cmd;
+    if (!ueRoot.empty()) {
+        cmd = "SAGE_UE_ROOT=" + quoteShellArg(ueRoot) + " ";
+    }
+    cmd += quoteShellArg(script);
+    return cmd;
+#endif
+}
 
 // Run a shell command, capture combined stdout/stderr, return exit code.
 // We keep only the last 32KB of output so a chatty UAT log doesn't blow
@@ -238,6 +311,7 @@ mcp::Tool buildRestartEditorTool(bridge::BridgeServer& bridge, RestartConfig cfg
         const bool saveDirty       = params.value("save_dirty",   true);
         const bool rebuildProject  = params.value("rebuild_project_modules", false);
         const int  waitHandshakeS  = params.value("wait_handshake_sec", 90);
+        const fs::path repoRoot = normalizeRepoRoot(cfg.repoRoot);
 
         // ---- Resolve target session ------------------------------------
         std::optional<bridge::EditorSession> session;
@@ -301,17 +375,13 @@ mcp::Tool buildRestartEditorTool(bridge::BridgeServer& bridge, RestartConfig cfg
 
         // ---- Step 2: build plugin (BEFORE killing — abort on failure) --
         if (buildPlugin) {
-            const auto script = cfg.repoRoot / "scripts" / "build-plugin.sh";
-            if (!fs::exists(script)) {
+            const std::optional<fs::path> script = findBuildPluginScript(repoRoot);
+            if (!script) {
                 return std::unexpected(mcp::ErrorObject::fromCode(
                     mcp::ErrorCode::InternalError,
-                    "build script not found: " + script.string()));
+                    "build script not found under repo root: " + repoRoot.string()));
             }
-            std::string cmd;
-            if (!cfg.ueRoot.empty()) {
-                cmd = "SAGE_UE_ROOT='" + cfg.ueRoot.string() + "' ";
-            }
-            cmd += "'" + script.string() + "'";
+            const std::string cmd = buildPluginCommand(*script, cfg.ueRoot);
 
             spdlog::info("restart_editor: running {}", cmd);
             const auto t0 = std::chrono::steady_clock::now();
@@ -344,7 +414,7 @@ mcp::Tool buildRestartEditorTool(bridge::BridgeServer& bridge, RestartConfig cfg
 
         // ---- Step 4: swap plugin binary -------------------------------
         if (buildPlugin) {
-            const auto srcDir = cfg.repoRoot / "build" / "plugin" / "Binaries"
+            const auto srcDir = repoRoot / "build" / "plugin" / "Binaries"
                                               / kPlatformDir;
             for (const char* fname : {kPluginDylib, kPluginModules}) {
                 const auto src = srcDir / fname;
@@ -387,9 +457,9 @@ mcp::Tool buildRestartEditorTool(bridge::BridgeServer& bridge, RestartConfig cfg
             const auto projectName  = fs::path{projectPath}.stem().string();
             const auto editorTarget = projectName + "Editor";
 
-            std::string cmd = "'" + buildScript.string() + "' "
+            std::string cmd = quoteShellArg(buildScript) + " "
                             + editorTarget + " " + std::string{kPlatformDir}
-                            + " Development -Project='" + projectPath + "' "
+                            + " Development -Project=" + quoteShellArg(projectPath) + " "
                             + "-WaitMutex -NoHotReload";
 
             spdlog::info("restart_editor: rebuilding project module: {}", cmd);
