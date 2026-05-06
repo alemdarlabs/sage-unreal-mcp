@@ -51,6 +51,12 @@ static nlohmann::json ruleExpr() {
         {"oneOf", nlohmann::json::array({str(), bln(), num(), anyObj()})}
     };
 }
+static nlohmann::json bindingExpr() {
+    return {
+        {"description","AnimGraph exposed-input binding expression. Accepts a direct path string like 'FlightLean.X' or an object such as {\"var\":\"FlightLean\",\"member\":\"X\"} / {\"path\":[\"FlightLean\",\"X\"]}. Arithmetic is intentionally not supported; bind one source property path to one AnimGraph input."},
+        {"oneOf", nlohmann::json::array({str(), anyObj()})}
+    };
+}
 
 }  // anonymous namespace
 
@@ -59,7 +65,7 @@ namespace sage::tools {
 void registerPhase4Schemas(mcp::ToolRegistry& registry) {
 
     // ========================================================================
-    // animation.* (46 tools)
+    // animation.* tools
     // ========================================================================
 
     reg(registry, Tool{.name="animation.list",
@@ -342,8 +348,13 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.bind_anim_node_property",
-        .description="DEPRECATED — current build returns -32601. UE 5.7 marked UAnimGraphNode_Base::PropertyBindings as PropertyBindings_DEPRECATED; the canonical replacement uses the UAnimBlueprintExtension subsystem and is pending Sage implementation. Until then, set node properties via animation.set_anim_node_property and accept the literal-value semantics.",
-        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()},{"property",str()},{"variable",str()}},{"path","node_id","property","variable"}),
+        .description="Bind a UAnimGraphNode_* exposed input property to an AnimBlueprint property path using UE 5.7 AnimGraphNodeBinding/PropertyAccess metadata. Supports direct variable paths and struct members (for example expression:'FlightLean.X' or {var:'FlightLean', member:'X'}). The target pin is exposed when it is an optional input, existing pin links are broken, and the binding is visible through animation.read_anim_node_properties. Legacy `variable` string remains accepted.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()},{"property",str()},{"expression",bindingExpr()},{"variable",str()}},{"path","node_id","property"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.read_anim_node_properties",
+        .description="Inspect one AnimGraph node's inner FAnimNode_* reflected properties, pins, and UE 5.7 exposed-input bindings. Use after bind_anim_node_property to verify property paths, pin visibility, link counts, and binding_count before compiling/validating the AnimBP.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()}},{"path","node_id"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.list_animgraph_nodes",
@@ -364,7 +375,7 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.add_blendspace_player",
-        .description="Spawn a UAnimGraphNode_BlendSpacePlayer and bind its asset to a UBlendSpace path. Returns {node_id, class, blendspace?}. Bind axis variables via animation.bind_anim_node_property when that's wired (currently DEPRECATED — see bind tool).",
+        .description="Spawn a UAnimGraphNode_BlendSpacePlayer and bind its asset to a UBlendSpace path. Returns {node_id, class, blendspace?}. Bind axis variables with animation.bind_anim_node_property, e.g. X <- FlightLean.X and Y <- FlightLean.Y.",
         .inputSchema=obj({{"path",str()},{"graph_name",str()},{"blendspace",str()},{"x",num()},{"y",num()}},{"path"}),
         .handler=nullptr,.remote=true});
 
@@ -378,9 +389,19 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .inputSchema=obj({{"path",str()},{"graph_name",str()},{"x",num()},{"y",num()}},{"path"}),
         .handler=nullptr,.remote=true});
 
+    reg(registry, Tool{.name="animation.add_blend_list_by_int",
+        .description="Spawn a UAnimGraphNode_BlendListByInt for multi-pose selection driven by an integer Active Child Index. Use animation.bind_anim_node_property on the active-index input, then add extra pose pins with animation.add_blend_list_pose_pin as needed. Returns {node_id, class}.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"x",num()},{"y",num()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
     reg(registry, Tool{.name="animation.add_blend_list_by_enum",
         .description="Spawn a UAnimGraphNode_BlendListByEnum. Set the `BoundEnum` UEnum class via animation.set_anim_node_property after spawn. Returns {node_id, class}.",
         .inputSchema=obj({{"path",str()},{"graph_name",str()},{"x",num()},{"y",num()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.add_blend_list_pose_pin",
+        .description="Add one dynamic pose input pin to an existing UAnimGraphNode_BlendListByInt and reconstruct the node. Use for A-E style multi-pose blends after animation.add_blend_list_by_int. Returns updated pin counts. Enum-specific pose pin exposure is still handled by the enum node's BoundEnum workflow.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()}},{"path","node_id"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.add_layered_blend_per_bone",
@@ -408,10 +429,12 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .inputSchema=obj({{"path",str()},{"graph_name",str()},{"x",num()},{"y",num()}},{"path"}),
         .handler=nullptr,.remote=true});
 
-    reg(registry, Tool{.name="animation.add_link_anim_layer",
-        .description="Spawn a UAnimGraphNode_LinkedAnimLayer (calls into a layer interface function on a runtime-linked AnimInstance). Set Interface + LayerFunctionName via animation.set_anim_node_property after. Returns {node_id, class}.",
-        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"x",num()},{"y",num()}},{"path"}),
-        .handler=nullptr,.remote=true});
+    // animation.add_link_anim_layer was a placeholder Cluster B spawn that
+    // produced a bare UAnimGraphNode_LinkedAnimLayer with no interface or
+    // layer name set — useless without a follow-up set_anim_node_property
+    // pass. Replaced by Phase 4-r6 Cluster G's animation.add_linked_anim_layer_node
+    // which sets Interface (UClass) + Layer (FName) before ReconstructNode so
+    // pose pins are wired automatically. See Cluster G block below.
 
     // ----- Phase 4-r6 Cluster J (runtime character.* — PIE-only) ----------
 
@@ -568,27 +591,78 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .inputSchema=obj({{"path",str()},{"modifier_class_path",str()}},{"path","modifier_class_path"}),
         .handler=nullptr,.remote=true});
 
-    // ----- Phase 4-r6 Cluster G (anim layer interface — stubbed) --------
+    // ----- Phase 4-r6 Cluster G (Animation Layer Interface authoring — REAL) -----
+    //
+    // Lyra-canonical linked-layer pattern (B_WeaponInstanceBase.cpp:110 +
+    // ALI_ItemAnimLayers + ABP_Mannequin_Pistol/Rifle override BPs):
+    //
+    //   1. ALI = UAnimBlueprint with BPTYPE_Interface, AnimationGraphSchema,
+    //      declares one or more layer functions (each a pose-output graph).
+    //   2. Child AnimBPs implement the ALI; each implementation spawns an
+    //      override AnimGraph for every declared function (state machines,
+    //      blendspaces, etc. flow into the function's Output Pose).
+    //   3. Master AnimBP also implements the ALI and spawns a
+    //      UAnimGraphNode_LinkedAnimLayer node per function, calling INTO
+    //      the linked child class at runtime.
+    //   4. Runtime: Mesh->LinkAnimClassLayers(ChildClass) routes the master's
+    //      LinkedAnimLayer call into the chosen child override.
+    //
+    // Schema authoring tools below cover all four stages plus diagnostics.
+    // PIE smoke (set_linked_anim_layer) closes the loop without packaging.
 
     reg(registry, Tool{.name="animation.create_anim_layer_interface",
-        .description="[NOT IMPLEMENTED] UAnimLayerInterface BP factory.",
-        .inputSchema=obj({{"path",str()},{"name",str()}},{"path","name"}),
+        .description="Create a new UAnimBlueprint asset with BPTYPE_Interface (an Animation Layer Interface / ALI). Schema is AnimationGraphSchema — every declared function is an animation layer. `path` is the destination package path like '/Game/Animations/ALI_FlightLocomotionLayer' (or omit and pass `package_path`+`name`). `skeleton` is the USkeleton soft path (required for anim BP). Returns {path, class_path, schema, function_count}.",
+        .inputSchema=obj({{"path",str()},{"package_path",str()},{"name",str()},{"skeleton",str()},{"compile",bln()}},{"skeleton"}),
         .handler=nullptr,.remote=true});
+
     reg(registry, Tool{.name="animation.add_layer_function",
-        .description="[NOT IMPLEMENTED] Anim layer interface function.",
-        .inputSchema=obj({{"path",str()},{"function_name",str()}},{"path","function_name"}),
+        .description="Declare a new layer function on an anim layer interface BP (BPTYPE_Interface UAnimBlueprint). Spawns an AnimationGraphSchema-bound function graph + UAnimGraphNode_Root output pose node. Idempotent: returns {already:true} if function already declared. Returns {function_name, graph_name, root_node_id, schema, compiled}.",
+        .inputSchema=obj({{"path",str()},{"function_name",str()},{"compile",bln()}},{"path","function_name"}),
         .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.add_layer_function_override",
+        .description="Spawn an AnimationGraphSchema-bound override graph for a single anim layer interface function on a child AnimBP. Equivalent to UE Editor 'Implement Function' on My Blueprint > Interfaces > <ALI> > <function>. `path` is the child AnimBP, `interface_path` is the ALI, `function_name` is one declared layer function. Auto-creates UAnimGraphNode_Root output pose node so the graph compiles immediately. Idempotent: returns {already:true} if override graph exists. -32602 if interface not implemented on child or function not declared on interface. Returns {function_name, graph_name, schema, output_node_id, compiled}.",
+        .inputSchema=obj({{"path",str()},{"interface_path",str()},{"function_name",str()},{"compile",bln()}},{"path","interface_path","function_name"}),
+        .handler=nullptr,.remote=true});
+
     reg(registry, Tool{.name="animation.implement_anim_layer_interface",
-        .description="[NOT IMPLEMENTED] AnimBP implements layer interface.",
-        .inputSchema=obj({{"path",str()},{"layer_interface_path",str()}},{"path","layer_interface_path"}),
+        .description="Anim-aware bp.add_interface: child AnimBP implements `interface_path` AND auto-spawns override graphs for every declared layer function on the interface. Composes bp.add_interface + (per function) animation.add_layer_function_override. Idempotent on a per-function basis. -32602 if path is not an AnimBP or interface_path is not an ALI. Returns {interface, functions_implemented[], functions_already[], errors[], compiled}.",
+        .inputSchema=obj({{"path",str()},{"interface_path",str()},{"compile",bln()}},{"path","interface_path"}),
         .handler=nullptr,.remote=true});
-    reg(registry, Tool{.name="animation.set_linked_anim_layer",
-        .description="[NOT IMPLEMENTED] Runtime SetLinkedAnimLayer on AnimInstance.",
-        .inputSchema=obj({{"actor",str()},{"layer_function_name",str()},{"anim_class_path",str()}},{"actor","layer_function_name","anim_class_path"}),
+
+    reg(registry, Tool{.name="animation.add_linked_anim_layer_node",
+        .description="Spawn a UAnimGraphNode_LinkedAnimLayer node in a master AnimBP's AnimGraph (replaces the bare placeholder animation.add_link_anim_layer). Sets Interface (UClass) + Layer (FName, the interface function) before ReconstructNode so the engine wires InputPose/OutputPose pins automatically. Pose pins return disconnected; use animation.connect_pose_pin to wire into the master AnimGraph. Master BP must implement `interface_path`; otherwise -32602. `instance_class_path` is optional (forces a specific child class at design-time; runtime can override via Mesh->LinkAnimClassLayers). Returns {node_id, class, interface, interface_function, instance_class, pin_count, input_pose_pin, output_pose_pin, compiled}.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"interface_path",str()},{"function_name",str()},{"instance_class_path",str()},{"x",num()},{"y",num()},{"compile",bln()}},{"path","interface_path","function_name"}),
         .handler=nullptr,.remote=true});
+
     reg(registry, Tool{.name="animation.list_implemented_layers",
-        .description="[NOT IMPLEMENTED] List anim layer interface implementations.",
+        .description="List anim layer interfaces implemented on `path` (child AnimBP) plus per-function override graph status. Each interface entry: {interface_path, interface_class, functions:[{name, override_graph: <name>|null, node_count}]}. `override_graph: null` means declared on interface but not yet implemented on this child — use animation.add_layer_function_override or animation.implement_anim_layer_interface to spawn.",
         .inputSchema=obj({{"path",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.list_layer_functions",
+        .description="List declared layer functions on an anim layer interface BP (interface-side verify — counterpart to list_implemented_layers). Returns {interface_path, interface_class, schema:'AnimationGraphSchema', functions:[{name, node_count, has_root_output}]}. Only AnimationGraphSchema-bound function graphs counted; non-anim graphs filtered.",
+        .inputSchema=obj({{"path",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.remove_layer_function_override",
+        .description="Remove a child AnimBP's override graph for a single anim layer interface function (inverse of add_layer_function_override). Interface implementation entry on the BP is preserved — only the override function graph is removed; that function call site reverts to the interface default (no body). confirmed:true required (destructive). Returns {removed_graph, function_name, removed_node_count, compiled}.",
+        .inputSchema=obj({{"path",str()},{"interface_path",str()},{"function_name",str()},{"confirmed",bln()},{"compile",bln()}},{"path","interface_path","function_name","confirmed"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.remove_layer_function",
+        .description="Remove a function declaration from an anim layer interface BP (inverse of add_layer_function). Child AnimBPs that already implement this function will retain their override graphs as orphans (the response includes _warning + orphan_implementers[] best-effort lookup via AssetRegistry references). confirmed:true required (destructive). Returns {removed_function, removed_graph, orphan_implementers[], _warning?, compiled}.",
+        .inputSchema=obj({{"path",str()},{"function_name",str()},{"confirmed",bln()},{"compile",bln()}},{"path","function_name","confirmed"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.create_linked_layer_pattern",
+        .description="Atomic Lyra-canonical linked-layer pattern setup. One call: child implements interface (auto-override every declared function, or just `function_name`) + master implements interface + master AnimGraph spawns UAnimGraphNode_LinkedAnimLayer call node + (optional) compile both BPs. Composes Phase A+B primitives; on first failure returns partial state with errors[] and rollback_advice. Use this for fresh setup; for existing partial state prefer the primitives. Returns {child_path, master_path, interface, functions[], override_graphs[], linked_layer_node_id, master_compiled, child_compiled}.",
+        .inputSchema=obj({{"interface_path",str()},{"child_path",str()},{"master_path",str()},{"master_graph",str()},{"function_name",str()},{"compile",bln()}},{"interface_path","child_path","master_path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.set_linked_anim_layer",
+        .description="PIE/editor-preview runtime tool: call USkeletalMeshComponent::LinkAnimClassLayers / UnlinkAnimClassLayers on a live actor. `actor` is a PIE actor path/label/name; `layer_class` is a UAnimInstance subclass UClass path. `mesh_component` optional (defaults to first SkeletalMeshComponent). `mode` ∈ {'link','unlink'} (default 'link'); 'unlink' uses UnlinkAnimClassLayers. PIE world dışında editor preview-only warning döner ve hiçbir package dirty yapmaz. Use this to verify asset authoring drives the linked child class at runtime without packaging. Returns {actor, mesh, layer_class, linked, previous_layers[], mode, errors[], _warning?}.",
+        .inputSchema=obj({{"actor",str()},{"layer_class",str()},{"mesh_component",str()},{"mode",str()}},{"actor","layer_class"}),
         .handler=nullptr,.remote=true});
 
     // ----- Phase 4-r6 Cluster H (sequence/montage advanced) -------------

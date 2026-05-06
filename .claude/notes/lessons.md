@@ -953,3 +953,74 @@ ileride eklenir.
 - Rule graph rewrite transaction içinde yapılmalı, eski non-result node'lar temizlenmeli ve Blueprint structurally modified işaretlenmeli.
 
 **Apply**: `animation.set_transition_rule` artık string shorthand (`Speed > 10 && bGrounded`) ve JSON AST (`{ "and": [...] }`) kabul eder; `animation.read_transition_rule` ile `bCanEnterTransition.linked_nodes[]` doğrulanır.
+
+## SageBridge default project deploy targets
+
+**Rule**: Mahmut'un bu repo için "deploy et" talebi varsayılan olarak iki projeye gider:
+- `D:\Steamworks\Lyra\Plugins\SageBridge`
+- `D:\Steamworks\HeroFlight\Plugins\SageBridge`
+
+**Deploy source**: `D:\Steamworks\sage-unreal-mcp\build\plugin`
+
+**Copy set**:
+1. `SageBridge.uplugin`
+2. `Binaries\Win64\*`
+3. `Source\` tamamı
+
+**Safety**: Önce `UnrealEditor` process yok mu kontrol et. Editor açıksa DLL/source üstüne yazma; kullanıcı hot-swap riskini açıkça onaylamadıkça bekle. Dış proje klasörleri sandbox dışı olduğundan gerekirse escalated shell kullan.
+
+## UE 5.7 AnimGraph exposed input binding yolu
+
+**Rule**: AnimGraph node runtime variable binding için deprecated `PropertyBindings_DEPRECATED` alanına yazma. UE 5.7 canonical path, node üzerindeki instanced binding objesinin `PropertyBindings` map'ine `FAnimGraphNodePropertyBinding` eklemek ve source path'i `IPropertyAccessEditor` ile resolve/validate etmektir.
+
+**Apply**:
+- Target property önce `UAnimGraphNode_Base::GetPinProperty(PropertyName)` ile doğrulanır.
+- Source path `SkeletonGeneratedClass` üzerinden `ResolvePropertyAccess` ile çözülür.
+- Type uyumu `GetPropertyCompatibility` ile kontrol edilir; incompatible binding asset'e yazılmaz.
+- Optional input pin varsa `SetPinVisibility(true, OptionalPinIndex)` ile expose edilir, sonra pin linkleri kırılır.
+- Binding sonrası node `ReconstructNode()` edilir ve Blueprint structurally modified işaretlenir.
+- Debug için `animation.read_anim_node_properties` ile pin görünürlüğü, link count ve binding listesi okunur.
+
+## EGraphRemoveFlags namespace-plain enum: bitwise OR int döner
+
+**Symptom**: `FBlueprintEditorUtils::RemoveGraph(BP, Graph, EGraphRemoveFlags::Recompile | EGraphRemoveFlags::MarkTransient)` 2026-05-06 Cluster G real impl build'inde compile error verdi:
+```
+error C2664: cannot convert argument 3 from 'int' to 'EGraphRemoveFlags::Type'
+note: Conversion to enumeration type requires an explicit cast
+```
+
+**Root**: `EGraphRemoveFlags` namespace içinde **plain enum** (UE 5.7 `Kismet2/BlueprintEditorUtils.h:448`). Plain enum'da bitwise OR int döner; namespace-scoped `Type` enum'una implicit conversion yok. Bu modern `enum class` davranışı değil — UE'nin C++03-uyumlu eski enum pattern'i.
+
+**Rule**: UE'de `EGraphRemoveFlags::Default` zaten `Recompile | MarkTransient` kombinasyonunu temsil eder — onu kullan. İstisnai bir kombo gerekirse `static_cast<EGraphRemoveFlags::Type>(Recompile | MarkTransient)` yaz.
+
+**How to apply**: Yeni UE namespace-enum API'si gördüğünde önce header'a bak:
+- `enum class Foo` (modern) → bitwise OR enum dönmüyor (sadece operator overload varsa).
+- `namespace EFoo { enum Type { ... } }` (eski UE) → bitwise OR int döner; pre-defined kombolar (Default, All, vs.) varsa onları kullan.
+
+## UAnimGraphNode_LinkedAnimLayer: Interface + Layer önce, ReconstructNode sonra
+
+**Symptom**: Cluster G `add_linked_anim_layer_node` ilk taslakta UAnimGraphNode_LinkedAnimLayer spawn ediliyor, sonra `Node->Node.Interface` set ediliyor, ardından manuel pin allocate deneniyordu — pose pin'leri eksik geliyordu.
+
+**Rule**: UAnimGraphNode_LinkedAnimLayer canonical pipeline:
+1. `NewObject<UAnimGraphNode_LinkedAnimLayer>(AnimGraph)` + `CreateNewGuid()` + position + `AnimGraph->AddNode(...)`.
+2. **PostPlacedNewNode'dan ÖNCE** inner struct property'leri set:
+   - `Node->Node.Interface = UClass*` (anim layer interface BPGC, TSubclassOf<UAnimInstance>)
+   - `Node->Node.Layer = FName(LayerFunctionName)` (interface'in declared function adı)
+   - (opsiyonel) `Node->Node.InstanceClass = UClass*` (compile-time forced child class)
+3. `Node->PostPlacedNewNode()` → `Node->AllocateDefaultPins()` → `Node->ReconstructNode()`.
+
+`ReconstructNode` Interface UClass + Layer FName'i okuyup layer fonksiyonunun signature'ına göre InputPose / OutputPose pin'lerini ALLOCATE eder. Önceden set etmezsen pin set'i yanlış (boş) gelir; manuel `CreatePin` çağrıları schema mismatch yaratır.
+
+**How to apply**: Tüm `UAnimGraphNode_*` türevlerinde inner `FAnimNode_*` struct property'lerini PostPlacedNewNode öncesi set et. Pin allocation reflection-driven; struct property'leri pin signature'ı belirler.
+
+## Cluster G ALI factory: BPTYPE_Interface + AnimationGraphSchema duality
+
+**Rule**: Anim Layer Interface (ALI) = UAnimBlueprint + `BlueprintType = BPTYPE_Interface` + Skeleton ref + AnimationGraphSchema-bound function graphs. Plain `UInterface` mantığıyla karıştırma:
+- `UInterface` (regular BP interface) = method declarations only, no graph storage.
+- `UAnimLayerInterface` (BPTYPE_Interface UAnimBlueprint) = AnimGraph schema'lı declared functions; her function pose-output bir layer.
+
+**How to apply**:
+- ALI factory: `UAnimBlueprintFactory + TargetSkeleton + BlueprintType=BPTYPE_Interface`. Interface filter for anim layer: `IsChildOf(UAnimBlueprint) && BlueprintType==BPTYPE_Interface`.
+- Layer function declaration: `FBlueprintEditorUtils::CreateNewGraph(IfaceBP, FuncName, UEdGraph::StaticClass(), UAnimationGraphSchema::StaticClass())` + push to `IfaceBP->FunctionGraphs`.
+- Child override graph: aynı CreateNewGraph + push to **child BP'nin** `FBPInterfaceDescription::Graphs` (interface BP'nin değil — child-side override semantik).
+- `IfaceCls->ClassGeneratedBy` üzerinden `UAnimBlueprint*`'ya geri dön ve `BlueprintType==BPTYPE_Interface` doğrulayarak ALI tespiti yap.

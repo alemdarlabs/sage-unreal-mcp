@@ -26,7 +26,9 @@
 #include "Factories/AnimCompositeFactory.h"
 #include "Factories/AnimMontageFactory.h"
 #include "Factories/BlueprintFactory.h"
+#include "Features/IModularFeatures.h"
 #include "IAssetTools.h"
+#include "IPropertyAccessEditor.h"
 #include "Modules/ModuleManager.h"
 #include "PhysicsEngine/PhysicsAsset.h"
 #include "ScopedTransaction.h"
@@ -44,6 +46,7 @@
 #include "AnimGraphNode_StateMachineBase.h"
 #include "AnimGraphNode_SequencePlayer.h"
 #include "AnimGraphNode_AssetPlayerBase.h"
+#include "AnimGraphNode_BlendListByInt.h"
 #include "AnimGraphNode_Root.h"
 #include "AnimGraphNode_StateResult.h"
 #include "AnimStateNode.h"
@@ -55,6 +58,8 @@
 #include "AnimationTransitionGraph.h"
 #include "AnimGraphNode_SkeletalControlBase.h"
 #include "AnimGraphNode_BlendListBase.h"
+#include "AnimGraphNode_LinkedAnimLayer.h"  // Cluster G: master AnimGraph linked-layer call
+#include "Animation/AnimNode_LinkedAnimLayer.h"  // Cluster G: inner FAnimNode_LinkedAnimLayer
 #include "Animation/AnimNodeBase.h"  // FPoseLink for pose-pin category check
 #include "BoneControllers/AnimNode_SkeletalControlBase.h"  // FComponentSpacePoseLink
 #include "Animation/AnimNode_SequencePlayer.h"  // FAnimNode_SequencePlayer for inner Node mutation
@@ -1903,9 +1908,10 @@ FSageToolDispatch::FOutcome GetPhysicsAssetImpl(const TSharedPtr<FJsonObject>& A
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("skeletal_mesh"), SK->GetPathName());
-    if (SK->PhysicsAsset)
+    UPhysicsAsset* PhysicsAsset = SK->GetPhysicsAsset();
+    if (PhysicsAsset)
     {
-        R->SetStringField(TEXT("physics_asset"), SK->PhysicsAsset->GetPathName());
+        R->SetStringField(TEXT("physics_asset"), PhysicsAsset->GetPathName());
     }
     else
     {
@@ -4280,6 +4286,537 @@ bool GetAnimNodeStructTarget(UAnimGraphNode_Base* AnimNode, FStructProperty*& Ou
     return false;
 }
 
+const UStruct* GetAnimBindingSourceRoot(const UAnimBlueprint* AnimBP)
+{
+    if (!AnimBP) return nullptr;
+    if (AnimBP->SkeletonGeneratedClass) return AnimBP->SkeletonGeneratedClass;
+    return AnimBP->GeneratedClass;
+}
+
+int32 FindOptionalPinIndexForProperty(const UAnimGraphNode_Base* AnimNode, FName PropertyName)
+{
+    if (!AnimNode) return INDEX_NONE;
+    for (int32 Index = 0; Index < AnimNode->ShowPinForProperties.Num(); ++Index)
+    {
+        if (AnimNode->ShowPinForProperties[Index].PropertyName == PropertyName)
+        {
+            return Index;
+        }
+    }
+    return INDEX_NONE;
+}
+
+UObject* GetAnimNodeBindingObject(const UAnimGraphNode_Base* AnimNode)
+{
+    if (!AnimNode) return nullptr;
+    const FObjectPropertyBase* BindingProp = FindFProperty<FObjectPropertyBase>(
+        UAnimGraphNode_Base::StaticClass(), TEXT("Binding"));
+    return BindingProp ? BindingProp->GetObjectPropertyValue_InContainer(AnimNode) : nullptr;
+}
+
+UObject* GetOrCreateAnimNodeBindingObject(UAnimBlueprint* AnimBP,
+                                          UAnimGraphNode_Base* AnimNode,
+                                          FString& OutError)
+{
+    OutError.Reset();
+    if (!AnimBP || !AnimNode)
+    {
+        OutError = TEXT("invalid AnimBP or AnimGraph node");
+        return nullptr;
+    }
+
+    FObjectPropertyBase* BindingProp = FindFProperty<FObjectPropertyBase>(
+        UAnimGraphNode_Base::StaticClass(), TEXT("Binding"));
+    if (!BindingProp)
+    {
+        OutError = TEXT("UAnimGraphNode_Base.Binding property not found");
+        return nullptr;
+    }
+
+    if (UObject* Existing = BindingProp->GetObjectPropertyValue_InContainer(AnimNode))
+    {
+        return Existing;
+    }
+
+    UClass* BindingClass = AnimBP->GetDefaultBindingClass();
+    if (!BindingClass)
+    {
+        BindingClass = FindObject<UClass>(nullptr, TEXT("/Script/AnimGraph.AnimGraphNodeBinding_Base"));
+    }
+    if (!BindingClass)
+    {
+        BindingClass = LoadObject<UClass>(nullptr, TEXT("/Script/AnimGraph.AnimGraphNodeBinding_Base"));
+    }
+    if (!BindingClass || BindingClass->HasAnyClassFlags(CLASS_Abstract))
+    {
+        OutError = TEXT("UE 5.7 default AnimGraph node binding class could not be resolved");
+        return nullptr;
+    }
+
+    UObject* BindingObj = NewObject<UObject>(AnimNode, BindingClass, NAME_None, RF_Transactional);
+    if (!BindingObj)
+    {
+        OutError = FString::Printf(TEXT("could not instantiate binding class %s"),
+                                   *BindingClass->GetPathName());
+        return nullptr;
+    }
+    BindingProp->SetObjectPropertyValue_InContainer(AnimNode, BindingObj);
+    return BindingObj;
+}
+
+bool GetAnimNodeBindingMap(UObject* BindingObj,
+                           FMapProperty*& OutMapProp,
+                           FStructProperty*& OutValueStruct,
+                           FString& OutError)
+{
+    OutMapProp = nullptr;
+    OutValueStruct = nullptr;
+    OutError.Reset();
+
+    if (!BindingObj)
+    {
+        OutError = TEXT("binding object is null");
+        return false;
+    }
+
+    OutMapProp = CastField<FMapProperty>(
+        BindingObj->GetClass()->FindPropertyByName(TEXT("PropertyBindings")));
+    if (!OutMapProp)
+    {
+        OutError = FString::Printf(TEXT("%s has no PropertyBindings map"),
+                                   *BindingObj->GetClass()->GetName());
+        return false;
+    }
+    if (!OutMapProp->KeyProp || !OutMapProp->KeyProp->IsA<FNameProperty>())
+    {
+        OutError = TEXT("PropertyBindings key is not FName");
+        return false;
+    }
+
+    OutValueStruct = CastField<FStructProperty>(OutMapProp->ValueProp);
+    if (!OutValueStruct
+        || OutValueStruct->Struct != FAnimGraphNodePropertyBinding::StaticStruct())
+    {
+        OutError = TEXT("PropertyBindings value is not FAnimGraphNodePropertyBinding");
+        return false;
+    }
+    return true;
+}
+
+void RemoveBindingMapEntries(UObject* BindingObj, FMapProperty* MapProp, FName BindingName)
+{
+    if (!BindingObj || !MapProp) return;
+
+    void* MapPtr = MapProp->ContainerPtrToValuePtr<void>(BindingObj);
+    FScriptMapHelper Helper(MapProp, MapPtr);
+    FNameProperty* KeyProp = CastFieldChecked<FNameProperty>(MapProp->KeyProp);
+
+    bool bRemoved = false;
+    for (int32 InternalIndex = Helper.GetMaxIndex() - 1; InternalIndex >= 0; --InternalIndex)
+    {
+        if (!Helper.IsValidIndex(InternalIndex)) continue;
+
+        const FName ExistingName = KeyProp->GetPropertyValue(Helper.GetKeyPtr(InternalIndex));
+        if (ExistingName == BindingName || FName(ExistingName, 0) == BindingName)
+        {
+            Helper.RemoveAt(InternalIndex);
+            bRemoved = true;
+        }
+    }
+    if (bRemoved)
+    {
+        Helper.Rehash();
+    }
+}
+
+bool AddBindingMapEntry(UObject* BindingObj,
+                        FMapProperty* MapProp,
+                        FStructProperty* ValueStruct,
+                        FName BindingName,
+                        const FAnimGraphNodePropertyBinding& Binding,
+                        FString& OutError)
+{
+    OutError.Reset();
+    if (!BindingObj || !MapProp || !ValueStruct)
+    {
+        OutError = TEXT("invalid PropertyBindings map");
+        return false;
+    }
+
+    RemoveBindingMapEntries(BindingObj, MapProp, BindingName);
+
+    void* MapPtr = MapProp->ContainerPtrToValuePtr<void>(BindingObj);
+    FScriptMapHelper Helper(MapProp, MapPtr);
+    FNameProperty* KeyProp = CastFieldChecked<FNameProperty>(MapProp->KeyProp);
+
+    const int32 NewIndex = Helper.AddDefaultValue_Invalid_NeedsRehash();
+    KeyProp->SetPropertyValue(Helper.GetKeyPtr(NewIndex), BindingName);
+    ValueStruct->CopyCompleteValue(Helper.GetValuePtr(NewIndex), &Binding);
+    Helper.Rehash();
+    return true;
+}
+
+bool AppendBindingPathSegments(const FString& Raw, TArray<FString>& OutPath)
+{
+    FString Trimmed = Raw;
+    Trimmed.TrimStartAndEndInline();
+    if (Trimmed.IsEmpty()) return false;
+
+    TArray<FString> Parts;
+    Trimmed.ParseIntoArray(Parts, TEXT("."), /*CullEmpty=*/true);
+    if (Parts.IsEmpty()) return false;
+
+    for (FString& Part : Parts)
+    {
+        Part.TrimStartAndEndInline();
+        if (Part.IsEmpty()) return false;
+        OutPath.Add(Part);
+    }
+    return true;
+}
+
+bool ParseAnimNodeBindingExpression(const TSharedPtr<FJsonObject>& Args,
+                                    TArray<FString>& OutPath,
+                                    FString& OutError)
+{
+    OutPath.Reset();
+    OutError.Reset();
+    if (!Args.IsValid())
+    {
+        OutError = TEXT("missing args");
+        return false;
+    }
+
+    if (TSharedPtr<FJsonValue> Expr = Args->TryGetField(TEXT("expression")))
+    {
+        if (Expr->Type == EJson::String)
+        {
+            if (!AppendBindingPathSegments(Expr->AsString(), OutPath))
+            {
+                OutError = TEXT("'expression' string must be a variable path like FlightLean.X");
+                return false;
+            }
+            return true;
+        }
+        if (Expr->Type == EJson::Object)
+        {
+            const TSharedPtr<FJsonObject> ExprObj = Expr->AsObject();
+            if (!ExprObj.IsValid())
+            {
+                OutError = TEXT("'expression' object is invalid");
+                return false;
+            }
+
+            const TArray<TSharedPtr<FJsonValue>>* PathValues = nullptr;
+            if (ExprObj->TryGetArrayField(TEXT("path"), PathValues))
+            {
+                for (const TSharedPtr<FJsonValue>& SegmentValue : *PathValues)
+                {
+                    if (!SegmentValue.IsValid() || SegmentValue->Type != EJson::String
+                        || !AppendBindingPathSegments(SegmentValue->AsString(), OutPath))
+                    {
+                        OutError = TEXT("'expression.path' must contain non-empty string segments");
+                        return false;
+                    }
+                }
+                if (!OutPath.IsEmpty()) return true;
+            }
+
+            FString VarName;
+            if (!ExprObj->TryGetStringField(TEXT("var"), VarName))
+            {
+                ExprObj->TryGetStringField(TEXT("variable"), VarName);
+            }
+            if (VarName.IsEmpty() || !AppendBindingPathSegments(VarName, OutPath))
+            {
+                OutError = TEXT("'expression' object must include 'var' or 'path'");
+                return false;
+            }
+
+            FString MemberName;
+            if (ExprObj->TryGetStringField(TEXT("member"), MemberName)
+                && !MemberName.IsEmpty()
+                && !AppendBindingPathSegments(MemberName, OutPath))
+            {
+                OutError = TEXT("'expression.member' must be a non-empty path segment");
+                return false;
+            }
+
+            const TArray<TSharedPtr<FJsonValue>>* Members = nullptr;
+            if (ExprObj->TryGetArrayField(TEXT("members"), Members))
+            {
+                for (const TSharedPtr<FJsonValue>& MemberValue : *Members)
+                {
+                    if (!MemberValue.IsValid() || MemberValue->Type != EJson::String
+                        || !AppendBindingPathSegments(MemberValue->AsString(), OutPath))
+                    {
+                        OutError = TEXT("'expression.members' must contain non-empty string segments");
+                        return false;
+                    }
+                }
+            }
+            return !OutPath.IsEmpty();
+        }
+
+        OutError = TEXT("'expression' must be a string or object");
+        return false;
+    }
+
+    FString VarName;
+    if (Args->TryGetStringField(TEXT("variable"), VarName)
+        && !VarName.IsEmpty()
+        && AppendBindingPathSegments(VarName, OutPath))
+    {
+        return true;
+    }
+
+    OutError = TEXT("missing 'expression' (or legacy 'variable')");
+    return false;
+}
+
+FString BindingPathToString(const TArray<FString>& Path)
+{
+    return FString::Join(Path, TEXT("."));
+}
+
+bool ResolveBindingLeafProperty(const UAnimBlueprint* AnimBP,
+                                const TArray<FString>& BindingPath,
+                                FProperty*& OutLeafProperty,
+                                int32& OutArrayIndex,
+                                FString& OutError)
+{
+    OutLeafProperty = nullptr;
+    OutArrayIndex = INDEX_NONE;
+    OutError.Reset();
+
+    const UStruct* SourceRoot = GetAnimBindingSourceRoot(AnimBP);
+    if (!SourceRoot)
+    {
+        OutError = TEXT("AnimBlueprint has no SkeletonGeneratedClass/GeneratedClass; compile it once before binding");
+        return false;
+    }
+
+    const FName FeatureName(TEXT("PropertyAccessEditor"));
+    if (!IModularFeatures::Get().IsModularFeatureAvailable(FeatureName))
+    {
+        OutError = TEXT("PropertyAccessEditor modular feature is not available");
+        return false;
+    }
+
+    IPropertyAccessEditor& PropertyAccessEditor =
+        IModularFeatures::Get().GetModularFeature<IPropertyAccessEditor>(FeatureName);
+    const FPropertyAccessResolveResult Result =
+        PropertyAccessEditor.ResolvePropertyAccess(SourceRoot, BindingPath, OutLeafProperty, OutArrayIndex);
+    if (Result.Result == EPropertyAccessResolveResult::Failed || !OutLeafProperty)
+    {
+        OutError = FString::Printf(TEXT("could not resolve AnimBP property path '%s' on %s"),
+                                   *BindingPathToString(BindingPath), *SourceRoot->GetName());
+        return false;
+    }
+    return true;
+}
+
+bool BuildAnimNodePropertyBinding(UAnimBlueprint* AnimBP,
+                                  UAnimGraphNode_Base* AnimNode,
+                                  FName BindingName,
+                                  const TArray<FString>& BindingPath,
+                                  FAnimGraphNodePropertyBinding& OutBinding,
+                                  FString& OutError)
+{
+    OutBinding = FAnimGraphNodePropertyBinding();
+    OutError.Reset();
+    if (!AnimBP || !AnimNode)
+    {
+        OutError = TEXT("invalid AnimBP or AnimGraph node");
+        return false;
+    }
+
+    FProperty* TargetProperty = AnimNode->GetPinProperty(BindingName);
+    if (!TargetProperty)
+    {
+        OutError = FString::Printf(TEXT("property '%s' is not an AnimGraph input pin property on %s"),
+                                   *BindingName.ToString(), *AnimNode->GetClass()->GetName());
+        return false;
+    }
+
+    FProperty* CompatibilityTarget = TargetProperty;
+    if (FArrayProperty* ArrayProperty = CastField<FArrayProperty>(CompatibilityTarget))
+    {
+        CompatibilityTarget = ArrayProperty->Inner;
+    }
+
+    FProperty* LeafProperty = nullptr;
+    int32 SourceArrayIndex = INDEX_NONE;
+    if (!ResolveBindingLeafProperty(AnimBP, BindingPath, LeafProperty, SourceArrayIndex, OutError))
+    {
+        return false;
+    }
+
+    const FName FeatureName(TEXT("PropertyAccessEditor"));
+    IPropertyAccessEditor& PropertyAccessEditor =
+        IModularFeatures::Get().GetModularFeature<IPropertyAccessEditor>(FeatureName);
+    const EPropertyAccessCompatibility Compatibility =
+        PropertyAccessEditor.GetPropertyCompatibility(LeafProperty, CompatibilityTarget);
+    if (Compatibility == EPropertyAccessCompatibility::Incompatible)
+    {
+        OutError = FString::Printf(TEXT("binding type mismatch: source '%s' (%s) cannot feed target '%s' (%s)"),
+            *BindingPathToString(BindingPath),
+            *LeafProperty->GetCPPType(),
+            *BindingName.ToString(),
+            *CompatibilityTarget->GetCPPType());
+        return false;
+    }
+
+    const UAnimationGraphSchema* Schema = GetDefault<UAnimationGraphSchema>();
+    OutBinding.PropertyName = BindingName;
+    OutBinding.ArrayIndex = INDEX_NONE;
+    OutBinding.PropertyPath = BindingPath;
+    OutBinding.PathAsText = PropertyAccessEditor.MakeTextPath(BindingPath, GetAnimBindingSourceRoot(AnimBP));
+    OutBinding.Type = EAnimGraphNodePropertyBindingType::Property;
+    OutBinding.bIsBound = true;
+    OutBinding.bOnlyUpdateWhenActive = false;
+    Schema->ConvertPropertyToPinType(LeafProperty, OutBinding.PinType);
+    OutBinding.bIsPromotion = (Compatibility == EPropertyAccessCompatibility::Promotable);
+    OutBinding.PromotedPinType = OutBinding.PinType;
+    return true;
+}
+
+TSharedPtr<FJsonObject> PinTypeToJson(const FEdGraphPinType& PinType)
+{
+    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+    Obj->SetStringField(TEXT("category"), PinType.PinCategory.ToString());
+    Obj->SetStringField(TEXT("subcategory"), PinType.PinSubCategory.ToString());
+    if (UObject* SubCategoryObject = PinType.PinSubCategoryObject.Get())
+    {
+        Obj->SetStringField(TEXT("subcategory_object"), SubCategoryObject->GetPathName());
+    }
+    return Obj;
+}
+
+FString BindingTypeToString(EAnimGraphNodePropertyBindingType Type)
+{
+    switch (Type)
+    {
+    case EAnimGraphNodePropertyBindingType::Property:
+        return TEXT("property");
+    case EAnimGraphNodePropertyBindingType::Function:
+        return TEXT("function");
+    case EAnimGraphNodePropertyBindingType::None:
+    default:
+        return TEXT("none");
+    }
+}
+
+TSharedPtr<FJsonObject> BindingToJson(FName BindingName,
+                                      const FAnimGraphNodePropertyBinding& Binding)
+{
+    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+    Obj->SetStringField(TEXT("name"), BindingName.ToString());
+    Obj->SetStringField(TEXT("property"), Binding.PropertyName.ToString());
+    Obj->SetNumberField(TEXT("array_index"), Binding.ArrayIndex);
+    Obj->SetStringField(TEXT("path"), BindingPathToString(Binding.PropertyPath));
+    Obj->SetStringField(TEXT("path_text"), Binding.PathAsText.ToString());
+    Obj->SetStringField(TEXT("type"), BindingTypeToString(Binding.Type));
+    Obj->SetBoolField(TEXT("bound"), Binding.bIsBound);
+    Obj->SetBoolField(TEXT("is_promotion"), Binding.bIsPromotion);
+    Obj->SetBoolField(TEXT("only_update_when_active"), Binding.bOnlyUpdateWhenActive);
+    Obj->SetObjectField(TEXT("pin_type"), PinTypeToJson(Binding.PinType));
+    Obj->SetObjectField(TEXT("promoted_pin_type"), PinTypeToJson(Binding.PromotedPinType));
+
+    TArray<TSharedPtr<FJsonValue>> Segments;
+    for (const FString& Segment : Binding.PropertyPath)
+    {
+        Segments.Add(MakeShared<FJsonValueString>(Segment));
+    }
+    Obj->SetArrayField(TEXT("path_segments"), Segments);
+    return Obj;
+}
+
+void ReadBindingMapEntries(UObject* BindingObj,
+                           TArray<TSharedPtr<FJsonValue>>& OutBindings,
+                           int32& OutCount)
+{
+    OutBindings.Reset();
+    OutCount = 0;
+    if (!BindingObj) return;
+
+    FMapProperty* MapProp = nullptr;
+    FStructProperty* ValueStruct = nullptr;
+    FString Error;
+    if (!GetAnimNodeBindingMap(BindingObj, MapProp, ValueStruct, Error)) return;
+
+    const void* MapPtr = MapProp->ContainerPtrToValuePtr<void>(BindingObj);
+    FScriptMapHelper Helper(MapProp, MapPtr);
+    const FNameProperty* KeyProp = CastFieldChecked<FNameProperty>(MapProp->KeyProp);
+
+    for (int32 InternalIndex = 0; InternalIndex < Helper.GetMaxIndex(); ++InternalIndex)
+    {
+        if (!Helper.IsValidIndex(InternalIndex)) continue;
+
+        const FName BindingName = KeyProp->GetPropertyValue(Helper.GetKeyPtr(InternalIndex));
+        const FAnimGraphNodePropertyBinding* Binding =
+            reinterpret_cast<const FAnimGraphNodePropertyBinding*>(Helper.GetValuePtr(InternalIndex));
+        if (!Binding) continue;
+
+        OutBindings.Add(MakeShared<FJsonValueObject>(BindingToJson(BindingName, *Binding)));
+        ++OutCount;
+    }
+}
+
+FString ExportPropertyValueText(const FProperty* Property, const void* Container)
+{
+    if (!Property || !Container) return FString();
+    const void* ValuePtr = Property->ContainerPtrToValuePtr<void>(Container);
+    FString Out;
+    Property->ExportTextItem_Direct(Out, ValuePtr, nullptr, nullptr, PPF_None);
+    return Out;
+}
+
+TSharedPtr<FJsonObject> AnimNodePropertyToJson(UAnimGraphNode_Base* AnimNode,
+                                               const FProperty* Property,
+                                               const void* Container)
+{
+    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+    if (!AnimNode || !Property)
+    {
+        Obj->SetBoolField(TEXT("valid"), false);
+        return Obj;
+    }
+
+    const FName PropertyName = Property->GetFName();
+    const int32 OptionalIndex = FindOptionalPinIndexForProperty(AnimNode, PropertyName);
+    const UEdGraphPin* Pin = AnimNode->FindPin(PropertyName);
+    const void* ValuePtr = Container ? Property->ContainerPtrToValuePtr<void>(Container) : nullptr;
+
+    Obj->SetBoolField(TEXT("valid"), true);
+    Obj->SetStringField(TEXT("name"), PropertyName.ToString());
+    Obj->SetStringField(TEXT("cpp_type"), Property->GetCPPType());
+    Obj->SetStringField(TEXT("property_class"), Property->GetClass()->GetName());
+    Obj->SetStringField(TEXT("value_text"), ExportPropertyValueText(Property, Container));
+    Obj->SetBoolField(TEXT("has_pin"), Pin != nullptr);
+    Obj->SetBoolField(TEXT("has_binding"), AnimNode->HasBinding(PropertyName));
+    Obj->SetNumberField(TEXT("optional_pin_index"), OptionalIndex);
+    Obj->SetBoolField(TEXT("optional_pin"), OptionalIndex != INDEX_NONE);
+    if (OptionalIndex != INDEX_NONE)
+    {
+        const FOptionalPinFromProperty& OptionalPin = AnimNode->ShowPinForProperties[OptionalIndex];
+        Obj->SetBoolField(TEXT("pin_visible"), OptionalPin.bShowPin);
+        Obj->SetBoolField(TEXT("can_toggle_visibility"), OptionalPin.bCanToggleVisibility);
+    }
+    if (Pin)
+    {
+        Obj->SetObjectField(TEXT("pin"), PinSummaryJson(Pin));
+    }
+    if (ValuePtr)
+    {
+        if (TSharedPtr<FJsonValue> JsonValue = detail::GetPropertyValueAtPtr(Property, ValuePtr))
+        {
+            Obj->SetField(TEXT("value"), JsonValue);
+        }
+    }
+    return Obj;
+}
+
 // ---------------------------------------------------------------------------
 // animation.add_animgraph_node
 // ---------------------------------------------------------------------------
@@ -4640,17 +5177,12 @@ FSageToolDispatch::FOutcome SetAnimNodePropertyImpl(const TSharedPtr<FJsonObject
 // ---------------------------------------------------------------------------
 // animation.bind_anim_node_property
 // ---------------------------------------------------------------------------
-//
-// Bind an inner FAnimNode_* property to an AnimBlueprint variable so the
-// runtime evaluates it from the variable each tick. Lyra-style "dynamic"
-// AnimBP authoring (Alpha pin → bIsFlying variable, etc.).
-
 FSageToolDispatch::FOutcome BindAnimNodePropertyImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FSageToolDispatch::FOutcome Reject;
     if (detail::RejectIfPie(Reject)) return Reject;
 
-    FString Path, GraphName, NodeId, PropName, VarName;
+    FString Path, GraphName, NodeId, PropName;
     if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
@@ -4663,28 +5195,205 @@ FSageToolDispatch::FOutcome BindAnimNodePropertyImpl(const TSharedPtr<FJsonObjec
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'property'"));
     }
-    if (!Args->TryGetStringField(TEXT("variable"), VarName) || VarName.IsEmpty())
+    Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+    TArray<FString> BindingPath;
+    FString ParseError;
+    if (!ParseAnimNodeBindingExpression(Args, BindingPath, ParseError))
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'variable'"));
+        return FSageToolDispatch::FOutcome::MakeError(-32602, ParseError);
+    }
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+    UEdGraph* TargetGraph = ResolveAnimGraphTarget(AnimBP, GraphName);
+    if (!TargetGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("graph '%s' not found"), *GraphName));
+    }
+    UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(
+        FindGraphNodeByGuid(TargetGraph, NodeId));
+    if (!AnimNode)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("node_id %s isn't a UAnimGraphNode_Base"), *NodeId));
+    }
+
+    const FName BindingName(*PropName);
+    FAnimGraphNodePropertyBinding PropertyBinding;
+    FString BindingError;
+    if (!BuildAnimNodePropertyBinding(AnimBP, AnimNode, BindingName,
+                                      BindingPath, PropertyBinding, BindingError))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, BindingError);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("BindAnimNodeProp", "Sage: Bind Anim Node Property"));
+    AnimBP->Modify();
+    TargetGraph->Modify();
+    AnimNode->Modify();
+
+    FString ObjectError;
+    UObject* BindingObj = GetOrCreateAnimNodeBindingObject(AnimBP, AnimNode, ObjectError);
+    if (!BindingObj)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, ObjectError);
+    }
+
+    FMapProperty* MapProp = nullptr;
+    FStructProperty* ValueStruct = nullptr;
+    FString MapError;
+    if (!GetAnimNodeBindingMap(BindingObj, MapProp, ValueStruct, MapError))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, MapError);
+    }
+    BindingObj->Modify();
+
+    bool bPinWasVisible = false;
+    bool bPinExposed = false;
+    const int32 OptionalPinIndex = FindOptionalPinIndexForProperty(AnimNode, BindingName);
+    if (OptionalPinIndex != INDEX_NONE)
+    {
+        bPinWasVisible = AnimNode->ShowPinForProperties[OptionalPinIndex].bShowPin;
+        if (!bPinWasVisible)
+        {
+            AnimNode->SetPinVisibility(/*bInVisible=*/true, OptionalPinIndex);
+            bPinExposed = true;
+        }
+    }
+
+    if (UEdGraphPin* Pin = AnimNode->FindPin(BindingName))
+    {
+        Pin->BreakAllPinLinks();
+    }
+
+    AnimNode->RemoveBindings(BindingName);
+    FString AddError;
+    if (!AddBindingMapEntry(BindingObj, MapProp, ValueStruct,
+                            BindingName, PropertyBinding, AddError))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, AddError);
+    }
+
+    AnimNode->ReconstructNode();
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
+    TArray<TSharedPtr<FJsonValue>> Bindings;
+    int32 BindingCount = 0;
+    ReadBindingMapEntries(BindingObj, Bindings, BindingCount);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("node_id"), NodeId);
+    R->SetStringField(TEXT("graph"), TargetGraph->GetFName().ToString());
+    R->SetStringField(TEXT("property"), PropName);
+    R->SetStringField(TEXT("path"), BindingPathToString(BindingPath));
+    R->SetStringField(TEXT("binding_class"), BindingObj->GetClass()->GetPathName());
+    R->SetBoolField(TEXT("bound"), true);
+    R->SetBoolField(TEXT("pin_was_visible"), bPinWasVisible);
+    R->SetBoolField(TEXT("pin_exposed"), bPinExposed);
+    R->SetNumberField(TEXT("optional_pin_index"), OptionalPinIndex);
+    R->SetNumberField(TEXT("binding_count"), BindingCount);
+    R->SetObjectField(TEXT("binding"), BindingToJson(BindingName, PropertyBinding));
+    R->SetArrayField(TEXT("bindings"), Bindings);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.read_anim_node_properties
+// ---------------------------------------------------------------------------
+FSageToolDispatch::FOutcome ReadAnimNodePropertiesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, GraphName, NodeId;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("node_id"), NodeId) || NodeId.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'node_id'"));
     }
     Args->TryGetStringField(TEXT("graph_name"), GraphName);
 
-    // UE 5.7 refactored UAnimGraphNode_Base::PropertyBindings →
-    // PropertyBindings_DEPRECATED. The canonical replacement is the
-    // UAnimBlueprintExtension subsystem (per-class extensions registered on
-    // the AnimBP at compile time). Implementing the binding correctly
-    // requires resolving the right extension and member graph + a recompile;
-    // shipping a half-correct version risks corrupting AnimBPs (lessons.md
-    // "silent fail anti-pattern" + production caution).
-    //
-    // Short-circuit BEFORE we touch the asset registry / GameThread asset
-    // load — there is no point spending those cycles when we know the
-    // handler always returns -32601. Once Sage wires the AnimBlueprintExt
-    // path the asset/graph resolution moves below this guard.
-    (void)Path; (void)NodeId; (void)PropName; (void)VarName; (void)GraphName;
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("animation.bind_anim_node_property: UE 5.7 deprecated PropertyBindings; "
-             "AnimBlueprintExtension-based replacement pending Sage implementation"));
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+    UEdGraph* TargetGraph = ResolveAnimGraphTarget(AnimBP, GraphName);
+    if (!TargetGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("graph '%s' not found"), *GraphName));
+    }
+    UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(
+        FindGraphNodeByGuid(TargetGraph, NodeId));
+    if (!AnimNode)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("node_id %s isn't a UAnimGraphNode_Base"), *NodeId));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Pins;
+    for (const UEdGraphPin* Pin : AnimNode->Pins)
+    {
+        Pins.Add(MakeShared<FJsonValueObject>(PinSummaryJson(Pin)));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Properties;
+    FStructProperty* NodeStructProp = nullptr;
+    void* NodeStructPtr = nullptr;
+    if (GetAnimNodeStructTarget(AnimNode, NodeStructProp, NodeStructPtr)
+        && NodeStructProp && NodeStructProp->Struct)
+    {
+        for (TFieldIterator<FProperty> It(NodeStructProp->Struct); It; ++It)
+        {
+            FProperty* Property = *It;
+            if (!Property) continue;
+            Properties.Add(MakeShared<FJsonValueObject>(
+                AnimNodePropertyToJson(AnimNode, Property, NodeStructPtr)));
+        }
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Bindings;
+    int32 BindingCount = 0;
+    UObject* BindingObj = GetAnimNodeBindingObject(AnimNode);
+    ReadBindingMapEntries(BindingObj, Bindings, BindingCount);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("node_id"), NodeId);
+    R->SetStringField(TEXT("graph"), TargetGraph->GetFName().ToString());
+    R->SetStringField(TEXT("node_class"), AnimNode->GetClass()->GetPathName());
+    if (UScriptStruct* FNodeType = AnimNode->GetFNodeType())
+    {
+        R->SetStringField(TEXT("fnode_type"), FNodeType->GetPathName());
+    }
+    if (NodeStructProp && NodeStructProp->Struct)
+    {
+        R->SetStringField(TEXT("inner_struct"), NodeStructProp->Struct->GetPathName());
+    }
+    if (BindingObj)
+    {
+        R->SetStringField(TEXT("binding_class"), BindingObj->GetClass()->GetPathName());
+    }
+    R->SetNumberField(TEXT("pin_count"), Pins.Num());
+    R->SetNumberField(TEXT("property_count"), Properties.Num());
+    R->SetNumberField(TEXT("binding_count"), BindingCount);
+    R->SetArrayField(TEXT("pins"), Pins);
+    R->SetArrayField(TEXT("properties"), Properties);
+    R->SetArrayField(TEXT("bindings"), Bindings);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ---------------------------------------------------------------------------
@@ -5129,6 +5838,12 @@ FSageToolDispatch::FOutcome SpawnByClassPathImpl(const TSharedPtr<FJsonObject>& 
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+FSageToolDispatch::FOutcome AddBlendListByIntImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return SpawnByClassPathImpl(Args,
+        TEXT("/Script/AnimGraph.AnimGraphNode_BlendListByInt"),
+        TEXT("Blend List By Int"));
+}
 FSageToolDispatch::FOutcome AddBlendListByBoolImpl(const TSharedPtr<FJsonObject>& Args)
 {
     return SpawnByClassPathImpl(Args,
@@ -5140,6 +5855,63 @@ FSageToolDispatch::FOutcome AddBlendListByEnumImpl(const TSharedPtr<FJsonObject>
     return SpawnByClassPathImpl(Args,
         TEXT("/Script/AnimGraph.AnimGraphNode_BlendListByEnum"),
         TEXT("Blend List By Enum"));
+}
+FSageToolDispatch::FOutcome AddBlendListPosePinImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, GraphName, NodeId;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("node_id"), NodeId) || NodeId.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'node_id'"));
+    }
+    Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+    UEdGraph* TargetGraph = ResolveAnimGraphTarget(AnimBP, GraphName);
+    if (!TargetGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("graph '%s' not found"), *GraphName));
+    }
+    UAnimGraphNode_BlendListByInt* Node = Cast<UAnimGraphNode_BlendListByInt>(
+        FindGraphNodeByGuid(TargetGraph, NodeId));
+    if (!Node)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("animation.add_blend_list_pose_pin currently supports UAnimGraphNode_BlendListByInt nodes"));
+    }
+
+    const int32 OldPinCount = Node->Pins.Num();
+    Node->AddPinToBlendList();
+
+    int32 InputPosePins = 0;
+    for (const UEdGraphPin* Pin : Node->Pins)
+    {
+        if (Pin && Pin->Direction == EGPD_Input && IsPosePin(Pin))
+        {
+            ++InputPosePins;
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("node_id"), NodeId);
+    R->SetStringField(TEXT("class"), Node->GetClass()->GetPathName());
+    R->SetNumberField(TEXT("old_pin_count"), OldPinCount);
+    R->SetNumberField(TEXT("pin_count"), Node->Pins.Num());
+    R->SetNumberField(TEXT("input_pose_pin_count"), InputPosePins);
+    R->SetBoolField(TEXT("added"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 FSageToolDispatch::FOutcome AddLayeredBlendPerBoneImpl(const TSharedPtr<FJsonObject>& Args)
 {
@@ -5194,12 +5966,10 @@ FSageToolDispatch::FOutcome AddSlotNodeImpl(const TSharedPtr<FJsonObject>& Args)
         TEXT("/Script/AnimGraph.AnimGraphNode_Slot"),
         TEXT("Slot"));
 }
-FSageToolDispatch::FOutcome AddLinkAnimLayerImpl(const TSharedPtr<FJsonObject>& Args)
-{
-    return SpawnByClassPathImpl(Args,
-        TEXT("/Script/AnimGraph.AnimGraphNode_LinkedAnimLayer"),
-        TEXT("Link Anim Layer"));
-}
+// AddLinkAnimLayerImpl removed — replaced by Phase 4-r6 Cluster G's
+// AddLinkedAnimLayerNodeImpl (sets Interface UClass + Layer FName before
+// ReconstructNode so InputPose/OutputPose pins are wired automatically).
+// See Cluster G impl block below.
 
 // ===========================================================================
 // Cluster J — Runtime character.* namespace (Lyra Sage Gap #19 + ek)
@@ -6639,33 +7409,1117 @@ FSageToolDispatch::FOutcome AddAnimationModifierImpl(const TSharedPtr<FJsonObjec
 }
 
 // ===========================================================================
-// Cluster G — Animation Layer Interface (stubs — complex API)
+// Cluster G — Animation Layer Interface (REAL impl, Phase 4-r6 + Lyra Gap #24)
 // ===========================================================================
+//
+// Lyra-canonical linked-layer pattern (B_WeaponInstanceBase.cpp:110 +
+// ALI_ItemAnimLayers + ABP_Mannequin_Pistol/Rifle override BPs):
+//
+//   1. ALI = UAnimBlueprint with BPTYPE_Interface, AnimationGraphSchema.
+//      Each declared function is one animation layer with a pose output.
+//   2. Child AnimBPs implement the ALI; per-function override graphs
+//      (state machines / blendspaces / etc.) flow into the function's
+//      Output Pose.
+//   3. Master AnimBP also implements the ALI and spawns one
+//      UAnimGraphNode_LinkedAnimLayer node per function — that node calls
+//      INTO the linked child class at runtime.
+//   4. Runtime: Mesh->LinkAnimClassLayers(ChildClass) routes the master's
+//      LinkedAnimLayer call into the chosen child override.
+//
+// 11 tools cover all four stages plus diagnostics and a PIE smoke test.
+
+// --- Cluster G shared helpers ---------------------------------------------
+
+// Detect anim layer interface (UAnimBlueprint with BPTYPE_Interface).
+static bool IsAnimLayerInterface(UBlueprint* BP)
+{
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(BP);
+    return AnimBP && AnimBP->BlueprintType == BPTYPE_Interface;
+}
+
+// Filter UBlueprint::FunctionGraphs to only AnimationGraphSchema-bound graphs
+// (the ones that act as layer functions on an ALI).
+static TArray<UEdGraph*> CollectAnimLayerFunctionGraphs(UAnimBlueprint* AnimBP)
+{
+    TArray<UEdGraph*> Out;
+    if (!AnimBP) return Out;
+    for (UEdGraph* Graph : AnimBP->FunctionGraphs)
+    {
+        if (!Graph || !Graph->Schema) continue;
+        if (Graph->Schema->IsChildOf(UAnimationGraphSchema::StaticClass()))
+        {
+            Out.Add(Graph);
+        }
+    }
+    return Out;
+}
+
+// Resolve a UClass for an anim layer interface from a path. Accepts both
+// /Game/.../ALI.ALI_C (BPGC) and /Game/.../ALI.ALI (the BP itself); the latter
+// resolves through ClassGeneratedBy.
+static UClass* ResolveAnimLayerInterfaceClass(const FString& Path)
+{
+    FSoftObjectPath Soft(Path);
+    UObject* Obj = Soft.ResolveObject();
+    if (!Obj) Obj = Soft.TryLoad();
+    if (!Obj) return nullptr;
+    if (UClass* Cls = Cast<UClass>(Obj)) return Cls;
+    if (UAnimBlueprint* IfaceBP = Cast<UAnimBlueprint>(Obj))
+    {
+        return IfaceBP->GeneratedClass;
+    }
+    return nullptr;
+}
+
+// Find FBPInterfaceDescription mutably for a given interface class on a child BP.
+static FBPInterfaceDescription* FindImplementedInterfaceMutable(UBlueprint* BP, UClass* IfaceClass)
+{
+    if (!BP || !IfaceClass) return nullptr;
+    for (FBPInterfaceDescription& Impl : BP->ImplementedInterfaces)
+    {
+        if (Impl.Interface == IfaceClass) return &Impl;
+    }
+    return nullptr;
+}
+
+// Return the override graph (if any) on a child BP for an implemented anim layer function.
+static UEdGraph* FindLayerFunctionOverrideGraph(UBlueprint* BP, UClass* IfaceClass, FName FunctionName)
+{
+    FBPInterfaceDescription* Desc = FindImplementedInterfaceMutable(BP, IfaceClass);
+    if (!Desc) return nullptr;
+    for (UEdGraph* Graph : Desc->Graphs)
+    {
+        if (Graph && Graph->GetFName() == FunctionName) return Graph;
+    }
+    return nullptr;
+}
+
+// Spawn an AnimationGraphSchema-bound function graph. Used for both interface
+// declarations (animation.add_layer_function) and child overrides
+// (animation.add_layer_function_override). The schema's CreateDefaultNodesForGraph
+// produces the Output Pose root; we ensure it explicitly to be robust against
+// variations across UE point releases.
+struct FSpawnedLayerGraph
+{
+    UEdGraph* Graph = nullptr;
+    UAnimGraphNode_Root* Root = nullptr;
+};
+
+static FSpawnedLayerGraph SpawnAnimLayerFunctionGraph(UBlueprint* BP, FName FunctionName)
+{
+    FSpawnedLayerGraph Out;
+    if (!BP) return Out;
+
+    UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(
+        BP, FunctionName, UEdGraph::StaticClass(),
+        UAnimationGraphSchema::StaticClass());
+    if (!NewGraph) return Out;
+
+    UAnimGraphNode_Root* Root = nullptr;
+    for (UEdGraphNode* Node : NewGraph->Nodes)
+    {
+        if (UAnimGraphNode_Root* R = Cast<UAnimGraphNode_Root>(Node))
+        {
+            Root = R; break;
+        }
+    }
+    if (!Root)
+    {
+        Root = NewObject<UAnimGraphNode_Root>(NewGraph);
+        Root->CreateNewGuid();
+        Root->NodePosX = 0;
+        Root->NodePosY = 0;
+        NewGraph->AddNode(Root, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+        Root->PostPlacedNewNode();
+        Root->AllocateDefaultPins();
+    }
+
+    Out.Graph = NewGraph;
+    Out.Root = Root;
+    return Out;
+}
+
+// --- (1) animation.create_anim_layer_interface ----------------------------
 
 FSageToolDispatch::FOutcome CreateAnimLayerInterfaceImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.create_anim_layer_interface — canonical: UAnimLayerInterface BP factory"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    if (!Args.IsValid())
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing args"));
+
+    FString Path, PackagePath, Name, SkelPath;
+    Args->TryGetStringField(TEXT("path"), Path);
+    Args->TryGetStringField(TEXT("package_path"), PackagePath);
+    Args->TryGetStringField(TEXT("name"), Name);
+    if (!Args->TryGetStringField(TEXT("skeleton"), SkelPath) || SkelPath.IsEmpty())
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
+    bool bCompile = false;
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
+
+    if (Path.IsEmpty())
+    {
+        if (PackagePath.IsEmpty() || Name.IsEmpty())
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("either 'path' or both 'package_path'+'name' must be provided"));
+        Path = PackagePath / Name;
+    }
+
+    USkeleton* Skel = Cast<USkeleton>(ResolveAsset(SkelPath));
+    if (!Skel)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("skeleton not found: %s"), *SkelPath));
+
+    FScopedTransaction Tx(LOCTEXT("CreateALI", "Sage: Create Anim Layer Interface"));
+
+    UAnimBlueprintFactory* Fac = NewObject<UAnimBlueprintFactory>();
+    Fac->TargetSkeleton = Skel;
+    Fac->BlueprintType = BPTYPE_Interface;
+
+    UObject* Created = CreateAssetFromPath(Path, UAnimBlueprint::StaticClass(), Fac);
+    if (!Created)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32000,
+            FString::Printf(TEXT("failed to create ALI at %s"), *Path));
+    }
+    Created->MarkPackageDirty();
+    UAnimBlueprint* IfaceBP = Cast<UAnimBlueprint>(Created);
+
+    bool bCompiled = false;
+    if (bCompile && IfaceBP)
+    {
+        FKismetEditorUtilities::CompileBlueprint(IfaceBP);
+        bCompiled = true;
+    }
+
+    int32 FunctionCount = IfaceBP ? CollectAnimLayerFunctionGraphs(IfaceBP).Num() : 0;
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Created->GetPathName());
+    R->SetStringField(TEXT("class_path"),
+        IfaceBP && IfaceBP->GeneratedClass
+            ? IfaceBP->GeneratedClass->GetPathName()
+            : Created->GetPathName());
+    R->SetStringField(TEXT("schema"), TEXT("AnimationGraphSchema"));
+    R->SetStringField(TEXT("blueprint_type"), TEXT("BPTYPE_Interface"));
+    R->SetNumberField(TEXT("function_count"), FunctionCount);
+    R->SetBoolField(TEXT("compiled"), bCompiled);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
+
+// --- (2) animation.add_layer_function -------------------------------------
+
 FSageToolDispatch::FOutcome AddLayerFunctionImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.add_layer_function — pending Sage impl"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, FuncName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("function_name"), FuncName)
+        || FuncName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path' or 'function_name'"));
+    }
+    bool bCompile = false;
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
+
+    UAnimBlueprint* IfaceBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!IfaceBP)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    if (!IsAnimLayerInterface(IfaceBP))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("AnimBP is not BPTYPE_Interface: %s"), *Path));
+
+    const FName FuncFName(*FuncName);
+
+    // Idempotency
+    for (UEdGraph* Graph : IfaceBP->FunctionGraphs)
+    {
+        if (!Graph || Graph->GetFName() != FuncFName) continue;
+        UAnimGraphNode_Root* RootNode = nullptr;
+        for (UEdGraphNode* N : Graph->Nodes)
+        {
+            if (UAnimGraphNode_Root* R = Cast<UAnimGraphNode_Root>(N)) { RootNode = R; break; }
+        }
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("function_name"), FuncName);
+        R->SetStringField(TEXT("graph_name"), Graph->GetName());
+        R->SetStringField(TEXT("schema"), TEXT("AnimationGraphSchema"));
+        R->SetStringField(TEXT("root_node_id"),
+            RootNode ? RootNode->NodeGuid.ToString(EGuidFormats::Digits) : FString());
+        R->SetBoolField(TEXT("already"), true);
+        R->SetBoolField(TEXT("compiled"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("AddLayerFunc", "Sage: Add Layer Function"));
+    IfaceBP->Modify();
+
+    FSpawnedLayerGraph Spawn = SpawnAnimLayerFunctionGraph(IfaceBP, FuncFName);
+    if (!Spawn.Graph)
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("CreateNewGraph returned null"));
+    IfaceBP->FunctionGraphs.Add(Spawn.Graph);
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(IfaceBP);
+
+    bool bCompiled = false;
+    if (bCompile)
+    {
+        FKismetEditorUtilities::CompileBlueprint(IfaceBP);
+        bCompiled = true;
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("function_name"), FuncName);
+    R->SetStringField(TEXT("graph_name"), Spawn.Graph->GetName());
+    R->SetStringField(TEXT("schema"), TEXT("AnimationGraphSchema"));
+    R->SetStringField(TEXT("root_node_id"),
+        Spawn.Root ? Spawn.Root->NodeGuid.ToString(EGuidFormats::Digits) : FString());
+    R->SetBoolField(TEXT("already"), false);
+    R->SetBoolField(TEXT("compiled"), bCompiled);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
+
+// --- (3) animation.add_layer_function_override ----------------------------
+
+FSageToolDispatch::FOutcome AddLayerFunctionOverrideImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, IfacePath, FuncName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("interface_path"), IfacePath)
+        || !Args->TryGetStringField(TEXT("function_name"), FuncName)
+        || FuncName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'interface_path', or 'function_name'"));
+    }
+    bool bCompile = false;
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
+
+    UBlueprint* ChildBP = Cast<UBlueprint>(ResolveAsset(Path));
+    if (!ChildBP)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("blueprint not found: %s"), *Path));
+    UClass* IfaceCls = ResolveAnimLayerInterfaceClass(IfacePath);
+    if (!IfaceCls)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("interface class not found: %s"), *IfacePath));
+
+    FBPInterfaceDescription* Desc = FindImplementedInterfaceMutable(ChildBP, IfaceCls);
+    if (!Desc)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("interface %s not implemented on %s"),
+                            *IfaceCls->GetName(), *ChildBP->GetName()));
+
+    UAnimBlueprint* IfaceBP = Cast<UAnimBlueprint>(IfaceCls->ClassGeneratedBy);
+    if (!IfaceBP || !IsAnimLayerInterface(IfaceBP))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("interface %s is not an animation layer interface"),
+                            *IfaceCls->GetName()));
+
+    const FName FuncFName(*FuncName);
+    bool bDeclared = false;
+    for (UEdGraph* G : IfaceBP->FunctionGraphs)
+    {
+        if (G && G->GetFName() == FuncFName) { bDeclared = true; break; }
+    }
+    if (!bDeclared)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("function '%s' not declared on interface %s"),
+                            *FuncName, *IfaceCls->GetName()));
+
+    // Idempotency
+    if (UEdGraph* Existing = FindLayerFunctionOverrideGraph(ChildBP, IfaceCls, FuncFName))
+    {
+        UAnimGraphNode_Root* RootNode = nullptr;
+        for (UEdGraphNode* N : Existing->Nodes)
+        {
+            if (UAnimGraphNode_Root* R = Cast<UAnimGraphNode_Root>(N)) { RootNode = R; break; }
+        }
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("function_name"), FuncName);
+        R->SetStringField(TEXT("graph_name"), Existing->GetName());
+        R->SetStringField(TEXT("schema"), TEXT("AnimationGraphSchema"));
+        R->SetStringField(TEXT("output_node_id"),
+            RootNode ? RootNode->NodeGuid.ToString(EGuidFormats::Digits) : FString());
+        R->SetBoolField(TEXT("already"), true);
+        R->SetBoolField(TEXT("compiled"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("AddOverride", "Sage: Add Layer Function Override"));
+    ChildBP->Modify();
+
+    FSpawnedLayerGraph Spawn = SpawnAnimLayerFunctionGraph(ChildBP, FuncFName);
+    if (!Spawn.Graph)
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("CreateNewGraph returned null"));
+    Desc->Graphs.Add(Spawn.Graph);
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ChildBP);
+
+    bool bCompiled = false;
+    if (bCompile)
+    {
+        FKismetEditorUtilities::CompileBlueprint(ChildBP);
+        bCompiled = true;
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("function_name"), FuncName);
+    R->SetStringField(TEXT("graph_name"), Spawn.Graph->GetName());
+    R->SetStringField(TEXT("schema"), TEXT("AnimationGraphSchema"));
+    R->SetStringField(TEXT("output_node_id"),
+        Spawn.Root ? Spawn.Root->NodeGuid.ToString(EGuidFormats::Digits) : FString());
+    R->SetBoolField(TEXT("already"), false);
+    R->SetBoolField(TEXT("compiled"), bCompiled);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// --- (4) animation.implement_anim_layer_interface -------------------------
+
 FSageToolDispatch::FOutcome ImplementAnimLayerInterfaceImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.implement_anim_layer_interface — pending Sage impl"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, IfacePath;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("interface_path"), IfacePath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path' or 'interface_path'"));
+    }
+    bool bCompile = false;
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
+
+    UAnimBlueprint* ChildBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!ChildBP)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    UClass* IfaceCls = ResolveAnimLayerInterfaceClass(IfacePath);
+    if (!IfaceCls)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("interface class not found: %s"), *IfacePath));
+    UAnimBlueprint* IfaceBP = Cast<UAnimBlueprint>(IfaceCls->ClassGeneratedBy);
+    if (!IfaceBP || !IsAnimLayerInterface(IfaceBP))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not an animation layer interface: %s"), *IfacePath));
+
+    FScopedTransaction Tx(LOCTEXT("ImplementALI", "Sage: Implement Anim Layer Interface"));
+    ChildBP->Modify();
+
+    bool bAlreadyImplemented = (FindImplementedInterfaceMutable(ChildBP, IfaceCls) != nullptr);
+    if (!bAlreadyImplemented)
+    {
+        const FTopLevelAssetPath IfaceAssetPath(IfaceCls->GetPathName());
+        if (!FBlueprintEditorUtils::ImplementNewInterface(ChildBP, IfaceAssetPath))
+            return FSageToolDispatch::FOutcome::MakeError(-32603,
+                TEXT("ImplementNewInterface returned false"));
+    }
+    FBPInterfaceDescription* Desc = FindImplementedInterfaceMutable(ChildBP, IfaceCls);
+    if (!Desc)
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("interface not implemented after ImplementNewInterface call"));
+
+    TArray<TSharedPtr<FJsonValue>> Implemented, Already, Errors;
+    for (UEdGraph* IfaceGraph : CollectAnimLayerFunctionGraphs(IfaceBP))
+    {
+        if (!IfaceGraph) continue;
+        const FName FuncFName = IfaceGraph->GetFName();
+        if (FindLayerFunctionOverrideGraph(ChildBP, IfaceCls, FuncFName))
+        {
+            Already.Add(MakeShared<FJsonValueString>(FuncFName.ToString()));
+            continue;
+        }
+        FSpawnedLayerGraph Spawn = SpawnAnimLayerFunctionGraph(ChildBP, FuncFName);
+        if (!Spawn.Graph)
+        {
+            auto E = MakeShared<FJsonObject>();
+            E->SetStringField(TEXT("function_name"), FuncFName.ToString());
+            E->SetStringField(TEXT("error"), TEXT("CreateNewGraph returned null"));
+            Errors.Add(MakeShared<FJsonValueObject>(E));
+            continue;
+        }
+        Desc->Graphs.Add(Spawn.Graph);
+        Implemented.Add(MakeShared<FJsonValueString>(FuncFName.ToString()));
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ChildBP);
+
+    bool bCompiled = false;
+    if (bCompile)
+    {
+        FKismetEditorUtilities::CompileBlueprint(ChildBP);
+        bCompiled = true;
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("interface_path"), IfaceCls->GetPathName());
+    R->SetStringField(TEXT("interface"), IfaceCls->GetName());
+    R->SetBoolField(TEXT("interface_already_implemented"), bAlreadyImplemented);
+    R->SetArrayField(TEXT("functions_implemented"), Implemented);
+    R->SetArrayField(TEXT("functions_already"), Already);
+    R->SetArrayField(TEXT("errors"), Errors);
+    R->SetBoolField(TEXT("compiled"), bCompiled);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
-FSageToolDispatch::FOutcome SetLinkedAnimLayerImpl(const TSharedPtr<FJsonObject>& Args)
+
+// --- (5) animation.add_linked_anim_layer_node -----------------------------
+
+FSageToolDispatch::FOutcome AddLinkedAnimLayerNodeImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.set_linked_anim_layer — pending Sage impl"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, GraphName, IfacePath, FuncName, InstClassPath;
+    double X = -400.0, Y = 0.0;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("interface_path"), IfacePath)
+        || !Args->TryGetStringField(TEXT("function_name"), FuncName)
+        || FuncName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'interface_path', or 'function_name'"));
+    }
+    Args->TryGetStringField(TEXT("graph_name"), GraphName);
+    Args->TryGetStringField(TEXT("instance_class_path"), InstClassPath);
+    Args->TryGetNumberField(TEXT("x"), X);
+    Args->TryGetNumberField(TEXT("y"), Y);
+    bool bCompile = false;
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
+
+    UAnimBlueprint* MasterBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!MasterBP)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    UClass* IfaceCls = ResolveAnimLayerInterfaceClass(IfacePath);
+    if (!IfaceCls)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("interface class not found: %s"), *IfacePath));
+    if (!FindImplementedInterfaceMutable(MasterBP, IfaceCls))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("interface %s not implemented on master %s"),
+                            *IfaceCls->GetName(), *MasterBP->GetName()));
+
+    UEdGraph* AnimGraph = ResolveAnimGraphTarget(MasterBP, GraphName);
+    if (!AnimGraph)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            GraphName.IsEmpty()
+                ? TEXT("master AnimBP has no AnimGraph")
+                : *FString::Printf(TEXT("graph '%s' not found"), *GraphName));
+
+    UClass* InstCls = nullptr;
+    if (!InstClassPath.IsEmpty())
+    {
+        InstCls = ResolveAnyClass(InstClassPath);
+        if (!InstCls)
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("instance_class_path not found: %s"), *InstClassPath));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("AddLinkedLayer", "Sage: Add Linked Anim Layer Node"));
+    MasterBP->Modify();
+    AnimGraph->Modify();
+
+    UAnimGraphNode_LinkedAnimLayer* Node = NewObject<UAnimGraphNode_LinkedAnimLayer>(AnimGraph);
+    Node->CreateNewGuid();
+    Node->NodePosX = static_cast<int32>(X);
+    Node->NodePosY = static_cast<int32>(Y);
+    AnimGraph->AddNode(Node, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+
+    // Set Interface (UClass) + Layer (FName) on the inner FAnimNode_LinkedAnimLayer
+    // BEFORE PostPlacedNewNode so ReconstructNode allocates pose pins matching the
+    // layer function's signature.
+    Node->Node.Interface = IfaceCls;
+    Node->Node.Layer = FName(*FuncName);
+    if (InstCls)
+    {
+        Node->Node.InstanceClass = InstCls;
+    }
+
+    Node->PostPlacedNewNode();
+    Node->AllocateDefaultPins();
+    Node->ReconstructNode();
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(MasterBP);
+
+    bool bCompiled = false;
+    if (bCompile)
+    {
+        FKismetEditorUtilities::CompileBlueprint(MasterBP);
+        bCompiled = true;
+    }
+
+    UEdGraphPin* InputPosePin  = FindFirstInputPosePin(Node);
+    UEdGraphPin* OutputPosePin = FindFirstOutputPosePin(Node);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("node_id"), Node->NodeGuid.ToString(EGuidFormats::Digits));
+    R->SetStringField(TEXT("class"), TEXT("/Script/AnimGraph.AnimGraphNode_LinkedAnimLayer"));
+    R->SetStringField(TEXT("interface"), IfaceCls->GetName());
+    R->SetStringField(TEXT("interface_path"), IfaceCls->GetPathName());
+    R->SetStringField(TEXT("interface_function"), FuncName);
+    R->SetStringField(TEXT("instance_class"), InstCls ? InstCls->GetPathName() : FString());
+    R->SetNumberField(TEXT("pin_count"), Node->Pins.Num());
+    R->SetStringField(TEXT("input_pose_pin"),
+        InputPosePin ? InputPosePin->PinName.ToString() : FString());
+    R->SetStringField(TEXT("output_pose_pin"),
+        OutputPosePin ? OutputPosePin->PinName.ToString() : FString());
+    R->SetBoolField(TEXT("compiled"), bCompiled);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
+
+// --- (6) animation.list_implemented_layers --------------------------------
+
 FSageToolDispatch::FOutcome ListImplementedLayersImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.list_implemented_layers — pending Sage impl"));
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    UBlueprint* BP = Cast<UBlueprint>(ResolveAsset(Path));
+    if (!BP)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("blueprint not found: %s"), *Path));
+
+    TArray<TSharedPtr<FJsonValue>> InterfaceArr;
+    for (FBPInterfaceDescription& Impl : BP->ImplementedInterfaces)
+    {
+        if (!Impl.Interface) continue;
+        UAnimBlueprint* IfaceBP = Cast<UAnimBlueprint>(Impl.Interface->ClassGeneratedBy);
+        if (!IfaceBP || !IsAnimLayerInterface(IfaceBP)) continue;  // anim layer filter
+
+        TArray<TSharedPtr<FJsonValue>> FuncArr;
+        for (UEdGraph* IfaceGraph : CollectAnimLayerFunctionGraphs(IfaceBP))
+        {
+            if (!IfaceGraph) continue;
+            const FName FuncFName = IfaceGraph->GetFName();
+            UEdGraph* OverrideGraph = nullptr;
+            for (UEdGraph* G : Impl.Graphs)
+            {
+                if (G && G->GetFName() == FuncFName) { OverrideGraph = G; break; }
+            }
+            auto F = MakeShared<FJsonObject>();
+            F->SetStringField(TEXT("name"), FuncFName.ToString());
+            if (OverrideGraph)
+            {
+                F->SetStringField(TEXT("override_graph"), OverrideGraph->GetName());
+                F->SetNumberField(TEXT("node_count"), OverrideGraph->Nodes.Num());
+            }
+            else
+            {
+                F->SetField(TEXT("override_graph"), MakeShared<FJsonValueNull>());
+                F->SetNumberField(TEXT("node_count"), 0);
+            }
+            FuncArr.Add(MakeShared<FJsonValueObject>(F));
+        }
+
+        auto I = MakeShared<FJsonObject>();
+        I->SetStringField(TEXT("interface_path"), Impl.Interface->GetPathName());
+        I->SetStringField(TEXT("interface_class"), Impl.Interface->GetName());
+        I->SetArrayField(TEXT("functions"), FuncArr);
+        InterfaceArr.Add(MakeShared<FJsonValueObject>(I));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), BP->GetPathName());
+    R->SetArrayField(TEXT("interfaces"), InterfaceArr);
+    R->SetNumberField(TEXT("count"), InterfaceArr.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// --- (7) animation.list_layer_functions -----------------------------------
+
+FSageToolDispatch::FOutcome ListLayerFunctionsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+
+    UAnimBlueprint* IfaceBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!IfaceBP)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    if (!IsAnimLayerInterface(IfaceBP))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("AnimBP is not BPTYPE_Interface: %s"), *Path));
+
+    TArray<TSharedPtr<FJsonValue>> FuncArr;
+    for (UEdGraph* Graph : CollectAnimLayerFunctionGraphs(IfaceBP))
+    {
+        if (!Graph) continue;
+        bool bHasRoot = false;
+        FString OutputPosePin;
+        for (UEdGraphNode* N : Graph->Nodes)
+        {
+            if (UAnimGraphNode_Root* RootNode = Cast<UAnimGraphNode_Root>(N))
+            {
+                bHasRoot = true;
+                if (UEdGraphPin* P = FindFirstInputPosePin(RootNode))
+                {
+                    OutputPosePin = P->PinName.ToString();
+                }
+                break;
+            }
+        }
+        auto F = MakeShared<FJsonObject>();
+        F->SetStringField(TEXT("name"), Graph->GetName());
+        F->SetNumberField(TEXT("node_count"), Graph->Nodes.Num());
+        F->SetBoolField(TEXT("has_root_output"), bHasRoot);
+        F->SetStringField(TEXT("output_pose_pin"), OutputPosePin);
+        FuncArr.Add(MakeShared<FJsonValueObject>(F));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("interface_path"), IfaceBP->GetPathName());
+    R->SetStringField(TEXT("interface_class"),
+        IfaceBP->GeneratedClass ? IfaceBP->GeneratedClass->GetName() : IfaceBP->GetName());
+    R->SetStringField(TEXT("schema"), TEXT("AnimationGraphSchema"));
+    R->SetArrayField(TEXT("functions"), FuncArr);
+    R->SetNumberField(TEXT("count"), FuncArr.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// --- (8) animation.remove_layer_function_override -------------------------
+
+FSageToolDispatch::FOutcome RemoveLayerFunctionOverrideImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, IfacePath, FuncName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("interface_path"), IfacePath)
+        || !Args->TryGetStringField(TEXT("function_name"), FuncName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'interface_path', or 'function_name'"));
+    }
+    bool bConfirmed = false;
+    Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    if (!bConfirmed)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("destructive op requires 'confirmed': true"));
+    bool bCompile = false;
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
+
+    UBlueprint* ChildBP = Cast<UBlueprint>(ResolveAsset(Path));
+    if (!ChildBP)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("blueprint not found: %s"), *Path));
+    UClass* IfaceCls = ResolveAnimLayerInterfaceClass(IfacePath);
+    if (!IfaceCls)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("interface class not found: %s"), *IfacePath));
+    FBPInterfaceDescription* Desc = FindImplementedInterfaceMutable(ChildBP, IfaceCls);
+    if (!Desc)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("interface not implemented on this BP"));
+    const FName FuncFName(*FuncName);
+    UEdGraph* OverrideGraph = nullptr;
+    for (UEdGraph* G : Desc->Graphs)
+    {
+        if (G && G->GetFName() == FuncFName) { OverrideGraph = G; break; }
+    }
+    if (!OverrideGraph)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("function_name"), FuncName);
+        R->SetNumberField(TEXT("removed_node_count"), 0);
+        R->SetBoolField(TEXT("already_absent"), true);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    const int32 RemovedNodes = OverrideGraph->Nodes.Num();
+    const FString RemovedName = OverrideGraph->GetName();
+
+    FScopedTransaction Tx(LOCTEXT("RemoveOverride", "Sage: Remove Layer Function Override"));
+    ChildBP->Modify();
+    Desc->Graphs.RemoveAll([OverrideGraph](UEdGraph* G){ return G == OverrideGraph; });
+    FBlueprintEditorUtils::RemoveGraph(ChildBP, OverrideGraph,
+        EGraphRemoveFlags::Default);  // == Recompile | MarkTransient
+
+    bool bCompiled = false;
+    if (bCompile)
+    {
+        FKismetEditorUtilities::CompileBlueprint(ChildBP);
+        bCompiled = true;
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("removed_graph"), RemovedName);
+    R->SetStringField(TEXT("function_name"), FuncName);
+    R->SetNumberField(TEXT("removed_node_count"), RemovedNodes);
+    R->SetBoolField(TEXT("compiled"), bCompiled);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// --- (9) animation.remove_layer_function ----------------------------------
+
+FSageToolDispatch::FOutcome RemoveLayerFunctionImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, FuncName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("function_name"), FuncName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path' or 'function_name'"));
+    }
+    bool bConfirmed = false;
+    Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    if (!bConfirmed)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("destructive op requires 'confirmed': true"));
+    bool bCompile = false;
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
+
+    UAnimBlueprint* IfaceBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!IfaceBP)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    if (!IsAnimLayerInterface(IfaceBP))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("AnimBP is not BPTYPE_Interface: %s"), *Path));
+
+    const FName FuncFName(*FuncName);
+    UEdGraph* DeclGraph = nullptr;
+    for (UEdGraph* G : IfaceBP->FunctionGraphs)
+    {
+        if (G && G->GetFName() == FuncFName) { DeclGraph = G; break; }
+    }
+    if (!DeclGraph)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("function_name"), FuncName);
+        R->SetBoolField(TEXT("already_absent"), true);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    // Best-effort orphan implementer detection deferred — Sage's knowledge
+    // graph gives a more reliable answer (DEPENDS_ON references). The _warning
+    // surface here is a heuristic hint only. Production: run
+    // animation.list_implemented_layers across known children before the
+    // remove, or use `references_to(<interface_path>)` from the graph layer.
+    TArray<TSharedPtr<FJsonValue>> Orphans;
+
+    const int32 NodeCount = DeclGraph->Nodes.Num();
+    const FString DeclName = DeclGraph->GetName();
+
+    FScopedTransaction Tx(LOCTEXT("RemoveLayerFunc", "Sage: Remove Layer Function"));
+    IfaceBP->Modify();
+    IfaceBP->FunctionGraphs.RemoveAll([DeclGraph](UEdGraph* G){ return G == DeclGraph; });
+    FBlueprintEditorUtils::RemoveGraph(IfaceBP, DeclGraph,
+        EGraphRemoveFlags::Default);  // == Recompile | MarkTransient
+
+    bool bCompiled = false;
+    if (bCompile)
+    {
+        FKismetEditorUtilities::CompileBlueprint(IfaceBP);
+        bCompiled = true;
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("removed_function"), FuncName);
+    R->SetStringField(TEXT("removed_graph"), DeclName);
+    R->SetNumberField(TEXT("removed_node_count"), NodeCount);
+    R->SetArrayField(TEXT("orphan_implementers"), Orphans);
+    R->SetStringField(TEXT("_warning"),
+        TEXT("orphan implementer detection deferred — child AnimBPs that already implemented this function will retain their override graphs. Run animation.list_implemented_layers across known children, or use Sage knowledge graph references_to(<interface_path>) for a reliable list."));
+    R->SetBoolField(TEXT("compiled"), bCompiled);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// --- (10) animation.create_linked_layer_pattern ---------------------------
+
+FSageToolDispatch::FOutcome CreateLinkedLayerPatternImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString IfacePath, ChildPath, MasterPath, MasterGraph, SingleFunc;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("interface_path"), IfacePath)
+        || !Args->TryGetStringField(TEXT("child_path"), ChildPath)
+        || !Args->TryGetStringField(TEXT("master_path"), MasterPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'interface_path', 'child_path', or 'master_path'"));
+    }
+    Args->TryGetStringField(TEXT("master_graph"), MasterGraph);
+    Args->TryGetStringField(TEXT("function_name"), SingleFunc);
+    bool bCompile = false;
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
+
+    UClass* IfaceCls = ResolveAnimLayerInterfaceClass(IfacePath);
+    if (!IfaceCls)
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("interface class not found: %s"), *IfacePath));
+    UAnimBlueprint* IfaceBP = Cast<UAnimBlueprint>(IfaceCls->ClassGeneratedBy);
+    if (!IfaceBP || !IsAnimLayerInterface(IfaceBP))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("not an animation layer interface"));
+
+    UAnimBlueprint* ChildBP  = Cast<UAnimBlueprint>(ResolveAsset(ChildPath));
+    UAnimBlueprint* MasterBP = Cast<UAnimBlueprint>(ResolveAsset(MasterPath));
+    if (!ChildBP)
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("child AnimBP not found"));
+    if (!MasterBP)
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("master AnimBP not found"));
+
+    TArray<FName> TargetFuncs;
+    if (!SingleFunc.IsEmpty())
+    {
+        TargetFuncs.Add(FName(*SingleFunc));
+    }
+    else
+    {
+        for (UEdGraph* G : CollectAnimLayerFunctionGraphs(IfaceBP))
+        {
+            if (G) TargetFuncs.Add(G->GetFName());
+        }
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Errors, Functions, OverrideGraphsOut;
+    FString LinkedNodeId;
+
+    FScopedTransaction Tx(LOCTEXT("LinkedLayerPattern", "Sage: Linked Layer Pattern"));
+    ChildBP->Modify();
+    MasterBP->Modify();
+
+    // Step 1: child implements interface
+    bool bChildImplemented = (FindImplementedInterfaceMutable(ChildBP, IfaceCls) != nullptr);
+    if (!bChildImplemented)
+    {
+        const FTopLevelAssetPath IfaceAssetPath(IfaceCls->GetPathName());
+        if (!FBlueprintEditorUtils::ImplementNewInterface(ChildBP, IfaceAssetPath))
+        {
+            auto E = MakeShared<FJsonObject>();
+            E->SetStringField(TEXT("step"), TEXT("child_implement"));
+            E->SetStringField(TEXT("error"), TEXT("ImplementNewInterface returned false on child"));
+            Errors.Add(MakeShared<FJsonValueObject>(E));
+        }
+    }
+    FBPInterfaceDescription* ChildDesc = FindImplementedInterfaceMutable(ChildBP, IfaceCls);
+
+    // Step 2: child override graphs spawn (per target function)
+    if (ChildDesc)
+    {
+        for (FName FuncFName : TargetFuncs)
+        {
+            if (FindLayerFunctionOverrideGraph(ChildBP, IfaceCls, FuncFName))
+            {
+                Functions.Add(MakeShared<FJsonValueString>(FuncFName.ToString()));
+                continue;
+            }
+            FSpawnedLayerGraph Spawn = SpawnAnimLayerFunctionGraph(ChildBP, FuncFName);
+            if (!Spawn.Graph)
+            {
+                auto E = MakeShared<FJsonObject>();
+                E->SetStringField(TEXT("step"), TEXT("child_override"));
+                E->SetStringField(TEXT("function_name"), FuncFName.ToString());
+                E->SetStringField(TEXT("error"), TEXT("CreateNewGraph returned null"));
+                Errors.Add(MakeShared<FJsonValueObject>(E));
+                continue;
+            }
+            ChildDesc->Graphs.Add(Spawn.Graph);
+            OverrideGraphsOut.Add(MakeShared<FJsonValueString>(Spawn.Graph->GetName()));
+            Functions.Add(MakeShared<FJsonValueString>(FuncFName.ToString()));
+        }
+    }
+
+    // Step 3: master implements interface
+    bool bMasterImplemented = (FindImplementedInterfaceMutable(MasterBP, IfaceCls) != nullptr);
+    if (!bMasterImplemented)
+    {
+        const FTopLevelAssetPath IfaceAssetPath(IfaceCls->GetPathName());
+        if (!FBlueprintEditorUtils::ImplementNewInterface(MasterBP, IfaceAssetPath))
+        {
+            auto E = MakeShared<FJsonObject>();
+            E->SetStringField(TEXT("step"), TEXT("master_implement"));
+            E->SetStringField(TEXT("error"), TEXT("ImplementNewInterface returned false on master"));
+            Errors.Add(MakeShared<FJsonValueObject>(E));
+        }
+    }
+
+    // Step 4: master AnimGraph spawns one LinkedAnimLayer node (first target func).
+    // Caller can repeat add_linked_anim_layer_node for additional functions.
+    UEdGraph* AnimGraph = ResolveAnimGraphTarget(MasterBP, MasterGraph);
+    if (AnimGraph && TargetFuncs.Num() > 0)
+    {
+        AnimGraph->Modify();
+        UAnimGraphNode_LinkedAnimLayer* Node = NewObject<UAnimGraphNode_LinkedAnimLayer>(AnimGraph);
+        Node->CreateNewGuid();
+        Node->NodePosX = -400;
+        Node->NodePosY = 0;
+        AnimGraph->AddNode(Node, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+        Node->Node.Interface = IfaceCls;
+        Node->Node.Layer = TargetFuncs[0];
+        if (ChildBP->GeneratedClass)
+        {
+            Node->Node.InstanceClass = ChildBP->GeneratedClass;
+        }
+        Node->PostPlacedNewNode();
+        Node->AllocateDefaultPins();
+        Node->ReconstructNode();
+        LinkedNodeId = Node->NodeGuid.ToString(EGuidFormats::Digits);
+    }
+    else if (TargetFuncs.Num() == 0)
+    {
+        auto E = MakeShared<FJsonObject>();
+        E->SetStringField(TEXT("step"), TEXT("master_link_node"));
+        E->SetStringField(TEXT("error"), TEXT("no functions declared on interface; nothing to link"));
+        Errors.Add(MakeShared<FJsonValueObject>(E));
+    }
+    else
+    {
+        auto E = MakeShared<FJsonObject>();
+        E->SetStringField(TEXT("step"), TEXT("master_link_node"));
+        E->SetStringField(TEXT("error"), TEXT("master AnimGraph not found"));
+        Errors.Add(MakeShared<FJsonValueObject>(E));
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ChildBP);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(MasterBP);
+
+    bool bChildCompiled = false, bMasterCompiled = false;
+    if (bCompile)
+    {
+        FKismetEditorUtilities::CompileBlueprint(ChildBP);  bChildCompiled = true;
+        FKismetEditorUtilities::CompileBlueprint(MasterBP); bMasterCompiled = true;
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("interface_path"), IfaceCls->GetPathName());
+    R->SetStringField(TEXT("child_path"),  ChildBP->GetPathName());
+    R->SetStringField(TEXT("master_path"), MasterBP->GetPathName());
+    R->SetArrayField (TEXT("functions"), Functions);
+    R->SetArrayField (TEXT("override_graphs"), OverrideGraphsOut);
+    R->SetStringField(TEXT("linked_layer_node_id"), LinkedNodeId);
+    R->SetBoolField  (TEXT("child_compiled"),  bChildCompiled);
+    R->SetBoolField  (TEXT("master_compiled"), bMasterCompiled);
+    R->SetArrayField (TEXT("errors"), Errors);
+    if (Errors.Num() > 0)
+    {
+        R->SetStringField(TEXT("rollback_advice"),
+            TEXT("inspect 'errors[]' for partial state; clean restart = animation.remove_layer_function_override per spawned override + bp.remove_interface on master/child"));
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// --- (11) animation.set_linked_anim_layer (PIE/preview runtime) -----------
+
+FSageToolDispatch::FOutcome SetLinkedAnimLayerImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString ActorPath, LayerClassPath, MeshComp, Mode = TEXT("link");
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("actor"), ActorPath)
+        || !Args->TryGetStringField(TEXT("layer_class"), LayerClassPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'actor' or 'layer_class'"));
+    }
+    Args->TryGetStringField(TEXT("mesh_component"), MeshComp);
+    Args->TryGetStringField(TEXT("mode"), Mode);
+    Mode = Mode.ToLower();
+
+    UClass* LayerCls = ResolveAnyClass(LayerClassPath);
+    if (LayerCls && !LayerCls->IsChildOf(UAnimInstance::StaticClass()))
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("layer_class %s is not a UAnimInstance subclass"), *LayerClassPath));
+
+    AActor* Actor = ResolveActorRuntime(ActorPath);
+    USkeletalMeshComponent* Mesh = nullptr;
+    if (Actor)
+    {
+        if (!MeshComp.IsEmpty())
+        {
+            for (UActorComponent* C : Actor->GetComponents())
+            {
+                if (C && C->GetName() == MeshComp)
+                {
+                    Mesh = Cast<USkeletalMeshComponent>(C);
+                    if (Mesh) break;
+                }
+            }
+            if (!Mesh)
+                return FSageToolDispatch::FOutcome::MakeError(-32602,
+                    FString::Printf(TEXT("mesh_component '%s' not found on actor"), *MeshComp));
+        }
+        else
+        {
+            Mesh = FindSkeletalMeshComp(Actor);
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    TArray<TSharedPtr<FJsonValue>> Errors;
+    R->SetStringField(TEXT("actor"), Actor ? Actor->GetPathName() : ActorPath);
+    R->SetStringField(TEXT("mesh"),  Mesh ? Mesh->GetName() : FString());
+    R->SetStringField(TEXT("layer_class"), LayerCls ? LayerCls->GetPathName() : LayerClassPath);
+    R->SetStringField(TEXT("mode"), Mode);
+
+    if (!Actor || !Mesh)
+    {
+        R->SetBoolField(TEXT("linked"), false);
+        R->SetStringField(TEXT("_warning"),
+            TEXT("editor preview only — no PIE actor / mesh component resolved; nothing applied. Run during PIE for runtime effect."));
+        R->SetArrayField(TEXT("errors"), Errors);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Previous;
+    if (UAnimInstance* AI = Mesh->GetAnimInstance())
+    {
+        if (UClass* AICls = AI->GetClass())
+        {
+            Previous.Add(MakeShared<FJsonValueString>(AICls->GetPathName()));
+        }
+    }
+    R->SetArrayField(TEXT("previous_layers"), Previous);
+
+    if (Mode == TEXT("link"))
+    {
+        if (!LayerCls)
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("link mode requires a resolvable layer_class"));
+        Mesh->LinkAnimClassLayers(LayerCls);
+        R->SetBoolField(TEXT("linked"), true);
+    }
+    else if (Mode == TEXT("unlink"))
+    {
+        if (!LayerCls)
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("unlink mode requires a resolvable layer_class"));
+        Mesh->UnlinkAnimClassLayers(LayerCls);
+        R->SetBoolField(TEXT("linked"), false);
+    }
+    else
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid mode '%s'; must be 'link' or 'unlink'"), *Mode));
+    }
+
+    R->SetArrayField(TEXT("errors"), Errors);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ===========================================================================
@@ -7068,20 +8922,24 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.disconnect_pose_pin"),        GT(&DisconnectPosePinImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_anim_node_property"),     GT(&SetAnimNodePropertyImpl));
     Dispatch.RegisterHandler(TEXT("animation.bind_anim_node_property"),    GT(&BindAnimNodePropertyImpl));
+    Dispatch.RegisterHandler(TEXT("animation.read_anim_node_properties"),  GT(&ReadAnimNodePropertiesImpl));
     Dispatch.RegisterHandler(TEXT("animation.list_animgraph_nodes"),       GT(&ListAnimGraphNodesImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_animgraph_root_pose"),    GT(&SetAnimGraphRootPoseImpl));
     // Phase 4-r6 Cluster B (AnimGraph convenience nodes)
     Dispatch.RegisterHandler(TEXT("animation.add_sequence_player"),        GT(&AddSequencePlayerImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_blendspace_player"),      GT(&AddBlendSpacePlayerImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_state_machine_node"),     GT(&AddStateMachineNodeImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_blend_list_by_int"),      GT(&AddBlendListByIntImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_blend_list_by_bool"),     GT(&AddBlendListByBoolImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_blend_list_by_enum"),     GT(&AddBlendListByEnumImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_blend_list_pose_pin"),    GT(&AddBlendListPosePinImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_layered_blend_per_bone"), GT(&AddLayeredBlendPerBoneImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_apply_additive"),         GT(&AddApplyAdditiveImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_two_bone_ik"),            GT(&AddTwoBoneIKImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_skeletal_control_node"),  GT(&AddSkeletalControlNodeImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_slot_node"),              GT(&AddSlotNodeImpl));
-    Dispatch.RegisterHandler(TEXT("animation.add_link_anim_layer"),        GT(&AddLinkAnimLayerImpl));
+    // animation.add_link_anim_layer removed — see Phase 4-r6 Cluster G's
+    // animation.add_linked_anim_layer_node (interface + function aware spawn).
     // Phase 4-r6 Cluster J (runtime character.* — PIE-only)
     Dispatch.RegisterHandler(TEXT("character.play_root_motion_source"),    GT(&CharacterPlayRootMotionSourceImpl));
     Dispatch.RegisterHandler(TEXT("character.remove_root_motion_source"),  GT(&CharacterRemoveRootMotionSourceImpl));
@@ -7120,12 +8978,18 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.set_curve_compression"),      GT(&SetCurveCompressionImpl));
     Dispatch.RegisterHandler(TEXT("animation.run_animation_modifier"),     GT(&RunAnimationModifierImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_animation_modifier"),     GT(&AddAnimationModifierImpl));
-    // Phase 4-r6 Cluster G (anim layer interface — stubbed pending impl)
-    Dispatch.RegisterHandler(TEXT("animation.create_anim_layer_interface"),GT(&CreateAnimLayerInterfaceImpl));
-    Dispatch.RegisterHandler(TEXT("animation.add_layer_function"),         GT(&AddLayerFunctionImpl));
+    // Phase 4-r6 Cluster G (Animation Layer Interface — REAL impl + Lyra Gap #24)
+    Dispatch.RegisterHandler(TEXT("animation.create_anim_layer_interface"),    GT(&CreateAnimLayerInterfaceImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_layer_function"),             GT(&AddLayerFunctionImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_layer_function_override"),    GT(&AddLayerFunctionOverrideImpl));
     Dispatch.RegisterHandler(TEXT("animation.implement_anim_layer_interface"), GT(&ImplementAnimLayerInterfaceImpl));
-    Dispatch.RegisterHandler(TEXT("animation.set_linked_anim_layer"),      GT(&SetLinkedAnimLayerImpl));
-    Dispatch.RegisterHandler(TEXT("animation.list_implemented_layers"),    GT(&ListImplementedLayersImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_linked_anim_layer_node"),     GT(&AddLinkedAnimLayerNodeImpl));
+    Dispatch.RegisterHandler(TEXT("animation.list_implemented_layers"),        GT(&ListImplementedLayersImpl));
+    Dispatch.RegisterHandler(TEXT("animation.list_layer_functions"),           GT(&ListLayerFunctionsImpl));
+    Dispatch.RegisterHandler(TEXT("animation.remove_layer_function_override"), GT(&RemoveLayerFunctionOverrideImpl));
+    Dispatch.RegisterHandler(TEXT("animation.remove_layer_function"),          GT(&RemoveLayerFunctionImpl));
+    Dispatch.RegisterHandler(TEXT("animation.create_linked_layer_pattern"),    GT(&CreateLinkedLayerPatternImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_linked_anim_layer"),          GT(&SetLinkedAnimLayerImpl));
     // Phase 4-r6 Cluster H (sequence/montage advanced)
     Dispatch.RegisterHandler(TEXT("animation.set_sequence_additive_settings"), GT(&SetSequenceAdditiveImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_sequence_compression_scheme"), GT(&SetSequenceCompressionImpl));

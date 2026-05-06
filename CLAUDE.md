@@ -85,7 +85,7 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Şu Anki Durum (Snapshot)
 
-> Tek satırda durum: **102 commit · 443 plugin tool · 457 server schema (444 _editor-aware) · 17 ADR · Phase 1+2+3+4 + Milestone 1.5b TAMAM · multi-editor per-call routing + bp.full_dump + bootstrap_module + UBT rebuild CANLI · ilk dogfooding turu (11 gap fix) bitti · Mac→Windows transition (2026-04-30)**.
+> Tek satırda durum: **560 tool · 17 ADR · Phase 1+2+3+4 + Milestone 1.5b + Cluster G AnimLayerInterface real impl TAMAM · multi-editor per-call routing + bp.full_dump + bootstrap_module + UBT rebuild + state-machine rule authoring + AnimLayerInterface authoring CANLI · Lyra Gap #21+#24 fix edildi · Mac→Windows transition (2026-04-30)**.
 
 - **Önceki test ortamı (Mac, dogfooding)**: `~/Developer/alemdarlabs/Kale/Kale.uproject` (Game Animation Sample, Motion Matching) + `~/Developer/alemdarlabs/SuperheroFlightAnimations/SuperheroFlightAnimations.uproject` (state machine + ActorComponent flight, dogfooding sırasında C++'a yükseltildi) + `~/Developer/alemdarlabs/SageTest/SageTest.uproject` (eski Third Person + Blueprint).
 - **Şimdi (2026-04-30)**: Mahmut Windows tarafına geçti, **gerçek production project'lerde** Sage'i kullanmaya başlıyor. Bkz. auto-memory `feedback_real_projects_caution.md` (destructive op disiplini) ve `project_windows_transition.md` (platform farkları).
