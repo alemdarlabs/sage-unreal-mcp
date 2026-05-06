@@ -105,6 +105,212 @@ Bir gap fix'lendikten sonra **non-obvious bir öğreti** çıktıysa (`obj({})` 
 
 <!-- Yeni gap entry'leri buraya. En üste yeni geleni koy. -->
 
+## Gap #25 — Anim node spawn tool'ları interface override graph'larını graph_name lookup'ında bulamıyor
+
+- **Status**: ✅ FIXED — deploy/verify pending (Lyra plugin install + Live Coding/restart)
+- **Reported**: 2026-05-06 17:25 tarafından Lyra Claude / FlightCore asset wiring sprint (Gap #24 verify oturumu)
+- **Project**: `D:\Steamworks\Lyra`
+- **Editor**: Lyra UE 5.7.4 (Sage Cluster G post-deploy, plugin .dll 3.0 MB install OK)
+- **Affected assets**:
+  - `/FlightCore/Animations/ABP_FlightCore_Locomotion.ABP_FlightCore_Locomotion` (parent `UFlightCoreAnimInstance`)
+  - `/FlightCore/Animations/ALI_FlightLocomotionLayer.ALI_FlightLocomotionLayer_C` (interface, 1 fonksiyon: `FlightLocomotionPose`)
+- **Related**: Gap #24 (Cluster G real impl) — bu gap, Cluster G tool'larıyla yaratılan override graph'lara mevcut node-injection tool'larının (Cluster A/D) erişememesinden kaynaklanıyor. Cross-cluster graph lookup divergence.
+
+### Hedef
+
+Cluster G ile yaratılan child override graph'a (FlightLocomotionPose) bir SequencePlayer node ekleyip Output Pose'a bağlayarak MVP locomotion layer'ı tamamlamak.
+
+Akış:
+1. `animation.add_layer_function_override` ile `FlightLocomotionPose` override graph spawn (Gap #24 Tool A — verified working).
+2. Bu graph'ın **içine** `animation.add_sequence_player` veya `animation.add_animgraph_node` ile bir UAnimGraphNode_SequencePlayer ekle.
+3. `animation.connect_pose_pin` ile sequence player'ı Output Pose'a bağla.
+4. Compile + verify.
+
+Adım 2'de tool'lar `graph_name="FlightLocomotionPose"` lookup'ını yapamıyor.
+
+### Denenen tool çağrıları
+
+**Önce Tool A doğrulandı** (Gap #24 Cluster G, çalışıyor):
+
+```json
+{ "tool": "animation.add_layer_function_override",
+  "args": {
+    "path": "/FlightCore/Animations/ABP_FlightCore_Locomotion.ABP_FlightCore_Locomotion",
+    "interface_path": "/FlightCore/Animations/ALI_FlightLocomotionLayer.ALI_FlightLocomotionLayer_C",
+    "function_name": "FlightLocomotionPose",
+    "compile": false
+  } }
+```
+
+Sonuç: `{"already": true, "compiled": false, "function_name": "FlightLocomotionPose", "graph_name": "FlightLocomotionPose", "output_node_id": "F19B84214469C90EFB2B22A05358DAE1", "schema": "AnimationGraphSchema"}` ✓
+
+**Force re-create teyit**: önce `animation.remove_layer_function_override` (`removed_node_count: 2` — graph gerçekten 2 node'la vardı), sonra `animation.add_layer_function_override` tekrar (yine `already=true`, yeni `output_node_id: F19B...`).
+
+`bp_full_dump` CDO doğrulaması:
+
+```text
+"AnimGraphNode_Root_1": "(Result=(LinkID=-1,SourceLinkID=-1),Name=\"FlightLocomotionPose\",LayerGroup=\"ItemAnimLayers\",...)"
+"AnimGraphNode_LinkedInputPose": "(Name=\"InputPose\",Graph=\"FlightLocomotionPose\",InputPose=(LinkID=-1,SourceLinkID=-1),bIsOutputLinked=False,...)"
+```
+
+Yani **graph fiziksel olarak BP'de var**, içinde 2 default node (UAnimGraphNode_Root + UAnimGraphNode_LinkedInputPose). Editor UI'da açılır + düzenlenebilir durumda.
+
+**Şimdi node injection — fail:**
+
+```json
+{ "tool": "animation.add_sequence_player",
+  "args": {
+    "path": "/FlightCore/Animations/ABP_FlightCore_Locomotion.ABP_FlightCore_Locomotion",
+    "graph_name": "FlightLocomotionPose",
+    "sequence": "/FlightCore/SuperheroFlight/Characters/Mannequins/Animations/Flight/Idle/A_Flight_Idle_A.A_Flight_Idle_A",
+    "loop": true,
+    "x": -300, "y": 0
+  } }
+```
+
+```
+MCP error -32602: graph 'FlightLocomotionPose' not found
+```
+
+```json
+{ "tool": "animation.add_animgraph_node",
+  "args": {
+    "path": "/FlightCore/Animations/ABP_FlightCore_Locomotion.ABP_FlightCore_Locomotion",
+    "graph_name": "FlightLocomotionPose",
+    "node_class": "/Script/AnimGraph.AnimGraphNode_SequencePlayer",
+    "x": -300, "y": 0
+  } }
+```
+
+```
+MCP error -32602: graph 'FlightLocomotionPose' not found on ABP_FlightCore_Locomotion
+```
+
+### Sonuç / hata
+
+`graph_name="FlightLocomotionPose"` Sage'in node-injection tool'ları (`animation.add_sequence_player`, `animation.add_animgraph_node`, muhtemelen tüm Cluster A/D `graph_name` parametreli tool'lar) tarafından bulunamıyor. Hata "graph not found" — graph fiziksel olarak var (Cluster G ile spawn edildi, CDO + LinkedInputPose node + Root_1 node mevcut), Editor UI'da görünür.
+
+Diğer tutarsızlıklar:
+- `bp.list_functions` → `count: 2 (AnimGraph + EventGraph)` — FlightLocomotionPose function listesinde **gözükmüyor**.
+- `animation.read_anim_blueprint` → `anim_graph_count: 1 (AnimGraph)` — FlightLocomotionPose yine **gözükmüyor**.
+- `bp.full_dump.functions[]` → 2 entry (ubergraph: EventGraph, function: AnimGraph) — FlightLocomotionPose **listesinde yok** ama CDO property'lerinde Root_1 + LinkedInputPose Graph="FlightLocomotionPose" referans veriyor.
+- `animation.list_layer_functions` (interface tarafı) → `FlightLocomotionPose` declared **görüyor** (interface BP, Cluster G).
+- `animation.implement_anim_layer_interface` → `functions_already: ["FlightLocomotionPose"]` (child BP, Cluster G) — already-implemented mantığı çalışıyor.
+- `animation.add_layer_function_override` (re-call) → `already: true, output_node_id: F19B...` — Cluster G internal state graph'ı tutuyor.
+
+**Yani Cluster G (yeni interface override tool'ları) graph'ı doğru şekilde spawn ediyor + tracking yapıyor, ama Cluster A/D (eski generic anim node spawn tool'ları) bu graph'ları kendi lookup mantığında görmüyor.** Cross-cluster collection mismatch.
+
+### Beklenen davranış
+
+`animation.add_animgraph_node` ve `animation.add_sequence_player` (ve aynı `graph_name` parametresini kullanan tüm Cluster A/D tool'ları), Cluster G ile yaratılan AnimLayerInterface override graph'larını `graph_name` lookup'ında bulmalı. Override graph'lar normal function graph'lar gibi UBlueprint'in graph collection'larında yer alıyor; Cluster A/D `graph_name` resolver bu collection'ı taramamış olabilir.
+
+Beklenen sonuç:
+
+```json
+{ "tool": "animation.add_sequence_player",
+  "args": { "path": "...", "graph_name": "FlightLocomotionPose", "sequence": "..." } }
+→ { "node_id": "<FGuid>", "class": "/Script/AnimGraph.AnimGraphNode_SequencePlayer", "sequence": "...", "loop": true, "rate": 1.0 }
+```
+
+Ek tutarlılık:
+- `bp.list_functions` ve `animation.read_anim_blueprint` interface override graph'larını da listelemeli (`kind: "anim_layer_function"` veya `interface_function: true` flag'iyle ayırarak). Şu an gizli kalıyor.
+- `bp.full_dump.functions[]` interface override graph'larını da içermeli.
+
+### Workaround
+
+Yok. Editor UI üzerinden manuel düzenleme:
+1. ABP_FlightCore_Locomotion'u editor'de aç → My Blueprint > Interfaces > ALI_FlightLocomotionLayer > FlightLocomotionPose üzerine çift tıkla (graph zaten oluşmuş, açılır).
+2. Boş graph içine sağ tık → Anim Sequence Player → A_Flight_Idle_A seç.
+3. SequencePlayer Output → Output Pose Result wire et.
+4. Compile.
+
+`bp.export_nodes_t3d` + `bp.import_nodes_t3d` (varsa) ile T3D inject edilebilir mi denenebilir ama bu graph_name lookup'a tabiyse muhtemelen aynı hata.
+
+### Öneri (öncelik A/B/C)
+
+**A — must (sprint critical)**
+Sage'in `graph_name` resolver'ında, anim BP context'inde override fonksiyonları için ek collection taranması.
+
+Pseudo-code:
+```cpp
+UEdGraph* ResolveAnimGraphByName(UBlueprint* BP, FName GraphName)
+{
+    // Mevcut: BP->FunctionGraphs içinde ara
+    for (UEdGraph* G : BP->FunctionGraphs) { if (G->GetFName() == GraphName) return G; }
+    // Mevcut: state machine sub-graphs içinde ara
+    // ...
+    
+    // Cluster G fix: AnimLayerInterface override graphs içinde ara
+    if (UAnimBlueprint* ABP = Cast<UAnimBlueprint>(BP))
+    {
+        // FBlueprintEditorUtils::GetAllGraphs(BP, AllGraphs) tüm graph türlerini kapsayabilir
+        TArray<UEdGraph*> AllGraphs;
+        FBlueprintEditorUtils::GetAllGraphs(BP, AllGraphs);
+        for (UEdGraph* G : AllGraphs)
+        {
+            if (G->GetFName() == GraphName) return G;
+        }
+    }
+    return nullptr;
+}
+```
+
+`FBlueprintEditorUtils::GetAllGraphs` daha kapsayıcı — function graphs + macro graphs + ubergraph + anim graph + interface override graphs hepsini döner. Cluster A/D tool'larının graph_name resolver'ı bunu kullanmalı.
+
+**B — should**
+`bp.list_functions`, `animation.read_anim_blueprint`, `bp.full_dump.functions[]` interface override graph'larını da göstersin. Yeni `kind: "interface_override"` veya `kind: "anim_layer_function"` enum value ekle. Override graph'lar invisible kalırsa bu Gap gibi confusion yaratır.
+
+**C — nice-to-have**
+`animation.list_layer_function_overrides`:
+
+```json
+{ "tool": "animation.list_layer_function_overrides",
+  "args": {
+    "path": "/FlightCore/Animations/ABP_FlightCore_Locomotion.ABP_FlightCore_Locomotion"
+  } }
+→ {
+  "implemented_interfaces": [{
+    "interface_path": "...ALI_FlightLocomotionLayer.ALI_FlightLocomotionLayer_C",
+    "override_functions": [
+      {"function_name": "FlightLocomotionPose", "graph_name": "FlightLocomotionPose", "node_count": 2, "output_node_id": "F19B..."}
+    ]
+  }]
+}
+```
+
+Bu `animation.list_implemented_layers`'ın daha detaylı çocuk-side variant'ı.
+
+### Notlar — context
+
+- Gap #24 verify oturumu sırasında yakalandı; Cluster G core fix doğru çalışıyor (graph spawn + tracking) ama Cluster A/D eski tool'ları yeni graph'ları görmüyor — **regression değil, eksik integration**.
+- Editor UI'da override graph'lar normal görünüyor; sadece Sage tool'ları ile programatik node injection bloklu. **Sprint critical** çünkü locomotion state machine tüm node injection bu tool'lara bağlı.
+- `animation.add_linked_anim_layer_node` (Cluster G) master AnimGraph'a node ekleyebildi (`A2AF5CFA...`) — bu tool kendi `graph_name="AnimGraph"` lookup'ında master'ın root AnimGraph'ı buluyor (root AnimGraph normal function graph collection'da). Dolayısıyla Cluster G tool'larının kendi graph lookup'ları farklı (kendi spawn ettikleri graph'ları takip ediyorlar) ama Cluster A/D'nin lookup'ı uyumsuz.
+
+---
+
+### Sage Claude triage (geliştirici doldurur)
+
+- **Triage tarihi**: 2026-05-06
+- **Kök sebep**: `ResolveAnimGraphTarget` (Cluster A/D'nin tüm `graph_name` parametreli tool'larını besleyen merkezi resolver, `SageAnimationTools.cpp:4186`) sadece `AnimBP->FunctionGraphs` + state machine sub-graph'ları + state bound-graph'ları arıyordu. Cluster G `animation.add_layer_function_override` override graph'ı `BP->ImplementedInterfaces[<i>].Graphs` (FBPInterfaceDescription'ın graph collection'ı) içine spawn ediyor — bu collection resolver'ın görüş alanında değildi. Aynı sebeple `bp.list_functions` (manuel `BP->FunctionGraphs/UbergraphPages/MacroGraphs` traversal'i, `SageBlueprintTools.cpp:471`) + `animation.read_anim_blueprint` (manuel `BP->FunctionGraphs` traversal'i, `SageAnimationTools.cpp:1595`) + `CollectAllGraphs` (4 root collection'ı dolaşan helper, `SageBlueprintTools.cpp:107` — `bp.list_graphs` + `bp.full_dump`'ı besler) interface override graph'larını gizliyordu. Cross-cluster collection mismatch.
+- **Fix scope (4 Edit, 2 dosya, 1 atomic commit)**:
+  1. **`ResolveAnimGraphTarget`** (Cluster A/D resolver) — yeni 4. fallback: `AnimBP->ImplementedInterfaces[<i>].Graphs` içinde FName eşleşme. Bu, `add_animgraph_node`, `add_sequence_player`, `add_state_machine_node`, `connect_pose_pin`, `set_anim_node_property`, `read_anim_node_properties`, `list_animgraph_nodes` ve `graph_name` parametresi alan TÜM Cluster A/D + C tool'larını otomatik unblocks.
+  2. **`bp.list_functions`** (`BpListFunctionsImpl`) — `ImplementedInterfaces[<i>].Graphs` traversal'i `kind:"interface_override"` + `interface_function:true` + `interface` + `interface_path` field'larıyla eklendi. `bp.full_dump.functions[]` bu tool'un sonucunu kullandığı için otomatik kapsanıyor.
+  3. **`animation.read_anim_blueprint`** (`ReadAnimBlueprintImpl`) — `ImplementedInterfaces[<i>].Graphs` her entry için anim/event schema split + `interface_function:true` flag. `anim_graph_count` artık total anim-schema-bound graph sayısı (FunctionGraphs anim'leri + override anim'leri); önceden `FunctionGraphs.Num()` döndürüyordu (yanlış, schema filter etmiyor + override gözükmüyor).
+  4. **`CollectAllGraphs`** (`SageBlueprintTools.cpp` ortak helper) — `ImplementedInterfaces` traversal'i eklendi, `kind:"interface_override"`, `ParentName`=interface class adı. `WalkComposites` recurse override graph içinde de çalışıyor (override içine collapse'lenmiş composite'ler için). Bu fix `bp.list_graphs`, `FindFunctionGraph` (composite descend fallback'i), ve diğer `CollectAllGraphs` consumer'larını otomatik unblocks.
+- **Mahmut'un B-should fix'i de dahil**: `kind:"interface_override"` enum value, `interface_function:true` flag — Lyra Claude'un confusion riski kapanıyor.
+- **C nice-to-have (`animation.list_layer_function_overrides`)**: implement edilmedi — `animation.list_implemented_layers` (Cluster G, mevcut tool) zaten aynı bilgiyi veriyor: per-interface entries + per-function `override_graph` + `node_count`. Yeni tool eklemek redundant.
+- **Fix commit**: pending (working dir: `SageAnimationTools.cpp`, `SageBlueprintTools.cpp`)
+- **Deploy adımı**: ⏳ Plugin UAT BuildPlugin Win64 in progress; Lyra editor açık (Cluster G yüklü) — Live Coding `compile_and_reload` muhtemel, gerekirse close+install+open; HeroFlight kapalı, doğrudan install.
+- **Verify durumu**: pending — Lyra Claude verify edecek. Önerilen smoke senaryo (Lyra'da `ABP_FlightCore_Locomotion` üzerinde):
+  1. `bp.list_functions path=ABP_FlightCore_Locomotion` → `FlightLocomotionPose` entry görünmeli (`kind:"interface_override", interface_function:true, interface:"ALI_FlightLocomotionLayer_C"`).
+  2. `animation.read_anim_blueprint path=ABP_FlightCore_Locomotion` → `anim_graphs[]` içinde `FlightLocomotionPose` görünmeli (`interface_function:true`); `anim_graph_count` 2 olmalı (AnimGraph + FlightLocomotionPose).
+  3. `bp.list_graphs path=ABP_FlightCore_Locomotion` → `FlightLocomotionPose` entry (`kind:"interface_override", parent:"ALI_FlightLocomotionLayer_C"`).
+  4. **Sprint critical**: `animation.add_sequence_player path=ABP_FlightCore_Locomotion graph_name="FlightLocomotionPose" sequence=A_Flight_Idle_A loop=true` → `{node_id, class, sequence, loop, rate}` (önceden `-32602: graph not found`).
+  5. `animation.connect_pose_pin path=ABP_FlightCore_Locomotion graph_name="FlightLocomotionPose" from_node=<seq_id> from_pin="Pose" to_node=<root_id> to_pin="Result"` → connected (Output Pose'a bağla).
+  6. `bp.full_dump path=ABP_FlightCore_Locomotion include_function_graphs=true` → `functions[]` içinde `FlightLocomotionPose` 3 node ile.
+
+---
+
 ## Gap #24 — AnimLayerInterface child override graph spawn + master AnimGraph linked-layer call eksik
 
 - **Status**: ✅ FIXED — deploy/verify pending (Lyra plugin install + tools/list verify)

@@ -1024,3 +1024,22 @@ note: Conversion to enumeration type requires an explicit cast
 - Layer function declaration: `FBlueprintEditorUtils::CreateNewGraph(IfaceBP, FuncName, UEdGraph::StaticClass(), UAnimationGraphSchema::StaticClass())` + push to `IfaceBP->FunctionGraphs`.
 - Child override graph: aynı CreateNewGraph + push to **child BP'nin** `FBPInterfaceDescription::Graphs` (interface BP'nin değil — child-side override semantik).
 - `IfaceCls->ClassGeneratedBy` üzerinden `UAnimBlueprint*`'ya geri dön ve `BlueprintType==BPTYPE_Interface` doğrulayarak ALI tespiti yap.
+
+## Cross-cluster collection mismatch: spawn site != lookup site
+
+**Symptom**: Lyra Sage Gap #25 (2026-05-06). Cluster G `add_layer_function_override` override graph'ı `BP->ImplementedInterfaces[<i>].Graphs` içine spawn ediyordu (canonical UE child-side semantic), ama Cluster A/D `ResolveAnimGraphTarget` resolver'ı sadece `BP->FunctionGraphs` + state machine sub-graph'larını arıyordu. Sonuç: Cluster G ile spawn edilen graph'lar fiziksel olarak BP'de var (Editor UI'da görünür), CDO'da node referansları doğru, ama Cluster A/D'nin `graph_name` lookup'ı bunları "graph not found" diye reddediyordu. Plus aynı collection blindspot'ı `bp.list_functions`, `animation.read_anim_blueprint`, `bp.list_graphs` (= `CollectAllGraphs`) → `bp.full_dump.functions[]`'a kadar zincirleme propagate oluyordu.
+
+**Rule**: Yeni bir tool/cluster bir UE collection'a yazıyorsa, mevcut tool'ların bu collection'ı OKUYUP OKUMADIĞINI denetle. Spawn site ile lookup site farkı = silent regression. UBlueprint için graph collection'ları:
+- `BP->FunctionGraphs` (regular function bodies)
+- `BP->UbergraphPages` (event graph)
+- `BP->MacroGraphs` (macros)
+- `BP->DelegateSignatureGraphs` (event dispatchers)
+- `BP->ImplementedInterfaces[<i>].Graphs` (override functions per implemented interface)
+- State machine sub-graphs (içinde bound graph'lar)
+- Composite collapsed sub-graphs (`UK2Node_Composite::BoundGraph`, recursive)
+
+**How to apply**:
+- Resolver/lookup helper'ları (`FindFunctionGraph`, `ResolveAnimGraphTarget`, `CollectAllGraphs`) hepsini kapsamalı; yeni collection eklenirse hepsi güncellenmeli.
+- List/dump tool'ları (`bp.list_functions`, `bp.list_graphs`, `read_anim_blueprint`, `bp.full_dump`) "kind" enum'una yeni türler eklemeli (örn. `interface_override`, `composite`) ve disambiguating field'ları (interface class adı, parent graph adı) sağlamalı — kullanıcı confusion riskini kapatır.
+- Yeni cluster eklerken integration test: spawn → list → resolve → mutate akışını **mevcut** generic tool'larla deneyip "graph not found" gibi hatalara bak. Cluster G v1'de bu adım atlanmıştı; Lyra Claude verify oturumunda Gap #25 olarak çıktı.
+- DRY: tek bir `IterateAllGraphs(BP, callback)` helper yaz, tüm consumer'lar onu kullansın. Yeni collection eklendiğinde tek nokta update.

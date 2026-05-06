@@ -126,6 +126,30 @@ TArray<FBpGraphEntry> CollectAllGraphs(UBlueprint* BP)
     AppendRoot(BP->FunctionGraphs,          TEXT("function"));
     AppendRoot(BP->DelegateSignatureGraphs, TEXT("delegate"));
     AppendRoot(BP->MacroGraphs,             TEXT("macro"));
+
+    // Interface override graphs (anim layer interface child overrides + plain
+    // UInterface override functions). These live in
+    // BP->ImplementedInterfaces[].Graphs, NOT in any of the four root
+    // collections — without this entry, Cluster G's spawned override graphs
+    // were invisible to bp.list_graphs, bp.full_dump, and FindFunctionGraph
+    // (Lyra Sage Gap #25). ParentName carries the interface class name so
+    // callers can disambiguate same-named overrides across multiple
+    // implemented interfaces.
+    for (FBPInterfaceDescription& Impl : BP->ImplementedInterfaces)
+    {
+        if (!Impl.Interface) continue;
+        const FString IfaceName = Impl.Interface->GetName();
+        for (UEdGraph* G : Impl.Graphs)
+        {
+            if (!G) continue;
+            FBpGraphEntry E;
+            E.Graph      = G;
+            E.Kind       = TEXT("interface_override");
+            E.ParentName = IfaceName;
+            Out.Add(E);
+            WalkComposites(G, G->GetName(), Out);
+        }
+    }
     return Out;
 }
 
@@ -490,6 +514,28 @@ FSageToolDispatch::FOutcome BpListFunctionsImpl(const TSharedPtr<FJsonObject>& A
     for (UEdGraph* G : BP->FunctionGraphs) Add(G, TEXT("function"));
     for (UEdGraph* G : BP->UbergraphPages) Add(G, TEXT("event_graph"));
     for (UEdGraph* G : BP->MacroGraphs)    Add(G, TEXT("macro"));
+
+    // Interface override graphs (Cluster G ALI overrides + plain UInterface
+    // overrides) were hidden from bp.list_functions / bp.full_dump.functions[]
+    // because they live in BP->ImplementedInterfaces[].Graphs, not in
+    // BP->FunctionGraphs. Surface them with kind="interface_override" and the
+    // interface class for disambiguation (Lyra Sage Gap #25).
+    for (FBPInterfaceDescription& Impl : BP->ImplementedInterfaces)
+    {
+        if (!Impl.Interface) continue;
+        for (UEdGraph* G : Impl.Graphs)
+        {
+            if (!G) continue;
+            auto Obj = MakeShared<FJsonObject>();
+            Obj->SetStringField(TEXT("name"), G->GetName());
+            Obj->SetStringField(TEXT("kind"), TEXT("interface_override"));
+            Obj->SetNumberField(TEXT("node_count"), G->Nodes.Num());
+            Obj->SetBoolField(TEXT("interface_function"), true);
+            Obj->SetStringField(TEXT("interface"), Impl.Interface->GetName());
+            Obj->SetStringField(TEXT("interface_path"), Impl.Interface->GetPathName());
+            Out.Add(MakeShared<FJsonValueObject>(Obj));
+        }
+    }
 
     auto R = MakeShared<FJsonObject>();
     R->SetArrayField(TEXT("functions"), Out);

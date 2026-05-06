@@ -1613,8 +1613,6 @@ FSageToolDispatch::FOutcome ReadAnimBlueprintImpl(const TSharedPtr<FJsonObject>&
         BP->TargetSkeleton ? BP->TargetSkeleton->GetPathName() : TEXT(""));
     R->SetStringField(TEXT("target_skeleton"),
         BP->TargetSkeleton ? BP->TargetSkeleton->GetPathName() : TEXT(""));
-    R->SetNumberField(TEXT("anim_graph_count"), BP->FunctionGraphs.Num());
-
     // Variables (mirror bp.list_variables shape: name + type-string).
     TArray<TSharedPtr<FJsonValue>> Vars;
     for (const FBPVariableDescription& V : BP->NewVariables)
@@ -1647,6 +1645,40 @@ FSageToolDispatch::FOutcome ReadAnimBlueprintImpl(const TSharedPtr<FJsonObject>&
             EventGraphs.Add(MakeShared<FJsonValueObject>(GObj));
         }
     }
+    // Interface override graphs (Cluster G ALI overrides + plain UInterface
+    // overrides). Same anim/event split — anim layer interface overrides are
+    // AnimationGraphSchema-bound, plain interface overrides are not. Tagged
+    // with interface_function:true + interface info so callers can identify
+    // and route them via the same graph_name lookup as native function graphs
+    // (Lyra Sage Gap #25).
+    for (FBPInterfaceDescription& Impl : BP->ImplementedInterfaces)
+    {
+        if (!Impl.Interface) continue;
+        for (UEdGraph* G : Impl.Graphs)
+        {
+            if (!G) continue;
+            auto GObj = MakeShared<FJsonObject>();
+            GObj->SetStringField(TEXT("name"),       G->GetFName().ToString());
+            GObj->SetStringField(TEXT("schema"),     G->Schema ? G->Schema->GetName() : TEXT(""));
+            GObj->SetNumberField(TEXT("node_count"), G->Nodes.Num());
+            GObj->SetBoolField  (TEXT("interface_function"), true);
+            GObj->SetStringField(TEXT("interface"),       Impl.Interface->GetName());
+            GObj->SetStringField(TEXT("interface_path"),  Impl.Interface->GetPathName());
+            if (G->Schema && G->Schema->IsChildOf(UAnimationGraphSchema::StaticClass()))
+            {
+                AnimGraphs.Add(MakeShared<FJsonValueObject>(GObj));
+            }
+            else
+            {
+                EventGraphs.Add(MakeShared<FJsonValueObject>(GObj));
+            }
+        }
+    }
+    // anim_graph_count = total anim-schema-bound graphs (FunctionGraphs anim
+    // entries + interface override anim entries). Previously was
+    // BP->FunctionGraphs.Num() which counted non-anim graphs too AND missed
+    // every interface override.
+    R->SetNumberField(TEXT("anim_graph_count"), AnimGraphs.Num());
     R->SetArrayField(TEXT("anim_graphs"),  AnimGraphs);
     R->SetArrayField(TEXT("event_graphs"), EventGraphs);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
@@ -4227,6 +4259,22 @@ UEdGraph* ResolveAnimGraphTarget(UAnimBlueprint* AnimBP, const FString& GraphNam
                 {
                     return Bound;
                 }
+            }
+        }
+    }
+    // AnimLayerInterface override graphs (Cluster G fix — Lyra Sage Gap #25).
+    // Override graphs live in AnimBP->ImplementedInterfaces[].Graphs, NOT in
+    // FunctionGraphs. Without this fallback Cluster A/D node injection
+    // (animation.add_animgraph_node graph_name="<override>", add_sequence_player,
+    // add_state_machine_node, connect_pose_pin, etc.) returns "graph not found"
+    // for any graph spawned by animation.add_layer_function_override.
+    {
+        const FName Wanted(*GraphName);
+        for (FBPInterfaceDescription& Impl : AnimBP->ImplementedInterfaces)
+        {
+            for (UEdGraph* G : Impl.Graphs)
+            {
+                if (G && G->GetFName() == Wanted) return G;
             }
         }
     }
