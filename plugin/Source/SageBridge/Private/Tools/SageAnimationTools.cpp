@@ -8467,6 +8467,11 @@ FOwnerLocomotionValue CreateOwnerLocomotionByteEquals(
     const FString& Kind,
     const FString& SourceText)
 {
+    if (!SourcePin)
+    {
+        Ctx.Error = FString::Printf(TEXT("%s source pin missing"), *Kind);
+        return FOwnerLocomotionValue();
+    }
     UK2Node_CallFunction* EqNode = CreateOwnerLocomotionCallNode(
         Ctx, UKismetMathLibrary::StaticClass(),
         GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, EqualEqual_ByteByte),
@@ -8489,6 +8494,14 @@ FOwnerLocomotionValue CreateOwnerLocomotionBoolAnd(
     const FString& Kind,
     const FString& SourceText)
 {
+    if (!A.Pin || !B.Pin)
+    {
+        Ctx.Error = FString::Printf(TEXT("%s source pin missing: A=%s B=%s"),
+            *Kind,
+            A.Pin ? *A.Pin->PinName.ToString() : TEXT("<null>"),
+            B.Pin ? *B.Pin->PinName.ToString() : TEXT("<null>"));
+        return FOwnerLocomotionValue();
+    }
     UK2Node_CallFunction* AndNode = CreateOwnerLocomotionCallNode(
         Ctx, UKismetMathLibrary::StaticClass(),
         GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, BooleanAND),
@@ -8511,6 +8524,11 @@ FOwnerLocomotionValue CreateOwnerLocomotionUnaryVectorFunction(
     const FString& Kind,
     const FString& SourceText)
 {
+    if (!VectorPin)
+    {
+        Ctx.Error = FString::Printf(TEXT("%s vector source pin missing"), *Kind);
+        return FOwnerLocomotionValue();
+    }
     UK2Node_CallFunction* Node = CreateOwnerLocomotionCallNode(
         Ctx, UKismetMathLibrary::StaticClass(), FunctionName, Kind);
     if (!Node) return FOwnerLocomotionValue();
@@ -8529,6 +8547,14 @@ FOwnerLocomotionValue CreateOwnerLocomotionDot(
     const FString& Kind,
     const FString& SourceText)
 {
+    if (!A || !B)
+    {
+        Ctx.Error = FString::Printf(TEXT("%s source pin missing: A=%s B=%s"),
+            *Kind,
+            A ? *A->PinName.ToString() : TEXT("<null>"),
+            B ? *B->PinName.ToString() : TEXT("<null>"));
+        return FOwnerLocomotionValue();
+    }
     UK2Node_CallFunction* DotNode = CreateOwnerLocomotionCallNode(
         Ctx, UKismetMathLibrary::StaticClass(),
         GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, Dot_VectorVector),
@@ -8550,6 +8576,11 @@ FOwnerLocomotionValue CreateOwnerLocomotionBreakVectorZ(
     const FString& Kind,
     const FString& SourceText)
 {
+    if (!VectorPin)
+    {
+        Ctx.Error = FString::Printf(TEXT("%s vector source pin missing"), *Kind);
+        return FOwnerLocomotionValue();
+    }
     UK2Node_CallFunction* BreakNode = CreateOwnerLocomotionCallNode(
         Ctx, UKismetMathLibrary::StaticClass(),
         GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, BreakVector),
@@ -8986,18 +9017,19 @@ FSageToolDispatch::FOutcome SetOwnerLocomotionUpdateImpl(const TSharedPtr<FJsonO
         return FSageToolDispatch::FOutcome::MakeError(-32603, Ctx.Error);
     }
 
-    const FOwnerLocomotionValue* CurrentVelocity = Values.Find(TEXT("current_velocity"));
-    if (!CurrentVelocity || !CurrentVelocity->Pin)
+    const FOwnerLocomotionValue* CurrentVelocityPtr = Values.Find(TEXT("current_velocity"));
+    if (!CurrentVelocityPtr || !CurrentVelocityPtr->Pin)
     {
         Tx.Cancel();
         return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("CurrentVelocity source was not produced"));
     }
+    const FOwnerLocomotionValue CurrentVelocity = *CurrentVelocityPtr;
 
     Values.Add(TEXT("planar_speed"), CreateOwnerLocomotionUnaryVectorFunction(
-        Ctx, GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, VSizeXY), CurrentVelocity->Pin,
+        Ctx, GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, VSizeXY), CurrentVelocity.Pin,
         TEXT("planar_speed"), TEXT("VSizeXY(movement.Velocity)")));
     Values.Add(TEXT("vertical_speed"), CreateOwnerLocomotionBreakVectorZ(
-        Ctx, CurrentVelocity->Pin, TEXT("vertical_speed"), TEXT("movement.Velocity.Z")));
+        Ctx, CurrentVelocity.Pin, TEXT("vertical_speed"), TEXT("movement.Velocity.Z")));
 
     UK2Node_CallFunction* ForwardNode = CreateOwnerLocomotionCallNode(
         Ctx, AActor::StaticClass(), GET_FUNCTION_NAME_CHECKED(AActor, GetActorForwardVector),
@@ -9032,10 +9064,10 @@ FSageToolDispatch::FOutcome SetOwnerLocomotionUpdateImpl(const TSharedPtr<FJsonO
     UEdGraphPin* RightPin = FindOutputDataPin(RightNode);
     UEdGraphPin* InputVectorPin = FindOutputDataPin(InputNode);
     Values.Add(TEXT("lean_x"), CreateOwnerLocomotionDot(
-        Ctx, CurrentVelocity->Pin, RightPin, TEXT("lean_x"),
+        Ctx, CurrentVelocity.Pin, RightPin, TEXT("lean_x"),
         TEXT("Dot(movement.Velocity, owner.GetActorRightVector())")));
     Values.Add(TEXT("lean_y"), CreateOwnerLocomotionDot(
-        Ctx, CurrentVelocity->Pin, ForwardPin, TEXT("lean_y"),
+        Ctx, CurrentVelocity.Pin, ForwardPin, TEXT("lean_y"),
         TEXT("Dot(movement.Velocity, owner.GetActorForwardVector())")));
     Values.Add(TEXT("movement_input_forward"), CreateOwnerLocomotionDot(
         Ctx, InputVectorPin, ForwardPin, TEXT("movement_input_forward"),
