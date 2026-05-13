@@ -371,40 +371,95 @@ GraphResult ingestSnapshot(GraphStore& store, const Json& snapshot) {
         || !snapshot["assets"].is_array()) {
         return GraphError{"ingestSnapshot: snapshot must contain 'assets' array", 0};
     }
-    const auto& assets = snapshot["assets"];
-    for (size_t i = 0; i < assets.size(); ++i) {
-        const auto& a = assets[i];
+    const auto& rawAssets = snapshot["assets"];
+    Json assets = Json::array();
+    Json skippedDuplicateAssetPaths = Json::array();
+    Json skippedEmptyAssetRows = Json::array();
+    std::unordered_set<std::string> seenAssetPaths;
+    int64_t skippedDuplicateAssetCount = 0;
+    int64_t skippedEmptyAssetPathCount = 0;
+    for (size_t i = 0; i < rawAssets.size(); ++i) {
+        const auto& a = rawAssets[i];
         if (!a.is_object()
             || !a.contains("path") || !a["path"].is_string()
             || !a.contains("kind") || !a["kind"].is_string()) {
             return GraphError{"ingestSnapshot: asset row " + std::to_string(i)
                               + " missing string 'path' or 'kind'", 0};
         }
+        const auto path = a["path"].get<std::string>();
+        if (path.empty()) {
+            ++skippedEmptyAssetPathCount;
+            if (skippedEmptyAssetRows.size() < 20) {
+                skippedEmptyAssetRows.push_back({{"row", static_cast<int64_t>(i)},
+                                                 {"kind", a.value("kind", std::string{})}});
+            }
+            continue;
+        }
+        if (!seenAssetPaths.insert(path).second) {
+            ++skippedDuplicateAssetCount;
+            if (skippedDuplicateAssetPaths.size() < 20) {
+                skippedDuplicateAssetPaths.push_back(path);
+            }
+            continue;
+        }
+        assets.push_back(a);
     }
 
     const bool hasDeps = snapshot.contains("dependencies")
                       && snapshot["dependencies"].is_array();
-    const auto& deps = hasDeps ? snapshot["dependencies"] : Json::array();
-    for (size_t i = 0; i < deps.size(); ++i) {
-        const auto& d = deps[i];
+    const auto& rawDeps = hasDeps ? snapshot["dependencies"] : Json::array();
+    Json deps = Json::array();
+    int64_t skippedEmptyDepEndpointCount = 0;
+    for (size_t i = 0; i < rawDeps.size(); ++i) {
+        const auto& d = rawDeps[i];
         if (!d.is_object()
             || !d.contains("from") || !d["from"].is_string()
             || !d.contains("to")   || !d["to"].is_string()) {
             return GraphError{"ingestSnapshot: dep row " + std::to_string(i)
                               + " missing string 'from' or 'to'", 0};
         }
+        if (d["from"].get_ref<const std::string&>().empty()
+            || d["to"].get_ref<const std::string&>().empty()) {
+            ++skippedEmptyDepEndpointCount;
+            continue;
+        }
+        deps.push_back(d);
     }
 
     const bool hasClasses = snapshot.contains("classes")
                          && snapshot["classes"].is_array();
-    const auto& classes = hasClasses ? snapshot["classes"] : Json::array();
-    for (size_t i = 0; i < classes.size(); ++i) {
-        const auto& c = classes[i];
+    const auto& rawClasses = hasClasses ? snapshot["classes"] : Json::array();
+    Json classes = Json::array();
+    std::unordered_set<std::string> seenClassNames;
+    int64_t skippedDuplicateClassCount = 0;
+    int64_t skippedEmptyClassNameCount = 0;
+    for (size_t i = 0; i < rawClasses.size(); ++i) {
+        const auto& c = rawClasses[i];
         if (!c.is_object()
             || !c.contains("name") || !c["name"].is_string()) {
             return GraphError{"ingestSnapshot: class row " + std::to_string(i)
                               + " missing string 'name'", 0};
         }
+        const auto name = c["name"].get<std::string>();
+        if (name.empty()) {
+            ++skippedEmptyClassNameCount;
+            continue;
+        }
+        if (!seenClassNames.insert(name).second) {
+            ++skippedDuplicateClassCount;
+            continue;
+        }
+        classes.push_back(c);
+    }
+    if (skippedEmptyAssetPathCount > 0 || skippedDuplicateAssetCount > 0
+        || skippedEmptyDepEndpointCount > 0 || skippedEmptyClassNameCount > 0
+        || skippedDuplicateClassCount > 0) {
+        spdlog::warn("ingestSnapshot: sanitized registry rows "
+                     "(assets input={}, kept={}, empty_asset_paths={}, duplicate_assets={}, "
+                     "empty_dep_endpoints={}, empty_class_names={}, duplicate_classes={})",
+                     rawAssets.size(), assets.size(), skippedEmptyAssetPathCount,
+                     skippedDuplicateAssetCount, skippedEmptyDepEndpointCount,
+                     skippedEmptyClassNameCount, skippedDuplicateClassCount);
     }
 
     // Per-stage timing so we can profile bottlenecks (Phase 4.4 work).
@@ -475,11 +530,23 @@ GraphResult ingestSnapshot(GraphStore& store, const Json& snapshot) {
     if (is_error(upsert)) return error_of(upsert);
 
     Json out = Json::object();
+    out["asset_input_count"]    = static_cast<int64_t>(rawAssets.size());
     out["asset_count"]        = static_cast<int64_t>(assets.size());
     out["dep_count"]          = depCount;
     out["class_count"]        = classCount;
     out["class_edge_count"]   = classEdgeCount;
     out["last_indexed_at_ms"] = at;
+    out["skipped_empty_asset_path_count"]      = skippedEmptyAssetPathCount;
+    out["skipped_duplicate_asset_path_count"]  = skippedDuplicateAssetCount;
+    out["skipped_empty_dep_endpoint_count"]    = skippedEmptyDepEndpointCount;
+    out["skipped_empty_class_name_count"]      = skippedEmptyClassNameCount;
+    out["skipped_duplicate_class_name_count"]  = skippedDuplicateClassCount;
+    if (!skippedDuplicateAssetPaths.empty()) {
+        out["skipped_duplicate_asset_path_examples"] = skippedDuplicateAssetPaths;
+    }
+    if (!skippedEmptyAssetRows.empty()) {
+        out["skipped_empty_asset_path_examples"] = skippedEmptyAssetRows;
+    }
     return out;
 }
 

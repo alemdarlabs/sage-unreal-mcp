@@ -267,6 +267,7 @@ void USageBridgeSubsystem::OnAssetRenamedHook(const FAssetData& Data,
     auto P = MakeShared<FJsonObject>();
     P->SetStringField(TEXT("old_path"), OldObjectPath);
     P->SetStringField(TEXT("new_path"), NewPath);
+    P->SetStringField(TEXT("kind"), Data.AssetClassPath.GetAssetName().ToString());
     SendDeltaEvent(TEXT("asset_renamed"), P);
 }
 

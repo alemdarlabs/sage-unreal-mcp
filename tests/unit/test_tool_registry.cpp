@@ -150,6 +150,33 @@ TEST_CASE("ToolRegistry routes remote tool via dispatcher", "[mcp][registry]") {
     REQUIRE((*outcome)["echoed"]["message"] == "hi");
 }
 
+TEST_CASE("ToolRegistry annotates remote tools with async job schema",
+          "[mcp][registry]") {
+    ToolRegistry reg;
+    Tool remote{
+        .name        = "asset.long_op",
+        .description = "remote",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"path", {{"type", "string"}}}}},
+            {"additionalProperties", false},
+        },
+        .handler     = nullptr,
+        .remote      = true,
+    };
+
+    REQUIRE(reg.registerTool(std::move(remote)).has_value());
+    auto tools = reg.list();
+    REQUIRE(tools.size() == 1);
+    const auto& schema = tools[0].inputSchema;
+    REQUIRE(schema["properties"].contains("path"));
+    REQUIRE(schema["properties"].contains("async"));
+    REQUIRE(schema["properties"].contains("job_timeout_seconds"));
+    REQUIRE(schema["properties"]["async"]["type"] == "boolean");
+    REQUIRE(schema["properties"]["job_timeout_seconds"]["maximum"] == 86400);
+    REQUIRE(schema["additionalProperties"] == false);
+}
+
 TEST_CASE("ToolRegistry remote without dispatcher yields InternalError",
           "[mcp][registry]") {
     ToolRegistry reg;

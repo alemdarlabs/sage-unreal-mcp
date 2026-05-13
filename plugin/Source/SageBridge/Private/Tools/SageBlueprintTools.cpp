@@ -8,8 +8,11 @@
 #include "Editor.h"
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
+#include "Engine/InheritableComponentHandler.h"
 #include "Engine/SCS_Node.h"
 #include "Engine/SimpleConstructionScript.h"
+#include "Components/ActorComponent.h"
+#include "Components/SceneComponent.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
@@ -44,6 +47,7 @@
 #include "ScopedTransaction.h"
 #include "Misc/ScopeExit.h"
 #include "GameFramework/Actor.h"
+#include "Subsystems/EditorAssetSubsystem.h"
 #include "UObject/Class.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectIterator.h"
@@ -1763,10 +1767,38 @@ FSageToolDispatch::FOutcome BpSetCdoPropertyImpl(const TSharedPtr<FJsonObject>& 
     CDO->PostEditChangeProperty(E);
     FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
 
+    TSharedPtr<FJsonValue> Readback = detail::GetUPropertyAsJson(CDO, P);
+    if (!Readback.IsValid())
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("property set but readback failed"));
+    }
+    const bool bReferenceProperty =
+        CastField<FObjectProperty>(P) != nullptr
+        || CastField<FSoftObjectProperty>(P) != nullptr;
+    if (!bReferenceProperty
+        && (*It).IsValid()
+        && (*It)->Type != EJson::Object
+        && (*It)->Type != EJson::Array
+        && !detail::JsonValuesEqual(*It, Readback))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("property set did not persist on CDO readback"));
+    }
+    if ((*It).IsValid() && (*It)->Type == EJson::Object && Readback->Type == EJson::Null)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("object reference set returned success but readback is null"));
+    }
+
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("blueprint"), BP->GetName());
     R->SetStringField(TEXT("property"),  PropName);
     R->SetField(TEXT("value"), *It);
+    R->SetField(TEXT("readback"), Readback);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -2252,6 +2284,199 @@ USCS_Node* FindSCSNode(UBlueprint* BP, const FString& Name)
     return SCS->FindSCSNode(FName(*Name));
 }
 
+UClass* ResolveActorComponentClassPath(const FString& Path, FString& OutError)
+{
+    if (Path.IsEmpty())
+    {
+        OutError = TEXT("missing component class");
+        return nullptr;
+    }
+
+    UClass* Cls = LoadClass<UActorComponent>(nullptr, *Path);
+    if (!Cls) Cls = StaticLoadClass(UActorComponent::StaticClass(), nullptr, *Path);
+
+    if (!Cls)
+    {
+        FSoftObjectPath Soft(Path);
+        UObject* Obj = Soft.ResolveObject();
+        if (!Obj) Obj = Soft.TryLoad();
+        if (UBlueprint* AsBP = Cast<UBlueprint>(Obj))
+        {
+            Cls = AsBP->GeneratedClass
+                ? AsBP->GeneratedClass
+                : AsBP->SkeletonGeneratedClass;
+        }
+        else
+        {
+            Cls = Cast<UClass>(Obj);
+        }
+    }
+
+    if (!Cls)
+    {
+        OutError = FString::Printf(TEXT("component class not found: %s"), *Path);
+        return nullptr;
+    }
+    if (!Cls->IsChildOf(UActorComponent::StaticClass()))
+    {
+        OutError = FString::Printf(TEXT("%s is not a UActorComponent class"),
+                                   *Cls->GetPathName());
+        return nullptr;
+    }
+    return Cls;
+}
+
+static FString CleanComponentTemplateName(const UActorComponent* Comp)
+{
+    FString Name = Comp ? Comp->GetName() : FString();
+    Name.RemoveFromEnd(UActorComponent::ComponentTemplateNameSuffix);
+    return Name;
+}
+
+static bool ComponentNameMatches(const UActorComponent* Comp, const FName& Name)
+{
+    if (!Comp || Name.IsNone()) return false;
+    if (Comp->GetFName() == Name) return true;
+    return CleanComponentTemplateName(Comp) == Name.ToString();
+}
+
+static UActorComponent* FindCdoComponentTemplate(UBlueprint* BP, const FName& Name)
+{
+    if (!BP || !BP->GeneratedClass || !BP->GeneratedClass->IsChildOf(AActor::StaticClass()))
+        return nullptr;
+
+    AActor* CDO = Cast<AActor>(BP->GeneratedClass->GetDefaultObject(/*bCreateIfNeeded=*/true));
+    if (!CDO) return nullptr;
+
+    TSet<UActorComponent*> Seen;
+    for (UActorComponent* Comp : CDO->GetComponents())
+    {
+        if (!Comp || Seen.Contains(Comp)) continue;
+        Seen.Add(Comp);
+        if (ComponentNameMatches(Comp, Name)) return Comp;
+    }
+
+    TArray<UObject*> Subobjects;
+    CDO->GetDefaultSubobjects(Subobjects);
+    for (UObject* Obj : Subobjects)
+    {
+        UActorComponent* Comp = Cast<UActorComponent>(Obj);
+        if (!Comp || Seen.Contains(Comp)) continue;
+        Seen.Add(Comp);
+        if (ComponentNameMatches(Comp, Name)) return Comp;
+    }
+    return nullptr;
+}
+
+static USCS_Node* FindInheritedSCSNode(UBlueprint* BP, const FName& Name)
+{
+    if (!BP) return nullptr;
+    for (UClass* C = BP->ParentClass; C; C = C->GetSuperClass())
+    {
+        UBlueprintGeneratedClass* BGC = Cast<UBlueprintGeneratedClass>(C);
+        if (!BGC || !BGC->SimpleConstructionScript) continue;
+        for (USCS_Node* Node : BGC->SimpleConstructionScript->GetAllNodes())
+        {
+            if (Node && Node->GetVariableName() == Name)
+                return Node;
+        }
+    }
+    return nullptr;
+}
+
+struct FBpComponentTemplateRef
+{
+    UActorComponent* Template = nullptr;
+    USCS_Node* Node = nullptr;
+    FString Location;
+};
+
+static FBpComponentTemplateRef ResolveBpComponentTemplate(
+    UBlueprint* BP,
+    const FString& ComponentName,
+    bool bCreateInheritedOverride,
+    FString& OutError)
+{
+    FBpComponentTemplateRef Ref;
+    if (!BP)
+    {
+        OutError = TEXT("blueprint not found");
+        return Ref;
+    }
+    const FName Name(*ComponentName);
+    if (USCS_Node* LocalNode = FindSCSNode(BP, ComponentName))
+    {
+        Ref.Template = LocalNode->ComponentTemplate;
+        Ref.Node = LocalNode;
+        Ref.Location = TEXT("scs");
+        if (!Ref.Template) OutError = TEXT("SCS node has no ComponentTemplate");
+        return Ref;
+    }
+
+    if (USCS_Node* InheritedNode = FindInheritedSCSNode(BP, Name))
+    {
+        Ref.Node = InheritedNode;
+        Ref.Location = TEXT("inherited_scs");
+        if (bCreateInheritedOverride)
+        {
+            UInheritableComponentHandler* Handler =
+                BP->GetInheritableComponentHandler(/*bCreateIfNecessary=*/true);
+            if (!Handler)
+            {
+                OutError = TEXT("inheritable component handler unavailable");
+                return Ref;
+            }
+            Handler->Modify();
+            Ref.Template = Handler->CreateOverridenComponentTemplate(FComponentKey(InheritedNode));
+            Ref.Location = TEXT("inherited_scs_override");
+        }
+        else
+        {
+            Ref.Template = InheritedNode->GetActualComponentTemplate(
+                Cast<UBlueprintGeneratedClass>(BP->GeneratedClass));
+        }
+        if (!Ref.Template) OutError = TEXT("inherited component template unavailable");
+        return Ref;
+    }
+
+    if (UActorComponent* CdoComp = FindCdoComponentTemplate(BP, Name))
+    {
+        Ref.Template = CdoComp;
+        Ref.Location = TEXT("cdo");
+        return Ref;
+    }
+
+    OutError = FString::Printf(TEXT("component not found: %s"), *ComponentName);
+    return Ref;
+}
+
+static bool SaveBlueprintAsset(UBlueprint* BP, FString& OutError)
+{
+    if (!BP)
+    {
+        OutError = TEXT("blueprint not found");
+        return false;
+    }
+    if (!GEditor)
+    {
+        OutError = TEXT("GEditor unavailable");
+        return false;
+    }
+    UEditorAssetSubsystem* AssetSubsystem =
+        GEditor->GetEditorSubsystem<UEditorAssetSubsystem>();
+    if (!AssetSubsystem)
+    {
+        OutError = TEXT("EditorAssetSubsystem unavailable");
+        return false;
+    }
+    if (!AssetSubsystem->SaveLoadedAsset(BP, /*bOnlyIfIsDirty=*/false))
+    {
+        OutError = FString::Printf(TEXT("failed to save blueprint: %s"), *BP->GetPathName());
+        return false;
+    }
+    return true;
+}
+
 FSageToolDispatch::FOutcome BpReadComponentPropertiesImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString Path, ComponentName;
@@ -2422,6 +2647,418 @@ FSageToolDispatch::FOutcome BpReparentComponentImpl(const TSharedPtr<FJsonObject
     R->SetStringField(TEXT("blueprint"),  BP->GetName());
     R->SetStringField(TEXT("component"),  ComponentName);
     R->SetStringField(TEXT("new_parent"), NewParent);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpAddComponentImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, ClassPath, VariableName, ParentName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("component_class"), ClassPath)
+        || !Args->TryGetStringField(TEXT("variable_name"), VariableName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'component_class', or 'variable_name'"));
+    }
+    Args->TryGetStringField(TEXT("parent"), ParentName);
+
+    bool bRecompile = true;
+    Args->TryGetBoolField(TEXT("recompile"), bRecompile);
+    Args->TryGetBoolField(TEXT("compile"), bRecompile);
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    if (!BP->GeneratedClass || !BP->GeneratedClass->IsChildOf(AActor::StaticClass()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("blueprint is not Actor-derived"));
+    }
+    USimpleConstructionScript* SCS = BP->SimpleConstructionScript;
+    if (!SCS) return FSageToolDispatch::FOutcome::MakeError(-32603,
+        TEXT("blueprint has no SimpleConstructionScript"));
+
+    if (VariableName.IsEmpty() || VariableName.Contains(TEXT(".")) || VariableName.Contains(TEXT("/")))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("'variable_name' must be a simple component variable name"));
+    }
+
+    FString ClassErr;
+    UClass* ComponentClass = ResolveActorComponentClassPath(ClassPath, ClassErr);
+    if (!ComponentClass)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, ClassErr);
+    }
+
+    if (USCS_Node* Existing = FindSCSNode(BP, VariableName))
+    {
+        UClass* ExistingClass = Existing->ComponentClass;
+        if (ExistingClass == ComponentClass)
+        {
+            auto R = MakeShared<FJsonObject>();
+            R->SetStringField(TEXT("blueprint"), BP->GetPathName());
+            R->SetStringField(TEXT("component"), VariableName);
+            R->SetStringField(TEXT("class"), ComponentClass->GetPathName());
+            R->SetBoolField(TEXT("already_exists"), true);
+            R->SetBoolField(TEXT("created"), false);
+            R->SetBoolField(TEXT("recompiled"), false);
+            return FSageToolDispatch::FOutcome::MakeSuccess(R);
+        }
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("component '%s' already exists with class %s"),
+                            *VariableName,
+                            ExistingClass ? *ExistingClass->GetPathName() : TEXT("<null>")));
+    }
+    if (FindInheritedSCSNode(BP, FName(*VariableName)) || FindCdoComponentTemplate(BP, FName(*VariableName)))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("component '%s' already exists on an inherited/native template"),
+                            *VariableName));
+    }
+
+    const bool bNewIsScene = ComponentClass->IsChildOf(USceneComponent::StaticClass());
+    if (!ParentName.IsEmpty() && !bNewIsScene)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("only USceneComponent descendants can be attached to a parent"));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("BpAddComponent", "Sage: Add BP Component"));
+    BP->Modify();
+    SCS->Modify();
+
+    USCS_Node* NewNode = SCS->CreateNode(ComponentClass, FName(*VariableName));
+    if (!NewNode || !NewNode->ComponentTemplate)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("CreateNode failed"));
+    }
+    NewNode->Modify();
+
+    FString AttachedTo;
+    if (!ParentName.IsEmpty())
+    {
+        USCS_Node* ParentNode = FindSCSNode(BP, ParentName);
+        if (ParentNode)
+        {
+            if (!ParentNode->ComponentClass
+                || !ParentNode->ComponentClass->IsChildOf(USceneComponent::StaticClass()))
+            {
+                Tx.Cancel();
+                return FSageToolDispatch::FOutcome::MakeError(-32602,
+                    TEXT("parent is not a USceneComponent"));
+            }
+            ParentNode->Modify();
+            ParentNode->AddChildNode(NewNode);
+            NewNode->SetParent(ParentNode);
+            AttachedTo = ParentName;
+        }
+        else if (USCS_Node* InheritedParent = FindInheritedSCSNode(BP, FName(*ParentName)))
+        {
+            if (!InheritedParent->ComponentClass
+                || !InheritedParent->ComponentClass->IsChildOf(USceneComponent::StaticClass()))
+            {
+                Tx.Cancel();
+                return FSageToolDispatch::FOutcome::MakeError(-32602,
+                    TEXT("inherited parent is not a USceneComponent"));
+            }
+            NewNode->SetParent(InheritedParent);
+            SCS->AddNode(NewNode);
+            AttachedTo = ParentName;
+        }
+        else if (USceneComponent* NativeParent =
+                     Cast<USceneComponent>(FindCdoComponentTemplate(BP, FName(*ParentName))))
+        {
+            NewNode->SetParent(NativeParent);
+            SCS->AddNode(NewNode);
+            AttachedTo = ParentName;
+        }
+        else
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("parent component not found: %s"), *ParentName));
+        }
+    }
+    else if (bNewIsScene)
+    {
+        USCS_Node* RootNode = nullptr;
+        USceneComponent* RootTemplate =
+            SCS->GetSceneRootComponentTemplate(/*bShouldUseDefaultRoot=*/false, &RootNode);
+        if (RootTemplate && RootNode && RootNode->GetSCS() == SCS)
+        {
+            RootNode->Modify();
+            RootNode->AddChildNode(NewNode);
+            NewNode->SetParent(RootNode);
+            AttachedTo = RootNode->GetVariableName().ToString();
+        }
+        else if (RootTemplate && RootNode)
+        {
+            NewNode->SetParent(RootNode);
+            SCS->AddNode(NewNode);
+            AttachedTo = RootNode->GetVariableName().ToString();
+        }
+        else if (RootTemplate)
+        {
+            NewNode->SetParent(RootTemplate);
+            SCS->AddNode(NewNode);
+            AttachedTo = RootTemplate->GetName();
+        }
+        else
+        {
+            SCS->AddNode(NewNode);
+            AttachedTo = TEXT("");
+        }
+    }
+    else
+    {
+        SCS->AddNode(NewNode);
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+    bool bDidCompile = false;
+    if (bRecompile)
+    {
+        FKismetEditorUtilities::CompileBlueprint(BP);
+        bDidCompile = true;
+    }
+    bool bSaved = false;
+    if (bSave)
+    {
+        FString SaveErr;
+        if (!SaveBlueprintAsset(BP, SaveErr))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32603, SaveErr);
+        }
+        bSaved = true;
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetPathName());
+    R->SetStringField(TEXT("component"), NewNode->GetVariableName().ToString());
+    R->SetStringField(TEXT("class"), ComponentClass->GetPathName());
+    R->SetStringField(TEXT("template"), NewNode->ComponentTemplate->GetPathName());
+    R->SetStringField(TEXT("parent"), AttachedTo);
+    R->SetBoolField(TEXT("created"), true);
+    R->SetBoolField(TEXT("already_exists"), false);
+    R->SetBoolField(TEXT("recompiled"), bDidCompile);
+    R->SetBoolField(TEXT("saved"), bSaved);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome BpCopyComponentDefaultsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString SourcePath, SourceComponent, TargetPath, TargetComponent;
+    if (Args.IsValid())
+    {
+        Args->TryGetStringField(TEXT("source_path"), SourcePath);
+        Args->TryGetStringField(TEXT("from_path"), SourcePath);
+        Args->TryGetStringField(TEXT("source_component"), SourceComponent);
+        Args->TryGetStringField(TEXT("from_component"), SourceComponent);
+        Args->TryGetStringField(TEXT("target_path"), TargetPath);
+        Args->TryGetStringField(TEXT("to_path"), TargetPath);
+        Args->TryGetStringField(TEXT("target_component"), TargetComponent);
+        Args->TryGetStringField(TEXT("to_component"), TargetComponent);
+    }
+    if (!Args.IsValid() || SourcePath.IsEmpty() || SourceComponent.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'source_path' or 'source_component'"));
+    }
+    if (TargetPath.IsEmpty()) TargetPath = SourcePath;
+    if (TargetComponent.IsEmpty()) TargetComponent = SourceComponent;
+
+    const TArray<TSharedPtr<FJsonValue>>* PropValues = nullptr;
+    if (!Args->TryGetArrayField(TEXT("properties"), PropValues) || !PropValues || PropValues->Num() == 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing/empty 'properties'"));
+    }
+
+    bool bRecompile = true;
+    Args->TryGetBoolField(TEXT("recompile"), bRecompile);
+    Args->TryGetBoolField(TEXT("compile"), bRecompile);
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+
+    UBlueprint* SourceBP = ResolveBlueprint(SourcePath);
+    if (!SourceBP) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        TEXT("source blueprint not found"));
+    UBlueprint* TargetBP = ResolveBlueprint(TargetPath);
+    if (!TargetBP) return FSageToolDispatch::FOutcome::MakeError(-32602,
+        TEXT("target blueprint not found"));
+
+    FString SourceErr, TargetErr;
+    FBpComponentTemplateRef SourceRef =
+        ResolveBpComponentTemplate(SourceBP, SourceComponent, false, SourceErr);
+    if (!SourceRef.Template)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, SourceErr);
+    }
+    FBpComponentTemplateRef TargetRef =
+        ResolveBpComponentTemplate(TargetBP, TargetComponent, true, TargetErr);
+    if (!TargetRef.Template)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TargetErr);
+    }
+
+    struct FCopyPlan
+    {
+        FString Name;
+        FProperty* SourceProp = nullptr;
+        FProperty* TargetProp = nullptr;
+        TSharedPtr<FJsonValue> Value;
+    };
+    TArray<FCopyPlan> Plans;
+    TArray<TSharedPtr<FJsonValue>> Errors;
+    auto AddError = [&Errors](const FString& Property, const FString& Message)
+    {
+        auto O = MakeShared<FJsonObject>();
+        O->SetStringField(TEXT("property"), Property);
+        O->SetStringField(TEXT("error"), Message);
+        Errors.Add(MakeShared<FJsonValueObject>(O));
+    };
+
+    for (const TSharedPtr<FJsonValue>& V : *PropValues)
+    {
+        const FString PropName = V.IsValid() ? V->AsString() : FString();
+        if (PropName.IsEmpty())
+        {
+            AddError(TEXT(""), TEXT("property name must be a non-empty string"));
+            continue;
+        }
+        FProperty* SourceProp = SourceRef.Template->GetClass()->FindPropertyByName(FName(*PropName));
+        FProperty* TargetProp = TargetRef.Template->GetClass()->FindPropertyByName(FName(*PropName));
+        if (!SourceProp)
+        {
+            AddError(PropName, TEXT("source property not found"));
+            continue;
+        }
+        if (!TargetProp)
+        {
+            AddError(PropName, TEXT("target property not found"));
+            continue;
+        }
+        if (!SourceProp->SameType(TargetProp))
+        {
+            AddError(PropName, TEXT("source and target property types differ"));
+            continue;
+        }
+        if (TargetProp->HasAnyPropertyFlags(
+                CPF_Transient | CPF_DuplicateTransient | CPF_EditConst | CPF_DisableEditOnTemplate))
+        {
+            AddError(PropName, TEXT("target property is not safe to edit on a component template"));
+            continue;
+        }
+        TSharedPtr<FJsonValue> Value = detail::GetUPropertyAsJson(SourceRef.Template, SourceProp);
+        if (!Value.IsValid())
+        {
+            AddError(PropName, TEXT("could not serialize source property"));
+            continue;
+        }
+
+        FCopyPlan Plan;
+        Plan.Name = PropName;
+        Plan.SourceProp = SourceProp;
+        Plan.TargetProp = TargetProp;
+        Plan.Value = Value;
+        Plans.Add(Plan);
+    }
+
+    if (Errors.Num() > 0)
+    {
+        TArray<FString> Parts;
+        for (const TSharedPtr<FJsonValue>& ErrorValue : Errors)
+        {
+            const TSharedPtr<FJsonObject> ErrorObj =
+                ErrorValue.IsValid() ? ErrorValue->AsObject() : nullptr;
+            if (!ErrorObj.IsValid()) continue;
+            FString Property, Message;
+            ErrorObj->TryGetStringField(TEXT("property"), Property);
+            ErrorObj->TryGetStringField(TEXT("error"), Message);
+            Parts.Add(FString::Printf(TEXT("%s: %s"), *Property, *Message));
+        }
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("component default copy preflight failed: %s"),
+                            *FString::Join(Parts, TEXT("; "))));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("BpCopyComponentDefaults",
+        "Sage: Copy BP Component Defaults"));
+    TargetBP->Modify();
+    TargetRef.Template->Modify();
+
+    TArray<TSharedPtr<FJsonValue>> Copied;
+    for (const FCopyPlan& Plan : Plans)
+    {
+        if (!detail::SetUPropertyFromJson(TargetRef.Template, Plan.TargetProp, Plan.Value))
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32603,
+                FString::Printf(TEXT("failed to set target property: %s"), *Plan.Name));
+        }
+
+        FPropertyChangedEvent ChangeEvent(Plan.TargetProp, EPropertyChangeType::ValueSet);
+        TargetRef.Template->PostEditChangeProperty(ChangeEvent);
+        TSharedPtr<FJsonValue> Readback =
+            detail::GetUPropertyAsJson(TargetRef.Template, Plan.TargetProp);
+
+        if (Plan.Value.IsValid()
+            && Plan.Value->Type != EJson::Object
+            && Plan.Value->Type != EJson::Array
+            && Readback.IsValid()
+            && !detail::JsonValuesEqual(Plan.Value, Readback))
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32603,
+                FString::Printf(TEXT("property readback mismatch after copy: %s"), *Plan.Name));
+        }
+
+        auto O = MakeShared<FJsonObject>();
+        O->SetStringField(TEXT("property"), Plan.Name);
+        O->SetField(TEXT("value"), Plan.Value);
+        if (Readback.IsValid()) O->SetField(TEXT("readback"), Readback);
+        Copied.Add(MakeShared<FJsonValueObject>(O));
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsModified(TargetBP);
+    bool bDidCompile = false;
+    if (bRecompile)
+    {
+        FKismetEditorUtilities::CompileBlueprint(TargetBP);
+        bDidCompile = true;
+    }
+    bool bSaved = false;
+    if (bSave)
+    {
+        FString SaveErr;
+        if (!SaveBlueprintAsset(TargetBP, SaveErr))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32603, SaveErr);
+        }
+        bSaved = true;
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("source_blueprint"), SourceBP->GetPathName());
+    R->SetStringField(TEXT("source_component"), SourceComponent);
+    R->SetStringField(TEXT("source_location"), SourceRef.Location);
+    R->SetStringField(TEXT("target_blueprint"), TargetBP->GetPathName());
+    R->SetStringField(TEXT("target_component"), TargetComponent);
+    R->SetStringField(TEXT("target_location"), TargetRef.Location);
+    R->SetArrayField(TEXT("copied"), Copied);
+    R->SetNumberField(TEXT("count"), Copied.Num());
+    R->SetBoolField(TEXT("recompiled"), bDidCompile);
+    R->SetBoolField(TEXT("saved"), bSaved);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -3284,6 +3921,37 @@ static FString LinkedLayerNodeKey(UBlueprint* BP, const UAnimGraphNode_LinkedAni
     return BPPath + TEXT("|") + NodeId;
 }
 
+static TArray<UEdGraph*> CollectGraphsForLinkedLayerScan(UBlueprint* BP)
+{
+    TArray<UEdGraph*> Out;
+    if (!BP) return Out;
+
+    TSet<UEdGraph*> Seen;
+    auto AddGraph = [&](UEdGraph* Graph)
+    {
+        if (!Graph || Seen.Contains(Graph)) return;
+        Seen.Add(Graph);
+        Out.Add(Graph);
+    };
+
+    TArray<UEdGraph*> NativeGraphs;
+    BP->GetAllGraphs(NativeGraphs);
+    for (UEdGraph* Graph : NativeGraphs)
+    {
+        AddGraph(Graph);
+    }
+
+    // Keep the local composite/interface override walker as a fallback for
+    // graph collections that are not always surfaced by GetAllGraphs during
+    // transient editor states.
+    for (const FBpGraphEntry& Entry : CollectAllGraphs(BP))
+    {
+        AddGraph(Entry.Graph);
+    }
+
+    return Out;
+}
+
 struct FLinkedLayerRenameSnapshot
 {
     bool bApplicable = false;
@@ -3309,10 +3977,8 @@ static void ForEachLinkedAnimLayerNodeInProject(
 {
     for (UAnimBlueprint* AnimBP : LoadAnimBlueprintsForLinkedLayerRenameScan())
     {
-        const TArray<FBpGraphEntry> Graphs = CollectAllGraphs(AnimBP);
-        for (const FBpGraphEntry& Entry : Graphs)
+        for (UEdGraph* Graph : CollectGraphsForLinkedLayerScan(AnimBP))
         {
-            UEdGraph* Graph = Entry.Graph;
             if (!Graph) continue;
             for (UEdGraphNode* GraphNode : Graph->Nodes)
             {
@@ -3382,6 +4048,22 @@ static void AddLinkedLayerRenameChange(
     }
 }
 
+static void NotifyLinkedAnimLayerStructuralPropertyChanged(UAnimGraphNode_LinkedAnimLayer* Node)
+{
+    if (!Node) return;
+    if (FProperty* LayerProperty =
+            FAnimNode_LinkedAnimLayer::StaticStruct()->FindPropertyByName(
+                GET_MEMBER_NAME_CHECKED(FAnimNode_LinkedAnimLayer, Layer)))
+    {
+        FPropertyChangedEvent ChangeEvent(LayerProperty, EPropertyChangeType::ValueSet);
+        Node->PostEditChangeProperty(ChangeEvent);
+    }
+    else
+    {
+        Node->ReconstructNode();
+    }
+}
+
 static void SetLinkedLayerNameForRename(
     FLinkedLayerRenameImpact& Impact,
     UAnimBlueprint* AnimBP,
@@ -3394,17 +4076,7 @@ static void SetLinkedLayerNameForRename(
     Graph->Modify();
     Node->Modify();
     Node->Node.Layer = NewLayer;
-    if (FProperty* LayerProperty =
-            FAnimNode_LinkedAnimLayer::StaticStruct()->FindPropertyByName(
-                GET_MEMBER_NAME_CHECKED(FAnimNode_LinkedAnimLayer, Layer)))
-    {
-        FPropertyChangedEvent ChangeEvent(LayerProperty, EPropertyChangeType::ValueSet);
-        Node->PostEditChangeProperty(ChangeEvent);
-    }
-    else
-    {
-        Node->ReconstructNode();
-    }
+    NotifyLinkedAnimLayerStructuralPropertyChanged(Node);
     Impact.StructurallyChangedBlueprints.Add(AnimBP);
 }
 
@@ -3505,6 +4177,266 @@ static UClass* GetAnimLayerInterfaceClassForRename(UBlueprint* BP)
     if (!AnimBP || AnimBP->BlueprintType != BPTYPE_Interface) return nullptr;
     if (AnimBP->GeneratedClass) return AnimBP->GeneratedClass;
     return AnimBP->SkeletonGeneratedClass;
+}
+
+static bool IsAnimLayerInterfaceClass(UClass* IfaceCls)
+{
+    if (!IfaceCls) return false;
+    UAnimBlueprint* IfaceBP = Cast<UAnimBlueprint>(IfaceCls->ClassGeneratedBy);
+    return IfaceBP && IfaceBP->BlueprintType == BPTYPE_Interface;
+}
+
+struct FLinkedLayerNodeState
+{
+    FName Layer = NAME_None;
+    UClass* Interface = nullptr;
+    FGuid InterfaceGuid;
+};
+
+struct FLinkedLayerInterfaceAddImpact
+{
+    int32 ModifiedNodeCount = 0;
+    int32 SpawnedNodeCount = 0;
+    int32 RemovedSpawnedNodeCount = 0;
+    TArray<TSharedPtr<FJsonValue>> Changes;
+};
+
+static void AppendLinkedLayerInterfaceAddImpact(
+    FLinkedLayerInterfaceAddImpact& Target,
+    const FLinkedLayerInterfaceAddImpact& Source)
+{
+    Target.ModifiedNodeCount += Source.ModifiedNodeCount;
+    Target.SpawnedNodeCount += Source.SpawnedNodeCount;
+    Target.RemovedSpawnedNodeCount += Source.RemovedSpawnedNodeCount;
+    Target.Changes.Append(Source.Changes);
+}
+
+static void ForEachLinkedAnimLayerNodeInBlueprint(
+    UBlueprint* BP,
+    TFunctionRef<void(UEdGraph* Graph, UAnimGraphNode_LinkedAnimLayer* Node)> Fn)
+{
+    for (UEdGraph* Graph : CollectGraphsForLinkedLayerScan(BP))
+    {
+        if (!Graph) continue;
+        TArray<UAnimGraphNode_LinkedAnimLayer*> LayerNodes;
+        Graph->GetNodesOfClass<UAnimGraphNode_LinkedAnimLayer>(LayerNodes);
+        for (UAnimGraphNode_LinkedAnimLayer* Node : LayerNodes)
+        {
+            if (Node) Fn(Graph, Node);
+        }
+    }
+}
+
+static TMap<FString, FLinkedLayerNodeState> CaptureLinkedLayerNodeStates(UBlueprint* BP)
+{
+    TMap<FString, FLinkedLayerNodeState> Out;
+    ForEachLinkedAnimLayerNodeInBlueprint(
+        BP,
+        [&](UEdGraph* /*Graph*/, UAnimGraphNode_LinkedAnimLayer* Node)
+        {
+            FLinkedLayerNodeState State;
+            State.Layer = Node->Node.Layer;
+            State.Interface = Node->Node.Interface.Get();
+            State.InterfaceGuid = Node->InterfaceGuid;
+            Out.Add(LinkedLayerNodeKey(BP, Node), State);
+        });
+    return Out;
+}
+
+static void AddInterfaceLinkedLayerChange(
+    FLinkedLayerInterfaceAddImpact& Impact,
+    const TCHAR* Action,
+    UBlueprint* BP,
+    UEdGraph* Graph,
+    UAnimGraphNode_LinkedAnimLayer* Node,
+    const FLinkedLayerNodeState* Before)
+{
+    auto O = MakeShared<FJsonObject>();
+    O->SetStringField(TEXT("action"), Action);
+    O->SetStringField(TEXT("blueprint"), BP ? BP->GetPathName() : FString());
+    O->SetStringField(TEXT("graph"), Graph ? Graph->GetName() : FString());
+    O->SetStringField(TEXT("node_id"),
+        Node ? Node->NodeGuid.ToString(EGuidFormats::Digits) : FString());
+    O->SetStringField(TEXT("current_interface"),
+        (Node && Node->Node.Interface.Get()) ? Node->Node.Interface.Get()->GetPathName() : FString());
+    O->SetStringField(TEXT("current_layer"),
+        Node ? Node->Node.Layer.ToString() : FString());
+    if (Before)
+    {
+        O->SetStringField(TEXT("restored_interface"),
+            Before->Interface ? Before->Interface->GetPathName() : FString());
+        O->SetStringField(TEXT("restored_layer"), Before->Layer.ToString());
+        O->SetStringField(TEXT("restored_interface_guid"),
+            Before->InterfaceGuid.ToString(EGuidFormats::Digits));
+    }
+    Impact.Changes.Add(MakeShared<FJsonValueObject>(O));
+}
+
+static FLinkedLayerInterfaceAddImpact ReconcileLinkedLayersAfterAddInterface(
+    UBlueprint* BP,
+    const TMap<FString, FLinkedLayerNodeState>& Before)
+{
+    FLinkedLayerInterfaceAddImpact Impact;
+    bool bChanged = false;
+
+    ForEachLinkedAnimLayerNodeInBlueprint(
+        BP,
+        [&](UEdGraph* Graph, UAnimGraphNode_LinkedAnimLayer* Node)
+        {
+            const FString Key = LinkedLayerNodeKey(BP, Node);
+            const FLinkedLayerNodeState* Prior = Before.Find(Key);
+            if (!Prior)
+            {
+                ++Impact.SpawnedNodeCount;
+                AddInterfaceLinkedLayerChange(Impact, TEXT("removed_spawned"), BP, Graph, Node, nullptr);
+                if (Graph) Graph->Modify();
+                if (Node) Node->Modify();
+                FBlueprintEditorUtils::RemoveNode(BP, Node, /*bDontRecompile=*/true);
+                ++Impact.RemovedSpawnedNodeCount;
+                bChanged = true;
+                return;
+            }
+
+            const bool bLayerChanged = (Node->Node.Layer != Prior->Layer);
+            UClass* CurrentInterface = Node->Node.Interface.Get();
+            const bool bInterfaceChanged =
+                CurrentInterface != Prior->Interface
+                && !IsSameGeneratedInterfaceAsset(CurrentInterface, Prior->Interface);
+            const bool bGuidChanged = (Node->InterfaceGuid != Prior->InterfaceGuid);
+            if (!bLayerChanged && !bInterfaceChanged && !bGuidChanged) return;
+
+            AddInterfaceLinkedLayerChange(Impact, TEXT("restored_existing"), BP, Graph, Node, Prior);
+            if (Graph) Graph->Modify();
+            Node->Modify();
+            Node->Node.Interface = Prior->Interface;
+            Node->Node.Layer = Prior->Layer;
+            Node->InterfaceGuid = Prior->InterfaceGuid;
+            NotifyLinkedAnimLayerStructuralPropertyChanged(Node);
+            Node->InterfaceGuid = Prior->InterfaceGuid;
+            ++Impact.ModifiedNodeCount;
+            bChanged = true;
+        });
+
+    if (bChanged && BP)
+    {
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+    }
+
+    return Impact;
+}
+
+struct FAnimLayerInterfaceGuidImpact
+{
+    int32 RegeneratedGraphGuidCount = 0;
+    TArray<TSharedPtr<FJsonValue>> Changes;
+};
+
+static void AddInterfaceGraphGuidChange(
+    FAnimLayerInterfaceGuidImpact& Impact,
+    UClass* InterfaceClass,
+    UEdGraph* Graph,
+    const FGuid& OldGuid,
+    const FGuid& NewGuid)
+{
+    auto O = MakeShared<FJsonObject>();
+    O->SetStringField(TEXT("interface"),
+        InterfaceClass ? InterfaceClass->GetPathName() : FString());
+    O->SetStringField(TEXT("function_name"), Graph ? Graph->GetName() : FString());
+    O->SetStringField(TEXT("old_guid"), OldGuid.ToString(EGuidFormats::Digits));
+    O->SetStringField(TEXT("new_guid"), NewGuid.ToString(EGuidFormats::Digits));
+    Impact.Changes.Add(MakeShared<FJsonValueObject>(O));
+}
+
+static void AddAnimLayerInterfaceGraphGuids(UClass* InterfaceClass, TSet<FGuid>& Out)
+{
+    UAnimBlueprint* InterfaceBP = InterfaceClass
+        ? Cast<UAnimBlueprint>(InterfaceClass->ClassGeneratedBy)
+        : nullptr;
+    if (!InterfaceBP || InterfaceBP->BlueprintType != BPTYPE_Interface) return;
+
+    for (UEdGraph* Graph : InterfaceBP->FunctionGraphs)
+    {
+        if (Graph && Graph->GraphGuid.IsValid())
+        {
+            Out.Add(Graph->GraphGuid);
+        }
+    }
+}
+
+static FAnimLayerInterfaceGuidImpact RegenerateCollidingAnimLayerInterfaceGraphGuids(
+    UAnimBlueprint* TargetBP,
+    UClass* NewInterfaceClass,
+    const TMap<FString, FLinkedLayerNodeState>& LinkedLayerSnapshot)
+{
+    FAnimLayerInterfaceGuidImpact Impact;
+    if (!TargetBP || !NewInterfaceClass) return Impact;
+
+    UAnimBlueprint* NewInterfaceBP =
+        Cast<UAnimBlueprint>(NewInterfaceClass->ClassGeneratedBy);
+    if (!NewInterfaceBP || NewInterfaceBP->BlueprintType != BPTYPE_Interface)
+    {
+        return Impact;
+    }
+
+    TSet<FGuid> ForbiddenGuids;
+    for (const FBPInterfaceDescription& Impl : TargetBP->ImplementedInterfaces)
+    {
+        if (!Impl.Interface
+            || IsSameGeneratedInterfaceAsset(Impl.Interface.Get(), NewInterfaceClass))
+        {
+            continue;
+        }
+        AddAnimLayerInterfaceGraphGuids(Impl.Interface.Get(), ForbiddenGuids);
+    }
+    for (const TPair<FString, FLinkedLayerNodeState>& Pair : LinkedLayerSnapshot)
+    {
+        const FLinkedLayerNodeState& State = Pair.Value;
+        if (State.InterfaceGuid.IsValid()
+            && !IsSameGeneratedInterfaceAsset(State.Interface, NewInterfaceClass))
+        {
+            ForbiddenGuids.Add(State.InterfaceGuid);
+        }
+    }
+
+    if (ForbiddenGuids.IsEmpty()) return Impact;
+
+    bool bChanged = false;
+    for (UEdGraph* Graph : NewInterfaceBP->FunctionGraphs)
+    {
+        if (!Graph || !Graph->GraphGuid.IsValid()) continue;
+        if (!ForbiddenGuids.Contains(Graph->GraphGuid)) continue;
+
+        const FGuid OldGuid = Graph->GraphGuid;
+        FGuid NewGuid = FGuid::NewGuid();
+        while (ForbiddenGuids.Contains(NewGuid))
+        {
+            NewGuid = FGuid::NewGuid();
+        }
+
+        NewInterfaceBP->Modify();
+        Graph->Modify();
+        Graph->GraphGuid = NewGuid;
+        ForbiddenGuids.Add(NewGuid);
+        ++Impact.RegeneratedGraphGuidCount;
+        AddInterfaceGraphGuidChange(
+            Impact, NewInterfaceClass, Graph, OldGuid, NewGuid);
+        bChanged = true;
+    }
+
+    if (bChanged)
+    {
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(NewInterfaceBP);
+        FKismetEditorUtilities::CompileBlueprint(NewInterfaceBP);
+    }
+
+    return Impact;
+}
+
+static void AddInterfaceDirect(UBlueprint* BP, UClass* InterfaceClass)
+{
+    FBPInterfaceDescription NewInterface;
+    NewInterface.Interface = InterfaceClass;
+    BP->ImplementedInterfaces.Add(NewInterface);
 }
 
 FSageToolDispatch::FOutcome BpRenameFunctionImpl(const TSharedPtr<FJsonObject>& Args)
@@ -3650,6 +4582,12 @@ FSageToolDispatch::FOutcome BpAddInterfaceImpl(const TSharedPtr<FJsonObject>& Ar
         return FSageToolDispatch::FOutcome::MakeError(-32602,
             FString::Printf(TEXT("class %s is not a UInterface"), *IfaceCls->GetName()));
     }
+    const bool bAnimLayerInterface = IsAnimLayerInterfaceClass(IfaceCls);
+    if (bAnimLayerInterface && !Cast<UAnimBlueprint>(BP))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("AnimLayerInterface requires an AnimBlueprint target: %s"), *Path));
+    }
 
     // Idempotency: already implemented?
     for (const FBPInterfaceDescription& Impl : BP->ImplementedInterfaces)
@@ -3661,17 +4599,68 @@ FSageToolDispatch::FOutcome BpAddInterfaceImpl(const TSharedPtr<FJsonObject>& Ar
             R->SetStringField(TEXT("interface"),      IfaceCls->GetName());
             R->SetStringField(TEXT("interface_path"), IfaceCls->GetPathName());
             R->SetBoolField  (TEXT("already"),        true);
+            R->SetBoolField  (TEXT("anim_layer_interface"), bAnimLayerInterface);
+            R->SetBoolField  (TEXT("used_direct_anim_layer_interface_add"), false);
+            R->SetBoolField  (TEXT("compiled"), false);
+            R->SetNumberField(TEXT("linked_layer_snapshot_node_count"), 0);
+            R->SetNumberField(TEXT("linked_layer_nodes_modified"), 0);
+            R->SetNumberField(TEXT("linked_layer_nodes_spawned"), 0);
+            R->SetNumberField(TEXT("linked_layer_nodes_restored"), 0);
+            R->SetNumberField(TEXT("linked_layer_nodes_removed"), 0);
+            R->SetNumberField(TEXT("linked_layer_engine_side_effect_count"), 0);
+            R->SetNumberField(TEXT("interface_graph_guids_regenerated"), 0);
+            R->SetArrayField(TEXT("interface_graph_guid_changes"), {});
+            R->SetArrayField(TEXT("linked_layer_changes"), {});
             return FSageToolDispatch::FOutcome::MakeSuccess(R);
         }
     }
 
+    const TMap<FString, FLinkedLayerNodeState> LinkedLayerSnapshot =
+        bAnimLayerInterface ? CaptureLinkedLayerNodeStates(BP)
+                            : TMap<FString, FLinkedLayerNodeState>();
+    const int32 LinkedLayerSnapshotNodeCount = LinkedLayerSnapshot.Num();
+
     FScopedTransaction Tx(LOCTEXT("BpAddInterface", "Sage: Implement BP Interface"));
     BP->Modify();
-    const FTopLevelAssetPath IfaceAssetPath(IfaceCls->GetPathName());
-    if (!FBlueprintEditorUtils::ImplementNewInterface(BP, IfaceAssetPath))
+    FAnimLayerInterfaceGuidImpact GuidImpact;
+    FLinkedLayerInterfaceAddImpact LinkedLayerImpact;
+    bool bUsedDirectAnimLayerAdd = false;
+    bool bCompiledBlueprint = false;
+
+    if (bAnimLayerInterface)
     {
-        return FSageToolDispatch::FOutcome::MakeError(-32603,
-            TEXT("ImplementNewInterface returned false"));
+        UAnimBlueprint* AnimBP = CastChecked<UAnimBlueprint>(BP);
+        GuidImpact = RegenerateCollidingAnimLayerInterfaceGraphGuids(
+            AnimBP, IfaceCls, LinkedLayerSnapshot);
+
+        AddInterfaceDirect(BP, IfaceCls);
+        bUsedDirectAnimLayerAdd = true;
+
+        // Compile inside the tool so UE's ConformImplementedInterfaces pass
+        // runs before we return. If any engine-side LinkedAnimLayer mutation
+        // still slips through, the restore pass below catches it and the
+        // second compile verifies the GUID collision has been neutralized.
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+        FKismetEditorUtilities::CompileBlueprint(BP);
+        bCompiledBlueprint = true;
+
+        AppendLinkedLayerInterfaceAddImpact(
+            LinkedLayerImpact,
+            ReconcileLinkedLayersAfterAddInterface(BP, LinkedLayerSnapshot));
+
+        FKismetEditorUtilities::CompileBlueprint(BP);
+        AppendLinkedLayerInterfaceAddImpact(
+            LinkedLayerImpact,
+            ReconcileLinkedLayersAfterAddInterface(BP, LinkedLayerSnapshot));
+    }
+    else
+    {
+        const FTopLevelAssetPath IfaceAssetPath(IfaceCls->GetPathName());
+        if (!FBlueprintEditorUtils::ImplementNewInterface(BP, IfaceAssetPath))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32603,
+                TEXT("ImplementNewInterface returned false"));
+        }
     }
 
     auto R = MakeShared<FJsonObject>();
@@ -3679,6 +4668,23 @@ FSageToolDispatch::FOutcome BpAddInterfaceImpl(const TSharedPtr<FJsonObject>& Ar
     R->SetStringField(TEXT("interface"),      IfaceCls->GetName());
     R->SetStringField(TEXT("interface_path"), IfaceCls->GetPathName());
     R->SetBoolField  (TEXT("already"),        false);
+    R->SetBoolField  (TEXT("anim_layer_interface"), bAnimLayerInterface);
+    R->SetBoolField  (TEXT("used_direct_anim_layer_interface_add"), bUsedDirectAnimLayerAdd);
+    R->SetBoolField  (TEXT("compiled"), bCompiledBlueprint);
+    R->SetNumberField(TEXT("linked_layer_snapshot_node_count"),
+        LinkedLayerSnapshotNodeCount);
+    R->SetNumberField(TEXT("linked_layer_nodes_modified"), 0);
+    R->SetNumberField(TEXT("linked_layer_nodes_spawned"), 0);
+    R->SetNumberField(TEXT("linked_layer_nodes_restored"),
+        LinkedLayerImpact.ModifiedNodeCount);
+    R->SetNumberField(TEXT("linked_layer_nodes_removed"),
+        LinkedLayerImpact.RemovedSpawnedNodeCount);
+    R->SetNumberField(TEXT("linked_layer_engine_side_effect_count"),
+        LinkedLayerImpact.ModifiedNodeCount + LinkedLayerImpact.RemovedSpawnedNodeCount);
+    R->SetNumberField(TEXT("interface_graph_guids_regenerated"),
+        GuidImpact.RegeneratedGraphGuidCount);
+    R->SetArrayField(TEXT("interface_graph_guid_changes"), GuidImpact.Changes);
+    R->SetArrayField(TEXT("linked_layer_changes"), LinkedLayerImpact.Changes);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -4515,12 +5521,17 @@ FSageToolDispatch::FOutcome BpReadGraphSummaryImpl(const TSharedPtr<FJsonObject>
 FSageToolDispatch::FOutcome BpDuplicateImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString Source, Destination;
-    if (!Args.IsValid()
-        || !Args->TryGetStringField(TEXT("source"), Source)
-        || !Args->TryGetStringField(TEXT("destination"), Destination))
+    if (Args.IsValid())
+    {
+        Args->TryGetStringField(TEXT("source"), Source);
+        Args->TryGetStringField(TEXT("path"), Source);
+        Args->TryGetStringField(TEXT("destination"), Destination);
+        Args->TryGetStringField(TEXT("dest"), Destination);
+    }
+    if (!Args.IsValid() || Source.IsEmpty() || Destination.IsEmpty())
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602,
-            TEXT("missing 'source' or 'destination'"));
+            TEXT("missing 'source'/'path' or 'destination'/'dest'"));
     }
     FSageToolDispatch::FOutcome PieErr;
     if (detail::RejectIfPie(PieErr)) return PieErr;
@@ -5267,6 +6278,8 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("bp.read_component_properties"),  GT(&BpReadComponentPropertiesImpl));
     Dispatch.RegisterHandler(TEXT("bp.get_component_property"),     GT(&BpGetComponentPropertyImpl));
     Dispatch.RegisterHandler(TEXT("bp.reparent_component"),         GT(&BpReparentComponentImpl));
+    Dispatch.RegisterHandler(TEXT("bp.add_component"),              GT(&BpAddComponentImpl));
+    Dispatch.RegisterHandler(TEXT("bp.copy_component_defaults"),    GT(&BpCopyComponentDefaultsImpl));
 
     // Read+Write — diagnostics + dry-run (Phase 4.2 round 2g/p4)
     Dispatch.RegisterHandler(TEXT("bp.validate"),                   GT(&BpValidateImpl));

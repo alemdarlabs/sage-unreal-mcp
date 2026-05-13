@@ -10,6 +10,7 @@
 #include "Animation/AnimMontage.h"
 #include "Animation/AnimSequence.h"
 #include "Animation/AnimSequenceBase.h"
+#include "Animation/AnimationAsset.h"
 #include "Animation/BlendSpace.h"
 #include "Animation/BlendSpace1D.h"
 #include "Animation/Skeleton.h"
@@ -32,6 +33,7 @@
 #include "Modules/ModuleManager.h"
 #include "PhysicsEngine/PhysicsAsset.h"
 #include "ScopedTransaction.h"
+#include "Subsystems/EditorAssetSubsystem.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectIterator.h"
 #include "UObject/UnrealType.h"
@@ -42,6 +44,7 @@
 #include "AnimationStateMachineGraph.h"
 #include "AnimationStateMachineSchema.h"
 #include "AnimGraphNode_Base.h"
+#include "AnimGraphNode_CustomProperty.h"
 #include "AnimGraphNode_TransitionResult.h"
 #include "AnimGraphNode_StateMachine.h"
 #include "AnimGraphNode_StateMachineBase.h"
@@ -59,6 +62,7 @@
 #include "AnimationTransitionGraph.h"
 #include "AnimGraphNode_SkeletalControlBase.h"
 #include "AnimGraphNode_BlendListBase.h"
+#include "AnimGraphNode_LinkedInputPose.h"  // Cluster G: ALI linked input pose parameters
 #include "AnimGraphNode_LinkedAnimLayer.h"  // Cluster G: master AnimGraph linked-layer call
 #include "Animation/AnimNode_LinkedAnimLayer.h"  // Cluster G: inner FAnimNode_LinkedAnimLayer
 #include "Animation/AnimNodeBase.h"  // FPoseLink for pose-pin category check
@@ -66,24 +70,42 @@
 #include "Animation/AnimNode_SequencePlayer.h"  // FAnimNode_SequencePlayer for inner Node mutation
 #include "EdGraphSchema_K2.h"
 #include "K2Node_CallFunction.h"
+#include "K2Node_DynamicCast.h"
+#include "K2Node_Event.h"
 #include "K2Node_VariableGet.h"
+#include "K2Node_VariableSet.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Kismet/KismetStringLibrary.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Kismet2/Kismet2NameValidators.h"  // FKismetNameValidator for RenameGraphWithSuggestion
+#include "IAnimationModifiersModule.h"
+#include "Misc/PackageName.h"
+#include "RetargetEditor/IKRetargetBatchOperation.h"
+#include "RetargetEditor/IKRetargeterController.h"
+#include "Retargeter/IKRetargeter.h"
+#include "Rig/IKRigDefinition.h"
 
 // IAnimationDataController for AnimSequence curve add (UE 5.5+ canonical path)
 #include "Animation/AnimData/IAnimationDataController.h"
 #include "Animation/AnimData/IAnimationDataModel.h"
+#include "Animation/AnimData/CurveIdentifier.h"
+#include "Animation/AttributeCurve.h"
 #include "Animation/AnimCurveTypes.h"
+#include "AnimationModifier.h"
+#include "AnimationModifiersAssetUserData.h"
+#include "EditorAnimUtils.h"
+#include "Engine/Blueprint.h"
 
 // IBlueprintGeneratedClass + Anim* class hierarchy
 #include "Animation/AnimBlueprintGeneratedClass.h"
 
 // Cluster J — runtime character.* (PIE-only)
+#include "GameFramework/Actor.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
+#include "GameFramework/MovementComponent.h"
+#include "GameFramework/Pawn.h"
 #include "GameFramework/RootMotionSource.h"
 #include "Animation/AnimInstance.h"
 #include "Components/SkeletalMeshComponent.h"
@@ -110,6 +132,66 @@ UObject* ResolveAsset(const FString& Path)
     return Obj;
 }
 
+FString ObjectPathForPackage(const FString& PackagePath)
+{
+    FString Clean = PackagePath;
+    Clean.ReplaceInline(TEXT("\\"), TEXT("/"));
+    const int32 Dot = Clean.Find(TEXT("."), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+    if (Dot != INDEX_NONE)
+    {
+        Clean = Clean.Left(Dot);
+    }
+    FString AssetName;
+    FString Unused;
+    if (!Clean.Split(TEXT("/"), &Unused, &AssetName, ESearchCase::CaseSensitive, ESearchDir::FromEnd))
+    {
+        AssetName = Clean;
+    }
+    return Clean + TEXT(".") + AssetName;
+}
+
+UObject* ResolveAssetOrPackage(const FString& Path)
+{
+    if (UObject* Obj = ResolveAsset(Path))
+    {
+        return Obj;
+    }
+    if (!Path.Contains(TEXT(".")))
+    {
+        return ResolveAsset(ObjectPathForPackage(Path));
+    }
+    return nullptr;
+}
+
+FString PackagePathForObjectPath(FString ObjectPath)
+{
+    ObjectPath.ReplaceInline(TEXT("\\"), TEXT("/"));
+    const int32 Dot = ObjectPath.Find(TEXT("."), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+    if (Dot != INDEX_NONE)
+    {
+        ObjectPath = ObjectPath.Left(Dot);
+    }
+    return ObjectPath;
+}
+
+FString ExtractObjectPathString(const TSharedPtr<FJsonValue>& Value)
+{
+    if (!Value.IsValid() || Value->IsNull())
+    {
+        return FString();
+    }
+    FString Raw = Value->AsString().TrimStartAndEnd();
+    int32 FirstQuote = INDEX_NONE;
+    int32 LastQuote = INDEX_NONE;
+    if (Raw.FindChar(TEXT('\''), FirstQuote)
+        && Raw.FindLastChar(TEXT('\''), LastQuote)
+        && LastQuote > FirstQuote)
+    {
+        Raw = Raw.Mid(FirstQuote + 1, LastQuote - FirstQuote - 1);
+    }
+    return Raw;
+}
+
 IAssetTools& GetAssetTools()
 {
     return FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
@@ -130,6 +212,457 @@ UObject* CreateAssetFromPath(const FString& FullPath, UClass* Cls, UFactory* Fac
         return nullptr;
     }
     return GetAssetTools().CreateAsset(AssetName, PackagePath, Cls, Factory);
+}
+
+TSharedRef<FJsonObject> TransformToJsonObject(const FTransform& T)
+{
+    auto Obj = MakeShared<FJsonObject>();
+    Obj->SetField(TEXT("translation"), detail::Vec3ToJson(T.GetTranslation()));
+    Obj->SetField(TEXT("location"),    detail::Vec3ToJson(T.GetLocation()));
+    Obj->SetField(TEXT("rotation"),    detail::Rot3ToJson(T.GetRotation().Rotator()));
+    Obj->SetField(TEXT("scale"),       detail::Vec3ToJson(T.GetScale3D()));
+    return Obj;
+}
+
+TSharedRef<FJsonValue> TransformToJsonValue(const FTransform& T)
+{
+    return MakeShared<FJsonValueObject>(TransformToJsonObject(T));
+}
+
+bool ReadVectorArray(const TSharedPtr<FJsonObject>& Obj, const TCHAR* FieldName, FVector& Out)
+{
+    const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+    if (!Obj.IsValid() || !Obj->TryGetArrayField(FieldName, Arr) || !Arr || Arr->Num() < 3)
+    {
+        return false;
+    }
+    Out = FVector((*Arr)[0]->AsNumber(), (*Arr)[1]->AsNumber(), (*Arr)[2]->AsNumber());
+    return true;
+}
+
+bool ReadRotatorArray(const TSharedPtr<FJsonObject>& Obj, const TCHAR* FieldName, FRotator& Out)
+{
+    const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+    if (!Obj.IsValid() || !Obj->TryGetArrayField(FieldName, Arr) || !Arr || Arr->Num() < 3)
+    {
+        return false;
+    }
+    Out = FRotator((*Arr)[0]->AsNumber(), (*Arr)[1]->AsNumber(), (*Arr)[2]->AsNumber());
+    return true;
+}
+
+bool ReadQuatArray(const TSharedPtr<FJsonObject>& Obj, const TCHAR* FieldName, FQuat& Out)
+{
+    const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+    if (!Obj.IsValid() || !Obj->TryGetArrayField(FieldName, Arr) || !Arr || Arr->Num() < 4)
+    {
+        return false;
+    }
+    Out = FQuat(
+        (*Arr)[0]->AsNumber(),
+        (*Arr)[1]->AsNumber(),
+        (*Arr)[2]->AsNumber(),
+        (*Arr)[3]->AsNumber());
+    Out.Normalize();
+    return true;
+}
+
+bool ReadStringArrayField(const TSharedPtr<FJsonObject>& Obj, const TCHAR* FieldName, TArray<FString>& Out)
+{
+    const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+    if (!Obj.IsValid() || !Obj->TryGetArrayField(FieldName, Arr) || !Arr)
+    {
+        return false;
+    }
+    for (const TSharedPtr<FJsonValue>& V : *Arr)
+    {
+        if (V.IsValid() && V->Type == EJson::String)
+        {
+            Out.Add(V->AsString());
+        }
+    }
+    return true;
+}
+
+bool ReadAnimationTransform(const TSharedPtr<FJsonObject>& Obj, FTransform& Out)
+{
+    if (!Obj.IsValid())
+    {
+        return false;
+    }
+
+    FVector Translation = Out.GetTranslation();
+    FVector Scale = Out.GetScale3D();
+    FQuat Rotation = Out.GetRotation();
+    FRotator Rotator;
+    if (ReadVectorArray(Obj, TEXT("translation"), Translation) ||
+        ReadVectorArray(Obj, TEXT("location"), Translation))
+    {
+        Out.SetTranslation(Translation);
+    }
+    if (ReadVectorArray(Obj, TEXT("scale"), Scale))
+    {
+        Out.SetScale3D(Scale);
+    }
+    if (ReadQuatArray(Obj, TEXT("quaternion"), Rotation))
+    {
+        Out.SetRotation(Rotation);
+    }
+    else if (ReadRotatorArray(Obj, TEXT("rotation"), Rotator))
+    {
+        Out.SetRotation(Rotator.Quaternion());
+    }
+    return true;
+}
+
+UClass* ResolveClassAsset(const FString& ClassPath)
+{
+    if (ClassPath.IsEmpty())
+    {
+        return nullptr;
+    }
+    if (UClass* Cls = FindObject<UClass>(nullptr, *ClassPath))
+    {
+        return Cls;
+    }
+    if (UClass* Cls = LoadObject<UClass>(nullptr, *ClassPath))
+    {
+        return Cls;
+    }
+    if (UObject* Obj = ResolveAsset(ClassPath))
+    {
+        if (UClass* Cls = Cast<UClass>(Obj))
+        {
+            return Cls;
+        }
+        if (UBlueprint* BP = Cast<UBlueprint>(Obj))
+        {
+            return BP->GeneratedClass;
+        }
+    }
+    const FSoftClassPath SoftClass(ClassPath);
+    return SoftClass.TryLoadClass<UObject>();
+}
+
+bool HasCurveNameFilter(const TSet<FName>& Names, FName Name)
+{
+    return Names.Num() == 0 || Names.Contains(Name);
+}
+
+FString RetargetSideToString(ERetargetSourceOrTarget Side)
+{
+    return Side == ERetargetSourceOrTarget::Source ? TEXT("source") : TEXT("target");
+}
+
+bool ParseRetargetSide(const FString& Raw, ERetargetSourceOrTarget& Out)
+{
+    if (Raw.Equals(TEXT("source"), ESearchCase::IgnoreCase) ||
+        Raw.Equals(TEXT("src"), ESearchCase::IgnoreCase))
+    {
+        Out = ERetargetSourceOrTarget::Source;
+        return true;
+    }
+    if (Raw.Equals(TEXT("target"), ESearchCase::IgnoreCase) ||
+        Raw.Equals(TEXT("dst"), ESearchCase::IgnoreCase) ||
+        Raw.Equals(TEXT("destination"), ESearchCase::IgnoreCase))
+    {
+        Out = ERetargetSourceOrTarget::Target;
+        return true;
+    }
+    return false;
+}
+
+FString RetargetModeToString(EBoneTranslationRetargetingMode::Type Mode)
+{
+    switch (Mode)
+    {
+    case EBoneTranslationRetargetingMode::Animation:         return TEXT("Animation");
+    case EBoneTranslationRetargetingMode::Skeleton:          return TEXT("Skeleton");
+    case EBoneTranslationRetargetingMode::AnimationScaled:   return TEXT("AnimationScaled");
+    case EBoneTranslationRetargetingMode::AnimationRelative: return TEXT("AnimationRelative");
+    case EBoneTranslationRetargetingMode::OrientAndScale:    return TEXT("OrientAndScale");
+    default:                                                 return TEXT("Unknown");
+    }
+}
+
+bool ParseRetargetMode(const FString& Raw, EBoneTranslationRetargetingMode::Type& Out)
+{
+    if (Raw.Equals(TEXT("Animation"), ESearchCase::IgnoreCase))         { Out = EBoneTranslationRetargetingMode::Animation; return true; }
+    if (Raw.Equals(TEXT("Skeleton"), ESearchCase::IgnoreCase))          { Out = EBoneTranslationRetargetingMode::Skeleton; return true; }
+    if (Raw.Equals(TEXT("AnimationScaled"), ESearchCase::IgnoreCase))   { Out = EBoneTranslationRetargetingMode::AnimationScaled; return true; }
+    if (Raw.Equals(TEXT("AnimationRelative"), ESearchCase::IgnoreCase)) { Out = EBoneTranslationRetargetingMode::AnimationRelative; return true; }
+    if (Raw.Equals(TEXT("OrientAndScale"), ESearchCase::IgnoreCase))    { Out = EBoneTranslationRetargetingMode::OrientAndScale; return true; }
+    return false;
+}
+
+int32 CountAnimationModifiers(UAnimSequence* Seq)
+{
+    if (!Seq)
+    {
+        return 0;
+    }
+    const UAnimationModifiersAssetUserData* UserData = Seq->GetAssetUserData<UAnimationModifiersAssetUserData>();
+    return UserData ? UserData->GetAnimationModifierInstances().Num() : 0;
+}
+
+TSharedPtr<FJsonValue> JsonStringValue(const FString& Value)
+{
+    return MakeShared<FJsonValueString>(Value);
+}
+
+TSharedPtr<FJsonValue> JsonNumberValue(double Value)
+{
+    return MakeShared<FJsonValueNumber>(Value);
+}
+
+TSharedPtr<FJsonValue> JsonBoolValue(bool Value)
+{
+    return MakeShared<FJsonValueBoolean>(Value);
+}
+
+void NotifyObjectPropertyChanged(UObject* Obj, FProperty* Property)
+{
+    if (!Obj || !Property)
+    {
+        return;
+    }
+    FPropertyChangedEvent Event(Property, EPropertyChangeType::ValueSet);
+    Obj->PostEditChangeProperty(Event);
+}
+
+bool SetReflectedProperty(UObject* Obj, const TCHAR* PropertyName, const TSharedPtr<FJsonValue>& Value)
+{
+    if (!Obj)
+    {
+        return false;
+    }
+    FProperty* Prop = FindFProperty<FProperty>(Obj->GetClass(), PropertyName);
+    if (!Prop)
+    {
+        return false;
+    }
+    if (!detail::SetUPropertyFromJson(Obj, Prop, Value))
+    {
+        return false;
+    }
+    NotifyObjectPropertyChanged(Obj, Prop);
+    return true;
+}
+
+bool SetStructField(UStruct* Struct, void* StructValue, const TCHAR* FieldName, const TSharedPtr<FJsonValue>& Value)
+{
+    if (!Struct || !StructValue)
+    {
+        return false;
+    }
+    FProperty* Field = Struct->FindPropertyByName(FName(FieldName));
+    if (!Field)
+    {
+        return false;
+    }
+    void* FieldValue = Field->ContainerPtrToValuePtr<void>(StructValue);
+    return detail::SetPropertyValueAtPtr(Field, FieldValue, Value);
+}
+
+FString GetObjectPathProperty(UObject* Obj, const TCHAR* PropertyName)
+{
+    if (!Obj)
+    {
+        return FString();
+    }
+    if (FProperty* Prop = FindFProperty<FProperty>(Obj->GetClass(), PropertyName))
+    {
+        TSharedPtr<FJsonValue> Value = detail::GetUPropertyAsJson(Obj, Prop);
+        if (Value.IsValid() && Value->Type == EJson::String)
+        {
+            return Value->AsString();
+        }
+    }
+    return FString();
+}
+
+bool ResolveExpectedObject(const FString& Path, const TCHAR* ExpectedClassPath, UObject*& OutObject, FString& OutError)
+{
+    OutObject = nullptr;
+    if (Path.IsEmpty())
+    {
+        return true;
+    }
+
+    UObject* Obj = ResolveAsset(Path);
+    if (!Obj)
+    {
+        OutError = FString::Printf(TEXT("asset not found: %s"), *Path);
+        return false;
+    }
+
+    if (ExpectedClassPath && ExpectedClassPath[0] != TEXT('\0'))
+    {
+        UClass* ExpectedClass = FindObject<UClass>(nullptr, ExpectedClassPath);
+        if (!ExpectedClass)
+        {
+            ExpectedClass = LoadObject<UClass>(nullptr, ExpectedClassPath);
+        }
+        if (ExpectedClass && !Obj->IsA(ExpectedClass))
+        {
+            OutError = FString::Printf(TEXT("asset %s is not a %s"), *Path, ExpectedClassPath);
+            return false;
+        }
+    }
+
+    OutObject = Obj;
+    return true;
+}
+
+int32 ParseBlendSpaceAxisIndex(const TSharedPtr<FJsonObject>& Args, UBlendSpace* BlendSpace, FString& OutAxisName)
+{
+    FString Axis;
+    if (Args.IsValid())
+    {
+        Args->TryGetStringField(TEXT("axis"), Axis);
+    }
+    Axis = Axis.TrimStartAndEnd();
+    OutAxisName = Axis;
+    if (Axis.Equals(TEXT("X"), ESearchCase::IgnoreCase) || Axis.Equals(TEXT("0"), ESearchCase::IgnoreCase))
+    {
+        return 0;
+    }
+    if (Axis.Equals(TEXT("Y"), ESearchCase::IgnoreCase) || Axis.Equals(TEXT("1"), ESearchCase::IgnoreCase))
+    {
+        return 1;
+    }
+    if (Axis.Equals(TEXT("Z"), ESearchCase::IgnoreCase) || Axis.Equals(TEXT("2"), ESearchCase::IgnoreCase))
+    {
+        return 2;
+    }
+    return INDEX_NONE;
+}
+
+void GetAnimCurveCounts(const UAnimSequence* Seq, int32& OutFloatCurves, int32& OutTransformCurves, int32& OutAttributes)
+{
+    OutFloatCurves = 0;
+    OutTransformCurves = 0;
+    OutAttributes = 0;
+    const IAnimationDataModel* Model = Seq ? Seq->GetDataModel() : nullptr;
+    if (!Model)
+    {
+        return;
+    }
+    OutFloatCurves = Model->GetFloatCurves().Num();
+    OutTransformCurves = Model->GetTransformCurves().Num();
+    OutAttributes = Model->GetAttributes().Num();
+}
+
+void AppendAssetDataJson(const FAssetData& AssetData, TArray<TSharedPtr<FJsonValue>>& Out)
+{
+    auto Obj = MakeShared<FJsonObject>();
+    Obj->SetStringField(TEXT("object_path"), AssetData.GetObjectPathString());
+    Obj->SetStringField(TEXT("package_name"), AssetData.PackageName.ToString());
+    Obj->SetStringField(TEXT("asset_name"), AssetData.AssetName.ToString());
+    Obj->SetStringField(TEXT("class"), AssetData.AssetClassPath.ToString());
+    Out.Add(MakeShared<FJsonValueObject>(Obj));
+}
+
+FString RichCurveInterpToString(ERichCurveInterpMode Mode)
+{
+    switch (Mode)
+    {
+    case RCIM_Linear:   return TEXT("linear");
+    case RCIM_Constant: return TEXT("constant");
+    case RCIM_Cubic:    return TEXT("cubic");
+    default:            return TEXT("none");
+    }
+}
+
+TSharedRef<FJsonObject> RichCurveKeyToJson(const FRichCurveKey& Key)
+{
+    auto Obj = MakeShared<FJsonObject>();
+    Obj->SetNumberField(TEXT("time"), Key.Time);
+    Obj->SetNumberField(TEXT("value"), Key.Value);
+    Obj->SetStringField(TEXT("interpolation"), RichCurveInterpToString(Key.InterpMode));
+    Obj->SetNumberField(TEXT("arrive_tangent"), Key.ArriveTangent);
+    Obj->SetNumberField(TEXT("leave_tangent"), Key.LeaveTangent);
+    Obj->SetNumberField(TEXT("arrive_tangent_weight"), Key.ArriveTangentWeight);
+    Obj->SetNumberField(TEXT("leave_tangent_weight"), Key.LeaveTangentWeight);
+    return Obj;
+}
+
+void AddRootMotionSummary(TSharedRef<FJsonObject> Result, const UAnimSequence* Seq)
+{
+    const IAnimationDataModel* Model = Seq ? Seq->GetDataModel() : nullptr;
+    USkeleton* Skel = Seq ? Seq->GetSkeleton() : nullptr;
+    if (!Model || !Skel || Skel->GetReferenceSkeleton().GetNum() == 0)
+    {
+        return;
+    }
+
+    const FName RootBone = Skel->GetReferenceSkeleton().GetBoneName(0);
+    TArray<FTransform> RootTransforms;
+    Model->GetBoneTrackTransforms(RootBone, RootTransforms);
+    if (RootTransforms.Num() == 0)
+    {
+        return;
+    }
+
+    const FTransform& First = RootTransforms[0];
+    const FTransform& Last = RootTransforms.Last();
+    const FVector TotalTranslation = Last.GetLocation() - First.GetLocation();
+    const FQuat TotalRotation = Last.GetRotation() * First.GetRotation().Inverse();
+
+    auto Summary = MakeShared<FJsonObject>();
+    Summary->SetStringField(TEXT("root_bone"), RootBone.ToString());
+    Summary->SetField(TEXT("total_translation"), detail::Vec3ToJson(TotalTranslation));
+    Summary->SetField(TEXT("total_rotation"), detail::Rot3ToJson(TotalRotation.Rotator()));
+    Summary->SetNumberField(TEXT("total_distance"), TotalTranslation.Size());
+    Summary->SetNumberField(TEXT("total_yaw_degrees"), TotalRotation.Rotator().Yaw);
+    const bool bHasRootMotion = TotalTranslation.Size() > 1.0 || FMath::Abs(TotalRotation.GetAngle()) > FMath::DegreesToRadians(1.0);
+    Summary->SetStringField(TEXT("classification"), bHasRootMotion ? TEXT("root_motion") : TEXT("in_place"));
+    Result->SetObjectField(TEXT("root_motion"), Summary);
+}
+
+void AddAnimSequenceTrackReadback(TSharedRef<FJsonObject> Result,
+                                  const UAnimSequence* Seq,
+                                  const FString& BoneName,
+                                  int32 StartFrame,
+                                  int32 EndFrame)
+{
+    const IAnimationDataModel* Model = Seq ? Seq->GetDataModel() : nullptr;
+    if (!Model) return;
+
+    TArray<FTransform> Transforms;
+    Model->GetBoneTrackTransforms(FName(*BoneName), Transforms);
+    const int32 NumKeys = Transforms.Num();
+    if (NumKeys == 0)
+    {
+        TArray<TSharedPtr<FJsonValue>> EmptyKeys;
+        Result->SetArrayField(TEXT("keys"), EmptyKeys);
+        Result->SetNumberField(TEXT("key_count"), 0);
+        return;
+    }
+
+    StartFrame = FMath::Clamp(StartFrame, 0, NumKeys - 1);
+    EndFrame = EndFrame < 0 ? NumKeys - 1 : FMath::Clamp(EndFrame, 0, NumKeys - 1);
+    if (EndFrame < StartFrame)
+    {
+        Swap(StartFrame, EndFrame);
+    }
+
+    const FFrameRate FrameRate = Model->GetFrameRate();
+    const double FrameRateDecimal = FrameRate.AsDecimal();
+    TArray<TSharedPtr<FJsonValue>> Keys;
+    for (int32 Frame = StartFrame; Frame <= EndFrame; ++Frame)
+    {
+        const FTransform& T = Transforms[Frame];
+        auto K = TransformToJsonObject(T);
+        K->SetNumberField(TEXT("frame"), Frame);
+        K->SetNumberField(TEXT("time"), FrameRateDecimal > 0.0 ? Frame / FrameRateDecimal : 0.0);
+        Keys.Add(MakeShared<FJsonValueObject>(K));
+    }
+    Result->SetArrayField(TEXT("keys"), Keys);
+    Result->SetNumberField(TEXT("key_count"), NumKeys);
+    Result->SetNumberField(TEXT("returned_key_count"), Keys.Num());
+    Result->SetNumberField(TEXT("start_frame"), StartFrame);
+    Result->SetNumberField(TEXT("end_frame"), EndFrame);
 }
 
 // ---------------------------------------------------------------------------
@@ -1817,20 +2350,87 @@ FSageToolDispatch::FOutcome GetSkeletonInfoImpl(const TSharedPtr<FJsonObject>& A
     const int32 NumBones = RefSkel.GetNum();
 
     TArray<TSharedPtr<FJsonValue>> BoneNames;
-    const int32 Limit = FMath::Min(NumBones, 50);
-    for (int32 I = 0; I < Limit; ++I)
+    TArray<TSharedPtr<FJsonValue>> Bones;
+    for (int32 I = 0; I < NumBones; ++I)
     {
-        BoneNames.Add(MakeShared<FJsonValueString>(RefSkel.GetBoneName(I).ToString()));
+        const FName BoneName = RefSkel.GetBoneName(I);
+        const int32 ParentIndex = RefSkel.GetParentIndex(I);
+        BoneNames.Add(MakeShared<FJsonValueString>(BoneName.ToString()));
+
+        auto B = MakeShared<FJsonObject>();
+        B->SetNumberField(TEXT("index"), I);
+        B->SetStringField(TEXT("name"), BoneName.ToString());
+        B->SetNumberField(TEXT("parent_index"), ParentIndex);
+        B->SetStringField(TEXT("parent_name"),
+            ParentIndex != INDEX_NONE ? RefSkel.GetBoneName(ParentIndex).ToString() : FString());
+        if (RefSkel.GetRefBonePose().IsValidIndex(I))
+        {
+            B->SetObjectField(TEXT("ref_pose"), TransformToJsonObject(RefSkel.GetRefBonePose()[I]));
+        }
+        FString RetargetMode;
+        switch (Skeleton->GetBoneTranslationRetargetingMode(I))
+        {
+        case EBoneTranslationRetargetingMode::Animation:         RetargetMode = TEXT("Animation"); break;
+        case EBoneTranslationRetargetingMode::Skeleton:          RetargetMode = TEXT("Skeleton"); break;
+        case EBoneTranslationRetargetingMode::AnimationScaled:   RetargetMode = TEXT("AnimationScaled"); break;
+        case EBoneTranslationRetargetingMode::AnimationRelative: RetargetMode = TEXT("AnimationRelative"); break;
+        case EBoneTranslationRetargetingMode::OrientAndScale:    RetargetMode = TEXT("OrientAndScale"); break;
+        default:                                                 RetargetMode = TEXT("Unknown"); break;
+        }
+        B->SetStringField(TEXT("translation_retargeting"), RetargetMode);
+        Bones.Add(MakeShared<FJsonValueObject>(B));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> VirtualBones;
+    for (const FVirtualBone& VB : Skeleton->GetVirtualBones())
+    {
+        auto V = MakeShared<FJsonObject>();
+        V->SetStringField(TEXT("name"), VB.VirtualBoneName.ToString());
+        V->SetStringField(TEXT("source_bone"), VB.SourceBoneName.ToString());
+        V->SetStringField(TEXT("target_bone"), VB.TargetBoneName.ToString());
+        VirtualBones.Add(MakeShared<FJsonValueObject>(V));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> SlotGroups;
+    for (const FAnimSlotGroup& Group : Skeleton->GetSlotGroups())
+    {
+        auto G = MakeShared<FJsonObject>();
+        G->SetStringField(TEXT("group_name"), Group.GroupName.ToString());
+        TArray<TSharedPtr<FJsonValue>> Slots;
+        for (const FName& SlotName : Group.SlotNames)
+        {
+            Slots.Add(MakeShared<FJsonValueString>(SlotName.ToString()));
+        }
+        G->SetArrayField(TEXT("slots"), Slots);
+        SlotGroups.Add(MakeShared<FJsonValueObject>(G));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Sockets;
+    for (const USkeletalMeshSocket* S : Skeleton->Sockets)
+    {
+        if (!S) continue;
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("name"), S->SocketName.ToString());
+        J->SetStringField(TEXT("parent_bone"), S->BoneName.ToString());
+        J->SetField(TEXT("location"), detail::Vec3ToJson(S->RelativeLocation));
+        J->SetField(TEXT("rotation"), detail::Rot3ToJson(S->RelativeRotation));
+        J->SetField(TEXT("scale"), detail::Vec3ToJson(S->RelativeScale));
+        J->SetBoolField(TEXT("force_always_animated"), S->bForceAlwaysAnimated);
+        J->SetStringField(TEXT("owner"), TEXT("skeleton"));
+        Sockets.Add(MakeShared<FJsonValueObject>(J));
     }
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"),       Skeleton->GetPathName());
     R->SetNumberField(TEXT("num_bones"),  NumBones);
     R->SetArrayField (TEXT("bone_names"), BoneNames);
-    if (NumBones > 50)
-    {
-        R->SetStringField(TEXT("note"), TEXT("bone_names capped at 50"));
-    }
+    R->SetArrayField (TEXT("bones"),      Bones);
+    R->SetArrayField (TEXT("virtual_bones"), VirtualBones);
+    R->SetNumberField(TEXT("virtual_bone_count"), VirtualBones.Num());
+    R->SetArrayField (TEXT("slot_groups"), SlotGroups);
+    R->SetNumberField(TEXT("slot_group_count"), SlotGroups.Num());
+    R->SetArrayField (TEXT("sockets"), Sockets);
+    R->SetNumberField(TEXT("socket_count"), Sockets.Num());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1845,25 +2445,49 @@ FSageToolDispatch::FOutcome ListSkeletonSocketsImpl(const TSharedPtr<FJsonObject
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
     }
-    USkeleton* Skeleton = Cast<USkeleton>(ResolveAsset(Path));
-    if (!Skeleton)
+    UObject* Asset = ResolveAsset(Path);
+    USkeleton* Skeleton = Cast<USkeleton>(Asset);
+    USkeletalMesh* Mesh = Cast<USkeletalMesh>(Asset);
+    if (!Skeleton && !Mesh)
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602,
-            FString::Printf(TEXT("not a USkeleton: %s"), *Path));
+            FString::Printf(TEXT("not a USkeleton or USkeletalMesh: %s"), *Path));
     }
 
     TArray<TSharedPtr<FJsonValue>> Sockets;
-    for (const USkeletalMeshSocket* S : Skeleton->Sockets)
+    auto AddSocket = [&Sockets](const USkeletalMeshSocket* S, const FString& Owner)
     {
-        if (!S) continue;
+        if (!S) return;
         auto J = MakeShared<FJsonObject>();
-        J->SetStringField(TEXT("name"),      S->SocketName.ToString());
-        J->SetStringField(TEXT("bone_name"), S->BoneName.ToString());
+        J->SetStringField(TEXT("name"),        S->SocketName.ToString());
+        J->SetStringField(TEXT("bone_name"),   S->BoneName.ToString());
+        J->SetStringField(TEXT("parent_bone"), S->BoneName.ToString());
+        J->SetField(TEXT("location"), detail::Vec3ToJson(S->RelativeLocation));
+        J->SetField(TEXT("rotation"), detail::Rot3ToJson(S->RelativeRotation));
+        J->SetField(TEXT("scale"), detail::Vec3ToJson(S->RelativeScale));
+        J->SetBoolField(TEXT("force_always_animated"), S->bForceAlwaysAnimated);
+        J->SetStringField(TEXT("owner"), Owner);
         Sockets.Add(MakeShared<FJsonValueObject>(J));
+    };
+    if (Skeleton)
+    {
+        for (const USkeletalMeshSocket* S : Skeleton->Sockets)
+        {
+            AddSocket(S, TEXT("skeleton"));
+        }
+    }
+    if (Mesh)
+    {
+        for (const USkeletalMeshSocket* S : Mesh->GetActiveSocketList())
+        {
+            const bool bMeshOwned = S && S->GetOuter() == Mesh;
+            AddSocket(S, bMeshOwned ? TEXT("mesh") : TEXT("skeleton"));
+        }
     }
 
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("path"),    Skeleton->GetPathName());
+    R->SetStringField(TEXT("path"),    Asset->GetPathName());
+    R->SetStringField(TEXT("asset_type"), Skeleton ? TEXT("USkeleton") : TEXT("USkeletalMesh"));
     R->SetArrayField (TEXT("sockets"), Sockets);
     R->SetNumberField(TEXT("count"),   Sockets.Num());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
@@ -1880,7 +2504,7 @@ FSageToolDispatch::FOutcome ListSkeletalMeshesImpl(const TSharedPtr<FJsonObject>
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
     }
-    USkeleton* Skeleton = Cast<USkeleton>(ResolveAsset(SkeletonPath));
+    USkeleton* Skeleton = Cast<USkeleton>(ResolveAssetOrPackage(SkeletonPath));
     if (!Skeleton)
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602,
@@ -2197,10 +2821,6 @@ FSageToolDispatch::FOutcome ReadBoneTrackImpl(const TSharedPtr<FJsonObject>& Arg
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'bone'"));
     }
-    double FrameD = 0.0;
-    Args->TryGetNumberField(TEXT("frame"), FrameD);
-    const int32 Frame = static_cast<int32>(FrameD);
-
     UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(Path));
     if (!Seq)
     {
@@ -2221,26 +2841,191 @@ FSageToolDispatch::FOutcome ReadBoneTrackImpl(const TSharedPtr<FJsonObject>& Arg
             FString::Printf(TEXT("bone '%s' not found in skeleton"), *BoneName));
     }
 
-    const float FrameRate  = Seq->GetSamplingFrameRate().AsDecimal();
-    const float TimeAtFrame = (FrameRate > 0.f) ? (Frame / FrameRate) : 0.f;
+    const IAnimationDataModel* Model = Seq->GetDataModel();
+    if (!Model)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("sequence has no animation data model"));
+    }
+    if (!Model->IsValidBoneTrackName(FName(*BoneName)))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("AnimSequence has no animated track for bone '%s'"), *BoneName));
+    }
 
-    // GetBoneTransform requires FSkeletonPoseBoneIndex in UE 5.7; use ref skeleton pose instead
-    FTransform BoneTransform = Skel->GetReferenceSkeleton().GetRefBonePose().IsValidIndex(BoneIdx)
-        ? Skel->GetReferenceSkeleton().GetRefBonePose()[BoneIdx]
-        : FTransform::Identity;
-    (void)TimeAtFrame;
-
-    const FVector Loc = BoneTransform.GetLocation();
-    const FRotator Rot = BoneTransform.GetRotation().Rotator();
-    const FVector  Sc  = BoneTransform.GetScale3D();
+    double StartFrameD = 0.0;
+    double EndFrameD = -1.0;
+    if (Args.IsValid())
+    {
+        if (Args->HasField(TEXT("frame")))
+        {
+            Args->TryGetNumberField(TEXT("frame"), StartFrameD);
+            EndFrameD = StartFrameD;
+        }
+        Args->TryGetNumberField(TEXT("start_frame"), StartFrameD);
+        Args->TryGetNumberField(TEXT("end_frame"), EndFrameD);
+    }
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"),      Seq->GetPathName());
     R->SetStringField(TEXT("bone_name"), BoneName);
-    R->SetNumberField(TEXT("frame"),     Frame);
-    R->SetField(TEXT("location"), detail::Vec3ToJson(Loc));
-    R->SetField(TEXT("rotation"), detail::Rot3ToJson(Rot));
-    R->SetField(TEXT("scale"),    detail::Vec3ToJson(Sc));
+    R->SetNumberField(TEXT("bone_index"), BoneIdx);
+    R->SetNumberField(TEXT("duration"), Model->GetPlayLength());
+    R->SetNumberField(TEXT("sample_rate"), Model->GetFrameRate().AsDecimal());
+    R->SetNumberField(TEXT("number_of_frames"), Model->GetNumberOfFrames());
+    R->SetNumberField(TEXT("number_of_keys"), Model->GetNumberOfKeys());
+    AddAnimSequenceTrackReadback(R, Seq, BoneName,
+        static_cast<int32>(StartFrameD),
+        static_cast<int32>(EndFrameD));
+    AddRootMotionSummary(R, Seq);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.read_animation_curves
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome ReadAnimationCurvesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+
+    UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(Path));
+    if (!Seq)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimSequence: %s"), *Path));
+    }
+    const IAnimationDataModel* Model = Seq->GetDataModel();
+    if (!Model)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("sequence has no animation data model"));
+    }
+
+    bool bIncludeKeys = true;
+    Args->TryGetBoolField(TEXT("include_keys"), bIncludeKeys);
+    TArray<FString> RequestedNames;
+    ReadStringArrayField(Args, TEXT("curve_names"), RequestedNames);
+    TSet<FName> Filter;
+    for (const FString& Name : RequestedNames)
+    {
+        if (!Name.IsEmpty())
+        {
+            Filter.Add(FName(*Name));
+        }
+    }
+
+    const double FrameRateDecimal = Model->GetFrameRate().AsDecimal();
+    auto TimeToFrame = [FrameRateDecimal](float Time) -> int32
+    {
+        return FrameRateDecimal > 0.0 ? FMath::RoundToInt(static_cast<double>(Time) * FrameRateDecimal) : 0;
+    };
+
+    TArray<TSharedPtr<FJsonValue>> FloatCurves;
+    for (const FFloatCurve& Curve : Model->GetFloatCurves())
+    {
+        const FName CurveName = Curve.GetName();
+        if (!HasCurveNameFilter(Filter, CurveName)) continue;
+
+        auto Obj = MakeShared<FJsonObject>();
+        Obj->SetStringField(TEXT("name"), CurveName.ToString());
+        Obj->SetStringField(TEXT("type"), TEXT("float"));
+        Obj->SetNumberField(TEXT("flags"), Curve.GetCurveTypeFlags());
+        Obj->SetNumberField(TEXT("key_count"), Curve.FloatCurve.GetNumKeys());
+#if WITH_EDITORONLY_DATA
+        const FLinearColor Color = Curve.GetColor();
+        TArray<TSharedPtr<FJsonValue>> ColorArr;
+        ColorArr.Add(MakeShared<FJsonValueNumber>(Color.R));
+        ColorArr.Add(MakeShared<FJsonValueNumber>(Color.G));
+        ColorArr.Add(MakeShared<FJsonValueNumber>(Color.B));
+        ColorArr.Add(MakeShared<FJsonValueNumber>(Color.A));
+        Obj->SetArrayField(TEXT("color"), ColorArr);
+#endif
+        if (bIncludeKeys)
+        {
+            TArray<TSharedPtr<FJsonValue>> Keys;
+            for (const FRichCurveKey& Key : Curve.FloatCurve.GetConstRefOfKeys())
+            {
+                auto KeyObj = RichCurveKeyToJson(Key);
+                KeyObj->SetNumberField(TEXT("frame"), TimeToFrame(Key.Time));
+                Keys.Add(MakeShared<FJsonValueObject>(KeyObj));
+            }
+            Obj->SetArrayField(TEXT("keys"), Keys);
+        }
+        FloatCurves.Add(MakeShared<FJsonValueObject>(Obj));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> TransformCurves;
+    for (const FTransformCurve& Curve : Model->GetTransformCurves())
+    {
+        const FName CurveName = Curve.GetName();
+        if (!HasCurveNameFilter(Filter, CurveName)) continue;
+
+        TArray<float> Times;
+        TArray<FTransform> Values;
+        Curve.GetKeys(Times, Values);
+
+        auto Obj = MakeShared<FJsonObject>();
+        Obj->SetStringField(TEXT("name"), CurveName.ToString());
+        Obj->SetStringField(TEXT("type"), TEXT("transform"));
+        Obj->SetNumberField(TEXT("flags"), Curve.GetCurveTypeFlags());
+        Obj->SetNumberField(TEXT("key_count"), Values.Num());
+        if (bIncludeKeys)
+        {
+            TArray<TSharedPtr<FJsonValue>> Keys;
+            for (int32 I = 0; I < Values.Num(); ++I)
+            {
+                auto KeyObj = TransformToJsonObject(Values[I]);
+                const float Time = Times.IsValidIndex(I) ? Times[I] : 0.0f;
+                KeyObj->SetNumberField(TEXT("time"), Time);
+                KeyObj->SetNumberField(TEXT("frame"), TimeToFrame(Time));
+                Keys.Add(MakeShared<FJsonValueObject>(KeyObj));
+            }
+            Obj->SetArrayField(TEXT("keys"), Keys);
+        }
+        TransformCurves.Add(MakeShared<FJsonValueObject>(Obj));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Attributes;
+    for (const FAnimatedBoneAttribute& Attribute : Model->GetAttributes())
+    {
+        const FAnimationAttributeIdentifier& Identifier = Attribute.Identifier;
+        if (!HasCurveNameFilter(Filter, Identifier.GetName())) continue;
+
+        auto Obj = MakeShared<FJsonObject>();
+        Obj->SetStringField(TEXT("name"), Identifier.GetName().ToString());
+        Obj->SetStringField(TEXT("type"), TEXT("attribute"));
+        Obj->SetStringField(TEXT("bone_name"), Identifier.GetBoneName().ToString());
+        Obj->SetNumberField(TEXT("bone_index"), Identifier.GetBoneIndex());
+        Obj->SetStringField(TEXT("value_type"), Identifier.GetScriptStructPath().ToString());
+        Obj->SetNumberField(TEXT("key_count"), Attribute.Curve.GetConstRefOfKeys().Num());
+        if (bIncludeKeys)
+        {
+            TArray<TSharedPtr<FJsonValue>> Keys;
+            for (const FAttributeKey& Key : Attribute.Curve.GetConstRefOfKeys())
+            {
+                auto KeyObj = MakeShared<FJsonObject>();
+                KeyObj->SetNumberField(TEXT("time"), Key.Time);
+                KeyObj->SetNumberField(TEXT("frame"), TimeToFrame(Key.Time));
+                Keys.Add(MakeShared<FJsonValueObject>(KeyObj));
+            }
+            Obj->SetArrayField(TEXT("keys"), Keys);
+        }
+        Attributes.Add(MakeShared<FJsonValueObject>(Obj));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Seq->GetPathName());
+    R->SetNumberField(TEXT("duration"), Model->GetPlayLength());
+    R->SetNumberField(TEXT("sample_rate"), Model->GetFrameRate().AsDecimal());
+    R->SetNumberField(TEXT("float_curve_count"), FloatCurves.Num());
+    R->SetNumberField(TEXT("transform_curve_count"), TransformCurves.Num());
+    R->SetNumberField(TEXT("attribute_count"), Attributes.Num());
+    R->SetArrayField(TEXT("float_curves"), FloatCurves);
+    R->SetArrayField(TEXT("transform_curves"), TransformCurves);
+    R->SetArrayField(TEXT("attributes"), Attributes);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -2633,9 +3418,100 @@ FSageToolDispatch::FOutcome CreateSequenceImpl(const TSharedPtr<FJsonObject>& Ar
 
 FSageToolDispatch::FOutcome SetBoneKeyframesImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32000,
-        TEXT("[NOT IMPLEMENTED] animation.set_bone_keyframes — use IAnimationDataController "
-             "via Persona (UE 5.5+ canonical) or editor.run_python with animation editor"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, BoneName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("bone"), BoneName) || BoneName.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("bone_name"), BoneName);
+    }
+    if (BoneName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'bone'"));
+    }
+    const TArray<TSharedPtr<FJsonValue>>* KeyValues = nullptr;
+    if (!Args->TryGetArrayField(TEXT("keyframes"), KeyValues) || !KeyValues || KeyValues->Num() == 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing non-empty 'keyframes' array"));
+    }
+
+    UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(Path));
+    if (!Seq)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimSequence: %s"), *Path));
+    }
+    USkeleton* Skel = Seq->GetSkeleton();
+    if (!Skel)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("sequence has no skeleton"));
+    }
+
+    const FName BoneF(*BoneName);
+    const int32 BoneIdx = Skel->GetReferenceSkeleton().FindBoneIndex(BoneF);
+    if (BoneIdx == INDEX_NONE)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("bone '%s' not found in skeleton"), *BoneName));
+    }
+
+    TArray<FVector> Positions;
+    TArray<FQuat> Rotations;
+    TArray<FVector> Scales;
+    Positions.Reserve(KeyValues->Num());
+    Rotations.Reserve(KeyValues->Num());
+    Scales.Reserve(KeyValues->Num());
+
+    for (int32 I = 0; I < KeyValues->Num(); ++I)
+    {
+        const TSharedPtr<FJsonValue>& V = (*KeyValues)[I];
+        const TSharedPtr<FJsonObject>* Obj = nullptr;
+        if (!V.IsValid() || !V->TryGetObject(Obj) || !Obj || !(*Obj).IsValid())
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("keyframes[%d] must be an object"), I));
+        }
+
+        FTransform T = FTransform::Identity;
+        ReadAnimationTransform(*Obj, T);
+        Positions.Add(T.GetTranslation());
+        Rotations.Add(T.GetRotation());
+        Scales.Add(T.GetScale3D());
+    }
+
+    IAnimationDataController& Controller = Seq->GetController();
+    {
+        IAnimationDataController::FScopedBracket Bracket(&Controller,
+            LOCTEXT("SageSetBoneKeyframes", "Sage: Set Bone Keyframes"));
+        Seq->Modify();
+        if (!Seq->GetDataModel() || !Seq->GetDataModel()->IsValidBoneTrackName(BoneF))
+        {
+            Controller.AddBoneCurve(BoneF, false);
+        }
+        if (!Controller.SetBoneTrackKeys(BoneF, Positions, Rotations, Scales, false))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32603,
+                FString::Printf(TEXT("SetBoneTrackKeys failed for bone '%s'"), *BoneName));
+        }
+    }
+
+    Seq->RefreshCacheData();
+    Seq->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Seq->GetPathName());
+    R->SetStringField(TEXT("bone"), BoneName);
+    R->SetNumberField(TEXT("bone_index"), BoneIdx);
+    R->SetNumberField(TEXT("written_key_count"), Positions.Num());
+    R->SetBoolField(TEXT("modified"), true);
+    AddAnimSequenceTrackReadback(R, Seq, BoneName, 0, Positions.Num() - 1);
+    AddRootMotionSummary(R, Seq);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ---------------------------------------------------------------------------
@@ -2704,9 +3580,108 @@ FSageToolDispatch::FOutcome GetBoneTransformsImpl(const TSharedPtr<FJsonObject>&
 
 FSageToolDispatch::FOutcome SetMontageSequenceImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32000,
-        TEXT("[NOT IMPLEMENTED] animation.set_montage_sequence — slot track editing "
-             "requires Persona session; use editor.run_python with anim editor API"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SequencePath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("sequence"), SequencePath) || SequencePath.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("sequence_path"), SequencePath);
+    }
+    if (SequencePath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'sequence'"));
+    }
+
+    UAnimMontage* Montage = Cast<UAnimMontage>(ResolveAsset(Path));
+    if (!Montage)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimMontage: %s"), *Path));
+    }
+    UAnimSequenceBase* Sequence = Cast<UAnimSequenceBase>(ResolveAsset(SequencePath));
+    if (!Sequence || Sequence->IsA<UAnimMontage>())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("sequence not a supported UAnimSequenceBase: %s"), *SequencePath));
+    }
+    if (!Sequence->CanBeUsedInComposition())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("sequence cannot be used in animation compositions: %s"), *SequencePath));
+    }
+
+    int32 SlotIndex = 0;
+    double SlotIndexNumber = 0.0;
+    if (Args->TryGetNumberField(TEXT("slot_index"), SlotIndexNumber))
+    {
+        SlotIndex = static_cast<int32>(SlotIndexNumber);
+    }
+
+    double StartTime = 0.0;
+    double EndTime = Sequence->GetPlayLength();
+    double PlayRate = 1.0;
+    double LoopingCountNumber = 1.0;
+    Args->TryGetNumberField(TEXT("start_time"), StartTime);
+    Args->TryGetNumberField(TEXT("anim_start_time"), StartTime);
+    Args->TryGetNumberField(TEXT("end_time"), EndTime);
+    Args->TryGetNumberField(TEXT("anim_end_time"), EndTime);
+    Args->TryGetNumberField(TEXT("play_rate"), PlayRate);
+    Args->TryGetNumberField(TEXT("looping_count"), LoopingCountNumber);
+    const int32 LoopingCount = FMath::Max(1, static_cast<int32>(LoopingCountNumber));
+    const float ClampedStart = FMath::Clamp(static_cast<float>(StartTime), 0.0f, Sequence->GetPlayLength());
+    const float ClampedEnd = FMath::Clamp(static_cast<float>(EndTime), ClampedStart, Sequence->GetPlayLength());
+
+    FScopedTransaction Tx(LOCTEXT("SageSetMontageSequence", "Sage: Set Montage Sequence"));
+    Montage->Modify();
+    if (Montage->SlotAnimTracks.Num() == 0)
+    {
+        Montage->AddSlot(FAnimSlotGroup::DefaultSlotName);
+    }
+    if (!Montage->SlotAnimTracks.IsValidIndex(SlotIndex))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("slot_index %d out of range (slots=%d)"),
+                            SlotIndex, Montage->SlotAnimTracks.Num()));
+    }
+
+    FSlotAnimationTrack& SlotTrack = Montage->SlotAnimTracks[SlotIndex];
+    SlotTrack.AnimTrack.AnimSegments.Reset();
+    FAnimSegment Segment;
+    Segment.SetAnimReference(Sequence, true);
+    Segment.StartPos = 0.0f;
+    Segment.AnimStartTime = ClampedStart;
+    Segment.AnimEndTime = ClampedEnd;
+    Segment.AnimPlayRate = FMath::IsNearlyZero(static_cast<float>(PlayRate)) ? 1.0f : static_cast<float>(PlayRate);
+    Segment.LoopingCount = LoopingCount;
+    SlotTrack.AnimTrack.AnimSegments.Add(Segment);
+
+    if (Montage->CompositeSections.Num() == 0)
+    {
+        FCompositeSection Section;
+        Section.SectionName = TEXT("Default");
+        Section.SetTime(0.0f);
+        Montage->CompositeSections.Add(Section);
+    }
+    Montage->RefreshCacheData();
+    Montage->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Montage->GetPathName());
+    R->SetStringField(TEXT("sequence"), Sequence->GetPathName());
+    R->SetNumberField(TEXT("slot_index"), SlotIndex);
+    R->SetStringField(TEXT("slot"), SlotTrack.SlotName.ToString());
+    R->SetNumberField(TEXT("start_time"), ClampedStart);
+    R->SetNumberField(TEXT("end_time"), ClampedEnd);
+    R->SetNumberField(TEXT("play_rate"), Segment.AnimPlayRate);
+    R->SetNumberField(TEXT("looping_count"), Segment.LoopingCount);
+    R->SetNumberField(TEXT("duration"), Montage->GetPlayLength());
+    R->SetBoolField(TEXT("modified"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ---------------------------------------------------------------------------
@@ -3248,6 +4223,95 @@ FSageToolDispatch::FOutcome SetTransitionBlendImpl(const TSharedPtr<FJsonObject>
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("transition_id"), TransitionId);
     R->SetNumberField(TEXT("blend_time"),    BlendTime);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.set_transition_automatic_rule (Lyra Sage Gap #29)
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome SetTransitionAutomaticRuleImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SMName, TransitionId;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("state_machine_name"), SMName) || SMName.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("graph_name"), SMName);
+    }
+    if (SMName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'state_machine_name'"));
+    }
+    if (!Args->TryGetStringField(TEXT("transition_id"), TransitionId) || TransitionId.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'transition_id'"));
+    }
+
+    bool bAutomatic = true;
+    Args->TryGetBoolField(TEXT("automatic_rule"), bAutomatic);
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+    UAnimationStateMachineGraph* SMGraph = FindStateMachineGraph(AnimBP, FName(*SMName));
+    if (!SMGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("state machine '%s' not found"), *SMName));
+    }
+    UAnimStateTransitionNode* T = FindTransitionByGuid(SMGraph, TransitionId);
+    if (!T)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("transition_id not found: %s"), *TransitionId));
+    }
+
+    double TriggerTime = T->AutomaticRuleTriggerTime;
+    const bool bHasTriggerTime =
+        Args->TryGetNumberField(TEXT("automatic_rule_trigger_time"), TriggerTime)
+        || Args->TryGetNumberField(TEXT("auto_trigger_time"), TriggerTime);
+
+    double BlendTime = T->CrossfadeDuration;
+    const bool bHasBlendTime =
+        Args->TryGetNumberField(TEXT("blend_time"), BlendTime)
+        || Args->TryGetNumberField(TEXT("auto_blend_in_time"), BlendTime);
+
+    FScopedTransaction Tx(LOCTEXT("SetTransitionAutomaticRule", "Sage: Set Transition Automatic Rule"));
+    AnimBP->Modify();
+    T->Modify();
+    T->bAutomaticRuleBasedOnSequencePlayerInState = bAutomatic;
+    if (bHasTriggerTime)
+    {
+        T->AutomaticRuleTriggerTime = static_cast<float>(TriggerTime);
+    }
+    if (bHasBlendTime)
+    {
+        T->CrossfadeDuration = static_cast<float>(FMath::Max(0.0, BlendTime));
+    }
+
+    FPropertyChangedEvent ChangeEvent(
+        FindFProperty<FProperty>(UAnimStateTransitionNode::StaticClass(),
+            GET_MEMBER_NAME_CHECKED(UAnimStateTransitionNode, bAutomaticRuleBasedOnSequencePlayerInState)),
+        EPropertyChangeType::ValueSet);
+    T->PostEditChangeProperty(ChangeEvent);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("transition_id"), TransitionId);
+    R->SetBoolField(TEXT("automatic_rule"), T->bAutomaticRuleBasedOnSequencePlayerInState);
+    R->SetNumberField(TEXT("automatic_rule_trigger_time"), T->AutomaticRuleTriggerTime);
+    R->SetNumberField(TEXT("blend_time"), T->CrossfadeDuration);
+    R->SetBoolField(TEXT("set"), true);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -4078,6 +5142,606 @@ FSageToolDispatch::FOutcome CreateIKRetargeterImpl(const TSharedPtr<FJsonObject>
 }
 
 // ---------------------------------------------------------------------------
+// animation.read_ik_retargeter
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome ReadIKRetargeterImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+
+    UIKRetargeter* Retargeter = Cast<UIKRetargeter>(ResolveAsset(Path));
+    if (!Retargeter)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UIKRetargeter: %s"), *Path));
+    }
+
+    UIKRetargeterController* Controller = UIKRetargeterController::GetController(Retargeter);
+    if (!Controller)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("failed to get IK Retargeter controller"));
+    }
+    Controller->CleanAsset();
+
+    auto AssetPathOrEmpty = [](const UObject* Obj) -> FString
+    {
+        return Obj ? Obj->GetPathName() : FString();
+    };
+    auto RigToJson = [&AssetPathOrEmpty](const UIKRigDefinition* Rig) -> TSharedRef<FJsonObject>
+    {
+        auto Obj = MakeShared<FJsonObject>();
+        Obj->SetStringField(TEXT("path"), AssetPathOrEmpty(Rig));
+        if (Rig)
+        {
+            Obj->SetStringField(TEXT("root_bone"), Rig->GetPelvis().ToString());
+            TArray<TSharedPtr<FJsonValue>> Chains;
+            for (const FBoneChain& Chain : Rig->GetRetargetChains())
+            {
+                auto ChainObj = MakeShared<FJsonObject>();
+                ChainObj->SetStringField(TEXT("name"), Chain.ChainName.ToString());
+                ChainObj->SetStringField(TEXT("start_bone"), Chain.StartBone.BoneName.ToString());
+                ChainObj->SetStringField(TEXT("end_bone"), Chain.EndBone.BoneName.ToString());
+                ChainObj->SetStringField(TEXT("ik_goal"), Chain.IKGoalName.ToString());
+                Chains.Add(MakeShared<FJsonValueObject>(ChainObj));
+            }
+            Obj->SetArrayField(TEXT("chains"), Chains);
+            Obj->SetNumberField(TEXT("chain_count"), Chains.Num());
+        }
+        return Obj;
+    };
+    auto PoseSideToJson = [Controller](ERetargetSourceOrTarget Side) -> TSharedRef<FJsonObject>
+    {
+        auto Obj = MakeShared<FJsonObject>();
+        Obj->SetStringField(TEXT("side"), RetargetSideToString(Side));
+        Obj->SetStringField(TEXT("current_pose"), Controller->GetCurrentRetargetPoseName(Side).ToString());
+        Obj->SetField(TEXT("root_offset"), detail::Vec3ToJson(Controller->GetRootOffsetInRetargetPose(Side)));
+        TArray<TSharedPtr<FJsonValue>> Poses;
+        for (const TPair<FName, FIKRetargetPose>& Pair : Controller->GetRetargetPoses(Side))
+        {
+            auto PoseObj = MakeShared<FJsonObject>();
+            PoseObj->SetStringField(TEXT("name"), Pair.Key.ToString());
+            PoseObj->SetField(TEXT("root_offset"), detail::Vec3ToJson(Pair.Value.GetRootTranslationDelta()));
+            TArray<TSharedPtr<FJsonValue>> Rotations;
+            for (const TPair<FName, FQuat>& RotationPair : Pair.Value.GetAllDeltaRotations())
+            {
+                auto RotObj = MakeShared<FJsonObject>();
+                RotObj->SetStringField(TEXT("bone"), RotationPair.Key.ToString());
+                RotObj->SetField(TEXT("rotation"), detail::Rot3ToJson(RotationPair.Value.Rotator()));
+                Rotations.Add(MakeShared<FJsonValueObject>(RotObj));
+            }
+            PoseObj->SetArrayField(TEXT("bone_rotations"), Rotations);
+            PoseObj->SetNumberField(TEXT("bone_rotation_count"), Rotations.Num());
+            Poses.Add(MakeShared<FJsonValueObject>(PoseObj));
+        }
+        Obj->SetArrayField(TEXT("poses"), Poses);
+        Obj->SetNumberField(TEXT("pose_count"), Poses.Num());
+        return Obj;
+    };
+
+    TArray<TSharedPtr<FJsonValue>> Ops;
+    TArray<TSharedPtr<FJsonValue>> ChainMappings;
+    const int32 NumOps = Controller->GetNumRetargetOps();
+    for (int32 I = 0; I < NumOps; ++I)
+    {
+        const FName OpName = Controller->GetOpName(I);
+        auto OpObj = MakeShared<FJsonObject>();
+        OpObj->SetNumberField(TEXT("index"), I);
+        OpObj->SetStringField(TEXT("name"), OpName.ToString());
+        OpObj->SetBoolField(TEXT("enabled"), Controller->GetRetargetOpEnabled(I));
+        if (FInstancedStruct* OpStruct = Controller->GetRetargetOpStructAtIndex(I))
+        {
+            if (const UScriptStruct* ScriptStruct = OpStruct->GetScriptStruct())
+            {
+                OpObj->SetStringField(TEXT("struct"), ScriptStruct->GetPathName());
+            }
+        }
+        Ops.Add(MakeShared<FJsonValueObject>(OpObj));
+
+        const FRetargetChainMapping* Mapping = Controller->GetChainMapping(OpName);
+        if (!Mapping)
+        {
+            continue;
+        }
+        for (const FRetargetChainPair& Pair : Mapping->GetChainPairs())
+        {
+            auto MapObj = MakeShared<FJsonObject>();
+            MapObj->SetStringField(TEXT("op_name"), OpName.ToString());
+            MapObj->SetStringField(TEXT("target_chain"), Pair.TargetChainName.ToString());
+            MapObj->SetStringField(TEXT("source_chain"), Pair.SourceChainName.ToString());
+            ChainMappings.Add(MakeShared<FJsonValueObject>(MapObj));
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+    R->SetStringField(TEXT("class"), Retargeter->GetClass()->GetName());
+    R->SetObjectField(TEXT("source"), RigToJson(Controller->GetIKRig(ERetargetSourceOrTarget::Source)));
+    R->SetObjectField(TEXT("target"), RigToJson(Controller->GetIKRig(ERetargetSourceOrTarget::Target)));
+    R->SetStringField(TEXT("source_preview_mesh"), AssetPathOrEmpty(Controller->GetPreviewMesh(ERetargetSourceOrTarget::Source)));
+    R->SetStringField(TEXT("target_preview_mesh"), AssetPathOrEmpty(Controller->GetPreviewMesh(ERetargetSourceOrTarget::Target)));
+    R->SetArrayField(TEXT("ops"), Ops);
+    R->SetNumberField(TEXT("op_count"), Ops.Num());
+    R->SetArrayField(TEXT("chain_mappings"), ChainMappings);
+    R->SetNumberField(TEXT("chain_mapping_count"), ChainMappings.Num());
+    R->SetObjectField(TEXT("source_poses"), PoseSideToJson(ERetargetSourceOrTarget::Source));
+    R->SetObjectField(TEXT("target_poses"), PoseSideToJson(ERetargetSourceOrTarget::Target));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.set_ik_retargeter_rigs
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome SetIKRetargeterRigsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UIKRetargeter* Retargeter = Cast<UIKRetargeter>(ResolveAsset(Path));
+    if (!Retargeter)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UIKRetargeter: %s"), *Path));
+    }
+    UIKRetargeterController* Controller = UIKRetargeterController::GetController(Retargeter);
+    if (!Controller)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("failed to get IK Retargeter controller"));
+    }
+
+    FString SourceRigPath, TargetRigPath, SourceMeshPath, TargetMeshPath;
+    UIKRigDefinition* SourceRig = nullptr;
+    UIKRigDefinition* TargetRig = nullptr;
+    if (Args->TryGetStringField(TEXT("source_ik_rig"), SourceRigPath) && !SourceRigPath.IsEmpty())
+    {
+        SourceRig = Cast<UIKRigDefinition>(ResolveAsset(SourceRigPath));
+        if (!SourceRig)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("not a source UIKRigDefinition: %s"), *SourceRigPath));
+        }
+    }
+    if (Args->TryGetStringField(TEXT("target_ik_rig"), TargetRigPath) && !TargetRigPath.IsEmpty())
+    {
+        TargetRig = Cast<UIKRigDefinition>(ResolveAsset(TargetRigPath));
+        if (!TargetRig)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("not a target UIKRigDefinition: %s"), *TargetRigPath));
+        }
+    }
+    USkeletalMesh* SourceMesh = nullptr;
+    USkeletalMesh* TargetMesh = nullptr;
+    if (Args->TryGetStringField(TEXT("source_preview_mesh"), SourceMeshPath) && !SourceMeshPath.IsEmpty())
+    {
+        SourceMesh = Cast<USkeletalMesh>(ResolveAsset(SourceMeshPath));
+        if (!SourceMesh)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("not a source USkeletalMesh: %s"), *SourceMeshPath));
+        }
+    }
+    if (Args->TryGetStringField(TEXT("target_preview_mesh"), TargetMeshPath) && !TargetMeshPath.IsEmpty())
+    {
+        TargetMesh = Cast<USkeletalMesh>(ResolveAsset(TargetMeshPath));
+        if (!TargetMesh)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("not a target USkeletalMesh: %s"), *TargetMeshPath));
+        }
+    }
+
+    bool bAddDefaultOps = true;
+    bool bAutoMap = true;
+    bool bForceRemap = true;
+    Args->TryGetBoolField(TEXT("add_default_ops"), bAddDefaultOps);
+    Args->TryGetBoolField(TEXT("auto_map"), bAutoMap);
+    Args->TryGetBoolField(TEXT("force_remap"), bForceRemap);
+    FString AutoMapTypeString = TEXT("fuzzy");
+    Args->TryGetStringField(TEXT("auto_map_type"), AutoMapTypeString);
+    EAutoMapChainType AutoMapType = EAutoMapChainType::Fuzzy;
+    if (AutoMapTypeString.Equals(TEXT("exact"), ESearchCase::IgnoreCase))
+    {
+        AutoMapType = EAutoMapChainType::Exact;
+    }
+    else if (AutoMapTypeString.Equals(TEXT("clear"), ESearchCase::IgnoreCase))
+    {
+        AutoMapType = EAutoMapChainType::Clear;
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageSetIKRetargeterRigs", "Sage: Set IK Retargeter Rigs"));
+    Retargeter->Modify();
+    if (SourceRig)
+    {
+        Controller->SetIKRig(ERetargetSourceOrTarget::Source, SourceRig);
+    }
+    if (TargetRig)
+    {
+        Controller->SetIKRig(ERetargetSourceOrTarget::Target, TargetRig);
+    }
+    if (SourceMesh)
+    {
+        Controller->SetPreviewMesh(ERetargetSourceOrTarget::Source, SourceMesh);
+    }
+    if (TargetMesh)
+    {
+        Controller->SetPreviewMesh(ERetargetSourceOrTarget::Target, TargetMesh);
+    }
+    if (bAddDefaultOps)
+    {
+        Controller->AddDefaultOps();
+    }
+    if (bAutoMap)
+    {
+        Controller->AutoMapChains(AutoMapType, bForceRemap);
+    }
+    Controller->CleanAsset();
+    Retargeter->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+    R->SetStringField(TEXT("source_ik_rig"), Controller->GetIKRig(ERetargetSourceOrTarget::Source)
+        ? Controller->GetIKRig(ERetargetSourceOrTarget::Source)->GetPathName() : FString());
+    R->SetStringField(TEXT("target_ik_rig"), Controller->GetIKRig(ERetargetSourceOrTarget::Target)
+        ? Controller->GetIKRig(ERetargetSourceOrTarget::Target)->GetPathName() : FString());
+    R->SetBoolField(TEXT("add_default_ops"), bAddDefaultOps);
+    R->SetBoolField(TEXT("auto_map"), bAutoMap);
+    R->SetBoolField(TEXT("force_remap"), bForceRemap);
+    R->SetBoolField(TEXT("modified"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.set_ik_retargeter_chain_mapping
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome SetIKRetargeterChainMappingImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, TargetChain, SourceChain, OpName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("target_chain"), TargetChain) || TargetChain.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'target_chain'"));
+    }
+    if (!Args->TryGetStringField(TEXT("source_chain"), SourceChain))
+    {
+        SourceChain = TEXT("None");
+    }
+    Args->TryGetStringField(TEXT("op_name"), OpName);
+
+    UIKRetargeter* Retargeter = Cast<UIKRetargeter>(ResolveAsset(Path));
+    if (!Retargeter)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UIKRetargeter: %s"), *Path));
+    }
+    UIKRetargeterController* Controller = UIKRetargeterController::GetController(Retargeter);
+    if (!Controller)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("failed to get IK Retargeter controller"));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageSetIKRetargeterChainMapping", "Sage: Set IK Retargeter Chain Mapping"));
+    Retargeter->Modify();
+    const bool bOk = Controller->SetSourceChain(FName(*SourceChain), FName(*TargetChain), FName(*OpName));
+    Retargeter->MarkPackageDirty();
+    if (!bOk)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("failed to map target chain '%s' to source chain '%s'"), *TargetChain, *SourceChain));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+    R->SetStringField(TEXT("target_chain"), TargetChain);
+    R->SetStringField(TEXT("source_chain"), Controller->GetSourceChain(FName(*TargetChain), FName(*OpName)).ToString());
+    R->SetStringField(TEXT("op_name"), OpName);
+    R->SetBoolField(TEXT("modified"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.set_ik_retargeter_pose
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome SetIKRetargeterPoseImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SideString, PoseName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("side"), SideString) || SideString.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'side'"));
+    }
+    ERetargetSourceOrTarget Side = ERetargetSourceOrTarget::Target;
+    if (!ParseRetargetSide(SideString, Side))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("side must be 'source' or 'target'"));
+    }
+    Args->TryGetStringField(TEXT("pose_name"), PoseName);
+
+    UIKRetargeter* Retargeter = Cast<UIKRetargeter>(ResolveAsset(Path));
+    if (!Retargeter)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UIKRetargeter: %s"), *Path));
+    }
+    UIKRetargeterController* Controller = UIKRetargeterController::GetController(Retargeter);
+    if (!Controller)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("failed to get IK Retargeter controller"));
+    }
+
+    bool bCreate = false;
+    bool bSetCurrent = true;
+    Args->TryGetBoolField(TEXT("create"), bCreate);
+    Args->TryGetBoolField(TEXT("current"), bSetCurrent);
+    FScopedTransaction Tx(LOCTEXT("SageSetIKRetargeterPose", "Sage: Set IK Retargeter Pose"));
+    Retargeter->Modify();
+    if (bCreate)
+    {
+        if (PoseName.IsEmpty())
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'pose_name' for create=true"));
+        }
+        PoseName = Controller->CreateRetargetPose(FName(*PoseName), Side).ToString();
+        bSetCurrent = true;
+    }
+    if (!PoseName.IsEmpty() && bSetCurrent)
+    {
+        if (!Controller->SetCurrentRetargetPose(FName(*PoseName), Side))
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("retarget pose not found: %s"), *PoseName));
+        }
+    }
+
+    FVector RootOffset;
+    if (ReadVectorArray(Args, TEXT("root_offset"), RootOffset))
+    {
+        Controller->SetRootOffsetInRetargetPose(RootOffset, Side);
+    }
+
+    int32 RotationCount = 0;
+    const TArray<TSharedPtr<FJsonValue>>* RotationValues = nullptr;
+    if (Args->TryGetArrayField(TEXT("bone_rotations"), RotationValues) && RotationValues)
+    {
+        for (const TSharedPtr<FJsonValue>& Value : *RotationValues)
+        {
+            const TSharedPtr<FJsonObject>* Obj = nullptr;
+            if (!Value.IsValid() || !Value->TryGetObject(Obj) || !Obj || !(*Obj).IsValid())
+            {
+                continue;
+            }
+            FString BoneName;
+            if (!(*Obj)->TryGetStringField(TEXT("bone"), BoneName) || BoneName.IsEmpty())
+            {
+                continue;
+            }
+            FQuat Rotation = FQuat::Identity;
+            FRotator Rotator;
+            if (!ReadQuatArray(*Obj, TEXT("quaternion"), Rotation))
+            {
+                if (ReadRotatorArray(*Obj, TEXT("rotation"), Rotator))
+                {
+                    Rotation = Rotator.Quaternion();
+                }
+            }
+            Controller->SetRotationOffsetForRetargetPoseBone(FName(*BoneName), Rotation, Side);
+            ++RotationCount;
+        }
+    }
+    Retargeter->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+    R->SetStringField(TEXT("side"), RetargetSideToString(Side));
+    R->SetStringField(TEXT("current_pose"), Controller->GetCurrentRetargetPoseName(Side).ToString());
+    R->SetField(TEXT("root_offset"), detail::Vec3ToJson(Controller->GetRootOffsetInRetargetPose(Side)));
+    R->SetNumberField(TEXT("bone_rotation_count"), RotationCount);
+    R->SetBoolField(TEXT("modified"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.retarget_animations
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome RetargetAnimationsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UIKRetargeter* Retargeter = Cast<UIKRetargeter>(ResolveAsset(Path));
+    if (!Retargeter)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UIKRetargeter: %s"), *Path));
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* AssetValues = nullptr;
+    if (!Args->TryGetArrayField(TEXT("assets"), AssetValues) || !AssetValues || AssetValues->Num() == 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing non-empty 'assets' array"));
+    }
+
+    TArray<TWeakObjectPtr<UObject>> AssetsToRetarget;
+    TArray<TSharedPtr<FJsonValue>> InputAssets;
+    for (const TSharedPtr<FJsonValue>& V : *AssetValues)
+    {
+        if (!V.IsValid() || V->Type != EJson::String) continue;
+        const FString AssetPath = V->AsString();
+        UObject* Asset = ResolveAsset(AssetPath);
+        if (!Asset)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("asset not found: %s"), *AssetPath));
+        }
+        AssetsToRetarget.Add(Asset);
+        InputAssets.Add(MakeShared<FJsonValueString>(Asset->GetPathName()));
+    }
+
+    FString SourceMeshPath, TargetMeshPath;
+    USkeletalMesh* SourceMesh = nullptr;
+    USkeletalMesh* TargetMesh = nullptr;
+    if (Args->TryGetStringField(TEXT("source_mesh"), SourceMeshPath) && !SourceMeshPath.IsEmpty())
+    {
+        SourceMesh = Cast<USkeletalMesh>(ResolveAsset(SourceMeshPath));
+        if (!SourceMesh)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("not a source USkeletalMesh: %s"), *SourceMeshPath));
+        }
+    }
+    if (Args->TryGetStringField(TEXT("target_mesh"), TargetMeshPath) && !TargetMeshPath.IsEmpty())
+    {
+        TargetMesh = Cast<USkeletalMesh>(ResolveAsset(TargetMeshPath));
+        if (!TargetMesh)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("not a target USkeletalMesh: %s"), *TargetMeshPath));
+        }
+    }
+
+    bool bDryRun = false;
+    bool bOverwrite = false;
+    bool bIncludeReferenced = true;
+    bool bUseSourcePath = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("overwrite"), bOverwrite);
+    Args->TryGetBoolField(TEXT("include_referenced_assets"), bIncludeReferenced);
+    Args->TryGetBoolField(TEXT("use_source_path"), bUseSourcePath);
+
+    FString DestinationPath = TEXT("/Game");
+    Args->TryGetStringField(TEXT("destination_path"), DestinationPath);
+    Args->TryGetStringField(TEXT("destination_package"), DestinationPath);
+    if (!DestinationPath.StartsWith(TEXT("/")))
+    {
+        DestinationPath = TEXT("/Game/") + DestinationPath;
+    }
+    DestinationPath.RemoveFromEnd(TEXT("/"));
+
+    EditorAnimUtils::FNameDuplicationRule NameRule;
+    Args->TryGetStringField(TEXT("prefix"), NameRule.Prefix);
+    Args->TryGetStringField(TEXT("suffix"), NameRule.Suffix);
+    Args->TryGetStringField(TEXT("search"), NameRule.ReplaceFrom);
+    Args->TryGetStringField(TEXT("replace"), NameRule.ReplaceTo);
+    NameRule.FolderPath = DestinationPath;
+
+    TArray<TSharedPtr<FJsonValue>> PlannedOutputs;
+    TArray<TSharedPtr<FJsonValue>> Conflicts;
+    for (TWeakObjectPtr<UObject> WeakAsset : AssetsToRetarget)
+    {
+        UObject* Asset = WeakAsset.Get();
+        if (!Asset) continue;
+        const FString Folder = bUseSourcePath
+            ? FPackageName::GetLongPackagePath(Asset->GetPathName())
+            : NameRule.FolderPath;
+        const FString NewName = NameRule.Rename(Asset);
+        const FString ObjectPath = Folder / NewName + TEXT(".") + NewName;
+        PlannedOutputs.Add(MakeShared<FJsonValueString>(ObjectPath));
+        if (!bOverwrite && ResolveAsset(ObjectPath))
+        {
+            auto Conflict = MakeShared<FJsonObject>();
+            Conflict->SetStringField(TEXT("object_path"), ObjectPath);
+            Conflict->SetStringField(TEXT("reason"), TEXT("exists_and_overwrite_false"));
+            Conflicts.Add(MakeShared<FJsonValueObject>(Conflict));
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+    R->SetArrayField(TEXT("input_assets"), InputAssets);
+    R->SetArrayField(TEXT("planned_outputs"), PlannedOutputs);
+    R->SetArrayField(TEXT("conflicts"), Conflicts);
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    R->SetBoolField(TEXT("overwrite"), bOverwrite);
+    R->SetStringField(TEXT("destination_path"), DestinationPath);
+    if (bDryRun)
+    {
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+    if (Conflicts.Num() > 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("retarget output conflicts exist; pass overwrite=true or choose another destination"));
+    }
+
+    IAssetRegistry& Registry = GetAssetRegistry();
+    TArray<FAssetData> BeforeAssets;
+    Registry.GetAssetsByPath(FName(*DestinationPath), BeforeAssets, true);
+    TSet<FName> BeforeObjectPaths;
+    for (const FAssetData& AssetData : BeforeAssets)
+    {
+        BeforeObjectPaths.Add(AssetData.GetObjectPathString().IsEmpty()
+            ? AssetData.PackageName
+            : FName(*AssetData.GetObjectPathString()));
+    }
+
+    FIKRetargetBatchOperationContext Context;
+    Context.AssetsToRetarget = AssetsToRetarget;
+    Context.SourceMesh = SourceMesh;
+    Context.TargetMesh = TargetMesh;
+    Context.IKRetargetAsset = Retargeter;
+    Context.NameRule = NameRule;
+    Context.bUseSourcePath = bUseSourcePath;
+    Context.bOverwriteExistingFiles = bOverwrite;
+    Context.bIncludeReferencedAssets = bIncludeReferenced;
+
+    UIKRetargetBatchOperation* Batch = NewObject<UIKRetargetBatchOperation>();
+    Batch->AddToRoot();
+    Batch->RunRetarget(Context);
+    Batch->RemoveFromRoot();
+
+    Registry.ScanPathsSynchronous({ DestinationPath }, true);
+    TArray<FAssetData> AfterAssets;
+    Registry.GetAssetsByPath(FName(*DestinationPath), AfterAssets, true);
+    TArray<TSharedPtr<FJsonValue>> CreatedAssets;
+    for (const FAssetData& AssetData : AfterAssets)
+    {
+        const FName ObjectPathName = AssetData.GetObjectPathString().IsEmpty()
+            ? AssetData.PackageName
+            : FName(*AssetData.GetObjectPathString());
+        if (!BeforeObjectPaths.Contains(ObjectPathName) || bOverwrite)
+        {
+            AppendAssetDataJson(AssetData, CreatedAssets);
+        }
+    }
+    R->SetBoolField(TEXT("modified"), true);
+    R->SetArrayField(TEXT("created_assets"), CreatedAssets);
+    R->SetNumberField(TEXT("created_asset_count"), CreatedAssets.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
 // animation.set_anim_blueprint_skeleton
 // ---------------------------------------------------------------------------
 
@@ -4127,14 +5791,405 @@ FSageToolDispatch::FOutcome SetAnimBlueprintSkeletonImpl(const TSharedPtr<FJsonO
 }
 
 // ---------------------------------------------------------------------------
+// animation.set_animation_asset_skeleton
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome SetAnimationAssetSkeletonImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    if (!Args.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing args"));
+    }
+
+    FString SkeletonPath;
+    if (!Args->TryGetStringField(TEXT("skeleton"), SkeletonPath) || SkeletonPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
+    }
+    USkeleton* Skeleton = Cast<USkeleton>(ResolveAsset(SkeletonPath));
+    if (!Skeleton)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("skeleton not found or not a USkeleton: %s"), *SkeletonPath));
+    }
+
+    bool bDryRun = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    bool bSave = true;
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    TSet<FString> AssetPaths;
+    auto AddAssetPath = [&AssetPaths](const FString& Raw)
+    {
+        if (!Raw.IsEmpty())
+        {
+            AssetPaths.Add(Raw);
+        }
+    };
+
+    FString SinglePath;
+    if (Args->TryGetStringField(TEXT("path"), SinglePath) && !SinglePath.IsEmpty())
+    {
+        UObject* MaybeAsset = ResolveAssetOrPackage(SinglePath);
+        if (Cast<UAnimationAsset>(MaybeAsset))
+        {
+            AddAssetPath(FSoftObjectPath(MaybeAsset).ToString());
+        }
+        else
+        {
+            FARFilter Filter;
+            Filter.PackagePaths.Add(FName(*PackagePathForObjectPath(SinglePath)));
+            Filter.bRecursivePaths = true;
+            Filter.bRecursiveClasses = true;
+            Filter.ClassPaths.Add(UAnimationAsset::StaticClass()->GetClassPathName());
+            FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+            TArray<FAssetData> Found;
+            ARM.Get().ScanPathsSynchronous({ PackagePathForObjectPath(SinglePath) }, /*bForceRescan=*/true);
+            ARM.Get().GetAssets(Filter, Found);
+            for (const FAssetData& Data : Found)
+            {
+                AddAssetPath(Data.GetSoftObjectPath().ToString());
+            }
+        }
+    }
+
+    FString Directory;
+    if ((Args->TryGetStringField(TEXT("directory"), Directory)
+            || Args->TryGetStringField(TEXT("folder"), Directory))
+        && !Directory.IsEmpty())
+    {
+        FARFilter Filter;
+        Filter.PackagePaths.Add(FName(*PackagePathForObjectPath(Directory)));
+        Filter.bRecursivePaths = true;
+        Filter.bRecursiveClasses = true;
+        Filter.ClassPaths.Add(UAnimationAsset::StaticClass()->GetClassPathName());
+        FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+        TArray<FAssetData> Found;
+        ARM.Get().ScanPathsSynchronous({ PackagePathForObjectPath(Directory) }, /*bForceRescan=*/true);
+        ARM.Get().GetAssets(Filter, Found);
+        for (const FAssetData& Data : Found)
+        {
+            AddAssetPath(Data.GetSoftObjectPath().ToString());
+        }
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* AssetsArray = nullptr;
+    if (Args->TryGetArrayField(TEXT("assets"), AssetsArray) && AssetsArray)
+    {
+        for (const TSharedPtr<FJsonValue>& Value : *AssetsArray)
+        {
+            AddAssetPath(Value.IsValid() ? Value->AsString() : FString());
+        }
+    }
+
+    if (AssetPaths.Num() == 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing animation asset target: pass path, directory/folder, or assets[]"));
+    }
+
+    UEditorAssetSubsystem* AssetSubsystem = GEditor
+        ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>()
+        : nullptr;
+    if (bSave && !AssetSubsystem)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("EditorAssetSubsystem unavailable for saving animation skeleton assignments"));
+    }
+
+    TArray<FString> SortedPaths;
+    for (const FString& Path : AssetPaths)
+    {
+        SortedPaths.Add(Path);
+    }
+    SortedPaths.Sort();
+
+    TArray<TSharedPtr<FJsonValue>> Repaired;
+    TArray<TSharedPtr<FJsonValue>> AlreadyValid;
+    TArray<TSharedPtr<FJsonValue>> Failed;
+    int32 ModifiedCount = 0;
+    int32 SavedCount = 0;
+
+    FScopedTransaction Tx(LOCTEXT("SetAnimationAssetSkeleton", "Set Animation Asset Skeleton"));
+    for (const FString& AssetPath : SortedPaths)
+    {
+        auto Row = MakeShared<FJsonObject>();
+        Row->SetStringField(TEXT("asset"), AssetPath);
+        Row->SetStringField(TEXT("requested_skeleton"), Skeleton->GetPathName());
+
+        UAnimationAsset* Anim = Cast<UAnimationAsset>(ResolveAssetOrPackage(AssetPath));
+        if (!Anim)
+        {
+            Row->SetStringField(TEXT("reason"), TEXT("not a UAnimationAsset or asset could not be loaded"));
+            Failed.Add(MakeShared<FJsonValueObject>(Row));
+            continue;
+        }
+
+        USkeleton* Before = Anim->GetSkeleton();
+        Row->SetStringField(TEXT("class"), Anim->GetClass()->GetName());
+        Row->SetStringField(TEXT("before_skeleton"), Before ? Before->GetPathName() : FString());
+        const bool bAlready = Before == Skeleton;
+        Row->SetBoolField(TEXT("already_valid"), bAlready);
+        if (bAlready)
+        {
+            Row->SetStringField(TEXT("after_skeleton"), Skeleton->GetPathName());
+            AlreadyValid.Add(MakeShared<FJsonValueObject>(Row));
+            continue;
+        }
+
+        if (!bDryRun)
+        {
+            FProperty* SkeletonProperty = Anim->GetClass()->FindPropertyByName(FName(TEXT("Skeleton")));
+            Anim->Modify();
+            if (SkeletonProperty)
+            {
+                Anim->PreEditChange(SkeletonProperty);
+            }
+            Anim->SetSkeleton(Skeleton);
+            if (SkeletonProperty)
+            {
+                FPropertyChangedEvent ChangeEvent(SkeletonProperty, EPropertyChangeType::ValueSet);
+                Anim->PostEditChangeProperty(ChangeEvent);
+            }
+            else
+            {
+                Anim->PostEditChange();
+            }
+            Anim->MarkPackageDirty();
+            ++ModifiedCount;
+            if (bSave && AssetSubsystem)
+            {
+                const FString Package = PackagePathForObjectPath(FSoftObjectPath(Anim).ToString());
+                const bool bSaved = AssetSubsystem->SaveAsset(Package, /*bOnlyIfIsDirty=*/false);
+                Row->SetBoolField(TEXT("saved"), bSaved);
+                if (bSaved)
+                {
+                    ++SavedCount;
+                }
+            }
+        }
+
+        USkeleton* After = bDryRun ? Skeleton : Anim->GetSkeleton();
+        Row->SetStringField(TEXT("after_skeleton"), After ? After->GetPathName() : FString());
+        Row->SetBoolField(TEXT("dry_run"), bDryRun);
+        Row->SetBoolField(TEXT("repaired"), !bDryRun && After == Skeleton);
+        if (bDryRun || After == Skeleton)
+        {
+            Repaired.Add(MakeShared<FJsonValueObject>(Row));
+        }
+        else
+        {
+            Row->SetStringField(TEXT("reason"), TEXT("UAnimationAsset::SetSkeleton did not persist on readback"));
+            Failed.Add(MakeShared<FJsonValueObject>(Row));
+        }
+    }
+
+    if (Failed.Num() > 0)
+    {
+        Tx.Cancel();
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    R->SetBoolField(TEXT("save"), bSave);
+    R->SetArrayField(TEXT("repaired_assets"), Repaired);
+    R->SetArrayField(TEXT("already_valid_assets"), AlreadyValid);
+    R->SetArrayField(TEXT("failed_assets"), Failed);
+    R->SetNumberField(TEXT("repaired_count"), Repaired.Num());
+    R->SetNumberField(TEXT("already_valid_count"), AlreadyValid.Num());
+    R->SetNumberField(TEXT("failed_count"), Failed.Num());
+    R->SetNumberField(TEXT("modified_count"), ModifiedCount);
+    R->SetNumberField(TEXT("saved_count"), SavedCount);
+    R->SetNumberField(TEXT("target_count"), SortedPaths.Num());
+    R->SetBoolField(TEXT("success"), Failed.Num() == 0);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
 // animation.bake_root_motion_from_bone
 // ---------------------------------------------------------------------------
 
 FSageToolDispatch::FOutcome BakeRootMotionFromBoneImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32000,
-        TEXT("[NOT IMPLEMENTED] animation.bake_root_motion_from_bone — use editor.run_python "
-             "with FBakingAnimationKeyHelper or open the sequence in Persona"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SourceBone, RootBoneName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("bone"), SourceBone) || SourceBone.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("source_bone"), SourceBone);
+    }
+    if (SourceBone.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'bone'"));
+    }
+
+    UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(Path));
+    if (!Seq)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimSequence: %s"), *Path));
+    }
+    USkeleton* Skel = Seq->GetSkeleton();
+    const IAnimationDataModel* Model = Seq->GetDataModel();
+    if (!Skel || !Model)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("sequence has no skeleton/data model"));
+    }
+
+    const FReferenceSkeleton& RefSkel = Skel->GetReferenceSkeleton();
+    if (RefSkel.GetNum() == 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("skeleton has no reference bones"));
+    }
+    Args->TryGetStringField(TEXT("root_bone"), RootBoneName);
+    if (RootBoneName.IsEmpty())
+    {
+        RootBoneName = RefSkel.GetBoneName(0).ToString();
+    }
+
+    const FName SourceBoneF(*SourceBone);
+    const FName RootBoneF(*RootBoneName);
+    if (RefSkel.FindBoneIndex(SourceBoneF) == INDEX_NONE)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("source bone '%s' not found in skeleton"), *SourceBone));
+    }
+    const int32 RootBoneIndex = RefSkel.FindBoneIndex(RootBoneF);
+    if (RootBoneIndex == INDEX_NONE)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("root bone '%s' not found in skeleton"), *RootBoneName));
+    }
+    if (!Model->IsValidBoneTrackName(SourceBoneF))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("AnimSequence has no animated track for source bone '%s'"), *SourceBone));
+    }
+
+    bool bDryRun = false;
+    bool bConfirmed = false;
+    bool bRelative = true;
+    bool bEnableRootMotion = true;
+    bool bZeroSourceTranslation = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    Args->TryGetBoolField(TEXT("relative"), bRelative);
+    Args->TryGetBoolField(TEXT("enable_root_motion"), bEnableRootMotion);
+    Args->TryGetBoolField(TEXT("zero_source_translation"), bZeroSourceTranslation);
+    if (!bDryRun && !bConfirmed)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("bake_root_motion_from_bone requires confirmed=true unless dry_run=true"));
+    }
+
+    TArray<FTransform> SourceTransforms;
+    TArray<FTransform> ExistingRootTransforms;
+    Model->GetBoneTrackTransforms(SourceBoneF, SourceTransforms);
+    Model->GetBoneTrackTransforms(RootBoneF, ExistingRootTransforms);
+    if (SourceTransforms.Num() == 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("source bone track has no keys"));
+    }
+
+    const FTransform RefRoot = RefSkel.GetRefBonePose().IsValidIndex(RootBoneIndex)
+        ? RefSkel.GetRefBonePose()[RootBoneIndex]
+        : FTransform::Identity;
+    const FTransform SourceBase = SourceTransforms[0];
+
+    TArray<FVector> RootPositions;
+    TArray<FQuat> RootRotations;
+    TArray<FVector> RootScales;
+    TArray<FVector> SourcePositions;
+    TArray<FQuat> SourceRotations;
+    TArray<FVector> SourceScales;
+    RootPositions.Reserve(SourceTransforms.Num());
+    RootRotations.Reserve(SourceTransforms.Num());
+    RootScales.Reserve(SourceTransforms.Num());
+    SourcePositions.Reserve(SourceTransforms.Num());
+    SourceRotations.Reserve(SourceTransforms.Num());
+    SourceScales.Reserve(SourceTransforms.Num());
+
+    for (int32 I = 0; I < SourceTransforms.Num(); ++I)
+    {
+        const FTransform ExistingRoot = ExistingRootTransforms.IsValidIndex(I) ? ExistingRootTransforms[I] : RefRoot;
+        FTransform Baked = bRelative
+            ? SourceTransforms[I].GetRelativeTransform(SourceBase)
+            : SourceTransforms[I];
+        Baked.SetScale3D(ExistingRoot.GetScale3D());
+
+        RootPositions.Add(Baked.GetTranslation());
+        RootRotations.Add(Baked.GetRotation());
+        RootScales.Add(Baked.GetScale3D());
+
+        FTransform SourceOut = SourceTransforms[I];
+        if (bZeroSourceTranslation)
+        {
+            SourceOut.SetTranslation(FVector::ZeroVector);
+        }
+        SourcePositions.Add(SourceOut.GetTranslation());
+        SourceRotations.Add(SourceOut.GetRotation());
+        SourceScales.Add(SourceOut.GetScale3D());
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Seq->GetPathName());
+    R->SetStringField(TEXT("source_bone"), SourceBone);
+    R->SetStringField(TEXT("root_bone"), RootBoneName);
+    R->SetNumberField(TEXT("key_count"), SourceTransforms.Num());
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    R->SetBoolField(TEXT("relative"), bRelative);
+    R->SetBoolField(TEXT("zero_source_translation"), bZeroSourceTranslation);
+    R->SetField(TEXT("first_source_transform"), TransformToJsonValue(SourceTransforms[0]));
+    R->SetField(TEXT("last_source_transform"), TransformToJsonValue(SourceTransforms.Last()));
+    if (bDryRun)
+    {
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    IAnimationDataController& Controller = Seq->GetController();
+    {
+        IAnimationDataController::FScopedBracket Bracket(&Controller,
+            LOCTEXT("SageBakeRootMotion", "Sage: Bake Root Motion From Bone"));
+        Seq->Modify();
+        if (!Model->IsValidBoneTrackName(RootBoneF))
+        {
+            Controller.AddBoneCurve(RootBoneF, false);
+        }
+        if (!Controller.SetBoneTrackKeys(RootBoneF, RootPositions, RootRotations, RootScales, false))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("failed to write root bone track"));
+        }
+        if (bZeroSourceTranslation)
+        {
+            if (!Controller.SetBoneTrackKeys(SourceBoneF, SourcePositions, SourceRotations, SourceScales, false))
+            {
+                return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("failed to update source bone track"));
+            }
+        }
+    }
+
+    if (bEnableRootMotion)
+    {
+        Seq->bEnableRootMotion = true;
+    }
+    Seq->RefreshCacheData();
+    Seq->MarkPackageDirty();
+
+    R->SetBoolField(TEXT("modified"), true);
+    R->SetBoolField(TEXT("root_motion_enabled"), Seq->bEnableRootMotion);
+    AddAnimSequenceTrackReadback(R, Seq, RootBoneName, 0, RootPositions.Num() - 1);
+    AddRootMotionSummary(R, Seq);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ---------------------------------------------------------------------------
@@ -4191,9 +6246,50 @@ FSageToolDispatch::FOutcome CreatePoseSearchDatabaseImpl(const TSharedPtr<FJsonO
 
 FSageToolDispatch::FOutcome SetPoseSearchSchemaImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32000,
-        TEXT("[NOT IMPLEMENTED] animation.set_pose_search_schema — PoseSearch plugin required; "
-             "use editor.run_python with PoseSearchEditor / Motion Matching API"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SchemaPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("schema"), SchemaPath) || SchemaPath.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("schema_path"), SchemaPath);
+    }
+    if (SchemaPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'schema'"));
+    }
+
+    UObject* DB = ResolveAsset(Path);
+    if (!DB || !DB->GetClass()->GetPathName().Contains(TEXT("PoseSearchDatabase")))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a PoseSearchDatabase: %s"), *Path));
+    }
+
+    UObject* Schema = nullptr;
+    FString Error;
+    if (!ResolveExpectedObject(SchemaPath, TEXT("/Script/PoseSearch.PoseSearchSchema"), Schema, Error))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageSetPoseSearchSchema", "Sage: Set PoseSearch Schema"));
+    DB->Modify();
+    if (!SetReflectedProperty(DB, TEXT("Schema"), JsonStringValue(SchemaPath)))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("failed to set PoseSearch Schema property"));
+    }
+    DB->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), DB->GetPathName());
+    R->SetStringField(TEXT("schema"), Schema ? Schema->GetPathName() : FString());
+    R->SetBoolField(TEXT("modified"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ---------------------------------------------------------------------------
@@ -4202,9 +6298,96 @@ FSageToolDispatch::FOutcome SetPoseSearchSchemaImpl(const TSharedPtr<FJsonObject
 
 FSageToolDispatch::FOutcome AddPoseSearchSequenceImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32000,
-        TEXT("[NOT IMPLEMENTED] animation.add_pose_search_sequence — PoseSearch plugin required; "
-             "use editor.run_python with PoseSearchEditor API"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SequencePath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("sequence"), SequencePath) || SequencePath.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("sequence_path"), SequencePath);
+    }
+    if (SequencePath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'sequence'"));
+    }
+
+    UObject* DB = ResolveAsset(Path);
+    if (!DB || !DB->GetClass()->GetPathName().Contains(TEXT("PoseSearchDatabase")))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a PoseSearchDatabase: %s"), *Path));
+    }
+    UObject* Sequence = ResolveAsset(SequencePath);
+    if (!Sequence || !Sequence->IsA<UAnimationAsset>())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimationAsset: %s"), *SequencePath));
+    }
+
+    FArrayProperty* AssetsProp = FindFProperty<FArrayProperty>(DB->GetClass(), TEXT("DatabaseAnimationAssets"));
+    FStructProperty* EntryStruct = AssetsProp ? CastField<FStructProperty>(AssetsProp->Inner) : nullptr;
+    if (!AssetsProp || !EntryStruct)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("PoseSearch DatabaseAnimationAssets property not found"));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageAddPoseSearchSequence", "Sage: Add PoseSearch Sequence"));
+    DB->Modify();
+    FScriptArrayHelper Helper(AssetsProp, AssetsProp->ContainerPtrToValuePtr<void>(DB));
+    const int32 ExistingCount = Helper.Num();
+    int32 ExistingIndex = INDEX_NONE;
+    FProperty* AnimAssetField = EntryStruct->Struct->FindPropertyByName(FName(TEXT("AnimAsset")));
+    for (int32 Index = 0; Index < ExistingCount; ++Index)
+    {
+        void* Entry = Helper.GetRawPtr(Index);
+        if (AnimAssetField)
+        {
+            TSharedPtr<FJsonValue> Existing = detail::GetPropertyValueAtPtr(
+                AnimAssetField, AnimAssetField->ContainerPtrToValuePtr<void>(Entry));
+            if (Existing.IsValid() && Existing->Type == EJson::String && Existing->AsString() == Sequence->GetPathName())
+            {
+                ExistingIndex = Index;
+                break;
+            }
+        }
+    }
+
+    int32 EntryIndex = ExistingIndex;
+    bool bAdded = false;
+    if (EntryIndex == INDEX_NONE)
+    {
+        EntryIndex = Helper.AddValue();
+        EntryStruct->InitializeValue(Helper.GetRawPtr(EntryIndex));
+        bAdded = true;
+    }
+
+    void* Entry = Helper.GetRawPtr(EntryIndex);
+    if (!SetStructField(EntryStruct->Struct, Entry, TEXT("AnimAsset"), JsonStringValue(Sequence->GetPathName())))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("failed to set PoseSearch AnimAsset field"));
+    }
+
+    bool bEnabled = true;
+    if (Args->TryGetBoolField(TEXT("enabled"), bEnabled))
+    {
+        SetStructField(EntryStruct->Struct, Entry, TEXT("bEnabled"), JsonBoolValue(bEnabled));
+    }
+
+    NotifyObjectPropertyChanged(DB, AssetsProp);
+    DB->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), DB->GetPathName());
+    R->SetStringField(TEXT("sequence"), Sequence->GetPathName());
+    R->SetNumberField(TEXT("index"), EntryIndex);
+    R->SetBoolField(TEXT("added"), bAdded);
+    R->SetNumberField(TEXT("count"), Helper.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ---------------------------------------------------------------------------
@@ -4213,9 +6396,33 @@ FSageToolDispatch::FOutcome AddPoseSearchSequenceImpl(const TSharedPtr<FJsonObje
 
 FSageToolDispatch::FOutcome BuildPoseSearchIndexImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32000,
-        TEXT("[NOT IMPLEMENTED] animation.build_pose_search_index — PoseSearch plugin required; "
-             "use editor.run_python with PoseSearchEditor build pipeline"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+
+    UObject* DB = ResolveAsset(Path);
+    if (!DB || !DB->GetClass()->GetPathName().Contains(TEXT("PoseSearchDatabase")))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a PoseSearchDatabase: %s"), *Path));
+    }
+
+    DB->Modify();
+    DB->PostEditChange();
+    DB->BeginCacheForCookedPlatformData(nullptr);
+    DB->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), DB->GetPathName());
+    R->SetBoolField(TEXT("build_requested"), true);
+    R->SetBoolField(TEXT("cache_loaded"), DB->IsCachedCookedPlatformDataLoaded(nullptr));
+    R->SetStringField(TEXT("note"), TEXT("PoseSearch derived-data rebuild requested through UObject cooked-platform cache API"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ---------------------------------------------------------------------------
@@ -4415,6 +6622,200 @@ int32 FindOptionalPinIndexForProperty(const UAnimGraphNode_Base* AnimNode, FName
         }
     }
     return INDEX_NONE;
+}
+
+TArray<FOptionalPinFromProperty>* GetCustomPinProperties(UAnimGraphNode_Base* AnimNode)
+{
+    UAnimGraphNode_CustomProperty* CustomNode = Cast<UAnimGraphNode_CustomProperty>(AnimNode);
+    if (!CustomNode) return nullptr;
+
+    FArrayProperty* CustomPinsProp = FindFProperty<FArrayProperty>(
+        UAnimGraphNode_CustomProperty::StaticClass(), TEXT("CustomPinProperties"));
+    if (!CustomPinsProp)
+    {
+        return nullptr;
+    }
+    return CustomPinsProp->ContainerPtrToValuePtr<TArray<FOptionalPinFromProperty>>(CustomNode);
+}
+
+const TArray<FOptionalPinFromProperty>* GetCustomPinProperties(const UAnimGraphNode_Base* AnimNode)
+{
+    return GetCustomPinProperties(const_cast<UAnimGraphNode_Base*>(AnimNode));
+}
+
+bool IsPropertyOnAnimNodeStruct(const UAnimGraphNode_Base* AnimNode, const FProperty* Property)
+{
+    if (!AnimNode || !Property) return false;
+
+    const FStructProperty* NodeStructProperty = AnimNode->GetFNodeProperty();
+    const UScriptStruct* OwnerStruct = Property->GetOwner<UScriptStruct>();
+    return NodeStructProperty && NodeStructProperty->Struct && OwnerStruct
+        && NodeStructProperty->Struct->IsChildOf(OwnerStruct);
+}
+
+struct FResolvedAnimNodePinBinding
+{
+    FName PinName = NAME_None;
+    FName BindingName = NAME_None;
+    FProperty* PinProperty = nullptr;
+    int32 OptionalPinIndex = INDEX_NONE;
+    bool bOptionalPin = false;
+    bool bCustomPropertyPin = false;
+    bool bPinVisible = false;
+};
+
+bool ResolveAnimNodePinBinding(const UAnimGraphNode_Base* AnimNode,
+                               FName PinName,
+                               FResolvedAnimNodePinBinding& OutInfo)
+{
+    OutInfo = FResolvedAnimNodePinBinding();
+    OutInfo.PinName = PinName;
+    if (!AnimNode || PinName == NAME_None)
+    {
+        return false;
+    }
+
+    FProperty* PinProperty = AnimNode->GetPinProperty(PinName);
+    if (!PinProperty)
+    {
+        return false;
+    }
+
+    OutInfo.PinProperty = PinProperty;
+    OutInfo.bCustomPropertyPin =
+        AnimNode->IsA<UAnimGraphNode_CustomProperty>()
+        && !IsPropertyOnAnimNodeStruct(AnimNode, PinProperty);
+
+    if (OutInfo.bCustomPropertyPin)
+    {
+        const UAnimGraphNode_CustomProperty* CustomNode =
+            Cast<UAnimGraphNode_CustomProperty>(AnimNode);
+        OutInfo.BindingName = CustomNode
+            ? FName(*CustomNode->GetPinTargetVariableName(PinName))
+            : PinName;
+
+        const TArray<FOptionalPinFromProperty>* CustomPins = GetCustomPinProperties(AnimNode);
+        if (CustomPins)
+        {
+            OutInfo.OptionalPinIndex = CustomPins->IndexOfByPredicate(
+                [PinName](const FOptionalPinFromProperty& OptionalPin)
+                {
+                    return OptionalPin.PropertyName == PinName;
+                });
+        }
+        OutInfo.bOptionalPin = OutInfo.OptionalPinIndex != INDEX_NONE;
+        OutInfo.bPinVisible =
+            CustomPins && CustomPins->IsValidIndex(OutInfo.OptionalPinIndex)
+                ? (*CustomPins)[OutInfo.OptionalPinIndex].bShowPin
+                : AnimNode->FindPin(PinName, EGPD_Input) != nullptr;
+        return true;
+    }
+
+    OutInfo.BindingName = PinName;
+    OutInfo.OptionalPinIndex = FindOptionalPinIndexForProperty(AnimNode, PinName);
+    OutInfo.bOptionalPin = OutInfo.OptionalPinIndex != INDEX_NONE;
+    OutInfo.bPinVisible =
+        AnimNode->ShowPinForProperties.IsValidIndex(OutInfo.OptionalPinIndex)
+            ? AnimNode->ShowPinForProperties[OutInfo.OptionalPinIndex].bShowPin
+            : AnimNode->FindPin(PinName, EGPD_Input) != nullptr;
+    return true;
+}
+
+bool SetResolvedAnimNodePinVisible(UAnimGraphNode_Base* AnimNode,
+                                   const FResolvedAnimNodePinBinding& PinInfo,
+                                   bool bReconstruct)
+{
+    if (!AnimNode || !PinInfo.bOptionalPin || PinInfo.OptionalPinIndex == INDEX_NONE)
+    {
+        return false;
+    }
+
+    if (PinInfo.bCustomPropertyPin)
+    {
+        TArray<FOptionalPinFromProperty>* CustomPins = GetCustomPinProperties(AnimNode);
+        if (!CustomPins || !CustomPins->IsValidIndex(PinInfo.OptionalPinIndex))
+        {
+            return false;
+        }
+
+        FOptionalPinFromProperty& OptionalPin = (*CustomPins)[PinInfo.OptionalPinIndex];
+        if (OptionalPin.bShowPin)
+        {
+            return false;
+        }
+
+        AnimNode->Modify();
+        OptionalPin.bShowPin = true;
+        if (bReconstruct)
+        {
+            AnimNode->ReconstructNode();
+        }
+        return true;
+    }
+
+    if (!AnimNode->ShowPinForProperties.IsValidIndex(PinInfo.OptionalPinIndex)
+        || AnimNode->ShowPinForProperties[PinInfo.OptionalPinIndex].bShowPin)
+    {
+        return false;
+    }
+
+    AnimNode->SetPinVisibility(/*bInVisible=*/true, PinInfo.OptionalPinIndex);
+    return true;
+}
+
+void ExposeAllCustomPropertyPins(UAnimGraphNode_Base* AnimNode,
+                                 TArray<FName>& OutVisiblePins,
+                                 TArray<FName>& OutNewlyExposedPins)
+{
+    OutVisiblePins.Reset();
+    OutNewlyExposedPins.Reset();
+
+    TArray<FOptionalPinFromProperty>* CustomPins = GetCustomPinProperties(AnimNode);
+    if (!AnimNode || !CustomPins)
+    {
+        return;
+    }
+
+    bool bChanged = false;
+    for (int32 Index = 0; Index < CustomPins->Num(); ++Index)
+    {
+        FOptionalPinFromProperty& OptionalPin = (*CustomPins)[Index];
+        if (OptionalPin.PropertyName == NAME_None)
+        {
+            continue;
+        }
+
+        FResolvedAnimNodePinBinding PinInfo;
+        if (!ResolveAnimNodePinBinding(AnimNode, OptionalPin.PropertyName, PinInfo)
+            || !PinInfo.bCustomPropertyPin)
+        {
+            continue;
+        }
+
+        OutVisiblePins.Add(OptionalPin.PropertyName);
+        if (!OptionalPin.bShowPin)
+        {
+            OptionalPin.bShowPin = true;
+            OutNewlyExposedPins.Add(OptionalPin.PropertyName);
+            bChanged = true;
+        }
+    }
+
+    if (bChanged)
+    {
+        AnimNode->Modify();
+        AnimNode->ReconstructNode();
+    }
+}
+
+TArray<TSharedPtr<FJsonValue>> NamesToJsonArray(const TArray<FName>& Names)
+{
+    TArray<TSharedPtr<FJsonValue>> Arr;
+    for (const FName& Name : Names)
+    {
+        Arr.Add(MakeShared<FJsonValueString>(Name.ToString()));
+    }
+    return Arr;
 }
 
 UObject* GetAnimNodeBindingObject(const UAnimGraphNode_Base* AnimNode)
@@ -4729,6 +7130,7 @@ bool ResolveBindingLeafProperty(const UAnimBlueprint* AnimBP,
 
 bool BuildAnimNodePropertyBinding(UAnimBlueprint* AnimBP,
                                   UAnimGraphNode_Base* AnimNode,
+                                  FName PinName,
                                   FName BindingName,
                                   const TArray<FString>& BindingPath,
                                   FAnimGraphNodePropertyBinding& OutBinding,
@@ -4742,11 +7144,11 @@ bool BuildAnimNodePropertyBinding(UAnimBlueprint* AnimBP,
         return false;
     }
 
-    FProperty* TargetProperty = AnimNode->GetPinProperty(BindingName);
+    FProperty* TargetProperty = AnimNode->GetPinProperty(PinName);
     if (!TargetProperty)
     {
         OutError = FString::Printf(TEXT("property '%s' is not an AnimGraph input pin property on %s"),
-                                   *BindingName.ToString(), *AnimNode->GetClass()->GetName());
+                                   *PinName.ToString(), *AnimNode->GetClass()->GetName());
         return false;
     }
 
@@ -4895,24 +7297,43 @@ TSharedPtr<FJsonObject> AnimNodePropertyToJson(UAnimGraphNode_Base* AnimNode,
     }
 
     const FName PropertyName = Property->GetFName();
-    const int32 OptionalIndex = FindOptionalPinIndexForProperty(AnimNode, PropertyName);
+    FResolvedAnimNodePinBinding PinInfo;
+    const bool bHasPinInfo = ResolveAnimNodePinBinding(AnimNode, PropertyName, PinInfo);
+    const FName BindingName = bHasPinInfo ? PinInfo.BindingName : PropertyName;
+    const int32 OptionalIndex = bHasPinInfo
+        ? PinInfo.OptionalPinIndex
+        : FindOptionalPinIndexForProperty(AnimNode, PropertyName);
     const UEdGraphPin* Pin = AnimNode->FindPin(PropertyName);
     const void* ValuePtr = Container ? Property->ContainerPtrToValuePtr<void>(Container) : nullptr;
 
     Obj->SetBoolField(TEXT("valid"), true);
     Obj->SetStringField(TEXT("name"), PropertyName.ToString());
+    Obj->SetStringField(TEXT("binding_name"), BindingName.ToString());
     Obj->SetStringField(TEXT("cpp_type"), Property->GetCPPType());
     Obj->SetStringField(TEXT("property_class"), Property->GetClass()->GetName());
     Obj->SetStringField(TEXT("value_text"), ExportPropertyValueText(Property, Container));
     Obj->SetBoolField(TEXT("has_pin"), Pin != nullptr);
-    Obj->SetBoolField(TEXT("has_binding"), AnimNode->HasBinding(PropertyName));
+    Obj->SetBoolField(TEXT("has_binding"), AnimNode->HasBinding(BindingName));
     Obj->SetNumberField(TEXT("optional_pin_index"), OptionalIndex);
     Obj->SetBoolField(TEXT("optional_pin"), OptionalIndex != INDEX_NONE);
     if (OptionalIndex != INDEX_NONE)
     {
-        const FOptionalPinFromProperty& OptionalPin = AnimNode->ShowPinForProperties[OptionalIndex];
-        Obj->SetBoolField(TEXT("pin_visible"), OptionalPin.bShowPin);
-        Obj->SetBoolField(TEXT("can_toggle_visibility"), OptionalPin.bCanToggleVisibility);
+        if (PinInfo.bCustomPropertyPin)
+        {
+            const TArray<FOptionalPinFromProperty>* CustomPins = GetCustomPinProperties(AnimNode);
+            if (CustomPins && CustomPins->IsValidIndex(OptionalIndex))
+            {
+                const FOptionalPinFromProperty& OptionalPin = (*CustomPins)[OptionalIndex];
+                Obj->SetBoolField(TEXT("pin_visible"), OptionalPin.bShowPin);
+                Obj->SetBoolField(TEXT("can_toggle_visibility"), OptionalPin.bCanToggleVisibility);
+            }
+        }
+        else if (AnimNode->ShowPinForProperties.IsValidIndex(OptionalIndex))
+        {
+            const FOptionalPinFromProperty& OptionalPin = AnimNode->ShowPinForProperties[OptionalIndex];
+            Obj->SetBoolField(TEXT("pin_visible"), OptionalPin.bShowPin);
+            Obj->SetBoolField(TEXT("can_toggle_visibility"), OptionalPin.bCanToggleVisibility);
+        }
     }
     if (Pin)
     {
@@ -4926,6 +7347,54 @@ TSharedPtr<FJsonObject> AnimNodePropertyToJson(UAnimGraphNode_Base* AnimNode,
         }
     }
     return Obj;
+}
+
+void AppendCustomAnimNodePropertiesToJson(UAnimGraphNode_Base* AnimNode,
+                                          TArray<TSharedPtr<FJsonValue>>& Properties)
+{
+    const TArray<FOptionalPinFromProperty>* CustomPins = GetCustomPinProperties(AnimNode);
+    if (!AnimNode || !CustomPins)
+    {
+        return;
+    }
+
+    for (int32 Index = 0; Index < CustomPins->Num(); ++Index)
+    {
+        const FOptionalPinFromProperty& OptionalPin = (*CustomPins)[Index];
+        if (OptionalPin.PropertyName == NAME_None)
+        {
+            continue;
+        }
+
+        FResolvedAnimNodePinBinding PinInfo;
+        if (!ResolveAnimNodePinBinding(AnimNode, OptionalPin.PropertyName, PinInfo)
+            || !PinInfo.bCustomPropertyPin
+            || !PinInfo.PinProperty)
+        {
+            continue;
+        }
+
+        const UEdGraphPin* Pin = AnimNode->FindPin(OptionalPin.PropertyName);
+        TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+        Obj->SetBoolField(TEXT("valid"), true);
+        Obj->SetBoolField(TEXT("custom_property"), true);
+        Obj->SetStringField(TEXT("name"), OptionalPin.PropertyName.ToString());
+        Obj->SetStringField(TEXT("binding_name"), PinInfo.BindingName.ToString());
+        Obj->SetStringField(TEXT("cpp_type"), PinInfo.PinProperty->GetCPPType());
+        Obj->SetStringField(TEXT("property_class"), PinInfo.PinProperty->GetClass()->GetName());
+        Obj->SetStringField(TEXT("value_text"), Pin ? Pin->DefaultValue : FString());
+        Obj->SetBoolField(TEXT("has_pin"), Pin != nullptr);
+        Obj->SetBoolField(TEXT("has_binding"), AnimNode->HasBinding(PinInfo.BindingName));
+        Obj->SetNumberField(TEXT("optional_pin_index"), PinInfo.OptionalPinIndex);
+        Obj->SetBoolField(TEXT("optional_pin"), true);
+        Obj->SetBoolField(TEXT("pin_visible"), OptionalPin.bShowPin);
+        Obj->SetBoolField(TEXT("can_toggle_visibility"), OptionalPin.bCanToggleVisibility);
+        if (Pin)
+        {
+            Obj->SetObjectField(TEXT("pin"), PinSummaryJson(Pin));
+        }
+        Properties.Add(MakeShared<FJsonValueObject>(Obj));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5352,10 +7821,18 @@ FSageToolDispatch::FOutcome BindAnimNodePropertyImpl(const TSharedPtr<FJsonObjec
             FString::Printf(TEXT("node_id %s isn't a UAnimGraphNode_Base"), *NodeId));
     }
 
-    const FName BindingName(*PropName);
+    const FName PinName(*PropName);
+    FResolvedAnimNodePinBinding PinInfo;
+    if (!ResolveAnimNodePinBinding(AnimNode, PinName, PinInfo))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("property '%s' is not a bindable AnimGraph input pin property on %s"),
+                            *PropName, *AnimNode->GetClass()->GetName()));
+    }
+
     FAnimGraphNodePropertyBinding PropertyBinding;
     FString BindingError;
-    if (!BuildAnimNodePropertyBinding(AnimBP, AnimNode, BindingName,
+    if (!BuildAnimNodePropertyBinding(AnimBP, AnimNode, PinName, PinInfo.BindingName,
                                       BindingPath, PropertyBinding, BindingError))
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, BindingError);
@@ -5386,26 +7863,25 @@ FSageToolDispatch::FOutcome BindAnimNodePropertyImpl(const TSharedPtr<FJsonObjec
 
     bool bPinWasVisible = false;
     bool bPinExposed = false;
-    const int32 OptionalPinIndex = FindOptionalPinIndexForProperty(AnimNode, BindingName);
-    if (OptionalPinIndex != INDEX_NONE)
+    const int32 OptionalPinIndex = PinInfo.OptionalPinIndex;
+    if (PinInfo.bOptionalPin)
     {
-        bPinWasVisible = AnimNode->ShowPinForProperties[OptionalPinIndex].bShowPin;
+        bPinWasVisible = PinInfo.bPinVisible;
         if (!bPinWasVisible)
         {
-            AnimNode->SetPinVisibility(/*bInVisible=*/true, OptionalPinIndex);
-            bPinExposed = true;
+            bPinExposed = SetResolvedAnimNodePinVisible(AnimNode, PinInfo, /*bReconstruct=*/true);
         }
     }
 
-    if (UEdGraphPin* Pin = AnimNode->FindPin(BindingName))
+    if (UEdGraphPin* Pin = AnimNode->FindPin(PinName))
     {
         Pin->BreakAllPinLinks();
     }
 
-    AnimNode->RemoveBindings(BindingName);
+    AnimNode->RemoveBindings(PinInfo.BindingName);
     FString AddError;
     if (!AddBindingMapEntry(BindingObj, MapProp, ValueStruct,
-                            BindingName, PropertyBinding, AddError))
+                            PinInfo.BindingName, PropertyBinding, AddError))
     {
         Tx.Cancel();
         return FSageToolDispatch::FOutcome::MakeError(-32603, AddError);
@@ -5422,14 +7898,16 @@ FSageToolDispatch::FOutcome BindAnimNodePropertyImpl(const TSharedPtr<FJsonObjec
     R->SetStringField(TEXT("node_id"), NodeId);
     R->SetStringField(TEXT("graph"), TargetGraph->GetFName().ToString());
     R->SetStringField(TEXT("property"), PropName);
+    R->SetStringField(TEXT("binding_name"), PinInfo.BindingName.ToString());
     R->SetStringField(TEXT("path"), BindingPathToString(BindingPath));
     R->SetStringField(TEXT("binding_class"), BindingObj->GetClass()->GetPathName());
     R->SetBoolField(TEXT("bound"), true);
     R->SetBoolField(TEXT("pin_was_visible"), bPinWasVisible);
     R->SetBoolField(TEXT("pin_exposed"), bPinExposed);
+    R->SetBoolField(TEXT("custom_property_pin"), PinInfo.bCustomPropertyPin);
     R->SetNumberField(TEXT("optional_pin_index"), OptionalPinIndex);
     R->SetNumberField(TEXT("binding_count"), BindingCount);
-    R->SetObjectField(TEXT("binding"), BindingToJson(BindingName, PropertyBinding));
+    R->SetObjectField(TEXT("binding"), BindingToJson(PinInfo.BindingName, PropertyBinding));
     R->SetArrayField(TEXT("bindings"), Bindings);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
@@ -5493,6 +7971,7 @@ FSageToolDispatch::FOutcome ReadAnimNodePropertiesImpl(const TSharedPtr<FJsonObj
                 AnimNodePropertyToJson(AnimNode, Property, NodeStructPtr)));
         }
     }
+    AppendCustomAnimNodePropertiesToJson(AnimNode, Properties);
 
     TArray<TSharedPtr<FJsonValue>> Bindings;
     int32 BindingCount = 0;
@@ -5521,6 +8000,1114 @@ FSageToolDispatch::FOutcome ReadAnimNodePropertiesImpl(const TSharedPtr<FJsonObj
     R->SetArrayField(TEXT("pins"), Pins);
     R->SetArrayField(TEXT("properties"), Properties);
     R->SetArrayField(TEXT("bindings"), Bindings);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.set_owner_locomotion_update
+// ---------------------------------------------------------------------------
+
+static const TCHAR* OwnerLocomotionUpdateMarker = TEXT("SAGE_ANIM_OWNER_LOCOMOTION_UPDATE");
+
+struct FOwnerLocomotionValue
+{
+    UEdGraphPin* Pin = nullptr;
+    FString Source;
+    FString SourceNodeId;
+};
+
+struct FOwnerLocomotionBuildContext
+{
+    UAnimBlueprint* AnimBP = nullptr;
+    UEdGraph* Graph = nullptr;
+    const UEdGraphSchema* Schema = nullptr;
+    const UEdGraphSchema_K2* K2Schema = nullptr;
+    int32 BaseX = 0;
+    int32 BaseY = 0;
+    int32 NodeIndex = 0;
+    FString Error;
+    TArray<TSharedPtr<FJsonValue>> AuthoredNodes;
+};
+
+bool IsOwnerLocomotionNode(const UEdGraphNode* Node)
+{
+    return Node && Node->NodeComment.Contains(OwnerLocomotionUpdateMarker);
+}
+
+void PositionOwnerLocomotionNode(FOwnerLocomotionBuildContext& Ctx, UEdGraphNode* Node)
+{
+    if (!Node) return;
+    const int32 Column = Ctx.NodeIndex % 5;
+    const int32 Row = Ctx.NodeIndex / 5;
+    Node->NodePosX = Ctx.BaseX + (Column * 290);
+    Node->NodePosY = Ctx.BaseY + (Row * 170);
+    ++Ctx.NodeIndex;
+}
+
+void MarkOwnerLocomotionNode(UEdGraphNode* Node, const FString& Kind)
+{
+    if (!Node) return;
+    Node->NodeComment = FString::Printf(TEXT("%s:%s"), OwnerLocomotionUpdateMarker, *Kind);
+    Node->bCommentBubblePinned = false;
+    Node->bCommentBubbleVisible = false;
+    Node->SetEnabledState(ENodeEnabledState::Enabled, /*bUserAction=*/false);
+}
+
+void AddOwnerLocomotionAuthoredNode(FOwnerLocomotionBuildContext& Ctx, const UEdGraphNode* Node, const FString& Kind)
+{
+    if (!Node) return;
+    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+    Obj->SetStringField(TEXT("node_id"), Node->NodeGuid.ToString(EGuidFormats::Digits));
+    Obj->SetStringField(TEXT("kind"), Kind);
+    Obj->SetStringField(TEXT("class"), Node->GetClass()->GetName());
+    Obj->SetNumberField(TEXT("x"), Node->NodePosX);
+    Obj->SetNumberField(TEXT("y"), Node->NodePosY);
+    Ctx.AuthoredNodes.Add(MakeShared<FJsonValueObject>(Obj));
+}
+
+UEdGraphPin* FindExecInputPin(UEdGraphNode* Node)
+{
+    return Node ? Node->FindPin(UEdGraphSchema_K2::PN_Execute, EGPD_Input) : nullptr;
+}
+
+UEdGraphPin* FindThenOutputPin(UEdGraphNode* Node)
+{
+    return Node ? Node->FindPin(UEdGraphSchema_K2::PN_Then, EGPD_Output) : nullptr;
+}
+
+UEdGraphPin* FindOutputDataPin(UEdGraphNode* Node, FName PreferredName = UEdGraphSchema_K2::PN_ReturnValue)
+{
+    if (!Node) return nullptr;
+    if (!PreferredName.IsNone())
+    {
+        if (UEdGraphPin* Pin = Node->FindPin(PreferredName, EGPD_Output))
+        {
+            if (Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+            {
+                return Pin;
+            }
+        }
+    }
+    for (UEdGraphPin* Pin : Node->Pins)
+    {
+        if (Pin && Pin->Direction == EGPD_Output
+            && Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+        {
+            return Pin;
+        }
+    }
+    return nullptr;
+}
+
+bool TryConnectOwnerLocomotionPins(
+    FOwnerLocomotionBuildContext& Ctx,
+    UEdGraphPin* From,
+    UEdGraphPin* To,
+    const FString& Context,
+    bool bBreakInput = true)
+{
+    if (!From || !To)
+    {
+        Ctx.Error = FString::Printf(TEXT("%s pin lookup failed: from=%s to=%s"),
+            *Context,
+            From ? *From->PinName.ToString() : TEXT("<null>"),
+            To ? *To->PinName.ToString() : TEXT("<null>"));
+        return false;
+    }
+    if (bBreakInput)
+    {
+        To->Modify();
+        To->BreakAllPinLinks();
+    }
+    if (!Ctx.Schema || !Ctx.Schema->TryCreateConnection(From, To))
+    {
+        Ctx.Error = FString::Printf(TEXT("%s connection failed: from node=%s to node=%s"),
+            *Context,
+            *DescribePinsForError(From->GetOwningNode()),
+            *DescribePinsForError(To->GetOwningNode()));
+        return false;
+    }
+    return true;
+}
+
+bool TrySetOwnerLocomotionPinDefault(
+    FOwnerLocomotionBuildContext& Ctx,
+    UEdGraphPin* Pin,
+    const FString& Value,
+    const FString& Context)
+{
+    if (!Pin)
+    {
+        Ctx.Error = FString::Printf(TEXT("%s default target pin missing"), *Context);
+        return false;
+    }
+    if (!Ctx.K2Schema)
+    {
+        Ctx.Error = TEXT("EventGraph schema is not UEdGraphSchema_K2; cannot set default pin value");
+        return false;
+    }
+    Pin->Modify();
+    Pin->BreakAllPinLinks();
+    Ctx.K2Schema->TrySetDefaultValue(*Pin, Value, false);
+    return true;
+}
+
+UClass* ResolveOwnerLocomotionClassOrDefault(
+    const TSharedPtr<FJsonObject>& Args,
+    const TCHAR* FieldName,
+    UClass* DefaultClass,
+    UClass* RequiredBase,
+    FString& OutPath,
+    FString& OutError)
+{
+    if (Args.IsValid())
+    {
+        Args->TryGetStringField(FieldName, OutPath);
+    }
+    UClass* Resolved = OutPath.IsEmpty() ? DefaultClass : ResolveClassAsset(OutPath);
+    if (!Resolved)
+    {
+        OutError = FString::Printf(TEXT("class not found for '%s': %s"), FieldName, *OutPath);
+        return nullptr;
+    }
+    if (RequiredBase && !Resolved->IsChildOf(RequiredBase))
+    {
+        OutError = FString::Printf(TEXT("'%s' must be a %s subclass, got %s"),
+            FieldName, *RequiredBase->GetName(), *Resolved->GetPathName());
+        return nullptr;
+    }
+    OutPath = Resolved->GetPathName();
+    return Resolved;
+}
+
+FProperty* ResolveBlueprintVisibleProperty(UClass* ScopeClass, FName PropertyName, FString& OutError)
+{
+    if (!ScopeClass || PropertyName.IsNone())
+    {
+        OutError = TEXT("property scope or name missing");
+        return nullptr;
+    }
+    FProperty* Property = FindFProperty<FProperty>(ScopeClass, PropertyName);
+    if (!Property)
+    {
+        OutError = FString::Printf(TEXT("property '%s' not found on %s"),
+            *PropertyName.ToString(), *ScopeClass->GetPathName());
+        return nullptr;
+    }
+    if (!Property->HasAnyPropertyFlags(CPF_BlueprintVisible))
+    {
+        OutError = FString::Printf(TEXT("property '%s' on %s is not BlueprintVisible"),
+            *PropertyName.ToString(), *ScopeClass->GetPathName());
+        return nullptr;
+    }
+    return Property;
+}
+
+bool HasAnimBlueprintVariable(UAnimBlueprint* AnimBP, FName VarName, FString& OutFoundIn)
+{
+    if (!AnimBP || VarName.IsNone())
+    {
+        return false;
+    }
+    if (FBlueprintEditorUtils::FindNewVariableIndex(AnimBP, VarName) != INDEX_NONE)
+    {
+        OutFoundIn = TEXT("NewVariables");
+        return true;
+    }
+    UClass* Classes[] = {
+        AnimBP->SkeletonGeneratedClass,
+        AnimBP->GeneratedClass,
+        AnimBP->ParentClass
+    };
+    for (UClass* Class : Classes)
+    {
+        if (Class && FindFProperty<FProperty>(Class, VarName))
+        {
+            OutFoundIn = Class->GetPathName();
+            return true;
+        }
+    }
+    return false;
+}
+
+UK2Node_CallFunction* CreateOwnerLocomotionCallNode(
+    FOwnerLocomotionBuildContext& Ctx,
+    UClass* FunctionOwner,
+    const FName& FunctionName,
+    const FString& Kind)
+{
+    if (!Ctx.Graph)
+    {
+        Ctx.Error = TEXT("EventGraph missing");
+        return nullptr;
+    }
+    UFunction* Function = FunctionOwner ? FunctionOwner->FindFunctionByName(FunctionName) : nullptr;
+    if (!Function)
+    {
+        Ctx.Error = FString::Printf(TEXT("function not found: %s.%s"),
+            FunctionOwner ? *FunctionOwner->GetName() : TEXT("<null>"),
+            *FunctionName.ToString());
+        return nullptr;
+    }
+
+    UK2Node_CallFunction* Node = NewObject<UK2Node_CallFunction>(Ctx.Graph);
+    Node->CreateNewGuid();
+    PositionOwnerLocomotionNode(Ctx, Node);
+    Node->SetFromFunction(Function);
+    Ctx.Graph->AddNode(Node, /*bSelectNewNode=*/false, /*bFromUI=*/true);
+    Node->AllocateDefaultPins();
+    Node->PostPlacedNewNode();
+    MarkOwnerLocomotionNode(Node, Kind);
+    AddOwnerLocomotionAuthoredNode(Ctx, Node, Kind);
+    return Node;
+}
+
+UK2Node_DynamicCast* CreateOwnerLocomotionCastNode(
+    FOwnerLocomotionBuildContext& Ctx,
+    UClass* TargetClass,
+    const FString& Kind)
+{
+    if (!Ctx.Graph || !TargetClass)
+    {
+        Ctx.Error = TEXT("cast node target missing");
+        return nullptr;
+    }
+    UK2Node_DynamicCast* Node = NewObject<UK2Node_DynamicCast>(Ctx.Graph);
+    Node->CreateNewGuid();
+    PositionOwnerLocomotionNode(Ctx, Node);
+    Node->TargetType = TargetClass;
+    Ctx.Graph->AddNode(Node, /*bSelectNewNode=*/false, /*bFromUI=*/true);
+    Node->AllocateDefaultPins();
+    Node->PostPlacedNewNode();
+    if (Node->IsNodePure())
+    {
+        Node->SetPurity(false);
+    }
+    MarkOwnerLocomotionNode(Node, Kind);
+    AddOwnerLocomotionAuthoredNode(Ctx, Node, Kind);
+    return Node;
+}
+
+UK2Node_VariableGet* CreateOwnerLocomotionVariableGetNode(
+    FOwnerLocomotionBuildContext& Ctx,
+    UClass* ScopeClass,
+    FName PropertyName,
+    UEdGraphPin* SourceObjectPin,
+    const FString& Kind,
+    UEdGraphPin*& OutValuePin)
+{
+    OutValuePin = nullptr;
+    FString PropertyError;
+    FProperty* Property = ResolveBlueprintVisibleProperty(ScopeClass, PropertyName, PropertyError);
+    if (!Property)
+    {
+        Ctx.Error = PropertyError;
+        return nullptr;
+    }
+
+    UK2Node_VariableGet* Node = NewObject<UK2Node_VariableGet>(Ctx.Graph);
+    Node->CreateNewGuid();
+    PositionOwnerLocomotionNode(Ctx, Node);
+    UClass* OwnerClass = Property->GetOwner<UClass>();
+    Node->SetFromProperty(Property, /*bSelfContext=*/false, OwnerClass ? OwnerClass : ScopeClass);
+    Ctx.Graph->AddNode(Node, /*bSelectNewNode=*/false, /*bFromUI=*/true);
+    Node->AllocateDefaultPins();
+    Node->PostPlacedNewNode();
+    MarkOwnerLocomotionNode(Node, Kind);
+    AddOwnerLocomotionAuthoredNode(Ctx, Node, Kind);
+
+    if (SourceObjectPin)
+    {
+        UEdGraphPin* SelfPin = Node->FindPin(UEdGraphSchema_K2::PN_Self, EGPD_Input);
+        if (!SelfPin)
+        {
+            Ctx.Error = FString::Printf(TEXT("self pin missing for property get '%s': node=%s"),
+                *PropertyName.ToString(), *DescribePinsForError(Node));
+            return nullptr;
+        }
+        if (!TryConnectOwnerLocomotionPins(Ctx, SourceObjectPin, SelfPin,
+            FString::Printf(TEXT("connect self for get %s"), *PropertyName.ToString())))
+        {
+            return nullptr;
+        }
+    }
+
+    OutValuePin = FindVariableGetOutputPin(Node, PropertyName);
+    if (!OutValuePin)
+    {
+        Ctx.Error = FString::Printf(TEXT("output pin missing for property get '%s': node=%s"),
+            *PropertyName.ToString(), *DescribePinsForError(Node));
+        return nullptr;
+    }
+    return Node;
+}
+
+UK2Node_VariableSet* CreateOwnerLocomotionVariableSetNode(
+    FOwnerLocomotionBuildContext& Ctx,
+    FName VariableName,
+    const FString& Kind,
+    UEdGraphPin*& OutValuePin)
+{
+    OutValuePin = nullptr;
+    UK2Node_VariableSet* Node = NewObject<UK2Node_VariableSet>(Ctx.Graph);
+    Node->CreateNewGuid();
+    PositionOwnerLocomotionNode(Ctx, Node);
+    Node->VariableReference.SetSelfMember(VariableName);
+    Ctx.Graph->AddNode(Node, /*bSelectNewNode=*/false, /*bFromUI=*/true);
+    Node->AllocateDefaultPins();
+    Node->PostPlacedNewNode();
+    MarkOwnerLocomotionNode(Node, Kind);
+    AddOwnerLocomotionAuthoredNode(Ctx, Node, Kind);
+
+    OutValuePin = Node->GetValuePin();
+    if (!OutValuePin)
+    {
+        OutValuePin = Node->FindPin(VariableName, EGPD_Input);
+    }
+    if (!OutValuePin)
+    {
+        for (UEdGraphPin* Pin : Node->Pins)
+        {
+            if (Pin && Pin->Direction == EGPD_Input
+                && Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec
+                && Pin->PinName != UEdGraphSchema_K2::PN_Self)
+            {
+                OutValuePin = Pin;
+                break;
+            }
+        }
+    }
+    if (!OutValuePin)
+    {
+        Ctx.Error = FString::Printf(TEXT("value pin missing for variable set '%s': node=%s"),
+            *VariableName.ToString(), *DescribePinsForError(Node));
+        return nullptr;
+    }
+    return Node;
+}
+
+bool AppendOptionalOwnerLocomotionExecCall(
+    FOwnerLocomotionBuildContext& Ctx,
+    UEdGraphPin*& ExecTail,
+    UK2Node_CallFunction* CallNode,
+    const FString& Context)
+{
+    if (!CallNode)
+    {
+        return false;
+    }
+    UEdGraphPin* ExecIn = FindExecInputPin(CallNode);
+    UEdGraphPin* ThenOut = FindThenOutputPin(CallNode);
+    if (!ExecIn && !ThenOut)
+    {
+        return true;
+    }
+    if (!ExecTail || !ExecIn || !ThenOut)
+    {
+        Ctx.Error = FString::Printf(TEXT("%s has incomplete exec pins: node=%s"),
+            *Context, *DescribePinsForError(CallNode));
+        return false;
+    }
+    if (!TryConnectOwnerLocomotionPins(Ctx, ExecTail, ExecIn, Context))
+    {
+        return false;
+    }
+    ExecTail = ThenOut;
+    return true;
+}
+
+FOwnerLocomotionValue MakeOwnerLocomotionValue(UEdGraphPin* Pin, const FString& Source)
+{
+    FOwnerLocomotionValue Value;
+    Value.Pin = Pin;
+    Value.Source = Source;
+    if (Pin && Pin->GetOwningNode())
+    {
+        Value.SourceNodeId = Pin->GetOwningNode()->NodeGuid.ToString(EGuidFormats::Digits);
+    }
+    return Value;
+}
+
+FOwnerLocomotionValue CreateOwnerLocomotionPropertyValue(
+    FOwnerLocomotionBuildContext& Ctx,
+    UClass* ScopeClass,
+    FName PropertyName,
+    UEdGraphPin* SourceObjectPin,
+    const FString& Kind,
+    const FString& SourceText)
+{
+    UEdGraphPin* OutputPin = nullptr;
+    UK2Node_VariableGet* Node = CreateOwnerLocomotionVariableGetNode(
+        Ctx, ScopeClass, PropertyName, SourceObjectPin, Kind, OutputPin);
+    if (!Node || !OutputPin)
+    {
+        return FOwnerLocomotionValue();
+    }
+    return MakeOwnerLocomotionValue(OutputPin, SourceText);
+}
+
+FOwnerLocomotionValue CreateOwnerLocomotionByteEquals(
+    FOwnerLocomotionBuildContext& Ctx,
+    UEdGraphPin* SourcePin,
+    int32 Literal,
+    const FString& Kind,
+    const FString& SourceText)
+{
+    UK2Node_CallFunction* EqNode = CreateOwnerLocomotionCallNode(
+        Ctx, UKismetMathLibrary::StaticClass(),
+        GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, EqualEqual_ByteByte),
+        Kind);
+    if (!EqNode) return FOwnerLocomotionValue();
+    UEdGraphPin* APin = EqNode->FindPin(TEXT("A"), EGPD_Input);
+    UEdGraphPin* BPin = EqNode->FindPin(TEXT("B"), EGPD_Input);
+    if (!TryConnectOwnerLocomotionPins(Ctx, SourcePin, APin, Kind)
+        || !TrySetOwnerLocomotionPinDefault(Ctx, BPin, FString::FromInt(Literal), Kind))
+    {
+        return FOwnerLocomotionValue();
+    }
+    return MakeOwnerLocomotionValue(FindBoolReturnPin(EqNode), SourceText);
+}
+
+FOwnerLocomotionValue CreateOwnerLocomotionBoolAnd(
+    FOwnerLocomotionBuildContext& Ctx,
+    const FOwnerLocomotionValue& A,
+    const FOwnerLocomotionValue& B,
+    const FString& Kind,
+    const FString& SourceText)
+{
+    UK2Node_CallFunction* AndNode = CreateOwnerLocomotionCallNode(
+        Ctx, UKismetMathLibrary::StaticClass(),
+        GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, BooleanAND),
+        Kind);
+    if (!AndNode) return FOwnerLocomotionValue();
+    UEdGraphPin* APin = AndNode->FindPin(TEXT("A"), EGPD_Input);
+    UEdGraphPin* BPin = AndNode->FindPin(TEXT("B"), EGPD_Input);
+    if (!TryConnectOwnerLocomotionPins(Ctx, A.Pin, APin, Kind)
+        || !TryConnectOwnerLocomotionPins(Ctx, B.Pin, BPin, Kind))
+    {
+        return FOwnerLocomotionValue();
+    }
+    return MakeOwnerLocomotionValue(FindBoolReturnPin(AndNode), SourceText);
+}
+
+FOwnerLocomotionValue CreateOwnerLocomotionUnaryVectorFunction(
+    FOwnerLocomotionBuildContext& Ctx,
+    FName FunctionName,
+    UEdGraphPin* VectorPin,
+    const FString& Kind,
+    const FString& SourceText)
+{
+    UK2Node_CallFunction* Node = CreateOwnerLocomotionCallNode(
+        Ctx, UKismetMathLibrary::StaticClass(), FunctionName, Kind);
+    if (!Node) return FOwnerLocomotionValue();
+    UEdGraphPin* APin = Node->FindPin(TEXT("A"), EGPD_Input);
+    if (!TryConnectOwnerLocomotionPins(Ctx, VectorPin, APin, Kind))
+    {
+        return FOwnerLocomotionValue();
+    }
+    return MakeOwnerLocomotionValue(FindOutputDataPin(Node), SourceText);
+}
+
+FOwnerLocomotionValue CreateOwnerLocomotionDot(
+    FOwnerLocomotionBuildContext& Ctx,
+    UEdGraphPin* A,
+    UEdGraphPin* B,
+    const FString& Kind,
+    const FString& SourceText)
+{
+    UK2Node_CallFunction* DotNode = CreateOwnerLocomotionCallNode(
+        Ctx, UKismetMathLibrary::StaticClass(),
+        GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, Dot_VectorVector),
+        Kind);
+    if (!DotNode) return FOwnerLocomotionValue();
+    UEdGraphPin* APin = DotNode->FindPin(TEXT("A"), EGPD_Input);
+    UEdGraphPin* BPin = DotNode->FindPin(TEXT("B"), EGPD_Input);
+    if (!TryConnectOwnerLocomotionPins(Ctx, A, APin, Kind)
+        || !TryConnectOwnerLocomotionPins(Ctx, B, BPin, Kind))
+    {
+        return FOwnerLocomotionValue();
+    }
+    return MakeOwnerLocomotionValue(FindOutputDataPin(DotNode), SourceText);
+}
+
+FOwnerLocomotionValue CreateOwnerLocomotionBreakVectorZ(
+    FOwnerLocomotionBuildContext& Ctx,
+    UEdGraphPin* VectorPin,
+    const FString& Kind,
+    const FString& SourceText)
+{
+    UK2Node_CallFunction* BreakNode = CreateOwnerLocomotionCallNode(
+        Ctx, UKismetMathLibrary::StaticClass(),
+        GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, BreakVector),
+        Kind);
+    if (!BreakNode) return FOwnerLocomotionValue();
+    UEdGraphPin* InVec = BreakNode->FindPin(TEXT("InVec"), EGPD_Input);
+    UEdGraphPin* ZPin = BreakNode->FindPin(TEXT("Z"), EGPD_Output);
+    if (!TryConnectOwnerLocomotionPins(Ctx, VectorPin, InVec, Kind))
+    {
+        return FOwnerLocomotionValue();
+    }
+    return MakeOwnerLocomotionValue(ZPin, SourceText);
+}
+
+UEdGraph* EnsureOwnerLocomotionEventGraph(UAnimBlueprint* AnimBP, bool& bCreated)
+{
+    bCreated = false;
+    UEdGraph* EventGraph = FBlueprintEditorUtils::FindEventGraph(AnimBP);
+    if (EventGraph)
+    {
+        return EventGraph;
+    }
+    EventGraph = FBlueprintEditorUtils::CreateNewGraph(
+        AnimBP,
+        UEdGraphSchema_K2::GN_EventGraph,
+        UEdGraph::StaticClass(),
+        UEdGraphSchema_K2::StaticClass());
+    if (!EventGraph)
+    {
+        return nullptr;
+    }
+    EventGraph->bAllowDeletion = false;
+    FBlueprintEditorUtils::AddUbergraphPage(AnimBP, EventGraph);
+    bCreated = true;
+    return EventGraph;
+}
+
+UK2Node_Event* EnsureOwnerLocomotionUpdateEvent(
+    UAnimBlueprint* AnimBP,
+    UEdGraph*& EventGraph,
+    int32 NodeX,
+    int32 NodeY,
+    bool& bCreated,
+    FString& OutError)
+{
+    bCreated = false;
+    const FName EventName(TEXT("BlueprintUpdateAnimation"));
+    if (UK2Node_Event* Existing = FBlueprintEditorUtils::FindOverrideForFunction(
+        AnimBP, UAnimInstance::StaticClass(), EventName))
+    {
+        Existing->Modify();
+        Existing->SetEnabledState(ENodeEnabledState::Enabled, /*bUserAction=*/false);
+        EventGraph = Existing->GetGraph();
+        return Existing;
+    }
+
+    if (!EventGraph)
+    {
+        bool bGraphCreated = false;
+        EventGraph = EnsureOwnerLocomotionEventGraph(AnimBP, bGraphCreated);
+    }
+    if (!EventGraph)
+    {
+        OutError = TEXT("could not create EventGraph");
+        return nullptr;
+    }
+
+    int32 EventY = NodeY;
+    UK2Node_Event* EventNode = FKismetEditorUtilities::AddDefaultEventNode(
+        AnimBP, EventGraph, EventName, UAnimInstance::StaticClass(), EventY);
+    if (!EventNode)
+    {
+        UFunction* UpdateFunction = UAnimInstance::StaticClass()->FindFunctionByName(EventName);
+        if (!UpdateFunction)
+        {
+            OutError = TEXT("UAnimInstance.BlueprintUpdateAnimation function not found");
+            return nullptr;
+        }
+        EventNode = NewObject<UK2Node_Event>(EventGraph);
+        EventNode->EventReference.SetFromField<UFunction>(UpdateFunction, false);
+        EventNode->bOverrideFunction = true;
+        EventNode->CreateNewGuid();
+        EventGraph->AddNode(EventNode, /*bSelectNewNode=*/false, /*bFromUI=*/true);
+        EventNode->AllocateDefaultPins();
+        EventNode->PostPlacedNewNode();
+    }
+    EventNode->Modify();
+    EventNode->NodePosX = NodeX;
+    EventNode->NodePosY = NodeY;
+    EventNode->bCommentBubblePinned = false;
+    EventNode->bCommentBubbleVisible = false;
+    EventNode->SetEnabledState(ENodeEnabledState::Enabled, /*bUserAction=*/false);
+    bCreated = true;
+    return EventNode;
+}
+
+int32 RemoveExistingOwnerLocomotionNodes(UAnimBlueprint* AnimBP, UEdGraph* Graph)
+{
+    if (!AnimBP || !Graph) return 0;
+    int32 Removed = 0;
+    TArray<UEdGraphNode*> Nodes = Graph->Nodes;
+    for (UEdGraphNode* Node : Nodes)
+    {
+        if (!Node || Node->IsA<UK2Node_Event>() || !IsOwnerLocomotionNode(Node))
+        {
+            continue;
+        }
+        FBlueprintEditorUtils::RemoveNode(AnimBP, Node, /*bDontRecompile=*/true);
+        ++Removed;
+    }
+    return Removed;
+}
+
+bool ParseOwnerLocomotionVariableMap(
+    const TSharedPtr<FJsonObject>& Args,
+    TMap<FString, FString>& OutVariables,
+    FString& OutError)
+{
+    struct FDefaultVar
+    {
+        const TCHAR* Role;
+        const TCHAR* Variable;
+    };
+    const FDefaultVar Defaults[] = {
+        { TEXT("flight_active"), TEXT("bIsFlightActive") },
+        { TEXT("sprint_active"), TEXT("bIsSprintActive") },
+        { TEXT("current_velocity"), TEXT("CurrentVelocity") },
+        { TEXT("planar_speed"), TEXT("PlanarSpeed") },
+        { TEXT("vertical_speed"), TEXT("VerticalSpeed") },
+        { TEXT("lean_x"), TEXT("LeanX") },
+        { TEXT("lean_y"), TEXT("LeanY") },
+        { TEXT("movement_input_forward"), TEXT("MovementInputForward") },
+        { TEXT("movement_input_right"), TEXT("MovementInputRight") },
+    };
+    for (const FDefaultVar& Entry : Defaults)
+    {
+        OutVariables.Add(Entry.Role, Entry.Variable);
+    }
+
+    const TSharedPtr<FJsonObject>* VariablesObj = nullptr;
+    if (Args.IsValid() && Args->TryGetObjectField(TEXT("variables"), VariablesObj) && VariablesObj && VariablesObj->IsValid())
+    {
+        for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*VariablesObj)->Values)
+        {
+            if (!OutVariables.Contains(Pair.Key))
+            {
+                continue;
+            }
+            if (!Pair.Value.IsValid() || Pair.Value->Type != EJson::String)
+            {
+                OutError = FString::Printf(TEXT("variables.%s must be a string variable name"), *Pair.Key);
+                return false;
+            }
+            OutVariables[Pair.Key] = Pair.Value->AsString().TrimStartAndEnd();
+        }
+    }
+    return true;
+}
+
+TSharedPtr<FJsonObject> OwnerLocomotionAssignmentJson(
+    const FString& Role,
+    const FString& VariableName,
+    const FOwnerLocomotionValue& Value,
+    const UK2Node_VariableSet* SetNode)
+{
+    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+    Obj->SetStringField(TEXT("role"), Role);
+    Obj->SetStringField(TEXT("variable"), VariableName);
+    Obj->SetStringField(TEXT("source"), Value.Source);
+    Obj->SetStringField(TEXT("source_node_id"), Value.SourceNodeId);
+    Obj->SetStringField(TEXT("set_node_id"),
+        SetNode ? SetNode->NodeGuid.ToString(EGuidFormats::Digits) : FString());
+    Obj->SetBoolField(TEXT("written"), SetNode != nullptr && Value.Pin != nullptr);
+    return Obj;
+}
+
+FSageToolDispatch::FOutcome SetOwnerLocomotionUpdateImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+
+    FString OwnerClassPath, MovementClassPath, ClassError;
+    UClass* OwnerClass = ResolveOwnerLocomotionClassOrDefault(
+        Args, TEXT("owner_class"), ACharacter::StaticClass(), ACharacter::StaticClass(),
+        OwnerClassPath, ClassError);
+    if (!OwnerClass)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, ClassError);
+    }
+    UClass* MovementClass = ResolveOwnerLocomotionClassOrDefault(
+        Args, TEXT("movement_class"), UCharacterMovementComponent::StaticClass(),
+        UCharacterMovementComponent::StaticClass(), MovementClassPath, ClassError);
+    if (!MovementClass)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, ClassError);
+    }
+
+    TMap<FString, FString> Variables;
+    FString VariablesError;
+    if (!ParseOwnerLocomotionVariableMap(Args, Variables, VariablesError))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, VariablesError);
+    }
+
+    TArray<TSharedPtr<FJsonValue>> MissingVariables;
+    for (const TPair<FString, FString>& Pair : Variables)
+    {
+        if (Pair.Value.IsEmpty())
+        {
+            continue;
+        }
+        FString FoundIn;
+        if (!HasAnimBlueprintVariable(AnimBP, FName(*Pair.Value), FoundIn))
+        {
+            TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+            Obj->SetStringField(TEXT("role"), Pair.Key);
+            Obj->SetStringField(TEXT("variable"), Pair.Value);
+            MissingVariables.Add(MakeShared<FJsonValueObject>(Obj));
+        }
+    }
+    if (MissingVariables.Num() > 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("one or more target AnimBlueprint variables are missing (count=%d)"),
+                MissingVariables.Num()));
+    }
+
+    FString FlightActiveProperty = TEXT("bWantsFlight");
+    FString SprintActiveProperty = TEXT("bWantsFlightSprint");
+    Args->TryGetStringField(TEXT("flight_active_property"), FlightActiveProperty);
+    Args->TryGetStringField(TEXT("sprint_active_property"), SprintActiveProperty);
+
+    double CustomModeNumber = 0.0;
+    const bool bUseCustomFlightMode = Args->TryGetNumberField(TEXT("flight_custom_mode"), CustomModeNumber);
+    const int32 FlightCustomMode = static_cast<int32>(FMath::RoundToDouble(CustomModeNumber));
+
+    bool bReplaceExisting = true;
+    bool bAllowOverwriteExec = false;
+    bool bCompile = true;
+    Args->TryGetBoolField(TEXT("replace_existing"), bReplaceExisting);
+    Args->TryGetBoolField(TEXT("allow_overwrite_exec"), bAllowOverwriteExec);
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
+
+    double X = 0.0;
+    double Y = 0.0;
+    Args->TryGetNumberField(TEXT("x"), X);
+    Args->TryGetNumberField(TEXT("y"), Y);
+
+    bool bEventGraphCreated = false;
+    UEdGraph* EventGraph = EnsureOwnerLocomotionEventGraph(AnimBP, bEventGraphCreated);
+    if (!EventGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("could not find or create EventGraph"));
+    }
+    const UEdGraphSchema* Schema = EventGraph->GetSchema();
+    const UEdGraphSchema_K2* K2Schema = Cast<UEdGraphSchema_K2>(Schema);
+    if (!K2Schema)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("EventGraph schema is not UEdGraphSchema_K2"));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SetOwnerLocomotionUpdate", "Sage: Set Owner Locomotion Update"));
+    AnimBP->Modify();
+    EventGraph->Modify();
+
+    int32 RemovedNodeCount = 0;
+    if (bReplaceExisting)
+    {
+        RemovedNodeCount = RemoveExistingOwnerLocomotionNodes(AnimBP, EventGraph);
+    }
+
+    bool bEventCreated = false;
+    FString EventError;
+    UK2Node_Event* UpdateEvent = EnsureOwnerLocomotionUpdateEvent(
+        AnimBP, EventGraph, static_cast<int32>(X), static_cast<int32>(Y), bEventCreated, EventError);
+    if (!UpdateEvent)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, EventError);
+    }
+    EventGraph = UpdateEvent->GetGraph();
+    EventGraph->Modify();
+
+    UEdGraphPin* EventThen = FindThenOutputPin(UpdateEvent);
+    if (!EventThen)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("BlueprintUpdateAnimation event has no Then pin: %s"),
+                *DescribePinsForError(UpdateEvent)));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> ExistingExecLinks;
+    for (UEdGraphPin* LinkedPin : EventThen->LinkedTo)
+    {
+        UEdGraphNode* LinkedNode = LinkedPin ? LinkedPin->GetOwningNode() : nullptr;
+        if (LinkedNode && IsOwnerLocomotionNode(LinkedNode))
+        {
+            continue;
+        }
+        TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+        Obj->SetStringField(TEXT("pin"), LinkedPin ? LinkedPin->PinName.ToString() : FString());
+        Obj->SetStringField(TEXT("node_id"), LinkedNode ? LinkedNode->NodeGuid.ToString(EGuidFormats::Digits) : FString());
+        Obj->SetStringField(TEXT("node_class"), LinkedNode ? LinkedNode->GetClass()->GetName() : FString());
+        ExistingExecLinks.Add(MakeShared<FJsonValueObject>(Obj));
+    }
+    if (ExistingExecLinks.Num() > 0 && !bAllowOverwriteExec)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("BlueprintUpdateAnimation Then pin is already linked to %d non-Sage node(s); pass allow_overwrite_exec:true to replace that exec chain"),
+                ExistingExecLinks.Num()));
+    }
+    EventThen->Modify();
+    EventThen->BreakAllPinLinks();
+
+    FOwnerLocomotionBuildContext Ctx;
+    Ctx.AnimBP = AnimBP;
+    Ctx.Graph = EventGraph;
+    Ctx.Schema = EventGraph->GetSchema();
+    Ctx.K2Schema = Cast<UEdGraphSchema_K2>(Ctx.Schema);
+    Ctx.BaseX = static_cast<int32>(X) + 260;
+    Ctx.BaseY = static_cast<int32>(Y);
+
+    UK2Node_CallFunction* TryOwnerNode = CreateOwnerLocomotionCallNode(
+        Ctx, UAnimInstance::StaticClass(),
+        GET_FUNCTION_NAME_CHECKED(UAnimInstance, TryGetPawnOwner),
+        TEXT("try_get_pawn_owner"));
+    if (!TryOwnerNode)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, Ctx.Error);
+    }
+    UEdGraphPin* PawnPin = FindOutputDataPin(TryOwnerNode);
+    if (!PawnPin)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("TryGetPawnOwner return pin missing: %s"), *DescribePinsForError(TryOwnerNode)));
+    }
+
+    UEdGraphPin* ExecTail = EventThen;
+    if (!AppendOptionalOwnerLocomotionExecCall(Ctx, ExecTail, TryOwnerNode, TEXT("exec TryGetPawnOwner")))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, Ctx.Error);
+    }
+
+    UK2Node_DynamicCast* OwnerCast = CreateOwnerLocomotionCastNode(Ctx, OwnerClass, TEXT("cast_owner"));
+    if (!OwnerCast
+        || !TryConnectOwnerLocomotionPins(Ctx, ExecTail, FindExecInputPin(OwnerCast), TEXT("exec cast owner"))
+        || !TryConnectOwnerLocomotionPins(Ctx, PawnPin, OwnerCast->GetCastSourcePin(), TEXT("source cast owner")))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, Ctx.Error);
+    }
+    UEdGraphPin* OwnerPin = OwnerCast->GetCastResultPin();
+    ExecTail = OwnerCast->GetValidCastPin();
+
+    UEdGraphPin* CharacterMovementPin = nullptr;
+    UK2Node_VariableGet* CharacterMovementGet = CreateOwnerLocomotionVariableGetNode(
+        Ctx, ACharacter::StaticClass(), FName(TEXT("CharacterMovement")), OwnerPin,
+        TEXT("get_character_movement"), CharacterMovementPin);
+    if (!CharacterMovementGet || !CharacterMovementPin)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, Ctx.Error);
+    }
+
+    UEdGraphPin* MovementPin = CharacterMovementPin;
+    if (MovementClass != UCharacterMovementComponent::StaticClass())
+    {
+        UK2Node_DynamicCast* MovementCast = CreateOwnerLocomotionCastNode(Ctx, MovementClass, TEXT("cast_movement"));
+        if (!MovementCast
+            || !TryConnectOwnerLocomotionPins(Ctx, ExecTail, FindExecInputPin(MovementCast), TEXT("exec cast movement"))
+            || !TryConnectOwnerLocomotionPins(Ctx, CharacterMovementPin, MovementCast->GetCastSourcePin(), TEXT("source cast movement")))
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32603, Ctx.Error);
+        }
+        MovementPin = MovementCast->GetCastResultPin();
+        ExecTail = MovementCast->GetValidCastPin();
+    }
+
+    TMap<FString, FOwnerLocomotionValue> Values;
+    if (bUseCustomFlightMode)
+    {
+        FOwnerLocomotionValue MovementMode = CreateOwnerLocomotionPropertyValue(
+            Ctx, UCharacterMovementComponent::StaticClass(), FName(TEXT("MovementMode")), MovementPin,
+            TEXT("get_movement_mode"), TEXT("movement.MovementMode"));
+        FOwnerLocomotionValue CustomMode = CreateOwnerLocomotionPropertyValue(
+            Ctx, UCharacterMovementComponent::StaticClass(), FName(TEXT("CustomMovementMode")), MovementPin,
+            TEXT("get_custom_movement_mode"), TEXT("movement.CustomMovementMode"));
+        FOwnerLocomotionValue IsCustom = CreateOwnerLocomotionByteEquals(
+            Ctx, MovementMode.Pin, static_cast<int32>(MOVE_Custom),
+            TEXT("movement_mode_is_custom"), TEXT("movement.MovementMode == MOVE_Custom"));
+        FOwnerLocomotionValue IsFlightMode = CreateOwnerLocomotionByteEquals(
+            Ctx, CustomMode.Pin, FlightCustomMode,
+            TEXT("custom_mode_is_flight"), FString::Printf(TEXT("movement.CustomMovementMode == %d"), FlightCustomMode));
+        Values.Add(TEXT("flight_active"), CreateOwnerLocomotionBoolAnd(
+            Ctx, IsCustom, IsFlightMode, TEXT("flight_active_from_mode"),
+            FString::Printf(TEXT("movement.MovementMode == MOVE_Custom && movement.CustomMovementMode == %d"), FlightCustomMode)));
+    }
+    else
+    {
+        Values.Add(TEXT("flight_active"), CreateOwnerLocomotionPropertyValue(
+            Ctx, MovementClass, FName(*FlightActiveProperty), MovementPin,
+            TEXT("get_flight_active"), FString::Printf(TEXT("movement.%s"), *FlightActiveProperty)));
+    }
+    Values.Add(TEXT("sprint_active"), CreateOwnerLocomotionPropertyValue(
+        Ctx, MovementClass, FName(*SprintActiveProperty), MovementPin,
+        TEXT("get_sprint_active"), FString::Printf(TEXT("movement.%s"), *SprintActiveProperty)));
+    Values.Add(TEXT("current_velocity"), CreateOwnerLocomotionPropertyValue(
+        Ctx, UMovementComponent::StaticClass(), FName(TEXT("Velocity")), MovementPin,
+        TEXT("get_velocity"), TEXT("movement.Velocity")));
+
+    if (!Ctx.Error.IsEmpty())
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, Ctx.Error);
+    }
+
+    const FOwnerLocomotionValue* CurrentVelocity = Values.Find(TEXT("current_velocity"));
+    if (!CurrentVelocity || !CurrentVelocity->Pin)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("CurrentVelocity source was not produced"));
+    }
+
+    Values.Add(TEXT("planar_speed"), CreateOwnerLocomotionUnaryVectorFunction(
+        Ctx, GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, VSizeXY), CurrentVelocity->Pin,
+        TEXT("planar_speed"), TEXT("VSizeXY(movement.Velocity)")));
+    Values.Add(TEXT("vertical_speed"), CreateOwnerLocomotionBreakVectorZ(
+        Ctx, CurrentVelocity->Pin, TEXT("vertical_speed"), TEXT("movement.Velocity.Z")));
+
+    UK2Node_CallFunction* ForwardNode = CreateOwnerLocomotionCallNode(
+        Ctx, AActor::StaticClass(), GET_FUNCTION_NAME_CHECKED(AActor, GetActorForwardVector),
+        TEXT("get_actor_forward"));
+    UK2Node_CallFunction* RightNode = CreateOwnerLocomotionCallNode(
+        Ctx, AActor::StaticClass(), GET_FUNCTION_NAME_CHECKED(AActor, GetActorRightVector),
+        TEXT("get_actor_right"));
+    UK2Node_CallFunction* InputNode = CreateOwnerLocomotionCallNode(
+        Ctx, APawn::StaticClass(), GET_FUNCTION_NAME_CHECKED(APawn, GetLastMovementInputVector),
+        TEXT("get_last_movement_input"));
+    if (!ForwardNode || !RightNode || !InputNode)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, Ctx.Error);
+    }
+    if (!TryConnectOwnerLocomotionPins(Ctx, OwnerPin, ForwardNode->FindPin(UEdGraphSchema_K2::PN_Self, EGPD_Input), TEXT("self GetActorForwardVector"))
+        || !TryConnectOwnerLocomotionPins(Ctx, OwnerPin, RightNode->FindPin(UEdGraphSchema_K2::PN_Self, EGPD_Input), TEXT("self GetActorRightVector"))
+        || !TryConnectOwnerLocomotionPins(Ctx, OwnerPin, InputNode->FindPin(UEdGraphSchema_K2::PN_Self, EGPD_Input), TEXT("self GetLastMovementInputVector")))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, Ctx.Error);
+    }
+    if (!AppendOptionalOwnerLocomotionExecCall(Ctx, ExecTail, ForwardNode, TEXT("exec GetActorForwardVector"))
+        || !AppendOptionalOwnerLocomotionExecCall(Ctx, ExecTail, RightNode, TEXT("exec GetActorRightVector"))
+        || !AppendOptionalOwnerLocomotionExecCall(Ctx, ExecTail, InputNode, TEXT("exec GetLastMovementInputVector")))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, Ctx.Error);
+    }
+
+    UEdGraphPin* ForwardPin = FindOutputDataPin(ForwardNode);
+    UEdGraphPin* RightPin = FindOutputDataPin(RightNode);
+    UEdGraphPin* InputVectorPin = FindOutputDataPin(InputNode);
+    Values.Add(TEXT("lean_x"), CreateOwnerLocomotionDot(
+        Ctx, CurrentVelocity->Pin, RightPin, TEXT("lean_x"),
+        TEXT("Dot(movement.Velocity, owner.GetActorRightVector())")));
+    Values.Add(TEXT("lean_y"), CreateOwnerLocomotionDot(
+        Ctx, CurrentVelocity->Pin, ForwardPin, TEXT("lean_y"),
+        TEXT("Dot(movement.Velocity, owner.GetActorForwardVector())")));
+    Values.Add(TEXT("movement_input_forward"), CreateOwnerLocomotionDot(
+        Ctx, InputVectorPin, ForwardPin, TEXT("movement_input_forward"),
+        TEXT("Dot(owner.GetLastMovementInputVector(), owner.GetActorForwardVector())")));
+    Values.Add(TEXT("movement_input_right"), CreateOwnerLocomotionDot(
+        Ctx, InputVectorPin, RightPin, TEXT("movement_input_right"),
+        TEXT("Dot(owner.GetLastMovementInputVector(), owner.GetActorRightVector())")));
+
+    if (!Ctx.Error.IsEmpty())
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, Ctx.Error);
+    }
+
+    const FString RoleOrder[] = {
+        TEXT("flight_active"),
+        TEXT("sprint_active"),
+        TEXT("current_velocity"),
+        TEXT("planar_speed"),
+        TEXT("vertical_speed"),
+        TEXT("lean_x"),
+        TEXT("lean_y"),
+        TEXT("movement_input_forward"),
+        TEXT("movement_input_right"),
+    };
+
+    TArray<TSharedPtr<FJsonValue>> Assignments;
+    for (const FString& Role : RoleOrder)
+    {
+        const FString* VariableName = Variables.Find(Role);
+        const FOwnerLocomotionValue* Value = Values.Find(Role);
+        if (!VariableName || VariableName->IsEmpty())
+        {
+            continue;
+        }
+        if (!Value || !Value->Pin)
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32603,
+                FString::Printf(TEXT("source value missing for role '%s'"), *Role));
+        }
+
+        UEdGraphPin* SetValuePin = nullptr;
+        UK2Node_VariableSet* SetNode = CreateOwnerLocomotionVariableSetNode(
+            Ctx, FName(**VariableName),
+            FString::Printf(TEXT("set_%s"), *Role),
+            SetValuePin);
+        if (!SetNode
+            || !TryConnectOwnerLocomotionPins(Ctx, ExecTail, FindExecInputPin(SetNode),
+                FString::Printf(TEXT("exec set %s"), **VariableName))
+            || !TryConnectOwnerLocomotionPins(Ctx, Value->Pin, SetValuePin,
+                FString::Printf(TEXT("value set %s"), **VariableName)))
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32603, Ctx.Error);
+        }
+        ExecTail = FindThenOutputPin(SetNode);
+        Assignments.Add(MakeShared<FJsonValueObject>(
+            OwnerLocomotionAssignmentJson(Role, *VariableName, *Value, SetNode)));
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+    AnimBP->MarkPackageDirty();
+    if (bCompile)
+    {
+        FKismetEditorUtilities::CompileBlueprint(AnimBP);
+    }
+
+    TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), AnimBP->GetPathName());
+    R->SetStringField(TEXT("event_graph"), EventGraph->GetName());
+    R->SetStringField(TEXT("event_node_id"), UpdateEvent->NodeGuid.ToString(EGuidFormats::Digits));
+    R->SetStringField(TEXT("owner_class"), OwnerClassPath);
+    R->SetStringField(TEXT("movement_class"), MovementClassPath);
+    R->SetBoolField(TEXT("event_graph_created"), bEventGraphCreated);
+    R->SetBoolField(TEXT("event_created"), bEventCreated);
+    R->SetNumberField(TEXT("removed_existing_nodes"), RemovedNodeCount);
+    R->SetBoolField(TEXT("compiled"), bCompile);
+    R->SetBoolField(TEXT("flight_custom_mode_enabled"), bUseCustomFlightMode);
+    if (bUseCustomFlightMode)
+    {
+        R->SetNumberField(TEXT("flight_custom_mode"), FlightCustomMode);
+    }
+    R->SetArrayField(TEXT("existing_exec_links_replaced"), ExistingExecLinks);
+    R->SetArrayField(TEXT("assignments"), Assignments);
+    R->SetArrayField(TEXT("authored_nodes"), Ctx.AuthoredNodes);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -7193,9 +10780,77 @@ FSageToolDispatch::FOutcome ReadTransitionRuleImpl(const TSharedPtr<FJsonObject>
 
 FSageToolDispatch::FOutcome SetStateEnteredEventImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.set_state_entered_event — StateNode.OnEntered/OnExited "
-             "event graph hook pending Sage impl"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SMName, StateId, EventName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    if (!Args->TryGetStringField(TEXT("state_machine_name"), SMName)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'state_machine_name'"));
+    if (!Args->TryGetStringField(TEXT("state_id"), StateId)) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'state_id'"));
+    if (!Args->TryGetStringField(TEXT("custom_event_name"), EventName) || EventName.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("event_name"), EventName);
+    }
+    if (EventName.IsEmpty()) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'custom_event_name'"));
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimBlueprint"));
+    UAnimationStateMachineGraph* SMGraph = FindStateMachineGraph(AnimBP, FName(*SMName));
+    if (!SMGraph) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("state machine not found"));
+
+    UAnimStateNode* State = nullptr;
+    for (UEdGraphNode* Node : SMGraph->Nodes)
+    {
+        UAnimStateNode* Candidate = Cast<UAnimStateNode>(Node);
+        if (!Candidate) continue;
+        const FString Guid = Candidate->NodeGuid.ToString(EGuidFormats::Digits);
+        if (Guid == StateId || Candidate->GetStateName() == StateId || Candidate->GetName() == StateId)
+        {
+            State = Candidate;
+            break;
+        }
+    }
+    if (!State) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("state_id not found"));
+
+    FString EventKind = TEXT("entered");
+    Args->TryGetStringField(TEXT("event"), EventKind);
+    Args->TryGetStringField(TEXT("event_kind"), EventKind);
+    FAnimNotifyEvent* TargetEvent = &State->StateEntered;
+    if (EventKind.Equals(TEXT("left"), ESearchCase::IgnoreCase) ||
+        EventKind.Equals(TEXT("exited"), ESearchCase::IgnoreCase) ||
+        EventKind.Equals(TEXT("exit"), ESearchCase::IgnoreCase))
+    {
+        TargetEvent = &State->StateLeft;
+        EventKind = TEXT("left");
+    }
+    else if (EventKind.Equals(TEXT("fully_blended"), ESearchCase::IgnoreCase) ||
+             EventKind.Equals(TEXT("full"), ESearchCase::IgnoreCase))
+    {
+        TargetEvent = &State->StateFullyBlended;
+        EventKind = TEXT("fully_blended");
+    }
+    else
+    {
+        EventKind = TEXT("entered");
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageSetStateNotifyEvent", "Sage: Set State Notify Event"));
+    State->Modify();
+    TargetEvent->NotifyName = FName(*EventName);
+    TargetEvent->Notify = nullptr;
+    TargetEvent->NotifyStateClass = nullptr;
+    TargetEvent->MontageTickType = EMontageNotifyTickType::Queued;
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), AnimBP->GetPathName());
+    R->SetStringField(TEXT("state_machine_name"), SMName);
+    R->SetStringField(TEXT("state_id"), State->NodeGuid.ToString(EGuidFormats::Digits));
+    R->SetStringField(TEXT("state_name"), State->GetStateName());
+    R->SetStringField(TEXT("event"), EventKind);
+    R->SetStringField(TEXT("custom_event_name"), EventName);
+    R->SetBoolField(TEXT("modified"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ===========================================================================
@@ -7365,23 +11020,205 @@ FSageToolDispatch::FOutcome RemoveBlendSpaceSampleImpl(const TSharedPtr<FJsonObj
 
 FSageToolDispatch::FOutcome SetBlendSpaceAxisImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    // BlendParameters is protected on UBlendSpace in UE 5.7 — pending
-    // UBlendSpaceEditorLibrary path or friend helper.
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.set_blendspace_axis — UBlendSpaceEditorLibrary "
-             "path pending (BlendParameters is protected in UE 5.7)"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UBlendSpace* BS = Cast<UBlendSpace>(ResolveAsset(Path));
+    if (!BS)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UBlendSpace"));
+    }
+
+    FString AxisName;
+    const int32 AxisIndex = ParseBlendSpaceAxisIndex(Args, BS, AxisName);
+    const int32 AxisCount = Cast<UBlendSpace1D>(BS) ? 1 : 2;
+    if (AxisIndex < 0 || AxisIndex >= AxisCount)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid axis '%s' for %s"), *AxisName, *BS->GetClass()->GetName()));
+    }
+
+    FStructProperty* BlendParamsProp = FindFProperty<FStructProperty>(BS->GetClass(), TEXT("BlendParameters"));
+    if (!BlendParamsProp || BlendParamsProp->ArrayDim <= AxisIndex)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("BlendParameters property unavailable"));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageSetBlendSpaceAxis", "Sage: Set BlendSpace Axis"));
+    BS->Modify();
+    void* AxisValue = BlendParamsProp->ContainerPtrToValuePtr<void>(BS, AxisIndex);
+    if (TSharedPtr<FJsonValue> V = Args->TryGetField(TEXT("name")))
+    {
+        SetStructField(BlendParamsProp->Struct, AxisValue, TEXT("DisplayName"), V);
+    }
+    if (TSharedPtr<FJsonValue> V = Args->TryGetField(TEXT("display_name")))
+    {
+        SetStructField(BlendParamsProp->Struct, AxisValue, TEXT("DisplayName"), V);
+    }
+    if (TSharedPtr<FJsonValue> V = Args->TryGetField(TEXT("min")))
+    {
+        SetStructField(BlendParamsProp->Struct, AxisValue, TEXT("Min"), V);
+    }
+    if (TSharedPtr<FJsonValue> V = Args->TryGetField(TEXT("max")))
+    {
+        SetStructField(BlendParamsProp->Struct, AxisValue, TEXT("Max"), V);
+    }
+    if (TSharedPtr<FJsonValue> V = Args->TryGetField(TEXT("grid_divisions")))
+    {
+        SetStructField(BlendParamsProp->Struct, AxisValue, TEXT("GridNum"), V);
+    }
+    if (TSharedPtr<FJsonValue> V = Args->TryGetField(TEXT("grid_num")))
+    {
+        SetStructField(BlendParamsProp->Struct, AxisValue, TEXT("GridNum"), V);
+    }
+    if (TSharedPtr<FJsonValue> V = Args->TryGetField(TEXT("snap_to_grid")))
+    {
+        SetStructField(BlendParamsProp->Struct, AxisValue, TEXT("bSnapToGrid"), V);
+    }
+    if (TSharedPtr<FJsonValue> V = Args->TryGetField(TEXT("wrap_input")))
+    {
+        SetStructField(BlendParamsProp->Struct, AxisValue, TEXT("bWrapInput"), V);
+    }
+    BS->ValidateSampleData();
+    NotifyObjectPropertyChanged(BS, BlendParamsProp);
+    BS->MarkPackageDirty();
+
+    const FBlendParameter& P = BS->GetBlendParameter(AxisIndex);
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), BS->GetPathName());
+    R->SetNumberField(TEXT("axis_index"), AxisIndex);
+    R->SetStringField(TEXT("axis"), AxisIndex == 0 ? TEXT("X") : TEXT("Y"));
+    R->SetStringField(TEXT("name"), P.DisplayName);
+    R->SetNumberField(TEXT("min"), P.Min);
+    R->SetNumberField(TEXT("max"), P.Max);
+    R->SetNumberField(TEXT("grid_divisions"), P.GridNum);
+    R->SetBoolField(TEXT("snap_to_grid"), P.bSnapToGrid);
+    R->SetBoolField(TEXT("wrap_input"), P.bWrapInput);
+    R->SetBoolField(TEXT("modified"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 FSageToolDispatch::FOutcome SetBlendSpaceSmoothingImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.set_blendspace_smoothing — pending Sage impl"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UBlendSpace* BS = Cast<UBlendSpace>(ResolveAsset(Path));
+    if (!BS)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UBlendSpace"));
+    }
+
+    FString AxisName;
+    const int32 AxisIndex = ParseBlendSpaceAxisIndex(Args, BS, AxisName);
+    const int32 AxisCount = Cast<UBlendSpace1D>(BS) ? 1 : 2;
+    if (AxisIndex < 0 || AxisIndex >= AxisCount)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid axis '%s' for %s"), *AxisName, *BS->GetClass()->GetName()));
+    }
+
+    FStructProperty* InterpProp = FindFProperty<FStructProperty>(BS->GetClass(), TEXT("InterpolationParam"));
+    if (!InterpProp || InterpProp->ArrayDim <= AxisIndex)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("InterpolationParam property unavailable"));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageSetBlendSpaceSmoothing", "Sage: Set BlendSpace Smoothing"));
+    BS->Modify();
+    void* InterpValue = InterpProp->ContainerPtrToValuePtr<void>(BS, AxisIndex);
+    if (TSharedPtr<FJsonValue> V = Args->TryGetField(TEXT("interpolation_speed")))
+    {
+        SetStructField(InterpProp->Struct, InterpValue, TEXT("InterpolationTime"), V);
+    }
+    if (TSharedPtr<FJsonValue> V = Args->TryGetField(TEXT("interpolation_time")))
+    {
+        SetStructField(InterpProp->Struct, InterpValue, TEXT("InterpolationTime"), V);
+    }
+    if (TSharedPtr<FJsonValue> V = Args->TryGetField(TEXT("time")))
+    {
+        SetStructField(InterpProp->Struct, InterpValue, TEXT("InterpolationTime"), V);
+    }
+    if (TSharedPtr<FJsonValue> V = Args->TryGetField(TEXT("damping_ratio")))
+    {
+        SetStructField(InterpProp->Struct, InterpValue, TEXT("DampingRatio"), V);
+    }
+    if (TSharedPtr<FJsonValue> V = Args->TryGetField(TEXT("max_speed")))
+    {
+        SetStructField(InterpProp->Struct, InterpValue, TEXT("MaxSpeed"), V);
+    }
+    if (TSharedPtr<FJsonValue> V = Args->TryGetField(TEXT("interpolation_type")))
+    {
+        SetStructField(InterpProp->Struct, InterpValue, TEXT("InterpolationType"), V);
+    }
+    if (TSharedPtr<FJsonValue> V = Args->TryGetField(TEXT("smoothing_type")))
+    {
+        SetStructField(InterpProp->Struct, InterpValue, TEXT("InterpolationType"), V);
+    }
+    NotifyObjectPropertyChanged(BS, InterpProp);
+    BS->MarkPackageDirty();
+
+    const FInterpolationParameter& P = BS->InterpolationParam[AxisIndex];
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), BS->GetPathName());
+    R->SetNumberField(TEXT("axis_index"), AxisIndex);
+    R->SetStringField(TEXT("axis"), AxisIndex == 0 ? TEXT("X") : TEXT("Y"));
+    R->SetNumberField(TEXT("interpolation_time"), P.InterpolationTime);
+    R->SetNumberField(TEXT("damping_ratio"), P.DampingRatio);
+    R->SetNumberField(TEXT("max_speed"), P.MaxSpeed);
+    R->SetNumberField(TEXT("interpolation_type"), static_cast<int32>(P.InterpolationType.GetValue()));
+    R->SetBoolField(TEXT("modified"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 FSageToolDispatch::FOutcome SetBlendSpaceTargetWeightImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.set_blendspace_target_weight_interpolation — pending Sage impl"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UBlendSpace* BS = Cast<UBlendSpace>(ResolveAsset(Path));
+    if (!BS)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UBlendSpace"));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageSetBlendSpaceTargetWeight", "Sage: Set BlendSpace Target Weight Interpolation"));
+    BS->Modify();
+    double Speed = BS->TargetWeightInterpolationSpeedPerSec;
+    Args->TryGetNumberField(TEXT("time"), Speed);
+    Args->TryGetNumberField(TEXT("speed"), Speed);
+    Args->TryGetNumberField(TEXT("target_weight_interpolation_speed"), Speed);
+    Args->TryGetNumberField(TEXT("target_weight_interpolation_speed_per_sec"), Speed);
+    BS->TargetWeightInterpolationSpeedPerSec = FMath::Max(0.0f, static_cast<float>(Speed));
+    Args->TryGetBoolField(TEXT("ease_in_out"), BS->bTargetWeightInterpolationEaseInOut);
+    Args->TryGetBoolField(TEXT("smoothing"), BS->bTargetWeightInterpolationEaseInOut);
+    if (FProperty* Prop = FindFProperty<FProperty>(BS->GetClass(), TEXT("TargetWeightInterpolationSpeedPerSec")))
+    {
+        NotifyObjectPropertyChanged(BS, Prop);
+    }
+    BS->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), BS->GetPathName());
+    R->SetNumberField(TEXT("target_weight_interpolation_speed_per_sec"), BS->TargetWeightInterpolationSpeedPerSec);
+    R->SetBoolField(TEXT("ease_in_out"), BS->bTargetWeightInterpolationEaseInOut);
+    R->SetBoolField(TEXT("modified"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 FSageToolDispatch::FOutcome ReadBlendSpaceSamplesImpl(const TSharedPtr<FJsonObject>& Args)
@@ -7520,20 +11357,228 @@ FSageToolDispatch::FOutcome ListSyncMarkersImpl(const TSharedPtr<FJsonObject>& A
 
 FSageToolDispatch::FOutcome SetCurveCompressionImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.set_curve_compression — canonical: assign UAnimCurveCompressionSettings asset to UAnimSequence::CurveCompressionSettings + RequestSyncAnimRecompression()"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SettingsPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    Args->TryGetStringField(TEXT("codec"), SettingsPath);
+    if (SettingsPath.IsEmpty()) Args->TryGetStringField(TEXT("settings"), SettingsPath);
+    if (SettingsPath.IsEmpty()) Args->TryGetStringField(TEXT("curve_compression_settings"), SettingsPath);
+
+    UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(Path));
+    if (!Seq)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimSequence"));
+    }
+
+    UObject* Settings = nullptr;
+    FString Error;
+    if (!ResolveExpectedObject(SettingsPath, TEXT("/Script/Engine.AnimCurveCompressionSettings"), Settings, Error))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    const FString Before = GetObjectPathProperty(Seq, TEXT("CurveCompressionSettings"));
+    FScopedTransaction Tx(LOCTEXT("SageSetCurveCompression", "Sage: Set Curve Compression"));
+    Seq->Modify();
+    if (!SetReflectedProperty(Seq, TEXT("CurveCompressionSettings"), Settings ? JsonStringValue(Settings->GetPathName()) : MakeShared<FJsonValueNull>()))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("failed to set CurveCompressionSettings"));
+    }
+    Seq->RefreshCacheData();
+    Seq->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Seq->GetPathName());
+    R->SetStringField(TEXT("curve_compression_settings_before"), Before);
+    R->SetStringField(TEXT("curve_compression_settings"), GetObjectPathProperty(Seq, TEXT("CurveCompressionSettings")));
+    R->SetBoolField(TEXT("modified"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 FSageToolDispatch::FOutcome RunAnimationModifierImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.run_animation_modifier — canonical: UAnimationModifier::ApplyToAnimationSequence (editor-only, requires AnimationModifierLibrary)"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, ModifierClassPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("modifier_class_path"), ModifierClassPath) || ModifierClassPath.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("modifier_class"), ModifierClassPath);
+    }
+    if (ModifierClassPath.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("modifier"), ModifierClassPath);
+    }
+    if (ModifierClassPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'modifier_class_path'"));
+    }
+
+    UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(Path));
+    if (!Seq)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimSequence"));
+    }
+    UClass* ModifierClass = ResolveClassAsset(ModifierClassPath);
+    if (!ModifierClass || !ModifierClass->IsChildOf(UAnimationModifier::StaticClass()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimationModifier class: %s"), *ModifierClassPath));
+    }
+
+    bool bDryRun = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    int32 BeforeFloat = 0;
+    int32 BeforeTransform = 0;
+    int32 BeforeAttributes = 0;
+    GetAnimCurveCounts(Seq, BeforeFloat, BeforeTransform, BeforeAttributes);
+    const int32 BeforeNotifies = Seq->Notifies.Num();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Seq->GetPathName());
+    R->SetStringField(TEXT("modifier_class"), ModifierClass->GetPathName());
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    if (bDryRun)
+    {
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageRunAnimationModifier", "Sage: Run Animation Modifier"));
+    Seq->Modify();
+    UAnimationModifier* Modifier = NewObject<UAnimationModifier>(GetTransientPackage(), ModifierClass);
+    const TSharedPtr<FJsonObject>* Properties = nullptr;
+    if (Args->TryGetObjectField(TEXT("properties"), Properties) && Properties && Properties->IsValid())
+    {
+        for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*Properties)->Values)
+        {
+            if (FProperty* Prop = FindFProperty<FProperty>(ModifierClass, FName(*Pair.Key)))
+            {
+                detail::SetUPropertyFromJson(Modifier, Prop, Pair.Value);
+            }
+        }
+    }
+
+    {
+        UE::Anim::FApplyModifiersScope Scope(UE::Anim::FApplyModifiersScope::SuppressWarningAndError);
+        Modifier->ApplyToAnimationSequence(Seq);
+    }
+    Seq->RefreshCacheData();
+    Seq->MarkPackageDirty();
+
+    int32 AfterFloat = 0;
+    int32 AfterTransform = 0;
+    int32 AfterAttributes = 0;
+    GetAnimCurveCounts(Seq, AfterFloat, AfterTransform, AfterAttributes);
+    R->SetBoolField(TEXT("modified"), true);
+    R->SetNumberField(TEXT("float_curve_delta"), AfterFloat - BeforeFloat);
+    R->SetNumberField(TEXT("transform_curve_delta"), AfterTransform - BeforeTransform);
+    R->SetNumberField(TEXT("attribute_delta"), AfterAttributes - BeforeAttributes);
+    R->SetNumberField(TEXT("notify_delta"), Seq->Notifies.Num() - BeforeNotifies);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 FSageToolDispatch::FOutcome AddAnimationModifierImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.add_animation_modifier — canonical: Sequence->AnimationModifier_AddInstance (editor-only)"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, ModifierClassPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("modifier_class"), ModifierClassPath) || ModifierClassPath.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("modifier"), ModifierClassPath);
+    }
+    if (ModifierClassPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'modifier_class'"));
+    }
+
+    UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(Path));
+    if (!Seq)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimSequence: %s"), *Path));
+    }
+    UClass* ModifierClass = ResolveClassAsset(ModifierClassPath);
+    if (!ModifierClass || !ModifierClass->IsChildOf(UAnimationModifier::StaticClass()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimationModifier class: %s"), *ModifierClassPath));
+    }
+
+    bool bApply = true;
+    bool bForceApply = true;
+    bool bDryRun = false;
+    Args->TryGetBoolField(TEXT("apply"), bApply);
+    Args->TryGetBoolField(TEXT("force_apply"), bForceApply);
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+
+    int32 BeforeFloat = 0;
+    int32 BeforeTransform = 0;
+    int32 BeforeAttributes = 0;
+    GetAnimCurveCounts(Seq, BeforeFloat, BeforeTransform, BeforeAttributes);
+    const int32 BeforeModifiers = CountAnimationModifiers(Seq);
+    const int32 BeforeNotifies = Seq->Notifies.Num();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Seq->GetPathName());
+    R->SetStringField(TEXT("modifier_class"), ModifierClass->GetPathName());
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    R->SetBoolField(TEXT("apply"), bApply);
+    R->SetBoolField(TEXT("force_apply"), bForceApply);
+    R->SetNumberField(TEXT("modifiers_before"), BeforeModifiers);
+    if (bDryRun)
+    {
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageAddAnimationModifier", "Sage: Add Animation Modifier"));
+    Seq->Modify();
+    if (!UAnimationModifiersAssetUserData::AddAnimationModifierOfClass(Seq, ModifierClass))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("failed to add animation modifier: %s"), *ModifierClass->GetName()));
+    }
+    if (bApply)
+    {
+        TArray<UAnimSequence*> Sequences;
+        Sequences.Add(Seq);
+        FModuleManager::LoadModuleChecked<IAnimationModifiersModule>(TEXT("AnimationModifiers"))
+            .ApplyAnimationModifiers(Sequences, bForceApply);
+    }
+
+    int32 AfterFloat = 0;
+    int32 AfterTransform = 0;
+    int32 AfterAttributes = 0;
+    GetAnimCurveCounts(Seq, AfterFloat, AfterTransform, AfterAttributes);
+    const int32 AfterModifiers = CountAnimationModifiers(Seq);
+    Seq->RefreshCacheData();
+    Seq->MarkPackageDirty();
+
+    R->SetBoolField(TEXT("modified"), true);
+    R->SetNumberField(TEXT("modifiers_after"), AfterModifiers);
+    R->SetNumberField(TEXT("added_modifier_count"), AfterModifiers - BeforeModifiers);
+    R->SetNumberField(TEXT("float_curve_delta"), AfterFloat - BeforeFloat);
+    R->SetNumberField(TEXT("transform_curve_delta"), AfterTransform - BeforeTransform);
+    R->SetNumberField(TEXT("attribute_delta"), AfterAttributes - BeforeAttributes);
+    R->SetNumberField(TEXT("notify_delta"), Seq->Notifies.Num() - BeforeNotifies);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ===========================================================================
@@ -7741,6 +11786,446 @@ static FSpawnedLayerGraph SpawnAnimLayerFunctionGraph(UBlueprint* BP, FName Func
     return Out;
 }
 
+struct FLayerFunctionInputPinSpec
+{
+    FName Name;
+    FString DisplayName;
+    FString TypeName;
+    FEdGraphPinType PinType;
+    bool bPose = false;
+};
+
+static bool IsLayerPoseTypeName(const FString& TypeName)
+{
+    const FString L = TypeName.ToLower();
+    return L == TEXT("pose")
+        || L == TEXT("poselink")
+        || L == TEXT("pose_link")
+        || L == TEXT("fposelink")
+        || L == TEXT("localpose")
+        || L == TEXT("local_space_pose");
+}
+
+static bool MakeLayerFunctionParameterPinType(const FString& TypeName,
+                                              const FString& TypeObjectPath,
+                                              bool bArray,
+                                              FEdGraphPinType& OutType,
+                                              FString& OutError)
+{
+    OutType.ResetToDefaults();
+    const FString L = TypeName.ToLower();
+
+    if (L == TEXT("bool") || L == TEXT("boolean"))
+    {
+        OutType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
+    }
+    else if (L == TEXT("int") || L == TEXT("integer") || L == TEXT("int32"))
+    {
+        OutType.PinCategory = UEdGraphSchema_K2::PC_Int;
+    }
+    else if (L == TEXT("int64"))
+    {
+        OutType.PinCategory = UEdGraphSchema_K2::PC_Int64;
+    }
+    else if (L == TEXT("real") || L == TEXT("double") || L == TEXT("float"))
+    {
+        OutType.PinCategory = UEdGraphSchema_K2::PC_Real;
+        OutType.PinSubCategory = (L == TEXT("float"))
+            ? UEdGraphSchema_K2::PC_Float
+            : UEdGraphSchema_K2::PC_Double;
+    }
+    else if (L == TEXT("string") || L == TEXT("str"))
+    {
+        OutType.PinCategory = UEdGraphSchema_K2::PC_String;
+    }
+    else if (L == TEXT("name"))
+    {
+        OutType.PinCategory = UEdGraphSchema_K2::PC_Name;
+    }
+    else if (L == TEXT("text"))
+    {
+        OutType.PinCategory = UEdGraphSchema_K2::PC_Text;
+    }
+    else if (L == TEXT("byte"))
+    {
+        OutType.PinCategory = UEdGraphSchema_K2::PC_Byte;
+    }
+    else if (L == TEXT("struct"))
+    {
+        OutType.PinCategory = UEdGraphSchema_K2::PC_Struct;
+    }
+    else if (L == TEXT("object"))
+    {
+        OutType.PinCategory = UEdGraphSchema_K2::PC_Object;
+    }
+    else if (L == TEXT("class"))
+    {
+        OutType.PinCategory = UEdGraphSchema_K2::PC_Class;
+    }
+    else if (L == TEXT("interface"))
+    {
+        OutType.PinCategory = UEdGraphSchema_K2::PC_Interface;
+    }
+    else if (L == TEXT("softobject"))
+    {
+        OutType.PinCategory = UEdGraphSchema_K2::PC_SoftObject;
+    }
+    else if (L == TEXT("softclass"))
+    {
+        OutType.PinCategory = UEdGraphSchema_K2::PC_SoftClass;
+    }
+    else if (L == TEXT("pc_real"))
+    {
+        OutType.PinCategory = UEdGraphSchema_K2::PC_Real;
+        OutType.PinSubCategory = UEdGraphSchema_K2::PC_Double;
+    }
+    else
+    {
+        OutType.PinCategory = FName(*TypeName);
+    }
+
+    if (!TypeObjectPath.IsEmpty())
+    {
+        UObject* TypeObject = ResolveAsset(TypeObjectPath);
+        if (!TypeObject)
+        {
+            OutError = FString::Printf(TEXT("type_object not found for pin type '%s': %s"),
+                *TypeName, *TypeObjectPath);
+            return false;
+        }
+        OutType.PinSubCategoryObject = TypeObject;
+    }
+    else if (OutType.PinCategory == UEdGraphSchema_K2::PC_Struct)
+    {
+        OutError = TEXT("struct pins require 'type_object' (use type:'pose' for FPoseLink input poses)");
+        return false;
+    }
+
+    if (bArray)
+    {
+        OutType.ContainerType = EPinContainerType::Array;
+    }
+    return true;
+}
+
+static bool ParseLayerFunctionInputPins(
+    const TArray<TSharedPtr<FJsonValue>>& PinValues,
+    TArray<FLayerFunctionInputPinSpec>& OutPins,
+    FString& OutError)
+{
+    TSet<FString> SeenNames;
+    for (const TSharedPtr<FJsonValue>& PinValue : PinValues)
+    {
+        const TSharedPtr<FJsonObject>* PinObj = nullptr;
+        if (!PinValue.IsValid() || !PinValue->TryGetObject(PinObj) || !PinObj || !PinObj->IsValid())
+        {
+            OutError = TEXT("each pins[] entry must be an object");
+            return false;
+        }
+
+        FString Name;
+        FString TypeName;
+        if (!(*PinObj)->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty()
+            || !(*PinObj)->TryGetStringField(TEXT("type"), TypeName) || TypeName.IsEmpty())
+        {
+            OutError = TEXT("each pins[] entry requires non-empty 'name' and 'type'");
+            return false;
+        }
+
+        if (SeenNames.Contains(Name))
+        {
+            OutError = FString::Printf(TEXT("duplicate input pin name: %s"), *Name);
+            return false;
+        }
+        SeenNames.Add(Name);
+
+        bool bArray = false;
+        (*PinObj)->TryGetBoolField(TEXT("array"), bArray);
+
+        FLayerFunctionInputPinSpec Spec;
+        Spec.Name = FName(*Name);
+        Spec.DisplayName = Name;
+        Spec.TypeName = TypeName;
+        Spec.bPose = IsLayerPoseTypeName(TypeName);
+        if (Spec.bPose)
+        {
+            if (bArray)
+            {
+                OutError = FString::Printf(TEXT("pose input pin '%s' cannot be an array"), *Name);
+                return false;
+            }
+            Spec.PinType = UAnimationGraphSchema::MakeLocalSpacePosePin();
+        }
+        else
+        {
+            FString TypeObjectPath;
+            (*PinObj)->TryGetStringField(TEXT("type_object"), TypeObjectPath);
+            if (!MakeLayerFunctionParameterPinType(TypeName, TypeObjectPath, bArray,
+                                                   Spec.PinType, OutError))
+            {
+                return false;
+            }
+            if (UAnimationGraphSchema::IsPosePin(Spec.PinType))
+            {
+                OutError = FString::Printf(TEXT("pin '%s' resolves to a pose type; use type:'pose'"),
+                    *Name);
+                return false;
+            }
+        }
+        OutPins.Add(Spec);
+    }
+
+    int32 PoseCount = 0;
+    for (const FLayerFunctionInputPinSpec& Spec : OutPins)
+    {
+        if (Spec.bPose) ++PoseCount;
+    }
+    if (PoseCount == 0)
+    {
+        OutError = TEXT("pins[] must include at least one pose pin, e.g. {name:'SourcePose', type:'pose'}");
+        return false;
+    }
+    return true;
+}
+
+static UEdGraph* FindLayerFunctionGraph(UAnimBlueprint* IfaceBP, FName FunctionName)
+{
+    if (!IfaceBP) return nullptr;
+    for (UEdGraph* Graph : CollectAnimLayerFunctionGraphs(IfaceBP))
+    {
+        if (Graph && Graph->GetFName() == FunctionName)
+        {
+            return Graph;
+        }
+    }
+    return nullptr;
+}
+
+static bool HasAnyLinkedPins(const UEdGraphNode* Node)
+{
+    if (!Node) return false;
+    for (const UEdGraphPin* Pin : Node->Pins)
+    {
+        if (Pin && Pin->LinkedTo.Num() > 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void FireLinkedInputPoseInputChange(UAnimGraphNode_LinkedInputPose* Node)
+{
+    if (!Node) return;
+    if (FProperty* InputsProp = UAnimGraphNode_LinkedInputPose::StaticClass()
+            ->FindPropertyByName(GET_MEMBER_NAME_CHECKED(UAnimGraphNode_LinkedInputPose, Inputs)))
+    {
+        FPropertyChangedEvent Event(InputsProp, EPropertyChangeType::ValueSet);
+        Node->PostEditChangeProperty(Event);
+    }
+    else
+    {
+        Node->ReconstructNode();
+    }
+}
+
+static TSharedPtr<FJsonObject> BuildLayerFunctionInputPinReadback(UEdGraph* Graph)
+{
+    TArray<UAnimGraphNode_LinkedInputPose*> Nodes;
+    if (Graph)
+    {
+        Graph->GetNodesOfClass(Nodes);
+    }
+    Nodes.Sort([](const UAnimGraphNode_LinkedInputPose& A,
+                  const UAnimGraphNode_LinkedInputPose& B)
+    {
+        if (A.NodePosY == B.NodePosY) return A.NodePosX < B.NodePosX;
+        return A.NodePosY < B.NodePosY;
+    });
+
+    TArray<TSharedPtr<FJsonValue>> NodeArr;
+    TArray<TSharedPtr<FJsonValue>> FunctionPins;
+    for (UAnimGraphNode_LinkedInputPose* Node : Nodes)
+    {
+        if (!Node) continue;
+
+        TArray<TSharedPtr<FJsonValue>> OutputPins;
+        for (UEdGraphPin* Pin : Node->Pins)
+        {
+            if (!Pin || Pin->Direction != EGPD_Output || Pin->bOrphanedPin) continue;
+            TSharedPtr<FJsonObject> PinObj = PinSummaryJson(Pin);
+            OutputPins.Add(MakeShared<FJsonValueObject>(PinObj));
+
+            TSharedPtr<FJsonObject> FunctionPin = MakeShared<FJsonObject>();
+            if (IsPosePin(Pin))
+            {
+                FunctionPin->SetStringField(TEXT("name"), Node->Node.Name.ToString());
+                FunctionPin->SetStringField(TEXT("kind"), TEXT("pose"));
+            }
+            else
+            {
+                FunctionPin->SetStringField(TEXT("name"), Pin->PinName.ToString());
+                FunctionPin->SetStringField(TEXT("kind"), TEXT("parameter"));
+            }
+            FunctionPin->SetObjectField(TEXT("pin_type"), PinTypeToJson(Pin->PinType));
+            FunctionPins.Add(MakeShared<FJsonValueObject>(FunctionPin));
+        }
+
+        TSharedPtr<FJsonObject> NodeObj = MakeShared<FJsonObject>();
+        NodeObj->SetStringField(TEXT("node_id"), Node->NodeGuid.ToString(EGuidFormats::Digits));
+        NodeObj->SetStringField(TEXT("pose_name"), Node->Node.Name.ToString());
+        NodeObj->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
+        NodeObj->SetNumberField(TEXT("input_parameter_count"), Node->Inputs.Num());
+        NodeObj->SetArrayField(TEXT("output_pins"), OutputPins);
+        NodeArr.Add(MakeShared<FJsonValueObject>(NodeObj));
+    }
+
+    TSharedPtr<FJsonObject> Readback = MakeShared<FJsonObject>();
+    Readback->SetArrayField(TEXT("linked_input_pose_nodes"), NodeArr);
+    Readback->SetArrayField(TEXT("function_pins"), FunctionPins);
+    Readback->SetNumberField(TEXT("linked_input_pose_node_count"), NodeArr.Num());
+    Readback->SetNumberField(TEXT("function_pin_count"), FunctionPins.Num());
+    return Readback;
+}
+
+static bool ApplyLayerFunctionInputPinsToGraph(
+    UAnimBlueprint* IfaceBP,
+    UEdGraph* Graph,
+    const TArray<FLayerFunctionInputPinSpec>& Pins,
+    bool bConnectFirstPoseToOutput,
+    FString& OutError,
+    TSharedPtr<FJsonObject>& OutReadback,
+    bool& bOutConnectedToOutput)
+{
+    if (!IfaceBP || !Graph)
+    {
+        OutError = TEXT("missing Anim Layer Interface function graph");
+        return false;
+    }
+
+    TArray<FLayerFunctionInputPinSpec> PosePins;
+    TArray<FLayerFunctionInputPinSpec> ParameterPins;
+    for (const FLayerFunctionInputPinSpec& Pin : Pins)
+    {
+        if (Pin.bPose) PosePins.Add(Pin);
+        else           ParameterPins.Add(Pin);
+    }
+    if (PosePins.Num() == 0)
+    {
+        OutError = TEXT("at least one pose pin is required");
+        return false;
+    }
+
+    TArray<FAnimBlueprintFunctionPinInfo> ParameterInfos;
+    for (const FLayerFunctionInputPinSpec& Pin : ParameterPins)
+    {
+        ParameterInfos.Add(FAnimBlueprintFunctionPinInfo(Pin.Name, Pin.PinType));
+    }
+
+    TArray<UAnimGraphNode_LinkedInputPose*> ExistingNodes;
+    Graph->GetNodesOfClass(ExistingNodes);
+    TSet<UAnimGraphNode_LinkedInputPose*> UsedNodes;
+    TArray<UAnimGraphNode_LinkedInputPose*> DesiredNodes;
+
+    auto FindUnusedNodeByPoseName = [&](FName PoseName) -> UAnimGraphNode_LinkedInputPose*
+    {
+        for (UAnimGraphNode_LinkedInputPose* Node : ExistingNodes)
+        {
+            if (Node && !UsedNodes.Contains(Node) && Node->Node.Name == PoseName)
+            {
+                return Node;
+            }
+        }
+        return nullptr;
+    };
+
+    auto FindAnyUnusedNode = [&]() -> UAnimGraphNode_LinkedInputPose*
+    {
+        for (UAnimGraphNode_LinkedInputPose* Node : ExistingNodes)
+        {
+            if (Node && !UsedNodes.Contains(Node))
+            {
+                return Node;
+            }
+        }
+        return nullptr;
+    };
+
+    for (int32 PoseIndex = 0; PoseIndex < PosePins.Num(); ++PoseIndex)
+    {
+        const FLayerFunctionInputPinSpec& PoseSpec = PosePins[PoseIndex];
+        UAnimGraphNode_LinkedInputPose* Node = FindUnusedNodeByPoseName(PoseSpec.Name);
+        if (!Node)
+        {
+            Node = FindAnyUnusedNode();
+        }
+        if (!Node)
+        {
+            const FVector2D Pos = UAnimationGraphSchema::GetPositionForNewLinkedInputPoseNode(*Graph);
+            Node = NewObject<UAnimGraphNode_LinkedInputPose>(Graph);
+            if (!Node)
+            {
+                OutError = TEXT("failed to create UAnimGraphNode_LinkedInputPose");
+                return false;
+            }
+            Node->CreateNewGuid();
+            Node->NodePosX = static_cast<int32>(Pos.X);
+            Node->NodePosY = static_cast<int32>(Pos.Y);
+            Graph->AddNode(Node, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+            Node->PostPlacedNewNode();
+            ExistingNodes.Add(Node);
+        }
+
+        UsedNodes.Add(Node);
+        DesiredNodes.Add(Node);
+
+        Node->Modify();
+        Node->Node.Name = PoseSpec.Name;
+        Node->InputPoseIndex = INDEX_NONE;
+        Node->Inputs = (PoseIndex == 0) ? ParameterInfos : TArray<FAnimBlueprintFunctionPinInfo>();
+        FireLinkedInputPoseInputChange(Node);
+    }
+
+    for (UAnimGraphNode_LinkedInputPose* Node : ExistingNodes)
+    {
+        if (!Node || UsedNodes.Contains(Node)) continue;
+        if (HasAnyLinkedPins(Node))
+        {
+            OutError = FString::Printf(
+                TEXT("refusing to remove obsolete linked input pose '%s' because it has linked pins"),
+                *Node->Node.Name.ToString());
+            return false;
+        }
+        Graph->RemoveNode(Node);
+    }
+
+    if (bConnectFirstPoseToOutput && DesiredNodes.Num() > 0)
+    {
+        UEdGraphNode* RootNode = FindAnimGraphOutput(Graph);
+        UEdGraphPin* RootInput = FindFirstInputPosePin(RootNode);
+        UEdGraphPin* PoseOutput = FindFirstOutputPosePin(DesiredNodes[0]);
+        if (RootInput && PoseOutput)
+        {
+            const bool bAlreadyLinked = RootInput->LinkedTo.Contains(PoseOutput);
+            if (bAlreadyLinked)
+            {
+                bOutConnectedToOutput = true;
+            }
+            else if (RootInput->LinkedTo.Num() == 0)
+            {
+                RootInput->Modify();
+                PoseOutput->Modify();
+                bOutConnectedToOutput = Graph->GetSchema()->TryCreateConnection(PoseOutput, RootInput);
+            }
+        }
+    }
+
+    UAnimationGraphSchema::AutoArrangeInterfaceGraph(*Graph);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(IfaceBP);
+    OutReadback = BuildLayerFunctionInputPinReadback(Graph);
+    return true;
+}
+
 // --- (1) animation.create_anim_layer_interface ----------------------------
 
 FSageToolDispatch::FOutcome CreateAnimLayerInterfaceImpl(const TSharedPtr<FJsonObject>& Args)
@@ -7829,6 +12314,24 @@ FSageToolDispatch::FOutcome AddLayerFunctionImpl(const TSharedPtr<FJsonObject>& 
     }
     bool bCompile = false;
     Args->TryGetBoolField(TEXT("compile"), bCompile);
+    bool bConnectFirstPoseToOutput = true;
+    Args->TryGetBoolField(TEXT("connect_first_pose_to_output"), bConnectFirstPoseToOutput);
+
+    const TArray<TSharedPtr<FJsonValue>>* PinValues = nullptr;
+    bool bHasInputPins = Args->TryGetArrayField(TEXT("pins"), PinValues);
+    if (!bHasInputPins)
+    {
+        bHasInputPins = Args->TryGetArrayField(TEXT("input_pins"), PinValues);
+    }
+    TArray<FLayerFunctionInputPinSpec> InputPins;
+    if (bHasInputPins)
+    {
+        FString ParseError;
+        if (!PinValues || !ParseLayerFunctionInputPins(*PinValues, InputPins, ParseError))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, ParseError);
+        }
+    }
 
     UAnimBlueprint* IfaceBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
     if (!IfaceBP)
@@ -7851,16 +12354,47 @@ FSageToolDispatch::FOutcome AddLayerFunctionImpl(const TSharedPtr<FJsonObject>& 
         {
             if (UAnimGraphNode_Root* R = Cast<UAnimGraphNode_Root>(N)) { RootNode = R; break; }
         }
+        TSharedPtr<FJsonObject> InputReadback;
+        bool bConnectedToOutput = false;
+        bool bInputPinsUpdated = false;
+        bool bCompiled = false;
+        if (bHasInputPins)
+        {
+            FScopedTransaction Tx(LOCTEXT("SetLayerFuncPinsExisting", "Sage: Set Layer Function Input Pins"));
+            IfaceBP->Modify();
+            Graph->Modify();
+            FString ApplyError;
+            if (!ApplyLayerFunctionInputPinsToGraph(IfaceBP, Graph, InputPins,
+                                                    bConnectFirstPoseToOutput,
+                                                    ApplyError, InputReadback,
+                                                    bConnectedToOutput))
+            {
+                Tx.Cancel();
+                return FSageToolDispatch::FOutcome::MakeError(-32603, ApplyError);
+            }
+            bInputPinsUpdated = true;
+            if (bCompile)
+            {
+                FKismetEditorUtilities::CompileBlueprint(IfaceBP);
+                bCompiled = true;
+            }
+        }
         auto R = MakeShared<FJsonObject>();
         R->SetStringField(TEXT("function_name"), FuncName);
         R->SetStringField(TEXT("graph_name"), Graph->GetName());
         R->SetStringField(TEXT("schema"), TEXT("AnimationGraphSchema"));
         R->SetStringField(TEXT("root_node_id"),
             RootNode ? RootNode->NodeGuid.ToString(EGuidFormats::Digits) : FString());
+        if (InputReadback.IsValid())
+        {
+            R->SetObjectField(TEXT("linked_input_pose_readback"), InputReadback);
+        }
+        R->SetBoolField(TEXT("input_pins_updated"), bInputPinsUpdated);
+        R->SetBoolField(TEXT("connected_first_pose_to_output"), bConnectedToOutput);
         R->SetArrayField(TEXT("collision_warnings"), CollisionWarnings);
         R->SetNumberField(TEXT("collision_warning_count"), CollisionWarnings.Num());
         R->SetBoolField(TEXT("already"), true);
-        R->SetBoolField(TEXT("compiled"), false);
+        R->SetBoolField(TEXT("compiled"), bCompiled);
         return FSageToolDispatch::FOutcome::MakeSuccess(R);
     }
 
@@ -7872,6 +12406,21 @@ FSageToolDispatch::FOutcome AddLayerFunctionImpl(const TSharedPtr<FJsonObject>& 
         return FSageToolDispatch::FOutcome::MakeError(-32603,
             TEXT("CreateNewGraph returned null"));
     IfaceBP->FunctionGraphs.Add(Spawn.Graph);
+
+    TSharedPtr<FJsonObject> InputReadback;
+    bool bConnectedToOutput = false;
+    if (bHasInputPins)
+    {
+        FString ApplyError;
+        if (!ApplyLayerFunctionInputPinsToGraph(IfaceBP, Spawn.Graph, InputPins,
+                                                bConnectFirstPoseToOutput,
+                                                ApplyError, InputReadback,
+                                                bConnectedToOutput))
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32603, ApplyError);
+        }
+    }
 
     FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(IfaceBP);
 
@@ -7888,9 +12437,99 @@ FSageToolDispatch::FOutcome AddLayerFunctionImpl(const TSharedPtr<FJsonObject>& 
     R->SetStringField(TEXT("schema"), TEXT("AnimationGraphSchema"));
     R->SetStringField(TEXT("root_node_id"),
         Spawn.Root ? Spawn.Root->NodeGuid.ToString(EGuidFormats::Digits) : FString());
+    if (InputReadback.IsValid())
+    {
+        R->SetObjectField(TEXT("linked_input_pose_readback"), InputReadback);
+    }
+    R->SetBoolField(TEXT("input_pins_updated"), bHasInputPins);
+    R->SetBoolField(TEXT("connected_first_pose_to_output"), bConnectedToOutput);
     R->SetArrayField(TEXT("collision_warnings"), CollisionWarnings);
     R->SetNumberField(TEXT("collision_warning_count"), CollisionWarnings.Num());
     R->SetBoolField(TEXT("already"), false);
+    R->SetBoolField(TEXT("compiled"), bCompiled);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// --- (2b) animation.set_layer_function_input_pins -------------------------
+
+FSageToolDispatch::FOutcome SetLayerFunctionInputPinsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, FuncName;
+    const TArray<TSharedPtr<FJsonValue>>* PinValues = nullptr;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || !Args->TryGetStringField(TEXT("function_name"), FuncName)
+        || FuncName.IsEmpty()
+        || !Args->TryGetArrayField(TEXT("pins"), PinValues)
+        || !PinValues)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'path', 'function_name', or 'pins'"));
+    }
+    bool bCompile = false;
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
+    bool bConnectFirstPoseToOutput = true;
+    Args->TryGetBoolField(TEXT("connect_first_pose_to_output"), bConnectFirstPoseToOutput);
+
+    TArray<FLayerFunctionInputPinSpec> InputPins;
+    FString ParseError;
+    if (!ParseLayerFunctionInputPins(*PinValues, InputPins, ParseError))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, ParseError);
+    }
+
+    UAnimBlueprint* IfaceBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!IfaceBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+    if (!IsAnimLayerInterface(IfaceBP))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("AnimBP is not BPTYPE_Interface: %s"), *Path));
+    }
+
+    UEdGraph* Graph = FindLayerFunctionGraph(IfaceBP, FName(*FuncName));
+    if (!Graph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("layer function not found: %s"), *FuncName));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SetLayerFuncPins", "Sage: Set Layer Function Input Pins"));
+    IfaceBP->Modify();
+    Graph->Modify();
+
+    TSharedPtr<FJsonObject> InputReadback;
+    bool bConnectedToOutput = false;
+    FString ApplyError;
+    if (!ApplyLayerFunctionInputPinsToGraph(IfaceBP, Graph, InputPins,
+                                            bConnectFirstPoseToOutput,
+                                            ApplyError, InputReadback,
+                                            bConnectedToOutput))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, ApplyError);
+    }
+
+    bool bCompiled = false;
+    if (bCompile)
+    {
+        FKismetEditorUtilities::CompileBlueprint(IfaceBP);
+        bCompiled = true;
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), IfaceBP->GetPathName());
+    R->SetStringField(TEXT("function_name"), FuncName);
+    R->SetStringField(TEXT("graph_name"), Graph->GetName());
+    R->SetStringField(TEXT("schema"), TEXT("AnimationGraphSchema"));
+    R->SetObjectField(TEXT("linked_input_pose_readback"), InputReadback);
+    R->SetBoolField(TEXT("connected_first_pose_to_output"), bConnectedToOutput);
     R->SetBoolField(TEXT("compiled"), bCompiled);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
@@ -8109,6 +12748,8 @@ FSageToolDispatch::FOutcome AddLinkedAnimLayerNodeImpl(const TSharedPtr<FJsonObj
     Args->TryGetNumberField(TEXT("y"), Y);
     bool bCompile = false;
     Args->TryGetBoolField(TEXT("compile"), bCompile);
+    bool bExposeInputProperties = true;
+    Args->TryGetBoolField(TEXT("expose_input_properties"), bExposeInputProperties);
 
     UAnimBlueprint* MasterBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
     if (!MasterBP)
@@ -8189,6 +12830,17 @@ FSageToolDispatch::FOutcome AddLinkedAnimLayerNodeImpl(const TSharedPtr<FJsonObj
     // events, guarantees pin reallocation + title cache regeneration.
     Node->ReconstructNode();
 
+    TArray<FName> InputPropertyPins;
+    TArray<FName> NewlyExposedInputPropertyPins;
+    if (bExposeInputProperties)
+    {
+        // Linked-layer scalar ALI params live in
+        // UAnimGraphNode_CustomProperty::CustomPinProperties, not the inner
+        // FAnimNode struct. Programmatic construction leaves those optional
+        // pins hidden unless we expose them explicitly.
+        ExposeAllCustomPropertyPins(Node, InputPropertyPins, NewlyExposedInputPropertyPins);
+    }
+
     FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(MasterBP);
 
     bool bCompiled = false;
@@ -8200,6 +12852,11 @@ FSageToolDispatch::FOutcome AddLinkedAnimLayerNodeImpl(const TSharedPtr<FJsonObj
 
     UEdGraphPin* InputPosePin  = FindFirstInputPosePin(Node);
     UEdGraphPin* OutputPosePin = FindFirstOutputPosePin(Node);
+    TArray<TSharedPtr<FJsonValue>> PinsArr;
+    for (const UEdGraphPin* Pin : Node->Pins)
+    {
+        PinsArr.Add(MakeShared<FJsonValueObject>(PinSummaryJson(Pin)));
+    }
 
     // Step 5: Verify the Layer actually took effect by reading the rendered
     // node title — the same surface bp.validate/bp.search_nodes use. If the
@@ -8222,6 +12879,9 @@ FSageToolDispatch::FOutcome AddLinkedAnimLayerNodeImpl(const TSharedPtr<FJsonObj
         InputPosePin ? InputPosePin->PinName.ToString() : FString());
     R->SetStringField(TEXT("output_pose_pin"),
         OutputPosePin ? OutputPosePin->PinName.ToString() : FString());
+    R->SetArrayField(TEXT("input_property_pins"), NamesToJsonArray(InputPropertyPins));
+    R->SetArrayField(TEXT("newly_exposed_input_property_pins"), NamesToJsonArray(NewlyExposedInputPropertyPins));
+    R->SetArrayField(TEXT("pins"), PinsArr);
     R->SetStringField(TEXT("node_title"), NodeTitle);
     R->SetBoolField  (TEXT("layer_resolved"), bLayerInTitle);
     if (!bLayerInTitle)
@@ -8983,26 +13643,295 @@ FSageToolDispatch::FOutcome RepairLinkedAnimLayerNodesImpl(const TSharedPtr<FJso
 
 FSageToolDispatch::FOutcome SetSequenceAdditiveImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.set_sequence_additive_settings — canonical: IAnimationDataController bracket (additive type/base pose are private in UE 5.7)"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, AdditiveTypeRaw;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("additive_type"), AdditiveTypeRaw))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'additive_type'"));
+    }
+
+    UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(Path));
+    if (!Seq)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimSequence"));
+    }
+
+    auto ParseAdditiveType = [](const FString& Raw, EAdditiveAnimationType& Out) -> bool
+    {
+        if (Raw.Equals(TEXT("None"), ESearchCase::IgnoreCase) || Raw.Equals(TEXT("AAT_None"), ESearchCase::IgnoreCase))
+        {
+            Out = AAT_None;
+            return true;
+        }
+        if (Raw.Equals(TEXT("LocalSpaceBase"), ESearchCase::IgnoreCase) || Raw.Equals(TEXT("LocalSpace"), ESearchCase::IgnoreCase)
+            || Raw.Equals(TEXT("AAT_LocalSpaceBase"), ESearchCase::IgnoreCase))
+        {
+            Out = AAT_LocalSpaceBase;
+            return true;
+        }
+        if (Raw.Equals(TEXT("MeshSpaceBase"), ESearchCase::IgnoreCase) || Raw.Equals(TEXT("MeshSpace"), ESearchCase::IgnoreCase)
+            || Raw.Equals(TEXT("RotationOffsetMeshSpace"), ESearchCase::IgnoreCase)
+            || Raw.Equals(TEXT("AAT_RotationOffsetMeshSpace"), ESearchCase::IgnoreCase))
+        {
+            Out = AAT_RotationOffsetMeshSpace;
+            return true;
+        }
+        return false;
+    };
+    auto ParseBasePoseType = [](const FString& Raw, EAdditiveBasePoseType& Out) -> bool
+    {
+        if (Raw.IsEmpty()) { return true; }
+        if (Raw.Equals(TEXT("None"), ESearchCase::IgnoreCase) || Raw.Equals(TEXT("ABPT_None"), ESearchCase::IgnoreCase))
+        {
+            Out = ABPT_None;
+            return true;
+        }
+        if (Raw.Equals(TEXT("RefPose"), ESearchCase::IgnoreCase) || Raw.Equals(TEXT("ReferencePose"), ESearchCase::IgnoreCase)
+            || Raw.Equals(TEXT("SkeletonReferencePose"), ESearchCase::IgnoreCase) || Raw.Equals(TEXT("ABPT_RefPose"), ESearchCase::IgnoreCase))
+        {
+            Out = ABPT_RefPose;
+            return true;
+        }
+        if (Raw.Equals(TEXT("AnimScaled"), ESearchCase::IgnoreCase) || Raw.Equals(TEXT("ABPT_AnimScaled"), ESearchCase::IgnoreCase))
+        {
+            Out = ABPT_AnimScaled;
+            return true;
+        }
+        if (Raw.Equals(TEXT("AnimFrame"), ESearchCase::IgnoreCase) || Raw.Equals(TEXT("ABPT_AnimFrame"), ESearchCase::IgnoreCase))
+        {
+            Out = ABPT_AnimFrame;
+            return true;
+        }
+        if (Raw.Equals(TEXT("LocalAnimFrame"), ESearchCase::IgnoreCase) || Raw.Equals(TEXT("ABPT_LocalAnimFrame"), ESearchCase::IgnoreCase))
+        {
+            Out = ABPT_LocalAnimFrame;
+            return true;
+        }
+        return false;
+    };
+
+    EAdditiveAnimationType AdditiveType = AAT_None;
+    if (!ParseAdditiveType(AdditiveTypeRaw, AdditiveType))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid additive_type: %s"), *AdditiveTypeRaw));
+    }
+    FString BasePoseTypeRaw;
+    Args->TryGetStringField(TEXT("base_pose_type"), BasePoseTypeRaw);
+    EAdditiveBasePoseType BasePoseType = Seq->RefPoseType;
+    if (!ParseBasePoseType(BasePoseTypeRaw, BasePoseType))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid base_pose_type: %s"), *BasePoseTypeRaw));
+    }
+    FString BaseAnimationPath;
+    Args->TryGetStringField(TEXT("base_animation"), BaseAnimationPath);
+    if (BaseAnimationPath.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("base_sequence"), BaseAnimationPath);
+    }
+    UAnimSequence* BaseSequence = nullptr;
+    if (!BaseAnimationPath.IsEmpty())
+    {
+        BaseSequence = Cast<UAnimSequence>(ResolveAsset(BaseAnimationPath));
+        if (!BaseSequence)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("base_animation is not a UAnimSequence: %s"), *BaseAnimationPath));
+        }
+    }
+    double RefFrame = Seq->RefFrameIndex;
+    Args->TryGetNumberField(TEXT("base_frame"), RefFrame);
+    Args->TryGetNumberField(TEXT("ref_frame_index"), RefFrame);
+
+    FScopedTransaction Tx(LOCTEXT("SageSetSequenceAdditive", "Sage: Set Sequence Additive Settings"));
+    Seq->Modify();
+    Seq->AdditiveAnimType = AdditiveType;
+    Seq->RefPoseType = BasePoseType;
+    Seq->RefPoseSeq = BaseSequence;
+    Seq->RefFrameIndex = FMath::Max(0, static_cast<int32>(RefFrame));
+    Seq->RefreshCacheData();
+    Seq->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Seq->GetPathName());
+    R->SetStringField(TEXT("additive_type"), StaticEnum<EAdditiveAnimationType>()->GetNameStringByValue(Seq->AdditiveAnimType));
+    R->SetStringField(TEXT("base_pose_type"), StaticEnum<EAdditiveBasePoseType>()->GetNameStringByValue(Seq->RefPoseType));
+    R->SetStringField(TEXT("base_animation"), Seq->RefPoseSeq ? Seq->RefPoseSeq->GetPathName() : FString());
+    R->SetNumberField(TEXT("ref_frame_index"), Seq->RefFrameIndex);
+    R->SetBoolField(TEXT("modified"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 FSageToolDispatch::FOutcome SetSequenceCompressionImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.set_sequence_compression_scheme — canonical: assign UAnimBoneCompressionSettings asset to UAnimSequence::BoneCompressionSettings + RequestSyncAnimRecompression()"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, SettingsPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    Args->TryGetStringField(TEXT("scheme_path"), SettingsPath);
+    if (SettingsPath.IsEmpty()) Args->TryGetStringField(TEXT("settings"), SettingsPath);
+    if (SettingsPath.IsEmpty()) Args->TryGetStringField(TEXT("bone_compression_settings"), SettingsPath);
+
+    UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(Path));
+    if (!Seq)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimSequence"));
+    }
+
+    UObject* Settings = nullptr;
+    FString Error;
+    if (!ResolveExpectedObject(SettingsPath, TEXT("/Script/Engine.AnimBoneCompressionSettings"), Settings, Error))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    const FString Before = GetObjectPathProperty(Seq, TEXT("BoneCompressionSettings"));
+    FScopedTransaction Tx(LOCTEXT("SageSetSequenceCompression", "Sage: Set Sequence Compression"));
+    Seq->Modify();
+    if (!SetReflectedProperty(Seq, TEXT("BoneCompressionSettings"), Settings ? JsonStringValue(Settings->GetPathName()) : MakeShared<FJsonValueNull>()))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("failed to set BoneCompressionSettings"));
+    }
+    Seq->RefreshCacheData();
+    Seq->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Seq->GetPathName());
+    R->SetStringField(TEXT("bone_compression_settings_before"), Before);
+    R->SetStringField(TEXT("bone_compression_settings"), GetObjectPathProperty(Seq, TEXT("BoneCompressionSettings")));
+    R->SetBoolField(TEXT("modified"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 FSageToolDispatch::FOutcome AddMontageBranchingPointImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.add_montage_branching_point — canonical: Persona montage editor (BranchingPointMarkers is private in UE 5.7)"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, BranchName;
+    double Time = 0.0;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("branch_name"), BranchName) || BranchName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'branch_name'"));
+    }
+    Args->TryGetNumberField(TEXT("time"), Time);
+    int32 TrackIndex = 0;
+    int32 SlotIndex = 0;
+    Args->TryGetNumberField(TEXT("track_index"), TrackIndex);
+    Args->TryGetNumberField(TEXT("slot_index"), SlotIndex);
+
+    UAnimMontage* M = Cast<UAnimMontage>(ResolveAsset(Path));
+    if (!M)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimMontage"));
+    }
+    const float ClampedTime = FMath::Clamp(static_cast<float>(Time), 0.0f, M->GetPlayLength());
+
+    FScopedTransaction Tx(LOCTEXT("SageAddMontageBranchingPoint", "Sage: Add Montage Branching Point"));
+    M->Modify();
+    FAnimNotifyEvent NewEvent;
+    NewEvent.NotifyName = FName(*BranchName);
+    NewEvent.MontageTickType = EMontageNotifyTickType::BranchingPoint;
+    NewEvent.TrackIndex = TrackIndex;
+    NewEvent.Link(M, ClampedTime, SlotIndex);
+    NewEvent.SetTime(ClampedTime);
+    NewEvent.TriggerTimeOffset = GetTriggerTimeOffsetForType(M->CalculateOffsetForNotify(ClampedTime));
+    M->Notifies.Add(NewEvent);
+    M->RefreshCacheData();
+    M->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), M->GetPathName());
+    R->SetStringField(TEXT("branch_name"), BranchName);
+    R->SetNumberField(TEXT("time"), ClampedTime);
+    R->SetNumberField(TEXT("index"), M->Notifies.Num() - 1);
+    R->SetBoolField(TEXT("branching_point"), M->Notifies.Last().IsBranchingPoint());
+    R->SetBoolField(TEXT("modified"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 FSageToolDispatch::FOutcome SetMontageBlendCurveImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.set_montage_blend_curve — canonical: assign UCurveFloat to UAnimMontage::BlendInProfile / BlendOutProfile (pending Sage impl)"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, Direction, CurvePath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    Args->TryGetStringField(TEXT("blend_in_or_out"), Direction);
+    if (Direction.IsEmpty()) Args->TryGetStringField(TEXT("direction"), Direction);
+    Args->TryGetStringField(TEXT("curve_path"), CurvePath);
+    if (CurvePath.IsEmpty()) Args->TryGetStringField(TEXT("curve"), CurvePath);
+
+    UAnimMontage* M = Cast<UAnimMontage>(ResolveAsset(Path));
+    if (!M)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UAnimMontage"));
+    }
+    UCurveFloat* Curve = nullptr;
+    if (!CurvePath.IsEmpty())
+    {
+        Curve = Cast<UCurveFloat>(ResolveAsset(CurvePath));
+        if (!Curve)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("not a UCurveFloat: %s"), *CurvePath));
+        }
+    }
+
+    const bool bBlendIn = Direction.Equals(TEXT("in"), ESearchCase::IgnoreCase)
+        || Direction.Equals(TEXT("blend_in"), ESearchCase::IgnoreCase)
+        || Direction.Equals(TEXT("BlendIn"), ESearchCase::CaseSensitive);
+    const bool bBlendOut = Direction.Equals(TEXT("out"), ESearchCase::IgnoreCase)
+        || Direction.Equals(TEXT("blend_out"), ESearchCase::IgnoreCase)
+        || Direction.Equals(TEXT("BlendOut"), ESearchCase::CaseSensitive);
+    if (!bBlendIn && !bBlendOut)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blend_in_or_out must be 'in' or 'out'"));
+    }
+
+    FAlphaBlend& Blend = bBlendIn ? M->BlendIn : M->BlendOut;
+    FScopedTransaction Tx(LOCTEXT("SageSetMontageBlendCurve", "Sage: Set Montage Blend Curve"));
+    M->Modify();
+    Blend.SetCustomCurve(Curve);
+    if (Curve)
+    {
+        Blend.SetBlendOption(EAlphaBlendOption::Custom);
+    }
+    double BlendTime = Blend.GetBlendTime();
+    if (Args->TryGetNumberField(TEXT("blend_time"), BlendTime))
+    {
+        Blend.SetBlendTime(FMath::Max(0.0f, static_cast<float>(BlendTime)));
+    }
+    M->RefreshCacheData();
+    M->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), M->GetPathName());
+    R->SetStringField(TEXT("blend_in_or_out"), bBlendIn ? TEXT("in") : TEXT("out"));
+    R->SetStringField(TEXT("curve_path"), Curve ? Curve->GetPathName() : FString());
+    R->SetNumberField(TEXT("blend_time"), Blend.GetBlendTime());
+    R->SetNumberField(TEXT("blend_option"), static_cast<int32>(Blend.GetBlendOption()));
+    R->SetBoolField(TEXT("modified"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 FSageToolDispatch::FOutcome SetMontageSectionLoopImpl(const TSharedPtr<FJsonObject>& Args)
@@ -9080,8 +14009,160 @@ FSageToolDispatch::FOutcome SetMontageSectionNextImpl(const TSharedPtr<FJsonObje
 
 FSageToolDispatch::FOutcome CopyAnimationCurvesImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.copy_animation_curves — canonical: IAnimationDataController curve mutation API on the destination sequence"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString SourcePath, DestPath;
+    if (!Args.IsValid() ||
+        (!Args->TryGetStringField(TEXT("source_sequence"), SourcePath) &&
+         !Args->TryGetStringField(TEXT("from_sequence"), SourcePath)))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'source_sequence'"));
+    }
+    if (!Args->TryGetStringField(TEXT("destination_sequence"), DestPath) &&
+        !Args->TryGetStringField(TEXT("to_sequence"), DestPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'destination_sequence'"));
+    }
+
+    UAnimSequence* Source = Cast<UAnimSequence>(ResolveAsset(SourcePath));
+    UAnimSequence* Dest = Cast<UAnimSequence>(ResolveAsset(DestPath));
+    if (!Source)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a source UAnimSequence: %s"), *SourcePath));
+    }
+    if (!Dest)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a destination UAnimSequence: %s"), *DestPath));
+    }
+    const IAnimationDataModel* SourceModel = Source->GetDataModel();
+    const IAnimationDataModel* DestModel = Dest->GetDataModel();
+    if (!SourceModel || !DestModel)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("source or destination sequence has no data model"));
+    }
+
+    bool bDryRun = false;
+    bool bOverwrite = true;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("overwrite"), bOverwrite);
+    TArray<FString> RequestedNames;
+    ReadStringArrayField(Args, TEXT("curve_names"), RequestedNames);
+    TSet<FName> Filter;
+    for (const FString& Name : RequestedNames)
+    {
+        if (!Name.IsEmpty()) Filter.Add(FName(*Name));
+    }
+
+    TSet<FName> ExistingFloat;
+    TSet<FName> ExistingTransform;
+    for (const FFloatCurve& Curve : DestModel->GetFloatCurves())
+    {
+        ExistingFloat.Add(Curve.GetName());
+    }
+    for (const FTransformCurve& Curve : DestModel->GetTransformCurves())
+    {
+        ExistingTransform.Add(Curve.GetName());
+    }
+
+    TArray<TSharedPtr<FJsonValue>> CopiedFloat;
+    TArray<TSharedPtr<FJsonValue>> CopiedTransform;
+    TArray<TSharedPtr<FJsonValue>> Conflicts;
+    auto AddNameValue = [](TArray<TSharedPtr<FJsonValue>>& Arr, const FName& Name)
+    {
+        Arr.Add(MakeShared<FJsonValueString>(Name.ToString()));
+    };
+    auto AddConflict = [&Conflicts](const FName& Name, const FString& Type)
+    {
+        auto Obj = MakeShared<FJsonObject>();
+        Obj->SetStringField(TEXT("name"), Name.ToString());
+        Obj->SetStringField(TEXT("type"), Type);
+        Obj->SetStringField(TEXT("reason"), TEXT("exists_and_overwrite_false"));
+        Conflicts.Add(MakeShared<FJsonValueObject>(Obj));
+    };
+
+    IAnimationDataController* ControllerPtr = bDryRun ? nullptr : &Dest->GetController();
+    TUniquePtr<IAnimationDataController::FScopedBracket> Bracket;
+    if (ControllerPtr)
+    {
+        Dest->Modify();
+        Bracket = MakeUnique<IAnimationDataController::FScopedBracket>(
+            ControllerPtr, LOCTEXT("SageCopyAnimationCurves", "Sage: Copy Animation Curves"));
+    }
+
+    for (const FFloatCurve& Curve : SourceModel->GetFloatCurves())
+    {
+        const FName CurveName = Curve.GetName();
+        if (!HasCurveNameFilter(Filter, CurveName)) continue;
+
+        const bool bExists = ExistingFloat.Contains(CurveName);
+        if (bExists && !bOverwrite)
+        {
+            AddConflict(CurveName, TEXT("float"));
+            continue;
+        }
+        if (!bDryRun)
+        {
+            const FAnimationCurveIdentifier Id(CurveName, ERawCurveTrackTypes::RCT_Float);
+            if (bExists)
+            {
+                ControllerPtr->RemoveCurve(Id, false);
+            }
+            ControllerPtr->AddCurve(Id, Curve.GetCurveTypeFlags(), false);
+            ControllerPtr->SetCurveKeys(Id, Curve.FloatCurve.GetConstRefOfKeys(), false);
+        }
+        AddNameValue(CopiedFloat, CurveName);
+    }
+
+    for (const FTransformCurve& Curve : SourceModel->GetTransformCurves())
+    {
+        const FName CurveName = Curve.GetName();
+        if (!HasCurveNameFilter(Filter, CurveName)) continue;
+
+        const bool bExists = ExistingTransform.Contains(CurveName);
+        if (bExists && !bOverwrite)
+        {
+            AddConflict(CurveName, TEXT("transform"));
+            continue;
+        }
+        if (!bDryRun)
+        {
+            TArray<float> Times;
+            TArray<FTransform> Values;
+            Curve.GetKeys(Times, Values);
+            const FAnimationCurveIdentifier Id(CurveName, ERawCurveTrackTypes::RCT_Transform);
+            if (bExists)
+            {
+                ControllerPtr->RemoveCurve(Id, false);
+            }
+            ControllerPtr->AddCurve(Id, Curve.GetCurveTypeFlags(), false);
+            ControllerPtr->SetTransformCurveKeys(Id, Values, Times, false);
+        }
+        AddNameValue(CopiedTransform, CurveName);
+    }
+
+    Bracket.Reset();
+    if (!bDryRun)
+    {
+        Dest->RefreshCacheData();
+        Dest->MarkPackageDirty();
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("source_sequence"), Source->GetPathName());
+    R->SetStringField(TEXT("destination_sequence"), Dest->GetPathName());
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    R->SetBoolField(TEXT("overwrite"), bOverwrite);
+    R->SetBoolField(TEXT("modified"), !bDryRun && (CopiedFloat.Num() + CopiedTransform.Num()) > 0);
+    R->SetArrayField(TEXT("copied_float_curves"), CopiedFloat);
+    R->SetArrayField(TEXT("copied_transform_curves"), CopiedTransform);
+    R->SetArrayField(TEXT("conflicts"), Conflicts);
+    R->SetNumberField(TEXT("copied_float_curve_count"), CopiedFloat.Num());
+    R->SetNumberField(TEXT("copied_transform_curve_count"), CopiedTransform.Num());
+    R->SetNumberField(TEXT("conflict_count"), Conflicts.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ===========================================================================
@@ -9250,14 +14331,152 @@ FSageToolDispatch::FOutcome AddSlotGroupImpl(const TSharedPtr<FJsonObject>& Args
 
 FSageToolDispatch::FOutcome SetBoneRetargetingImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.set_bone_translation_retargeting — pending Sage impl"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString SkeletonPath, BoneName, ModeString;
+    if (!Args.IsValid() ||
+        (!Args->TryGetStringField(TEXT("skeleton"), SkeletonPath) &&
+         !Args->TryGetStringField(TEXT("path"), SkeletonPath)))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
+    }
+    if (!Args->TryGetStringField(TEXT("bone"), BoneName) || BoneName.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("bone_name"), BoneName);
+    }
+    if (BoneName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'bone'"));
+    }
+    if (!Args->TryGetStringField(TEXT("mode"), ModeString) || ModeString.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'mode'"));
+    }
+
+    EBoneTranslationRetargetingMode::Type Mode = EBoneTranslationRetargetingMode::Animation;
+    if (!ParseRetargetMode(ModeString, Mode))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid retargeting mode: %s"), *ModeString));
+    }
+
+    USkeleton* Skel = Cast<USkeleton>(ResolveAsset(SkeletonPath));
+    if (!Skel)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a USkeleton: %s"), *SkeletonPath));
+    }
+    const int32 BoneIndex = Skel->GetReferenceSkeleton().FindBoneIndex(FName(*BoneName));
+    if (BoneIndex == INDEX_NONE)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("bone '%s' not found in skeleton"), *BoneName));
+    }
+
+    bool bChildrenToo = false;
+    Args->TryGetBoolField(TEXT("children"), bChildrenToo);
+    Args->TryGetBoolField(TEXT("children_too"), bChildrenToo);
+
+    FScopedTransaction Tx(LOCTEXT("SageSetBoneRetargeting", "Sage: Set Bone Retargeting"));
+    Skel->Modify();
+    Skel->SetBoneTranslationRetargetingMode(BoneIndex, Mode, bChildrenToo);
+    Skel->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Skel->GetPathName());
+    R->SetStringField(TEXT("bone"), BoneName);
+    R->SetNumberField(TEXT("bone_index"), BoneIndex);
+    R->SetStringField(TEXT("mode"), RetargetModeToString(Skel->GetBoneTranslationRetargetingMode(BoneIndex)));
+    R->SetBoolField(TEXT("children"), bChildrenToo);
+    R->SetBoolField(TEXT("modified"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 FSageToolDispatch::FOutcome AddSkeletonCurveMetadataImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    return FSageToolDispatch::FOutcome::MakeError(-32601,
-        TEXT("[NOT IMPLEMENTED] animation.add_skeleton_curve_metadata — pending Sage impl"));
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString SkeletonPath, CurveName, Type;
+    if (!Args.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing args"));
+    }
+    Args->TryGetStringField(TEXT("path"), SkeletonPath);
+    if (SkeletonPath.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("skeleton"), SkeletonPath);
+    }
+    if (SkeletonPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("curve_name"), CurveName) || CurveName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'curve_name'"));
+    }
+    if (!Args->TryGetStringField(TEXT("type"), Type) || Type.IsEmpty())
+    {
+        Type = TEXT("attribute");
+    }
+
+    USkeleton* Skel = Cast<USkeleton>(ResolveAsset(SkeletonPath));
+    if (!Skel)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a USkeleton: %s"), *SkeletonPath));
+    }
+
+    bool bMaterial = false;
+    bool bMorphTarget = false;
+    if (Type.Equals(TEXT("material"), ESearchCase::IgnoreCase) || Type.Equals(TEXT("material_curve"), ESearchCase::IgnoreCase))
+    {
+        bMaterial = true;
+    }
+    else if (Type.Equals(TEXT("morph"), ESearchCase::IgnoreCase) || Type.Equals(TEXT("morph_target"), ESearchCase::IgnoreCase)
+        || Type.Equals(TEXT("morphtarget"), ESearchCase::IgnoreCase))
+    {
+        bMorphTarget = true;
+    }
+    else if (Type.Equals(TEXT("both"), ESearchCase::IgnoreCase))
+    {
+        bMaterial = true;
+        bMorphTarget = true;
+    }
+    else if (!Type.Equals(TEXT("attribute"), ESearchCase::IgnoreCase) && !Type.Equals(TEXT("curve"), ESearchCase::IgnoreCase))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid curve metadata type: %s"), *Type));
+    }
+    Args->TryGetBoolField(TEXT("material"), bMaterial);
+    Args->TryGetBoolField(TEXT("morph_target"), bMorphTarget);
+
+    const FName Name(*CurveName);
+    const bool bAlready = Skel->GetCurveMetaData(Name) != nullptr;
+    FScopedTransaction Tx(LOCTEXT("SageAddSkeletonCurveMetadata", "Sage: Add Skeleton Curve Metadata"));
+    Skel->Modify();
+    const bool bAdded = bAlready || Skel->AddCurveMetaData(Name, false);
+    if (!bAdded)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("failed to add curve metadata"));
+    }
+    Skel->SetCurveMetaDataMaterial(Name, bMaterial);
+    Skel->SetCurveMetaDataMorphTarget(Name, bMorphTarget);
+    Skel->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Skel->GetPathName());
+    R->SetStringField(TEXT("curve_name"), CurveName);
+    R->SetStringField(TEXT("type"), Type);
+    R->SetBoolField(TEXT("already"), bAlready);
+    R->SetBoolField(TEXT("added"), !bAlready);
+    R->SetBoolField(TEXT("material"), Skel->GetCurveMetaDataMaterial(Name));
+    R->SetBoolField(TEXT("morph_target"), Skel->GetCurveMetaDataMorphTarget(Name));
+    R->SetNumberField(TEXT("metadata_count"), Skel->GetNumCurveMetaData());
+    R->SetBoolField(TEXT("modified"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ---------------------------------------------------------------------------
@@ -9330,6 +14549,7 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.read_anim_graph"),            GT(&ReadAnimGraphImpl));
     Dispatch.RegisterHandler(TEXT("animation.list_modifiers"),             GT(&ListModifiersImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_bone_track"),            GT(&ReadBoneTrackImpl));
+    Dispatch.RegisterHandler(TEXT("animation.read_animation_curves"),       GT(&ReadAnimationCurvesImpl));
     Dispatch.RegisterHandler(TEXT("animation.list_control_rig_variables"), GT(&ListControlRigVariablesImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_pose_search_database"),  GT(&ReadPoseSearchDatabaseImpl));
 
@@ -9348,6 +14568,7 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.add_transition"),             GT(&AddTransitionImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_state_animation"),        GT(&SetStateAnimationImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_transition_blend"),       GT(&SetTransitionBlendImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_transition_automatic_rule"), GT(&SetTransitionAutomaticRuleImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_curve"),                  GT(&AddCurveImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_montage_slot"),           GT(&SetMontageSlotImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_montage_section"),        GT(&AddMontageSectionImpl));
@@ -9358,7 +14579,13 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.remove_virtual_bone"),        GT(&RemoveVirtualBoneImpl));
     Dispatch.RegisterHandler(TEXT("animation.create_composite"),           GT(&CreateCompositeImpl));
     Dispatch.RegisterHandler(TEXT("animation.create_ik_retargeter"),       GT(&CreateIKRetargeterImpl));
+    Dispatch.RegisterHandler(TEXT("animation.read_ik_retargeter"),         GT(&ReadIKRetargeterImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_ik_retargeter_rigs"),     GT(&SetIKRetargeterRigsImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_ik_retargeter_chain_mapping"), GT(&SetIKRetargeterChainMappingImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_ik_retargeter_pose"),     GT(&SetIKRetargeterPoseImpl));
+    Dispatch.RegisterHandler(TEXT("animation.retarget_animations"),        GT(&RetargetAnimationsImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_anim_blueprint_skeleton"),GT(&SetAnimBlueprintSkeletonImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_animation_asset_skeleton"),GT(&SetAnimationAssetSkeletonImpl));
     Dispatch.RegisterHandler(TEXT("animation.bake_root_motion_from_bone"), GT(&BakeRootMotionFromBoneImpl));
     Dispatch.RegisterHandler(TEXT("animation.create_pose_search_database"),GT(&CreatePoseSearchDatabaseImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_pose_search_schema"),     GT(&SetPoseSearchSchemaImpl));
@@ -9378,6 +14605,7 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.set_anim_node_property"),     GT(&SetAnimNodePropertyImpl));
     Dispatch.RegisterHandler(TEXT("animation.bind_anim_node_property"),    GT(&BindAnimNodePropertyImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_anim_node_properties"),  GT(&ReadAnimNodePropertiesImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_owner_locomotion_update"),GT(&SetOwnerLocomotionUpdateImpl));
     Dispatch.RegisterHandler(TEXT("animation.list_animgraph_nodes"),       GT(&ListAnimGraphNodesImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_animgraph_root_pose"),    GT(&SetAnimGraphRootPoseImpl));
     // Phase 4-r6 Cluster B (AnimGraph convenience nodes)
@@ -9436,6 +14664,7 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     // Phase 4-r6 Cluster G (Animation Layer Interface — REAL impl + Lyra Gap #24)
     Dispatch.RegisterHandler(TEXT("animation.create_anim_layer_interface"),    GT(&CreateAnimLayerInterfaceImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_layer_function"),             GT(&AddLayerFunctionImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_layer_function_input_pins"),  GT(&SetLayerFunctionInputPinsImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_layer_function_override"),    GT(&AddLayerFunctionOverrideImpl));
     Dispatch.RegisterHandler(TEXT("animation.implement_anim_layer_interface"), GT(&ImplementAnimLayerInterfaceImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_linked_anim_layer_node"),     GT(&AddLinkedAnimLayerNodeImpl));

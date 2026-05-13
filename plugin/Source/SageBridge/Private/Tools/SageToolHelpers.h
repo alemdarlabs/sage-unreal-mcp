@@ -12,6 +12,7 @@ class UActorComponent;
 class FProperty;
 class FJsonObject;
 class FJsonValue;
+class UObject;
 
 namespace sage::tools::detail
 {
@@ -26,6 +27,26 @@ namespace sage::tools::detail
 // Populates OutErr with the canonical -32004 PIE-active error and returns
 // true when the editor is in PIE; otherwise returns false untouched.
 [[nodiscard]] bool RejectIfPie(FSageToolDispatch::FOutcome& OutErr);
+
+struct FPythonReferenceCleanupReport
+{
+    bool bPythonAvailable = false;
+    bool bPythonCommandRan = false;
+    bool bPythonCommandSucceeded = false;
+    bool bClearedMainGlobals = false;
+    bool bCollectedUnrealGarbage = false;
+    int32 CleansedRootCount = 0;
+    FString Error;
+    TArray<FString> CleansedRoots;
+};
+
+// Purges Python-held UObject wrappers through UE's editor cleanse delegate,
+// optionally clears public __main__ globals, then runs Python and UE GC.
+[[nodiscard]] FPythonReferenceCleanupReport CleanupPythonReferences(
+    bool bClearMainGlobals,
+    bool bIncludePieWorlds,
+    bool bIncludeEditorWorld,
+    bool bCollectUnrealGarbage);
 
 // ---- JSON helpers ----------------------------------------------------------
 

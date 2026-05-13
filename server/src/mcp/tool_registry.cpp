@@ -18,6 +18,50 @@ bool isValidToolName(std::string_view name) noexcept {
     });
 }
 
+void ensureObjectSchema(nlohmann::json& schema) {
+    if (!schema.is_object()) {
+        schema = {
+            {"type", "object"},
+            {"properties", nlohmann::json::object()},
+            {"additionalProperties", false},
+        };
+        return;
+    }
+
+    if (!schema.contains("type")) {
+        schema["type"] = "object";
+    }
+    if (!schema.contains("properties") || !schema["properties"].is_object()) {
+        schema["properties"] = nlohmann::json::object();
+    }
+}
+
+void ensureRemoteAsyncSchema(Tool& tool) {
+    if (!tool.remote) return;
+
+    ensureObjectSchema(tool.inputSchema);
+    auto& props = tool.inputSchema["properties"];
+    if (!props.contains("async")) {
+        props["async"] = {
+            {"type", "boolean"},
+            {"description",
+             "When true, start this remote editor tool as a detached Sage job "
+             "and return {job_id,state} immediately. Poll with jobs.get, "
+             "jobs.wait, or jobs.logs. The plugin receives the same args with "
+             "async removed."},
+        };
+    }
+    if (!props.contains("job_timeout_seconds")) {
+        props["job_timeout_seconds"] = {
+            {"type", "integer"},
+            {"minimum", 1},
+            {"maximum", 86400},
+            {"description",
+             "Detached job editor-dispatch timeout. Default 3600 seconds."},
+        };
+    }
+}
+
 }  // namespace
 
 std::expected<void, ToolRegistry::RegisterError> ToolRegistry::registerTool(Tool tool) {
@@ -32,6 +76,7 @@ std::expected<void, ToolRegistry::RegisterError> ToolRegistry::registerTool(Tool
     }
     spdlog::debug("Registering tool: {} (remote={})",
                   tool.name, tool.remote ? "yes" : "no");
+    ensureRemoteAsyncSchema(tool);
     tools_.emplace(tool.name, std::move(tool));
     return {};
 }

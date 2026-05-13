@@ -27,14 +27,23 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <csignal>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -75,6 +84,375 @@ extern "C" void signalHandler(int signal) {
         return fallback;
     }
 }
+
+[[nodiscard]] int64_t nowEpochMs() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
+
+class JobManager : public std::enable_shared_from_this<JobManager> {
+public:
+    explicit JobManager(sage::bridge::BridgeServer& bridge)
+        : bridge_(bridge) {}
+
+    nlohmann::json startRemote(std::string tool,
+                               nlohmann::json args,
+                               std::string targetEditor,
+                               std::chrono::milliseconds timeout) {
+        const std::string jobId = nextJobId();
+        auto record = createQueuedRecord(jobId, std::move(tool), args, std::move(targetEditor), timeout.count());
+
+        spdlog::info("jobs: queued job_id={} tool={} target={}",
+                     jobId, record->tool,
+                     record->targetEditor.empty() ? "<active>" : record->targetEditor);
+
+        auto self = shared_from_this();
+        std::thread([self, jobId, args = std::move(args), timeout]() mutable {
+            self->runRemote(jobId, std::move(args), timeout);
+        }).detach();
+
+        return snapshot(jobId, /*includeResult=*/false).value_or(nlohmann::json{
+            {"job_id", jobId},
+            {"state", "queued"},
+        });
+    }
+
+    nlohmann::json startLocal(std::string tool,
+                              nlohmann::json args,
+                              std::function<sage::mcp::ToolResult()> body) {
+        const std::string jobId = nextJobId();
+        auto record = createQueuedRecord(jobId, std::move(tool), args, std::string{}, 0);
+
+        spdlog::info("jobs: queued local job_id={} tool={}", jobId, record->tool);
+
+        auto self = shared_from_this();
+        std::thread([self, jobId, body = std::move(body)]() mutable {
+            self->runLocal(jobId, std::move(body));
+        }).detach();
+
+        return snapshot(jobId, /*includeResult=*/false).value_or(nlohmann::json{
+            {"job_id", jobId},
+            {"state", "queued"},
+        });
+    }
+
+    std::optional<nlohmann::json> snapshot(const std::string& jobId,
+                                           bool includeResult = true) const {
+        std::lock_guard lk(mu_);
+        auto it = jobs_.find(jobId);
+        if (it == jobs_.end()) return std::nullopt;
+        return toJsonLocked(*it->second, includeResult);
+    }
+
+    nlohmann::json list(int limit, bool includeCompletedDetails) const {
+        std::lock_guard lk(mu_);
+        nlohmann::json arr = nlohmann::json::array();
+        if (limit <= 0) limit = 50;
+        int emitted = 0;
+        for (auto it = order_.rbegin(); it != order_.rend() && emitted < limit; ++it) {
+            auto found = jobs_.find(*it);
+            if (found == jobs_.end()) continue;
+            arr.push_back(toJsonLocked(*found->second, includeCompletedDetails));
+            ++emitted;
+        }
+        return {
+            {"jobs", arr},
+            {"count", arr.size()},
+            {"total", jobs_.size()},
+        };
+    }
+
+    std::optional<nlohmann::json> wait(const std::string& jobId,
+                                       std::chrono::milliseconds timeout) const {
+        std::unique_lock lk(mu_);
+        auto exists = [&]() { return jobs_.find(jobId) != jobs_.end(); };
+        if (!exists()) return std::nullopt;
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (exists() && !isTerminalLocked(*jobs_.at(jobId))) {
+            if (cv_.wait_until(lk, deadline) == std::cv_status::timeout) break;
+        }
+        nlohmann::json out = toJsonLocked(*jobs_.at(jobId), /*includeResult=*/true);
+        out["wait_timed_out"] = !isTerminalLocked(*jobs_.at(jobId));
+        return out;
+    }
+
+    std::optional<nlohmann::json> logs(const std::string& jobId,
+                                       std::size_t cursor,
+                                       std::size_t limit) const {
+        std::lock_guard lk(mu_);
+        auto it = jobs_.find(jobId);
+        if (it == jobs_.end()) return std::nullopt;
+        if (limit == 0 || limit > 500) limit = 100;
+        const auto& entries = it->second->logs;
+        nlohmann::json arr = nlohmann::json::array();
+        for (std::size_t i = cursor; i < entries.size() && arr.size() < limit; ++i) {
+            arr.push_back(entries[i]);
+        }
+        nlohmann::json out = {
+            {"job_id", jobId},
+            {"cursor", cursor},
+            {"next_cursor", std::min(cursor + arr.size(), entries.size())},
+            {"log_count", entries.size()},
+            {"logs", arr},
+        };
+        return out;
+    }
+
+    std::optional<nlohmann::json> cancel(const std::string& jobId) {
+        std::lock_guard lk(mu_);
+        auto it = jobs_.find(jobId);
+        if (it == jobs_.end()) return std::nullopt;
+        auto& job = *it->second;
+        job.cancelRequested = true;
+        if (!isTerminalLocked(job)) {
+            job.state = "cancel_requested";
+        }
+        job.updatedAtMs = nowEpochMs();
+        appendLogLocked(job, "warn", "cancel requested; Unreal operations are best-effort and may continue until the editor tool returns",
+                        nlohmann::json::object());
+        cv_.notify_all();
+        spdlog::warn("jobs: cancel requested job_id={} tool={}", job.id, job.tool);
+        return toJsonLocked(job, /*includeResult=*/true);
+    }
+
+private:
+    struct JobRecord {
+        std::string id;
+        std::string tool;
+        std::string targetEditor;
+        std::string state;
+        nlohmann::json args;
+        nlohmann::json result;
+        nlohmann::json error;
+        std::vector<nlohmann::json> logs;
+        int64_t createdAtMs = 0;
+        int64_t updatedAtMs = 0;
+        int64_t completedAtMs = 0;
+        int64_t timeoutMs = 0;
+        bool cancelRequested = false;
+    };
+
+    std::shared_ptr<JobRecord> createQueuedRecord(const std::string& jobId,
+                                                  std::string tool,
+                                                  const nlohmann::json& args,
+                                                  std::string targetEditor,
+                                                  int64_t timeoutMs) {
+        auto record = std::make_shared<JobRecord>();
+        record->id = jobId;
+        record->tool = std::move(tool);
+        record->targetEditor = std::move(targetEditor);
+        record->args = args;
+        record->state = "queued";
+        record->createdAtMs = nowEpochMs();
+        record->updatedAtMs = record->createdAtMs;
+        record->timeoutMs = timeoutMs;
+        appendLogLocked(*record, "info", "queued", nlohmann::json::object());
+        {
+            std::lock_guard lk(mu_);
+            jobs_[jobId] = record;
+            order_.push_back(jobId);
+            trimLocked();
+        }
+        cv_.notify_all();
+        return record;
+    }
+
+    [[nodiscard]] std::string nextJobId() {
+        const auto n = ++counter_;
+        std::ostringstream oss;
+        oss << "job-" << n;
+        return oss.str();
+    }
+
+    static bool isTerminalLocked(const JobRecord& job) {
+        return job.state == "completed" || job.state == "failed"
+            || job.state == "editor_crashed" || job.state == "stale";
+    }
+
+    void setState(const std::string& jobId,
+                  std::string state,
+                  std::string message,
+                  nlohmann::json data = nlohmann::json::object()) {
+        {
+            std::lock_guard lk(mu_);
+            auto it = jobs_.find(jobId);
+            if (it == jobs_.end()) return;
+            it->second->state = std::move(state);
+            it->second->updatedAtMs = nowEpochMs();
+            appendLogLocked(*it->second, "info", std::move(message), std::move(data));
+        }
+        cv_.notify_all();
+    }
+
+    void runRemote(const std::string& jobId,
+                   nlohmann::json args,
+                   std::chrono::milliseconds timeout) {
+        std::string tool;
+        std::string target;
+        {
+            std::lock_guard lk(mu_);
+            auto it = jobs_.find(jobId);
+            if (it == jobs_.end()) return;
+            tool = it->second->tool;
+            target = it->second->targetEditor;
+        }
+
+        setState(jobId, "dispatched", "dispatching remote tool to editor",
+                 {{"tool", tool}, {"target_editor", target.empty() ? "<active>" : target}});
+        setState(jobId, "running", "remote tool call is running");
+        setState(jobId, "waiting_editor", "waiting for editor tool result");
+        spdlog::info("jobs: dispatch job_id={} tool={} timeout_ms={}",
+                     jobId, tool, timeout.count());
+
+        auto outcome = bridge_.dispatchTool(tool, args, timeout, target);
+        {
+            std::lock_guard lk(mu_);
+            auto it = jobs_.find(jobId);
+            if (it == jobs_.end()) return;
+            auto& job = *it->second;
+            job.updatedAtMs = nowEpochMs();
+            job.completedAtMs = job.updatedAtMs;
+            if (outcome.has_value()) {
+                job.state = "completed";
+                job.result = *outcome;
+                appendLogLocked(job, "info", "completed", nlohmann::json::object());
+                spdlog::info("jobs: completed job_id={} tool={}", jobId, tool);
+            } else {
+                job.error = outcome.error().toJson();
+                const std::string msg = job.error.value("message", std::string{});
+                const int code = job.error.value("code", 0);
+                if (code == static_cast<int>(sage::mcp::ErrorCode::EditorNotConnected)
+                    && msg.find("disconnected") != std::string::npos) {
+                    job.state = "editor_crashed";
+                } else {
+                    job.state = "failed";
+                }
+                appendLogLocked(job, "error", msg.empty() ? "failed" : msg, job.error);
+                spdlog::warn("jobs: failed job_id={} tool={} state={} error={}",
+                             jobId, tool, job.state, msg);
+            }
+        }
+        cv_.notify_all();
+    }
+
+    void runLocal(const std::string& jobId,
+                  std::function<sage::mcp::ToolResult()> body) {
+        std::string tool;
+        {
+            std::lock_guard lk(mu_);
+            auto it = jobs_.find(jobId);
+            if (it == jobs_.end()) return;
+            tool = it->second->tool;
+        }
+        setState(jobId, "running", "local tool job is running");
+        spdlog::info("jobs: running local job_id={} tool={}", jobId, tool);
+
+        sage::mcp::ToolResult outcome = std::unexpected(
+            sage::mcp::ErrorObject::fromCode(sage::mcp::ErrorCode::InternalError,
+                                             "local job did not run"));
+        try {
+            outcome = body();
+        } catch (const std::exception& ex) {
+            outcome = std::unexpected(sage::mcp::ErrorObject::fromCode(
+                sage::mcp::ErrorCode::InternalError,
+                std::string{"local job exception: "} + ex.what()));
+        } catch (...) {
+            outcome = std::unexpected(sage::mcp::ErrorObject::fromCode(
+                sage::mcp::ErrorCode::InternalError, "local job unknown exception"));
+        }
+
+        {
+            std::lock_guard lk(mu_);
+            auto it = jobs_.find(jobId);
+            if (it == jobs_.end()) return;
+            auto& job = *it->second;
+            job.updatedAtMs = nowEpochMs();
+            job.completedAtMs = job.updatedAtMs;
+            if (outcome.has_value()) {
+                job.state = "completed";
+                job.result = *outcome;
+                appendLogLocked(job, "info", "completed", nlohmann::json::object());
+                spdlog::info("jobs: completed local job_id={} tool={}", jobId, tool);
+            } else {
+                job.state = "failed";
+                job.error = outcome.error().toJson();
+                const std::string msg = job.error.value("message", std::string{});
+                appendLogLocked(job, "error", msg.empty() ? "failed" : msg, job.error);
+                spdlog::warn("jobs: failed local job_id={} tool={} error={}",
+                             jobId, tool, msg);
+            }
+        }
+        cv_.notify_all();
+    }
+
+    static void appendLogLocked(JobRecord& job,
+                                std::string level,
+                                std::string message,
+                                nlohmann::json data) {
+        job.logs.push_back({
+            {"seq", job.logs.size()},
+            {"time_ms", nowEpochMs()},
+            {"level", std::move(level)},
+            {"state", job.state},
+            {"message", std::move(message)},
+            {"data", std::move(data)},
+        });
+        if (job.logs.size() > 500) {
+            job.logs.erase(job.logs.begin(), job.logs.begin() + (job.logs.size() - 500));
+            for (std::size_t i = 0; i < job.logs.size(); ++i) {
+                job.logs[i]["seq"] = i;
+            }
+        }
+    }
+
+    nlohmann::json toJsonLocked(const JobRecord& job, bool includeResult) const {
+        nlohmann::json out = {
+            {"job_id", job.id},
+            {"tool", job.tool},
+            {"state", job.state},
+            {"cancel_requested", job.cancelRequested},
+            {"created_at_ms", job.createdAtMs},
+            {"updated_at_ms", job.updatedAtMs},
+            {"completed_at_ms", job.completedAtMs == 0 ? nullptr : nlohmann::json(job.completedAtMs)},
+            {"timeout_ms", job.timeoutMs},
+            {"log_count", job.logs.size()},
+            {"terminal", isTerminalLocked(job)},
+        };
+        out["target_editor"] = job.targetEditor.empty()
+            ? nlohmann::json(nullptr)
+            : nlohmann::json(job.targetEditor);
+        if (!job.logs.empty()) {
+            out["last_log"] = job.logs.back();
+        }
+        if (includeResult) {
+            if (!job.result.is_null()) out["result"] = job.result;
+            if (!job.error.is_null()) out["error"] = job.error;
+        }
+        return out;
+    }
+
+    void trimLocked() {
+        constexpr std::size_t maxJobs = 200;
+        while (order_.size() > maxJobs) {
+            const std::string oldest = order_.front();
+            order_.pop_front();
+            auto it = jobs_.find(oldest);
+            if (it != jobs_.end() && isTerminalLocked(*it->second)) {
+                jobs_.erase(it);
+            } else {
+                order_.push_back(oldest);
+                break;
+            }
+        }
+    }
+
+    sage::bridge::BridgeServer& bridge_;
+    mutable std::mutex mu_;
+    mutable std::condition_variable cv_;
+    std::unordered_map<std::string, std::shared_ptr<JobRecord>> jobs_;
+    std::deque<std::string> order_;
+    std::atomic<std::uint64_t> counter_{0};
+};
 
 }  // namespace
 
@@ -152,13 +530,27 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     g_runningBridge.store(&bridge, std::memory_order_release);
+    auto jobMgr = std::make_shared<JobManager>(bridge);
 
     // ---- Wire bridge into tool registry (remote tools route via WS) -----
     // ADR-004 §2 + Milestone 1.5b: dispatcher forwards `_editor` (extracted by
     // MCPServer::onToolsCall) so each call can target a specific editor.
     registry->setRemoteDispatcher(
-        [&bridge](std::string_view tool, const nlohmann::json& args,
-                  std::string_view targetEditor) {
+        [&bridge, jobMgr](std::string_view tool, const nlohmann::json& args,
+                          std::string_view targetEditor) {
+            if (args.is_object() && args.value("async", false)) {
+                nlohmann::json cleanArgs = args;
+                cleanArgs.erase("async");
+                const int timeoutSeconds = std::clamp(
+                    cleanArgs.value("job_timeout_seconds", 3600), 1, 86400);
+                cleanArgs.erase("job_timeout_seconds");
+                cleanArgs.erase("job_timeout_ms");
+                return sage::mcp::ToolResult(jobMgr->startRemote(
+                    std::string{tool},
+                    std::move(cleanArgs),
+                    std::string{targetEditor},
+                    std::chrono::seconds(timeoutSeconds)));
+            }
             return bridge.dispatchTool(tool, args,
                                        bridge.config().defaultDispatchTimeout,
                                        targetEditor);
@@ -220,6 +612,136 @@ int main(int argc, char* argv[]) {
             spdlog::warn("Failed to register remote tool '{}'", name);
         }
     };
+    auto registerLocal = [&registry](sage::mcp::Tool tool) {
+        const auto name = tool.name;
+        if (auto r = registry->registerTool(std::move(tool)); !r.has_value()) {
+            spdlog::warn("Failed to register local tool '{}'", name);
+        }
+    };
+
+    registerLocal(sage::mcp::Tool{
+        .name = "jobs.list",
+        .description = "List detached async Sage jobs started with async:true. "
+                       "Returns newest-first job summaries and terminal state.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"limit", {{"type", "integer"}, {"minimum", 1}, {"maximum", 200}}},
+                {"include_completed_details", {{"type", "boolean"}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = [jobMgr](const nlohmann::json& params) -> sage::mcp::ToolResult {
+            const int limit = params.is_object() ? params.value("limit", 50) : 50;
+            const bool include = params.is_object()
+                && params.value("include_completed_details", false);
+            return jobMgr->list(limit, include);
+        },
+        .remote = false,
+    });
+    registerLocal(sage::mcp::Tool{
+        .name = "jobs.get",
+        .description = "Read a detached async Sage job by job_id, including "
+                       "final result/error when available.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"job_id", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"job_id"})},
+            {"additionalProperties", false},
+        },
+        .handler = [jobMgr](const nlohmann::json& params) -> sage::mcp::ToolResult {
+            const std::string id = params.value("job_id", std::string{});
+            if (id.empty()) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InvalidParams, "missing job_id"));
+            }
+            if (auto job = jobMgr->snapshot(id, /*includeResult=*/true)) return *job;
+            return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                sage::mcp::ErrorCode::InvalidParams, "unknown job_id: " + id));
+        },
+        .remote = false,
+    });
+    registerLocal(sage::mcp::Tool{
+        .name = "jobs.wait",
+        .description = "Wait for a detached async Sage job to reach a terminal "
+                       "state, or return the current state with wait_timed_out.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"job_id", {{"type", "string"}}},
+                {"timeout_seconds", {{"type", "number"}, {"minimum", 0}, {"maximum", 600}}},
+            }},
+            {"required", nlohmann::json::array({"job_id"})},
+            {"additionalProperties", false},
+        },
+        .handler = [jobMgr](const nlohmann::json& params) -> sage::mcp::ToolResult {
+            const std::string id = params.value("job_id", std::string{});
+            const double seconds = params.value("timeout_seconds", 30.0);
+            if (id.empty()) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InvalidParams, "missing job_id"));
+            }
+            const auto timeout = std::chrono::milliseconds(
+                static_cast<int64_t>(std::clamp(seconds, 0.0, 600.0) * 1000.0));
+            if (auto job = jobMgr->wait(id, timeout)) return *job;
+            return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                sage::mcp::ErrorCode::InvalidParams, "unknown job_id: " + id));
+        },
+        .remote = false,
+    });
+    registerLocal(sage::mcp::Tool{
+        .name = "jobs.logs",
+        .description = "Read structured async job logs from a cursor. Use "
+                       "next_cursor for incremental polling.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"job_id", {{"type", "string"}}},
+                {"cursor", {{"type", "integer"}, {"minimum", 0}}},
+                {"limit", {{"type", "integer"}, {"minimum", 1}, {"maximum", 500}}},
+            }},
+            {"required", nlohmann::json::array({"job_id"})},
+            {"additionalProperties", false},
+        },
+        .handler = [jobMgr](const nlohmann::json& params) -> sage::mcp::ToolResult {
+            const std::string id = params.value("job_id", std::string{});
+            const std::size_t cursor = static_cast<std::size_t>(
+                std::max(0, params.value("cursor", 0)));
+            const std::size_t limit = static_cast<std::size_t>(
+                std::max(1, params.value("limit", 100)));
+            if (id.empty()) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InvalidParams, "missing job_id"));
+            }
+            if (auto logs = jobMgr->logs(id, cursor, limit)) return *logs;
+            return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                sage::mcp::ErrorCode::InvalidParams, "unknown job_id: " + id));
+        },
+        .remote = false,
+    });
+    registerLocal(sage::mcp::Tool{
+        .name = "jobs.cancel",
+        .description = "Best-effort cancel for a detached async Sage job. "
+                       "Unreal editor operations may continue until the active "
+                       "tool call returns; state records cancel_requested.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {{"job_id", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"job_id"})},
+            {"additionalProperties", false},
+        },
+        .handler = [jobMgr](const nlohmann::json& params) -> sage::mcp::ToolResult {
+            const std::string id = params.value("job_id", std::string{});
+            if (id.empty()) {
+                return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                    sage::mcp::ErrorCode::InvalidParams, "missing job_id"));
+            }
+            if (auto job = jobMgr->cancel(id)) return *job;
+            return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                sage::mcp::ErrorCode::InvalidParams, "unknown job_id: " + id));
+        },
+        .remote = false,
+    });
 
     registerRemote(sage::mcp::Tool{
         .name        = "spawn_actor",
@@ -429,8 +951,13 @@ int main(int argc, char* argv[]) {
     registerRemote(sage::mcp::Tool{
         .name        = "modify_asset_property",
         .description = "Set a UProperty on a content-browser asset by path. "
-                       "Same primitive types as modify_actor_property. "
-                       "MarkPackageDirty + FScopedTransaction. Rejects during PIE.",
+                       "Same primitive types as modify_actor_property plus "
+                       "object refs and TSubclassOf/FClassProperty class paths "
+                       "(Blueprint generated classes accepted). "
+                       "MarkPackageDirty + FScopedTransaction. Rejects during PIE. "
+                       "For UAnimationAsset.Skeleton, routes through "
+                       "UAnimationAsset::SetSkeleton with readback diagnostics "
+                       "instead of raw reflected assignment.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
@@ -449,12 +976,17 @@ int main(int argc, char* argv[]) {
     registerRemote(sage::mcp::Tool{
         .name        = "rename_asset",
         .description = "Rename an asset within the same folder (UEditorAsset"
-                       "Subsystem::RenameAsset). FScopedTransaction. PIE rejected.",
+                       "Subsystem::RenameAsset). FScopedTransaction. PIE rejected. "
+                       "Optional overwrite:true requires confirmed:true and "
+                       "returns overwrite delete diagnostics if the destination "
+                       "had to be cleared first.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
                 {"source",      {{"type", "string"}}},
                 {"destination", {{"type", "string"}}},
+                {"overwrite",   {{"type", "boolean"}}},
+                {"confirmed",   {{"type", "boolean"}}},
             }},
             {"required", nlohmann::json::array({"source", "destination"})},
             {"additionalProperties", false},
@@ -467,12 +999,17 @@ int main(int argc, char* argv[]) {
         .name        = "move_asset",
         .description = "Move an asset to a different folder (RenameAsset under "
                        "the hood; semantic alias of rename_asset for cross-folder "
-                       "moves). FScopedTransaction. PIE rejected.",
+                       "moves). FScopedTransaction. PIE rejected. Optional "
+                       "overwrite:true requires confirmed:true and can replace a "
+                       "stale/invalid destination package through editor delete "
+                       "diagnostics before moving.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
                 {"source",      {{"type", "string"}}},
                 {"destination", {{"type", "string"}}},
+                {"overwrite",   {{"type", "boolean"}}},
+                {"confirmed",   {{"type", "boolean"}}},
             }},
             {"required", nlohmann::json::array({"source", "destination"})},
             {"additionalProperties", false},
@@ -502,7 +1039,10 @@ int main(int argc, char* argv[]) {
         .name        = "delete_asset",
         .description = "Delete an asset by path (UEditorAssetSubsystem::"
                        "DeleteAsset). FScopedTransaction. PIE rejected. "
-                       "Pass `confirmed:true` to proceed (destructive).",
+                       "Pass `confirmed:true` to proceed (destructive). Delete "
+                       "failures include blocker diagnostics such as loaded/dirty "
+                       "package, redirector, referencer count, unresolved object, "
+                       "or read-only package file.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
@@ -679,8 +1219,18 @@ int main(int argc, char* argv[]) {
     });
     registerRemote(sage::mcp::Tool{
         .name        = "get_pie_state",
-        .description = "Whether PIE is active; if so, returns the play-world path. "
-                       "Read-only.",
+        .description = "Whether PIE is active; if so, returns play-world path, "
+                       "live PIE world candidates, and current LevelEditor "
+                       "play settings. Read-only.",
+        .inputSchema = noArgSchema,
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name        = "editor.get_play_settings",
+        .description = "Return typed ULevelEditorPlaySettings readback for PIE "
+                       "automation: PlayNetMode, PlayNumberOfClients, "
+                       "RunUnderOneProcess, PrimaryPIEClientIndex, selected "
+                       "play mode, and related flags. Read-only.",
         .inputSchema = noArgSchema,
         .handler = nullptr, .remote = true,
     });
@@ -919,16 +1469,67 @@ int main(int argc, char* argv[]) {
     // PIE control (Milestone 1.3c → spec'te 1.7'de listelenmişti, hot path).
     registerRemote(sage::mcp::Tool{
         .name        = "run_pie",
-        .description = "Start Play-In-Editor with default parameters (PIE in "
-                       "selected viewport). Errors if PIE already active.",
-        .inputSchema = noArgSchema,
+        .description = "Start Play-In-Editor. By default uses the editor's "
+                       "current play settings in selected viewport. Can use "
+                       "transient LevelEditorPlaySettings overrides to force "
+                       "standalone/listen/client net mode, client count, "
+                       "selected viewport vs new editor window, primary/local "
+                       "player index, and single-local-player smoke sessions. "
+                       "Does not mutate saved editor defaults. Errors if PIE "
+                       "already active.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"force_local_player", {{"type", "boolean"},
+                    {"description", "Force standalone, clients=1, RunUnderOneProcess=true, no separate server, and selected viewport unless new_editor_window=true."}}},
+                {"single_local_player", {{"type", "boolean"},
+                    {"description", "Alias of force_local_player."}}},
+                {"net_mode", {{"type", "string"},
+                    {"description", "standalone, listen_server, or client. Aliases like listen/client/pie_standalone are accepted."}}},
+                {"play_net_mode", {{"type", "string"},
+                    {"description", "Alias of net_mode."}}},
+                {"clients", {{"type", "integer"}, {"minimum", 1}, {"maximum", 64}}},
+                {"num_clients", {{"type", "integer"}, {"minimum", 1}, {"maximum", 64}}},
+                {"number_of_clients", {{"type", "integer"}, {"minimum", 1}, {"maximum", 64}}},
+                {"play_number_of_clients", {{"type", "integer"}, {"minimum", 1}, {"maximum", 64}}},
+                {"selected_viewport", {{"type", "boolean"}}},
+                {"use_selected_viewport", {{"type", "boolean"}}},
+                {"new_editor_window", {{"type", "boolean"}}},
+                {"local_player_index", {{"type", "integer"}, {"minimum", 0}, {"maximum", 64}}},
+                {"target_local_player_index", {{"type", "integer"}, {"minimum", 0}, {"maximum", 64}}},
+                {"primary_pie_client_index", {{"type", "integer"}, {"minimum", 0}, {"maximum", 64}}},
+                {"run_under_one_process", {{"type", "boolean"}}},
+                {"launch_separate_server", {{"type", "boolean"}}},
+                {"game_gets_mouse_control", {{"type", "boolean"}}},
+                {"use_mouse_for_touch", {{"type", "boolean"}}},
+                {"allow_online_subsystem", {{"type", "boolean"}}},
+                {"restore_settings_after_start", {{"type", "boolean"},
+                    {"description", "Accepted for workflow compatibility; run_pie uses transient settings so defaults do not need restoring."}}},
+                {"map", {{"type", "string"},
+                    {"description", "Optional global map override for the play session."}}},
+                {"map_path", {{"type", "string"},
+                    {"description", "Alias of map."}}},
+            }},
+            {"additionalProperties", false},
+        },
         .handler = nullptr, .remote = true,
     });
     registerRemote(sage::mcp::Tool{
         .name        = "stop_pie",
         .description = "Request end of the active PIE session "
-                       "(GEditor->RequestEndPlayMap). Errors if PIE not active.",
-        .inputSchema = noArgSchema,
+                       "(GEditor->RequestEndPlayMap). Before teardown it "
+                       "purges Python-held PIE UObject wrappers through "
+                       "PrepareToCleanseEditorObject, runs Python GC, and "
+                       "runs UE GC unless cleanup_python_refs=false. Errors "
+                       "if PIE not active.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"cleanup_python_refs", {{"type", "boolean"}}},
+                {"clear_python_main_globals", {{"type", "boolean"}}},
+            }},
+            {"additionalProperties", false},
+        },
         .handler = nullptr, .remote = true,
     });
 
@@ -1395,11 +1996,22 @@ int main(int argc, char* argv[]) {
     registerRemote(sage::mcp::Tool{
         .name = "bp.add_interface",
         .description = "Implement a UInterface on the BP via "
-                       "FBlueprintEditorUtils::ImplementNewInterface. "
+                       "FBlueprintEditorUtils::ImplementNewInterface. For "
+                       "AnimLayerInterface targets, Sage bypasses UE's "
+                       "ImplementNewInterface convenience flow, adds the "
+                       "interface entry directly, regenerates colliding "
+                       "interface graph GUIDs, compiles once inside the tool, "
+                       "and restores any engine-side LinkedAnimLayer drift so "
+                       "this tool does not mutate AnimGraph call nodes; use "
+                       "animation.add_linked_anim_layer_node explicitly for "
+                       "new layer calls. "
                        "interface_path: '/Script/Foo.UMyInterface' or BP "
                        "interface asset path. Idempotent — already-implemented "
                        "returns {already: true}. Class must derive from "
-                       "UInterface or -32602. PIE rejected.",
+                       "UInterface or -32602. PIE rejected. Net linked-layer "
+                       "mutation counters remain modified=0/spawned=0; "
+                       "snapshot/restored/removed/GUID counters report any UE "
+                       "side effects that were prevented or repaired.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
@@ -1490,7 +2102,7 @@ int main(int argc, char* argv[]) {
                        "enumerates class refs (parent + variable subtypes). "
                        "Returns {dependencies[], dependency_count, "
                        "referenced_classes[]} or {referencers[], "
-                       "referencer_count} depending on direction.",
+                       "referencer_count} based on direction.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
@@ -1614,6 +2226,68 @@ int main(int argc, char* argv[]) {
     });
 
     // -- read+write — T3D node clipboard (Phase 4.2 round 2g/p2) --
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.add_component",
+        .description = "Add a component template to an Actor Blueprint's "
+                       "SimpleConstructionScript. component_class accepts "
+                       "native class paths or Blueprint generated classes. "
+                       "variable_name is idempotent: an existing component "
+                       "with the same class returns already_exists=true; "
+                       "class/name collisions are rejected. Optional parent "
+                       "may reference a local, inherited, or native scene "
+                       "component. Recompiles by default; pass compile:false "
+                       "or recompile:false to defer. Pass save:true to save "
+                       "the Blueprint asset after mutation.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",            {{"type", "string"}}},
+                {"component_class", {{"type", "string"}}},
+                {"variable_name",   {{"type", "string"}}},
+                {"parent",          {{"type", "string"}}},
+                {"compile",         {{"type", "boolean"}}},
+                {"recompile",       {{"type", "boolean"}}},
+                {"save",            {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "component_class", "variable_name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "bp.copy_component_defaults",
+        .description = "Copy named reflected component-template defaults "
+                       "from one Blueprint component to another. Resolves "
+                       "local SCS templates, inherited SCS templates "
+                       "(creating an inheritable override for the target), "
+                       "and CDO/native component fallbacks. properties[] is "
+                       "preflighted for existence and matching property type "
+                       "before mutation. Recompiles target by default; pass "
+                       "compile:false or recompile:false to defer. Pass "
+                       "save:true to save the target Blueprint asset.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"source_path",      {{"type", "string"}}},
+                {"from_path",        {{"type", "string"}}},
+                {"source_component", {{"type", "string"}}},
+                {"from_component",   {{"type", "string"}}},
+                {"target_path",      {{"type", "string"}}},
+                {"to_path",          {{"type", "string"}}},
+                {"target_component", {{"type", "string"}}},
+                {"to_component",     {{"type", "string"}}},
+                {"properties",       {{"type", "array"},
+                                      {"items", {{"type", "string"}}},
+                                      {"minItems", 1}}},
+                {"compile",          {{"type", "boolean"}}},
+                {"recompile",        {{"type", "boolean"}}},
+                {"save",             {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"source_path", "source_component", "properties"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
     registerRemote(sage::mcp::Tool{
         .name = "bp.export_nodes_t3d",
         .description = "Export BP graph nodes to UE's T3D ASCII format via "
@@ -3063,7 +3737,8 @@ int main(int argc, char* argv[]) {
     registerRemote(sage::mcp::Tool{
         .name = "asset.delete_batch",
         .description = "Bulk delete a list of assets. Returns per-path "
-                       "{status: 'deleted'|'missing'|'failed'} plus "
+                       "{status: 'deleted'|'missing'|'failed'} plus failure "
+                       "reason/diagnostics for failed deletes and "
                        "rollup counters {deleted, missing, failed, "
                        "total}. Soft-tolerates missing paths (no error). "
                        "Wrapped in single FScopedTransaction so the "
@@ -3381,15 +4056,22 @@ int main(int argc, char* argv[]) {
     });
     registerRemote(sage::mcp::Tool{
         .name = "editor.read_log",
-        .description = "Tail recent editor log lines. filter (substring) and "
-                       "max_lines (1..5000, default 200). Returns {log_path, "
-                       "lines[], count, total_lines}.",
+        .description = "Tail recent editor log lines with Windows shared-read "
+                       "fallback while the editor is appending. filter "
+                       "(substring), max_lines (1..5000, default 200), "
+                       "case_sensitive=false, optional path/log_path and "
+                       "max_bytes. Returns read_diagnostics with normalized "
+                       "path, exists/size, read method, and fallback status.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
-                {"filter",    {{"type", "string"}}},
-                {"max_lines", {{"type", "integer"},
-                               {"minimum", 1}, {"maximum", 5000}}},
+                {"filter",         {{"type", "string"}}},
+                {"max_lines",      {{"type", "integer"},
+                                    {"minimum", 1}, {"maximum", 5000}}},
+                {"case_sensitive", {{"type", "boolean"}}},
+                {"path",           {{"type", "string"}}},
+                {"log_path",       {{"type", "string"}}},
+                {"max_bytes",      {{"type", "integer"}, {"minimum", 1}}},
             }},
             {"additionalProperties", false},
         },
@@ -3463,10 +4145,13 @@ int main(int argc, char* argv[]) {
         .description = "Write a UProperty on any UObject by SoftObjectPath. "
                        "Routes through Sage's SetUPropertyFromJson — "
                        "structured JSON value (numbers / booleans / nested "
-                       "structs / TArray / object refs) instead of "
+                       "structs / TArray / object refs / TSubclassOf class paths) instead of "
                        "ImportText strings. PIE rejected. -32602 on path / "
                        "property miss or type-coercion failure. "
-                       "MarkPackageDirty after write so the editor re-saves.",
+                       "MarkPackageDirty after write so the editor re-saves. "
+                       "For UAnimationAsset.Skeleton, uses "
+                       "UAnimationAsset::SetSkeleton and fails if readback does "
+                       "not match.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
@@ -3496,20 +4181,369 @@ int main(int argc, char* argv[]) {
         .handler = nullptr, .remote = true,
     });
 
-    // ---- Log + crash forensics (Phase 4.6 round 3 batch 3) -------------
     registerRemote(sage::mcp::Tool{
-        .name = "editor.search_log",
-        .description = "Substring search across the active editor log. "
-                       "Returns {hits: [{line, text}], count, total_lines, "
-                       "capped} where text is line-truncated to 500 chars. "
-                       "max_lines clamped 1..5000 (default 100). Pair with "
-                       "editor.read_log for tail / editor.get_log_file_path "
-                       "for direct fs access.",
+        .name = "input.press_key",
+        .description = "Simulate a key press in the active PIE viewport/local "
+                       "player, then release it immediately or after optional "
+                       "duration_seconds. Routes through the PIE GameViewport "
+                       "and PlayerController so Enhanced Input mappings see "
+                       "pressed/released state. Resolves the same live PIE "
+                       "world context used by gameplay readback, accepts "
+                       "explicit world/controller/pawn targets, and returns "
+                       "target plus route details.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
-                {"query",     {{"type", "string"}}},
-                {"max_lines", {{"type", "integer"}, {"minimum", 1}, {"maximum", 5000}}},
+                {"key", {{"type", "string"}}},
+                {"local_player_index", {{"type", "integer"}, {"minimum", 0}}},
+                {"world", {{"type", "string"}}},
+                {"world_name", {{"type", "string"}}},
+                {"world_path", {{"type", "string"}}},
+                {"expected_world", {{"type", "string"}}},
+                {"controller", {{"type", "string"}}},
+                {"controller_id", {{"type", "string"}}},
+                {"player_controller", {{"type", "string"}}},
+                {"player_controller_id", {{"type", "string"}}},
+                {"pawn", {{"type", "string"}}},
+                {"pawn_id", {{"type", "string"}}},
+                {"expected_pawn", {{"type", "string"}}},
+                {"amount", {{"type", "number"}}},
+                {"duration", {{"type", "number"}, {"minimum", 0}}},
+                {"duration_seconds", {{"type", "number"}, {"minimum", 0}}},
+            }},
+            {"required", nlohmann::json::array({"key"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "input.hold_key",
+        .description = "Send a key-down event to the active PIE local player. "
+                       "Use input.release_key to end the hold, or pass "
+                       "duration_seconds to schedule release on the same "
+                       "resolved PIE world/controller/pawn target.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"key", {{"type", "string"}}},
+                {"local_player_index", {{"type", "integer"}, {"minimum", 0}}},
+                {"world", {{"type", "string"}}},
+                {"world_name", {{"type", "string"}}},
+                {"world_path", {{"type", "string"}}},
+                {"expected_world", {{"type", "string"}}},
+                {"controller", {{"type", "string"}}},
+                {"controller_id", {{"type", "string"}}},
+                {"player_controller", {{"type", "string"}}},
+                {"player_controller_id", {{"type", "string"}}},
+                {"pawn", {{"type", "string"}}},
+                {"pawn_id", {{"type", "string"}}},
+                {"expected_pawn", {{"type", "string"}}},
+                {"amount", {{"type", "number"}}},
+                {"duration", {{"type", "number"}, {"minimum", 0}}},
+                {"duration_seconds", {{"type", "number"}, {"minimum", 0}}},
+            }},
+            {"required", nlohmann::json::array({"key"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "input.release_key",
+        .description = "Send a key-up event to the active PIE local player. "
+                       "Accepts explicit world/controller/pawn targets and "
+                       "returns target plus viewport/controller route details.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"key", {{"type", "string"}}},
+                {"local_player_index", {{"type", "integer"}, {"minimum", 0}}},
+                {"world", {{"type", "string"}}},
+                {"world_name", {{"type", "string"}}},
+                {"world_path", {{"type", "string"}}},
+                {"expected_world", {{"type", "string"}}},
+                {"controller", {{"type", "string"}}},
+                {"controller_id", {{"type", "string"}}},
+                {"player_controller", {{"type", "string"}}},
+                {"player_controller_id", {{"type", "string"}}},
+                {"pawn", {{"type", "string"}}},
+                {"pawn_id", {{"type", "string"}}},
+                {"expected_pawn", {{"type", "string"}}},
+            }},
+            {"required", nlohmann::json::array({"key"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "input.trigger_action",
+        .description = "Inject an Enhanced Input action or player mapping in "
+                       "PIE. `action`/`action_path` accepts a UInputAction "
+                       "asset path; `mapping_name` targets player mappings. "
+                       "mode is once/start/update/stop/hold/release; start/"
+                       "hold supports duration_seconds for scheduled stop. "
+                       "Resolves the live PIE world context and returns target "
+                       "identity for stale-world diagnostics.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"action", {{"type", "string"}}},
+                {"action_path", {{"type", "string"}}},
+                {"mapping_name", {{"type", "string"}}},
+                {"value", {{"description", "boolean, number, [x,y,z], or {x,y,z}"}}},
+                {"mode", {{"type", "string"}}},
+                {"continuous", {{"type", "boolean"}}},
+                {"duration", {{"type", "number"}, {"minimum", 0}}},
+                {"duration_seconds", {{"type", "number"}, {"minimum", 0}}},
+                {"local_player_index", {{"type", "integer"}, {"minimum", 0}}},
+                {"world", {{"type", "string"}}},
+                {"world_name", {{"type", "string"}}},
+                {"world_path", {{"type", "string"}}},
+                {"expected_world", {{"type", "string"}}},
+                {"controller", {{"type", "string"}}},
+                {"controller_id", {{"type", "string"}}},
+                {"player_controller", {{"type", "string"}}},
+                {"player_controller_id", {{"type", "string"}}},
+                {"pawn", {{"type", "string"}}},
+                {"pawn_id", {{"type", "string"}}},
+                {"expected_pawn", {{"type", "string"}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "gameplay.trace_input_action",
+        .description = "PIE-safe diagnostic trace around a key or Enhanced "
+                       "Input injection. Captures Enhanced Input action/value/"
+                       "mapping readback, pawn movement before/after, ASC "
+                       "owned tags, Lyra-style pressed/held/released spec "
+                       "handle arrays, ability specs, optional reflected "
+                       "ProcessAbilityInput, and optional TryActivateAbility "
+                       "for matched specs.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"key", {{"type", "string"}}},
+                {"action", {{"type", "string"}}},
+                {"action_path", {{"type", "string"}}},
+                {"mapping_name", {{"type", "string"}}},
+                {"value", {{"description", "boolean, number, [x,y,z], or {x,y,z}"}}},
+                {"mode", {{"type", "string"}}},
+                {"input_mode", {{"type", "string"}}},
+                {"amount", {{"type", "number"}}},
+                {"duration", {{"type", "number"}, {"minimum", 0}}},
+                {"duration_seconds", {{"type", "number"}, {"minimum", 0}}},
+                {"local_player_index", {{"type", "integer"}, {"minimum", 0}}},
+                {"world", {{"type", "string"}}},
+                {"world_name", {{"type", "string"}}},
+                {"world_path", {{"type", "string"}}},
+                {"expected_world", {{"type", "string"}}},
+                {"controller", {{"type", "string"}}},
+                {"controller_id", {{"type", "string"}}},
+                {"player_controller", {{"type", "string"}}},
+                {"player_controller_id", {{"type", "string"}}},
+                {"actor_id", {{"type", "string"}}},
+                {"actor", {{"type", "string"}}},
+                {"pawn", {{"type", "string"}}},
+                {"pawn_id", {{"type", "string"}}},
+                {"expected_pawn", {{"type", "string"}}},
+                {"ability", {{"type", "string"}}},
+                {"ability_name", {{"type", "string"}}},
+                {"ability_path", {{"type", "string"}}},
+                {"ability_class", {{"type", "string"}}},
+                {"input_tag", {{"type", "string"}}},
+                {"tag", {{"type", "string"}}},
+                {"input_id", {{"type", "integer"}}},
+                {"max_specs", {{"type", "integer"}, {"minimum", 1}, {"maximum", 500}}},
+                {"include_raw", {{"type", "boolean"}}},
+                {"process_ability_input", {{"type", "boolean"}}},
+                {"delta_time", {{"type", "number"}, {"minimum", 0}}},
+                {"process_delta_time", {{"type", "number"}, {"minimum", 0}}},
+                {"game_paused", {{"type", "boolean"}}},
+                {"try_activate", {{"type", "boolean"}}},
+                {"allow_remote_activation", {{"type", "boolean"}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "gas.trace_ability_activation",
+        .description = "Alias of gameplay.trace_input_action focused on GAS "
+                       "activation diagnostics; accepts the same schema and "
+                       "returns the same before/injection/process/try/after "
+                       "trace.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"key", {{"type", "string"}}},
+                {"action", {{"type", "string"}}},
+                {"action_path", {{"type", "string"}}},
+                {"mapping_name", {{"type", "string"}}},
+                {"value", {{"description", "boolean, number, [x,y,z], or {x,y,z}"}}},
+                {"mode", {{"type", "string"}}},
+                {"input_mode", {{"type", "string"}}},
+                {"amount", {{"type", "number"}}},
+                {"duration", {{"type", "number"}, {"minimum", 0}}},
+                {"duration_seconds", {{"type", "number"}, {"minimum", 0}}},
+                {"local_player_index", {{"type", "integer"}, {"minimum", 0}}},
+                {"world", {{"type", "string"}}},
+                {"world_name", {{"type", "string"}}},
+                {"world_path", {{"type", "string"}}},
+                {"expected_world", {{"type", "string"}}},
+                {"controller", {{"type", "string"}}},
+                {"controller_id", {{"type", "string"}}},
+                {"player_controller", {{"type", "string"}}},
+                {"player_controller_id", {{"type", "string"}}},
+                {"actor_id", {{"type", "string"}}},
+                {"actor", {{"type", "string"}}},
+                {"pawn", {{"type", "string"}}},
+                {"pawn_id", {{"type", "string"}}},
+                {"expected_pawn", {{"type", "string"}}},
+                {"ability", {{"type", "string"}}},
+                {"ability_name", {{"type", "string"}}},
+                {"ability_path", {{"type", "string"}}},
+                {"ability_class", {{"type", "string"}}},
+                {"input_tag", {{"type", "string"}}},
+                {"tag", {{"type", "string"}}},
+                {"input_id", {{"type", "integer"}}},
+                {"max_specs", {{"type", "integer"}, {"minimum", 1}, {"maximum", 500}}},
+                {"include_raw", {{"type", "boolean"}}},
+                {"process_ability_input", {{"type", "boolean"}}},
+                {"delta_time", {{"type", "number"}, {"minimum", 0}}},
+                {"process_delta_time", {{"type", "number"}, {"minimum", 0}}},
+                {"game_paused", {{"type", "boolean"}}},
+                {"try_activate", {{"type", "boolean"}}},
+                {"allow_remote_activation", {{"type", "boolean"}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name = "gameplay.simulate_input_tag",
+        .description = "PIE-safe Lyra/GAS input-tag simulation. Resolves a "
+                       "PIE actor/pawn and input tag, finds the matching "
+                       "InputAction from Lyra-style input config data, executes "
+                       "the Enhanced Input bound delegate for press/release, "
+                       "then calls PlayerController::PostProcessInput so the "
+                       "Lyra AbilitySystemComponent input pipeline processes "
+                       "the tag. Returns before/after movement and GAS readback.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"input_tag", {{"type", "string"}}},
+                {"tag", {{"type", "string"}}},
+                {"mode", {{"type", "string"}, {"description", "press, release, or tap"}}},
+                {"input_mode", {{"type", "string"}}},
+                {"duration", {{"type", "number"}, {"minimum", 0}}},
+                {"duration_seconds", {{"type", "number"}, {"minimum", 0}}},
+                {"action", {{"type", "string"}}},
+                {"action_path", {{"type", "string"}}},
+                {"local_player_index", {{"type", "integer"}, {"minimum", 0}}},
+                {"world", {{"type", "string"}}},
+                {"world_name", {{"type", "string"}}},
+                {"world_path", {{"type", "string"}}},
+                {"expected_world", {{"type", "string"}}},
+                {"controller", {{"type", "string"}}},
+                {"controller_id", {{"type", "string"}}},
+                {"player_controller", {{"type", "string"}}},
+                {"player_controller_id", {{"type", "string"}}},
+                {"actor_id", {{"type", "string"}}},
+                {"actor", {{"type", "string"}}},
+                {"pawn", {{"type", "string"}}},
+                {"pawn_id", {{"type", "string"}}},
+                {"expected_pawn", {{"type", "string"}}},
+                {"ability", {{"type", "string"}}},
+                {"ability_name", {{"type", "string"}}},
+                {"ability_path", {{"type", "string"}}},
+                {"ability_class", {{"type", "string"}}},
+                {"input_id", {{"type", "integer"}}},
+                {"max_specs", {{"type", "integer"}, {"minimum", 1}, {"maximum", 500}}},
+                {"include_raw", {{"type", "boolean"}}},
+                {"post_process_input", {{"type", "boolean"}}},
+                {"call_reflected_asc_fallback", {{"type", "boolean"}}},
+                {"delta_time", {{"type", "number"}, {"minimum", 0}}},
+                {"process_delta_time", {{"type", "number"}, {"minimum", 0}}},
+                {"game_paused", {{"type", "boolean"}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    registerRemote(sage::mcp::Tool{
+        .name = "gameplay.spawn_pie_actor_snapshot",
+        .description = "Safely spawn a transient native/Blueprint Actor class "
+                       "inside a live PIE world, read back requested actor and "
+                       "component state, destroy the actor before returning, "
+                       "and run the same Python reference cleanup discipline "
+                       "used before stop_pie. This is for runtime spawn/readback "
+                       "diagnostics; it does not create editor-world actors.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"class", {{"type", "string"}}},
+                {"class_path", {{"type", "string"}}},
+                {"uclass", {{"type", "string"}}},
+                {"transform", {{"type", "object"}}},
+                {"location", {{"type", "array"}}},
+                {"rotation", {{"type", "array"}}},
+                {"scale", {{"type", "array"}}},
+                {"collision_handling", {{"type", "string"}}},
+                {"spawn_collision_handling", {{"type", "string"}}},
+                {"replicates", {{"type", "boolean"}}},
+                {"replicate_movement", {{"type", "boolean"}}},
+                {"always_relevant", {{"type", "boolean"}}},
+                {"net_load_on_client", {{"type", "boolean"}}},
+                {"include_actor_properties", {{"type", "boolean"}}},
+                {"include_components", {{"type", "boolean"}}},
+                {"include_component_properties", {{"type", "boolean"}}},
+                {"properties", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"components", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"component_properties", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"max_properties", {{"type", "integer"}, {"minimum", 1}, {"maximum", 500}}},
+                {"max_components", {{"type", "integer"}, {"minimum", 1}, {"maximum", 500}}},
+                {"max_depth", {{"type", "integer"}, {"minimum", 0}, {"maximum", 8}}},
+                {"cleanup_python_refs", {{"type", "boolean"}}},
+                {"clear_python_main_globals", {{"type", "boolean"}}},
+                {"local_player_index", {{"type", "integer"}, {"minimum", 0}}},
+                {"world", {{"type", "string"}}},
+                {"world_name", {{"type", "string"}}},
+                {"world_path", {{"type", "string"}}},
+                {"expected_world", {{"type", "string"}}},
+                {"controller", {{"type", "string"}}},
+                {"controller_id", {{"type", "string"}}},
+                {"player_controller", {{"type", "string"}}},
+                {"player_controller_id", {{"type", "string"}}},
+                {"pawn", {{"type", "string"}}},
+                {"pawn_id", {{"type", "string"}}},
+                {"expected_pawn", {{"type", "string"}}},
+            }},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+
+    // ---- Log + crash forensics (Phase 4.6 round 3 batch 3) -------------
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.search_log",
+        .description = "Substring search across the active editor log with "
+                       "Windows shared-read fallback while the editor is "
+                       "appending. case_sensitive=false by default. "
+                       "Returns {hits: [{line, text}], count, total_lines, "
+                       "capped, read_diagnostics} where text is line-truncated "
+                       "to 500 chars. max_lines clamped 1..5000 (default 100).",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"query",          {{"type", "string"}}},
+                {"max_lines",      {{"type", "integer"}, {"minimum", 1}, {"maximum", 5000}}},
+                {"case_sensitive", {{"type", "boolean"}}},
+                {"path",           {{"type", "string"}}},
+                {"log_path",       {{"type", "string"}}},
+                {"max_bytes",      {{"type", "integer"}, {"minimum", 1}}},
             }},
             {"required", nlohmann::json::array({"query"})},
             {"additionalProperties", false},
@@ -3662,14 +4696,42 @@ int main(int argc, char* argv[]) {
                        "type ∈ Info/Warning/Error, output), _security_warning}. "
                        "-32603 if the project hasn't enabled the "
                        "PythonScriptPlugin (IsPythonAvailable=false). "
+                       "Known crash-prone Enhanced Input IMC Mappings array "
+                       "mutations are rejected unless "
+                       "allow_unsafe_asset_mutation=true; use the typed "
+                       "gameplay.set_imc_mapping_* tools instead. "
                        "Returns `_security_warning`; this tool exposes "
                        "arbitrary Python with full UE editor access and is "
                        "expected to be auth-gated server-side before public "
                        "release.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
-            {"properties", {{"code", {{"type", "string"}}}}},
+            {"properties", {
+                {"code", {{"type", "string"}}},
+                {"allow_unsafe_asset_mutation", {{"type", "boolean"}}},
+            }},
             {"required", nlohmann::json::array({"code"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "editor.cleanup_python_refs",
+        .description = "Purge Python-held UObject wrappers for PIE/editor "
+                       "world roots via PrepareToCleanseEditorObject, "
+                       "optionally clear public __main__ globals, then run "
+                       "Python and UE garbage collection. Use before map "
+                       "loads or PIE teardown when Python inspected runtime "
+                       "objects.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"clear_main_globals", {{"type", "boolean"}}},
+                {"clear_python_main_globals", {{"type", "boolean"}}},
+                {"include_pie_worlds", {{"type", "boolean"}}},
+                {"include_editor_world", {{"type", "boolean"}}},
+                {"collect_unreal_garbage", {{"type", "boolean"}}},
+            }},
             {"additionalProperties", false},
         },
         .handler = nullptr, .remote = true,
@@ -3782,8 +4844,13 @@ int main(int argc, char* argv[]) {
         .description = "Reindex the slot's knowledge graph from the editor's "
                        "AssetRegistry. Server asks the connected plugin for a "
                        "full asset scan, then full-replaces the Asset table. "
+                       "Duplicate or empty primary-key rows from transient "
+                       "asset move/delete states are skipped with counts/examples "
+                       "instead of failing the full reindex. "
                        "If 'slot_id' omitted, uses the active editor (or the "
                        "single connected editor when exactly one is present). "
+                       "Supports async:true through the same jobs.* surface as "
+                       "remote long-running tools. "
                        "Returns {slot_id, asset_count, last_indexed_at_ms, "
                        "scan_ms?}. -32001 EditorNotConnected if no editor "
                        "available, -32603 InternalError on plugin or DB failure.",
@@ -3791,45 +4858,56 @@ int main(int argc, char* argv[]) {
             {"type", "object"},
             {"properties", {
                 {"slot_id", {{"type", "string"}}},
+                {"async", {{"type", "boolean"}}},
             }},
             {"additionalProperties", false},
         },
-        .handler = [&bridge, graphMgr, resolveSlotId](const nlohmann::json& params)
+        .handler = [&bridge, graphMgr, resolveSlotId, jobMgr](const nlohmann::json& params)
             -> sage::mcp::ToolResult {
-            auto slot = resolveSlotId(params);
-            if (!slot.has_value()) return std::unexpected(slot.error());
+            nlohmann::json cleanParams = params.is_object() ? params : nlohmann::json::object();
+            cleanParams.erase("async");
 
-            // Plugin scans AssetRegistry; we receive {assets, scan_ms}.
-            auto scan = bridge.dispatchTool(
-                "_scan_asset_registry", nlohmann::json::object());
-            if (!scan.has_value()) return std::unexpected(scan.error());
+            auto runIndex = [&bridge, graphMgr, resolveSlotId, cleanParams]() -> sage::mcp::ToolResult {
+                auto slot = resolveSlotId(cleanParams);
+                if (!slot.has_value()) return std::unexpected(slot.error());
 
-            const auto& payload = scan.value();
-            if (!payload.contains("assets") || !payload["assets"].is_array()) {
-                return std::unexpected(sage::mcp::ErrorObject::fromCode(
-                    sage::mcp::ErrorCode::InternalError,
-                    "plugin response missing 'assets' array"));
-            }
+                // Plugin scans AssetRegistry; we receive {assets, scan_ms}.
+                auto scan = bridge.dispatchTool(
+                    "_scan_asset_registry", nlohmann::json::object());
+                if (!scan.has_value()) return std::unexpected(scan.error());
 
-            try {
-                auto& store = graphMgr->acquireSlot(*slot);
-                // payload already has the {assets, dependencies?} shape that
-                // ingestSnapshot expects.
-                auto ingest = sage::graph::ingestSnapshot(store, payload);
-                if (sage::graph::is_error(ingest)) {
+                const auto& payload = scan.value();
+                if (!payload.contains("assets") || !payload["assets"].is_array()) {
                     return std::unexpected(sage::mcp::ErrorObject::fromCode(
                         sage::mcp::ErrorCode::InternalError,
-                        "ingest failed: " + sage::graph::error_of(ingest).message));
+                        "plugin response missing 'assets' array"));
                 }
-                nlohmann::json out = sage::graph::value_of(ingest);
-                out["slot_id"] = *slot;
-                if (payload.contains("scan_ms")) out["scan_ms"] = payload["scan_ms"];
-                return out;
-            } catch (const std::exception& ex) {
-                return std::unexpected(sage::mcp::ErrorObject::fromCode(
-                    sage::mcp::ErrorCode::InternalError,
-                    std::string{"graph slot acquire failed: "} + ex.what()));
+
+                try {
+                    auto& store = graphMgr->acquireSlot(*slot);
+                    // payload already has the {assets, dependencies?} shape that
+                    // ingestSnapshot expects.
+                    auto ingest = sage::graph::ingestSnapshot(store, payload);
+                    if (sage::graph::is_error(ingest)) {
+                        return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                            sage::mcp::ErrorCode::InternalError,
+                            "ingest failed: " + sage::graph::error_of(ingest).message));
+                    }
+                    nlohmann::json out = sage::graph::value_of(ingest);
+                    out["slot_id"] = *slot;
+                    if (payload.contains("scan_ms")) out["scan_ms"] = payload["scan_ms"];
+                    return out;
+                } catch (const std::exception& ex) {
+                    return std::unexpected(sage::mcp::ErrorObject::fromCode(
+                        sage::mcp::ErrorCode::InternalError,
+                        std::string{"graph slot acquire failed: "} + ex.what()));
+                }
+            };
+
+            if (params.is_object() && params.value("async", false)) {
+                return jobMgr->startLocal("index_slot", cleanParams, std::move(runIndex));
             }
+            return runIndex();
         },
         .remote = false,
     };
@@ -4410,17 +5488,30 @@ int main(int argc, char* argv[]) {
                 }
                 else if (ev.kind == "asset_renamed") {
                     if (!p.contains("old_path") || !p.contains("new_path")) return;
-                    // Kuzu allows updating the PK column via SET; edges
-                    // attached to the node move with it (verified via smoke).
-                    std::ostringstream q;
-                    q << "MATCH (a:Asset {path: "
-                      << escCypher(p["old_path"].get<std::string>())
-                      << "}) SET a.path = "
-                      << escCypher(p["new_path"].get<std::string>()) << ";";
-                    auto r = store.execute(q.str());
-                    if (sage::graph::is_error(r)) {
+                    std::ostringstream del;
+                    del << "MATCH (a:Asset {path: "
+                        << escCypher(p["old_path"].get<std::string>())
+                        << "}) DETACH DELETE a;";
+                    auto delRes = store.execute(del.str());
+                    if (sage::graph::is_error(delRes)) {
                         spdlog::warn("delta asset_renamed failed: {}",
-                                     sage::graph::error_of(r).message);
+                                     sage::graph::error_of(delRes).message);
+                        return;
+                    }
+
+                    std::ostringstream add;
+                    add << "MERGE (a:Asset {path: "
+                        << escCypher(p["new_path"].get<std::string>())
+                        << "})";
+                    if (p.contains("kind") && p["kind"].is_string()) {
+                        add << " SET a.kind = "
+                            << escCypher(p["kind"].get<std::string>());
+                    }
+                    add << ";";
+                    auto addRes = store.execute(add.str());
+                    if (sage::graph::is_error(addRes)) {
+                        spdlog::warn("delta asset_renamed failed: {}",
+                                     sage::graph::error_of(addRes).message);
                     }
                 }
                 else {

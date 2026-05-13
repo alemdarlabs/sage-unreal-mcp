@@ -22,8 +22,14 @@
 #include "GameFramework/WorldSettings.h"
 #include "Kismet/GameplayStatics.h"
 #include "Materials/MaterialInterface.h"
+#include "FileHelpers.h"
+#include "HAL/FileManager.h"
+#include "Misc/PackageName.h"
+#include "Misc/Paths.h"
 #include "ScopedTransaction.h"
+#include "Subsystems/AssetEditorSubsystem.h"
 #include "UObject/Package.h"
+#include "UObject/SavePackage.h"
 
 #define LOCTEXT_NAMESPACE "SageLevel"
 
@@ -32,10 +38,243 @@ namespace sage::tools
 namespace
 {
 
+void AddPythonCleanupReport(TSharedRef<FJsonObject> Result,
+                            const detail::FPythonReferenceCleanupReport& Report)
+{
+    auto Cleanup = MakeShared<FJsonObject>();
+    Cleanup->SetBoolField(TEXT("python_available"), Report.bPythonAvailable);
+    Cleanup->SetBoolField(TEXT("python_command_ran"), Report.bPythonCommandRan);
+    Cleanup->SetBoolField(TEXT("python_command_succeeded"), Report.bPythonCommandSucceeded);
+    Cleanup->SetBoolField(TEXT("cleared_main_globals"), Report.bClearedMainGlobals);
+    Cleanup->SetBoolField(TEXT("collected_unreal_garbage"), Report.bCollectedUnrealGarbage);
+    Cleanup->SetNumberField(TEXT("cleansed_root_count"), Report.CleansedRootCount);
+    if (!Report.Error.IsEmpty())
+    {
+        Cleanup->SetStringField(TEXT("error"), Report.Error);
+    }
+    TArray<TSharedPtr<FJsonValue>> Roots;
+    for (const FString& Root : Report.CleansedRoots)
+    {
+        Roots.Add(MakeShared<FJsonValueString>(Root));
+    }
+    Cleanup->SetArrayField(TEXT("cleansed_roots"), Roots);
+    Result->SetObjectField(TEXT("python_reference_cleanup"), Cleanup);
+}
+
 UWorld* GetEditorWorld()
 {
     if (!GEditor) return nullptr;
     return GEditor->GetEditorWorldContext().World();
+}
+
+FString CurrentEditorWorldPackage()
+{
+    if (UWorld* World = GetEditorWorld())
+    {
+        if (UPackage* Package = World->GetOutermost())
+        {
+            return Package->GetName();
+        }
+    }
+    return FString();
+}
+
+FString CurrentEditorWorldObjectPath()
+{
+    if (UWorld* World = GetEditorWorld())
+    {
+        return World->GetPathName();
+    }
+    return FString();
+}
+
+bool TryGetActorIdentifier(const TSharedPtr<FJsonObject>& Args, FString& OutId)
+{
+    OutId.Reset();
+    return Args.IsValid()
+        && (Args->TryGetStringField(TEXT("actor_id"), OutId)
+            || Args->TryGetStringField(TEXT("actor"), OutId))
+        && !OutId.IsEmpty();
+}
+
+TSharedRef<FJsonObject> ObjectPropertiesToJson(const UObject* Obj, int32 MaxDepth)
+{
+    auto Props = MakeShared<FJsonObject>();
+    if (!Obj) return Props;
+
+    detail::FInstancedRecurseCtx Ctx;
+    Ctx.MaxDepth = FMath::Max(0, MaxDepth);
+    for (TFieldIterator<FProperty> It(Obj->GetClass(), EFieldIteratorFlags::IncludeSuper); It; ++It)
+    {
+        const FProperty* Prop = *It;
+        if (!Prop) continue;
+        TSharedPtr<FJsonValue> Value = detail::GetUPropertyAsJson(Obj, Prop, &Ctx);
+        if (Value.IsValid())
+        {
+            Props->SetField(Prop->GetName(), Value);
+        }
+    }
+    return Props;
+}
+
+void CollectRootedNonCurrentEditorWorlds(TArray<FString>& OutWorlds)
+{
+    OutWorlds.Reset();
+    UWorld* CurrentWorld = GetEditorWorld();
+    for (TObjectIterator<UWorld> It; It; ++It)
+    {
+        UWorld* World = *It;
+        if (!World || World == CurrentWorld) continue;
+        if (World->WorldType != EWorldType::Editor) continue;
+        if (!World->IsRooted()) continue;
+        OutWorlds.Add(World->GetPathName());
+    }
+}
+
+struct FResolvedLevelPath
+{
+    FString InputPath;
+    FString ExpectedPackage;
+    FString ObjectPath;
+    FString Filename;
+    FString AssetClass;
+    bool bAssetFound = false;
+};
+
+FString StripObjectSuffixFromPath(const FString& InPath)
+{
+    FString Path = InPath;
+    int32 DotIdx = INDEX_NONE;
+    int32 SlashIdx = INDEX_NONE;
+    if (Path.FindLastChar(TEXT('/'), SlashIdx)
+        && Path.FindChar(TEXT('.'), DotIdx)
+        && DotIdx > SlashIdx)
+    {
+        Path = Path.Left(DotIdx);
+    }
+    return Path;
+}
+
+bool ResolveLevelLoadPath(const FString& RawPath,
+                          FResolvedLevelPath& OutTarget,
+                          FString& OutError)
+{
+    OutTarget = FResolvedLevelPath();
+    OutError.Reset();
+
+    FString Path = RawPath;
+    Path.TrimStartAndEndInline();
+    if (Path.IsEmpty())
+    {
+        OutError = TEXT("level path is empty");
+        return false;
+    }
+
+    OutTarget.InputPath = Path;
+
+    const FString ExportObjectPath = FPackageName::ExportTextPathToObjectPath(Path);
+    if (!ExportObjectPath.IsEmpty())
+    {
+        Path = ExportObjectPath;
+    }
+
+    FString LongPackageName;
+    if (Path.EndsWith(FPackageName::GetMapPackageExtension(), ESearchCase::IgnoreCase))
+    {
+        if (!FPackageName::TryConvertFilenameToLongPackageName(Path, LongPackageName))
+        {
+            OutError = FString::Printf(TEXT("map filename is not under a mounted content root: %s"), *Path);
+            return false;
+        }
+        Path = LongPackageName;
+    }
+
+    OutTarget.ExpectedPackage = StripObjectSuffixFromPath(Path);
+    if (!FPackageName::IsValidLongPackageName(OutTarget.ExpectedPackage))
+    {
+        OutError = FString::Printf(TEXT("not a valid long package name: %s"), *OutTarget.ExpectedPackage);
+        return false;
+    }
+
+    TArray<FAssetData> Assets;
+    IAssetRegistry& Registry =
+        FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+    Registry.GetAssetsByPackageName(FName(*OutTarget.ExpectedPackage), Assets);
+    for (const FAssetData& Asset : Assets)
+    {
+        if (Asset.AssetClassPath == UWorld::StaticClass()->GetClassPathName())
+        {
+            OutTarget.bAssetFound = true;
+            OutTarget.AssetClass = Asset.AssetClassPath.ToString();
+            OutTarget.ObjectPath = Asset.GetSoftObjectPath().ToString();
+            OutTarget.ExpectedPackage = Asset.PackageName.ToString();
+            break;
+        }
+    }
+
+    if (OutTarget.ObjectPath.IsEmpty())
+    {
+        const FString AssetName = FPackageName::GetShortName(OutTarget.ExpectedPackage);
+        OutTarget.ObjectPath = OutTarget.ExpectedPackage + TEXT(".") + AssetName;
+        if (!Assets.IsEmpty())
+        {
+            OutTarget.AssetClass = Assets[0].AssetClassPath.ToString();
+        }
+    }
+
+    if (!FPackageName::DoesPackageExist(OutTarget.ExpectedPackage, &OutTarget.Filename))
+    {
+        OutError = FString::Printf(TEXT("map package does not exist on disk or in mounted content: %s"),
+                                   *OutTarget.ExpectedPackage);
+        return false;
+    }
+
+    if (!OutTarget.AssetClass.IsEmpty()
+        && OutTarget.AssetClass != UWorld::StaticClass()->GetClassPathName().ToString())
+    {
+        OutError = FString::Printf(TEXT("package '%s' resolves to %s, not UWorld"),
+                                   *OutTarget.ExpectedPackage,
+                                   *OutTarget.AssetClass);
+        return false;
+    }
+
+    return true;
+}
+
+UWorld* WaitForEditorWorldPackage(const FString& ExpectedPackage,
+                                  double TimeoutSeconds,
+                                  int32& OutPolls,
+                                  FString& OutCurrentPackage,
+                                  FString& OutCurrentObjectPath)
+{
+    OutPolls = 0;
+    OutCurrentPackage.Reset();
+    OutCurrentObjectPath.Reset();
+
+    const double Deadline = FPlatformTime::Seconds() + FMath::Max(0.0, TimeoutSeconds);
+    do
+    {
+        ++OutPolls;
+        UWorld* World = GetEditorWorld();
+        if (World)
+        {
+            OutCurrentObjectPath = World->GetPathName();
+            if (UPackage* Package = World->GetOutermost())
+            {
+                OutCurrentPackage = Package->GetName();
+                if (OutCurrentPackage == ExpectedPackage)
+                {
+                    return World;
+                }
+            }
+        }
+
+        FlushAsyncLoading();
+        FPlatformProcess::Sleep(0.025f);
+    }
+    while (FPlatformTime::Seconds() < Deadline);
+
+    return nullptr;
 }
 
 // ---- level.get_outliner ----------------------------------------------------
@@ -76,12 +315,25 @@ FSageToolDispatch::FOutcome LevelGetOutlinerImpl(const TSharedPtr<FJsonObject>& 
 FSageToolDispatch::FOutcome LevelGetActorDetailsImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString Id;
-    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("actor_id"), Id))
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor_id'"));
+    if (!TryGetActorIdentifier(Args, Id))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor'"));
 
     AActor* A = detail::ResolveActor(Id);
     if (!A) return FSageToolDispatch::FOutcome::MakeError(-32602,
         FString::Printf(TEXT("actor not found: %s"), *Id));
+
+    bool bIncludeActorProperties = true;
+    bool bIncludeComponentProperties = false;
+    double MaxDepthD = 3.0;
+    if (Args.IsValid())
+    {
+        Args->TryGetBoolField(TEXT("include_actor_properties"), bIncludeActorProperties);
+        Args->TryGetBoolField(TEXT("include_actor_props"), bIncludeActorProperties);
+        Args->TryGetBoolField(TEXT("include_component_properties"), bIncludeComponentProperties);
+        Args->TryGetBoolField(TEXT("include_component_props"), bIncludeComponentProperties);
+        Args->TryGetNumberField(TEXT("max_depth"), MaxDepthD);
+    }
+    const int32 MaxDepth = FMath::Clamp(static_cast<int32>(MaxDepthD), 0, 8);
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("name"),   A->GetActorLabel());
@@ -102,6 +354,10 @@ FSageToolDispatch::FOutcome LevelGetActorDetailsImpl(const TSharedPtr<FJsonObjec
         MakeShared<FJsonValueNumber>(Rot.Roll)
     });
     R->SetArrayField(TEXT("scale"),    ToArr(A->GetActorScale3D()));
+    if (bIncludeActorProperties)
+    {
+        R->SetObjectField(TEXT("properties"), ObjectPropertiesToJson(A, MaxDepth));
+    }
 
     TArray<TSharedPtr<FJsonValue>> Comps;
     TArray<UActorComponent*> CompArr;
@@ -112,9 +368,17 @@ FSageToolDispatch::FOutcome LevelGetActorDetailsImpl(const TSharedPtr<FJsonObjec
         auto CJ = MakeShared<FJsonObject>();
         CJ->SetStringField(TEXT("name"),  C->GetName());
         CJ->SetStringField(TEXT("class"), C->GetClass()->GetName());
+        CJ->SetStringField(TEXT("path"),  C->GetPathName());
+        if (bIncludeComponentProperties)
+        {
+            CJ->SetObjectField(TEXT("properties"), ObjectPropertiesToJson(C, MaxDepth));
+        }
         Comps.Add(MakeShared<FJsonValueObject>(CJ));
     }
     R->SetArrayField(TEXT("components"), Comps);
+    R->SetBoolField(TEXT("included_actor_properties"), bIncludeActorProperties);
+    R->SetBoolField(TEXT("included_component_properties"), bIncludeComponentProperties);
+    R->SetNumberField(TEXT("max_depth"), MaxDepth);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -146,12 +410,129 @@ FSageToolDispatch::FOutcome LevelLoadImpl(const TSharedPtr<FJsonObject>& Args)
         }
     }
 
-    GEditor->Exec(GEditor->GetEditorWorldContext().World(),
-        *FString::Printf(TEXT("open %s"), *LevelPath), *GLog);
+    FResolvedLevelPath Target;
+    FString ResolveError;
+    if (!ResolveLevelLoadPath(LevelPath, Target, ResolveError))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, ResolveError);
+    }
+
+    bool bCleanupPythonRefs = true;
+    bool bClearMainGlobals = true;
+    if (Args.IsValid())
+    {
+        Args->TryGetBoolField(TEXT("cleanup_python_refs"), bCleanupPythonRefs);
+        Args->TryGetBoolField(TEXT("clear_python_main_globals"), bClearMainGlobals);
+    }
+
+    const FString BeforePackage = CurrentEditorWorldPackage();
+    const FString BeforeObjectPath = CurrentEditorWorldObjectPath();
+
+    detail::FPythonReferenceCleanupReport CleanupReport;
+    if (bCleanupPythonRefs)
+    {
+        CleanupReport = detail::CleanupPythonReferences(
+            bClearMainGlobals,
+            /*bIncludePieWorlds=*/true,
+            /*bIncludeEditorWorld=*/true,
+            /*bCollectUnrealGarbage=*/true);
+        if (CleanupReport.bPythonCommandRan && !CleanupReport.bPythonCommandSucceeded)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32603,
+                FString::Printf(TEXT("Python reference cleanup failed before level.load: %s"),
+                                *CleanupReport.Error));
+        }
+    }
+
+    TArray<FString> RootedEditorWorlds;
+    CollectRootedNonCurrentEditorWorlds(RootedEditorWorlds);
+    if (RootedEditorWorlds.Num() > 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("level.load refused to switch maps because rooted non-current editor worlds are still alive; requires_restart_before_load=true; leaked_worlds=%s"),
+                            *FString::Join(RootedEditorWorlds, TEXT(","))));
+    }
+
+    bool bLoadMapOk = false;
+    bool bOpenAssetFallbackAttempted = false;
+    bool bOpenAssetFallbackOk = false;
+
+    {
+        TGuardValue<bool> UnattendedScriptGuard(GIsRunningUnattendedScript, true);
+        bLoadMapOk = FEditorFileUtils::LoadMap(Target.ObjectPath,
+                                               /*LoadAsTemplate=*/false,
+                                               /*bShowProgress=*/false);
+    }
+
+    int32 PollCount = 0;
+    FString LoadedPackage;
+    FString LoadedObjectPath;
+    UWorld* LoadedWorld = WaitForEditorWorldPackage(Target.ExpectedPackage,
+        /*TimeoutSeconds=*/2.0,
+        PollCount,
+        LoadedPackage,
+        LoadedObjectPath);
+
+    if (!LoadedWorld && GEditor)
+    {
+        bOpenAssetFallbackAttempted = true;
+        UObject* WorldAsset = StaticLoadObject(UWorld::StaticClass(), nullptr, *Target.ObjectPath);
+        if (WorldAsset)
+        {
+            if (UAssetEditorSubsystem* AssetEditorSubsystem =
+                    GEditor->GetEditorSubsystem<UAssetEditorSubsystem>())
+            {
+                bOpenAssetFallbackOk = AssetEditorSubsystem->OpenEditorForAsset(WorldAsset);
+            }
+        }
+
+        int32 FallbackPollCount = 0;
+        LoadedWorld = WaitForEditorWorldPackage(Target.ExpectedPackage,
+            /*TimeoutSeconds=*/3.0,
+            FallbackPollCount,
+            LoadedPackage,
+            LoadedObjectPath);
+        PollCount += FallbackPollCount;
+    }
+
+    if (!LoadedWorld)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("level.load did not switch the editor world "
+                                 "(requested=%s, object_path=%s, filename=%s, "
+                                 "load_map_ok=%s, open_asset_fallback_attempted=%s, "
+                                 "open_asset_fallback_ok=%s, before=%s, current=%s, polls=%d)"),
+                            *Target.ExpectedPackage,
+                            *Target.ObjectPath,
+                            *Target.Filename,
+                            bLoadMapOk ? TEXT("true") : TEXT("false"),
+                            bOpenAssetFallbackAttempted ? TEXT("true") : TEXT("false"),
+                            bOpenAssetFallbackOk ? TEXT("true") : TEXT("false"),
+                            BeforePackage.IsEmpty() ? TEXT("<none>") : *BeforePackage,
+                            LoadedPackage.IsEmpty() ? TEXT("<none>") : *LoadedPackage,
+                            PollCount));
+    }
 
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("path"),   LevelPath);
-    R->SetBoolField  (TEXT("loaded"), true);
+    R->SetStringField(TEXT("path"),           LevelPath);
+    R->SetStringField(TEXT("requested_package"), Target.ExpectedPackage);
+    R->SetStringField(TEXT("object_path"),    Target.ObjectPath);
+    R->SetStringField(TEXT("filename"),       Target.Filename);
+    R->SetStringField(TEXT("loaded_package"), LoadedPackage);
+    R->SetStringField(TEXT("world_path"),     LoadedObjectPath);
+    R->SetStringField(TEXT("previous_package"), BeforePackage);
+    R->SetStringField(TEXT("previous_world_path"), BeforeObjectPath);
+    R->SetBoolField  (TEXT("command_ok"),     bLoadMapOk || bOpenAssetFallbackOk);
+    R->SetBoolField  (TEXT("load_map_ok"),    bLoadMapOk);
+    R->SetBoolField  (TEXT("open_asset_fallback_attempted"), bOpenAssetFallbackAttempted);
+    R->SetBoolField  (TEXT("open_asset_fallback_ok"), bOpenAssetFallbackOk);
+    R->SetBoolField  (TEXT("asset_found"),    Target.bAssetFound);
+    R->SetNumberField(TEXT("poll_count"),     PollCount);
+    R->SetBoolField  (TEXT("loaded"),         true);
+    if (bCleanupPythonRefs)
+    {
+        AddPythonCleanupReport(R, CleanupReport);
+    }
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -225,10 +606,10 @@ FSageToolDispatch::FOutcome LevelCreateImpl(const TSharedPtr<FJsonObject>& Args)
     if (!Pkg) return FSageToolDispatch::FOutcome::MakeError(-32000, TEXT("CreatePackage failed"));
     Pkg->FullyLoad();
 
-    // Use UWorld::CreateWorld so the world is properly registered
-    // (FWorldDelegates fire, scene/physics init runs). The plain
-    // NewObject<UWorld>+MarkPackageDirty stub crashed at save time because
-    // FXSystem / Niagara world subsystems never spun up.
+    // Create the map asset without registering it as an editor world context
+    // or rooting it. Registering + rooting here leaves a second live Editor
+    // UWorld behind and can make the next map switch fail world-cleanup
+    // verification.
     const UWorld::InitializationValues IVS = UWorld::InitializationValues()
         .ShouldSimulatePhysics(false)
         .EnableTraceCollision(true)
@@ -238,10 +619,10 @@ FSageToolDispatch::FOutcome LevelCreateImpl(const TSharedPtr<FJsonObject>& Args)
 
     UWorld* NewWorld = UWorld::CreateWorld(
         EWorldType::Editor,
-        /*bInformEngineOfWorld=*/true,
+        /*bInformEngineOfWorld=*/false,
         FName(*AssetName),
         Pkg,
-        /*bAddToRoot=*/true,
+        /*bAddToRoot=*/false,
         ERHIFeatureLevel::Num,
         &IVS);
     if (!NewWorld)
@@ -258,10 +639,32 @@ FSageToolDispatch::FOutcome LevelCreateImpl(const TSharedPtr<FJsonObject>& Args)
     FAssetRegistryModule::AssetCreated(NewWorld);
     NewWorld->MarkPackageDirty();
 
+    const FString Filename = FPackageName::LongPackageNameToFilename(
+        Pkg->GetName(), FPackageName::GetMapPackageExtension());
+    IFileManager::Get().MakeDirectory(*FPaths::GetPath(Filename), /*Tree=*/true);
+
+    FSavePackageArgs SaveArgs;
+    SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+    SaveArgs.SaveFlags = SAVE_NoError;
+    const bool bSaved = UPackage::SavePackage(Pkg, NewWorld, *Filename, SaveArgs);
+    if (!bSaved)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("failed to save level package: %s"), *Filename));
+    }
+    Pkg->SetDirtyFlag(false);
+
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"), NewWorld->GetPathName());
     R->SetStringField(TEXT("name"), NewWorld->GetName());
+    R->SetStringField(TEXT("package"), Pkg->GetName());
+    R->SetStringField(TEXT("filename"), Filename);
     R->SetBoolField  (TEXT("initialized"), true);
+    R->SetBoolField  (TEXT("saved"), true);
+    R->SetBoolField  (TEXT("registered_as_editor_world"), false);
+    R->SetBoolField  (TEXT("rooted"), NewWorld->IsRooted());
+    R->SetStringField(TEXT("current_editor_world"), CurrentEditorWorldObjectPath());
+    R->SetBoolField  (TEXT("requires_restart_before_load"), false);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -733,30 +1136,182 @@ FSageToolDispatch::FOutcome LevelSetWorldSettingsImpl(const TSharedPtr<FJsonObje
     AWorldSettings* WS = World->GetWorldSettings();
     if (!WS) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no WorldSettings"));
 
-    FScopedTransaction Tx(LOCTEXT("SetWS", "Set World Settings"));
-    WS->Modify();
+    auto Props = MakeShared<FJsonObject>();
+    const TSharedPtr<FJsonObject>* PropsField = nullptr;
+    if (Args.IsValid()
+        && Args->TryGetObjectField(TEXT("properties"), PropsField)
+        && PropsField && PropsField->IsValid())
+    {
+        for (const auto& KV : (*PropsField)->Values)
+        {
+            Props->SetField(KV.Key, KV.Value);
+        }
+    }
 
     double Val;
     if (Args.IsValid() && Args->TryGetNumberField(TEXT("gravity_z"), Val))
-        WS->WorldGravityZ = static_cast<float>(Val);
+        Props->SetField(TEXT("WorldGravityZ"), MakeShared<FJsonValueNumber>(Val));
     if (Args.IsValid() && Args->TryGetNumberField(TEXT("kill_z"), Val))
-        WS->KillZ = Val;
+        Props->SetField(TEXT("KillZ"), MakeShared<FJsonValueNumber>(Val));
 
     FString GMPath;
     if (Args.IsValid() && Args->TryGetStringField(TEXT("default_game_mode"), GMPath))
+        Props->SetField(TEXT("DefaultGameMode"), MakeShared<FJsonValueString>(GMPath));
+
+    if (Props->Values.Num() == 0)
     {
-        UClass* GMCls = FindObject<UClass>(nullptr, *GMPath);
-        if (!GMCls) GMCls = LoadObject<UClass>(nullptr, *GMPath);
-        if (GMCls) WS->DefaultGameMode = GMCls;
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing WorldSettings properties"));
     }
 
-    WS->PostEditChange();
+    FScopedTransaction Tx(LOCTEXT("SetWS", "Set World Settings"));
+    WS->Modify();
+
+    auto Readback = MakeShared<FJsonObject>();
+    int32 SetCount = 0;
+    for (const auto& KV : Props->Values)
+    {
+        FProperty* P = WS->GetClass()->FindPropertyByName(*KV.Key);
+        if (!P)
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("WorldSettings property not found: %s"), *KV.Key));
+        }
+        if (!P->HasAnyPropertyFlags(CPF_Edit))
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("WorldSettings property '%s' is not editable"), *KV.Key));
+        }
+        if (P->HasAnyPropertyFlags(CPF_DisableEditOnInstance))
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("WorldSettings property '%s' is not editable on the "
+                                     "level instance (DisableEditOnInstance/EditDefaultsOnly)"),
+                                *KV.Key));
+        }
+        WS->PreEditChange(P);
+        if (!detail::SetUPropertyFromJson(WS, P, KV.Value))
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("failed to set WorldSettings property '%s'"), *KV.Key));
+        }
+        FPropertyChangedEvent ChangeEvent(P, EPropertyChangeType::ValueSet);
+        WS->PostEditChangeProperty(ChangeEvent);
+
+        TSharedPtr<FJsonValue> After = detail::GetUPropertyAsJson(WS, P);
+        if (!After.IsValid())
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32603,
+                FString::Printf(TEXT("failed to read back WorldSettings property '%s'"), *KV.Key));
+        }
+        if (KV.Value.IsValid()
+            && KV.Value->Type != EJson::Object
+            && KV.Value->Type != EJson::Array
+            && !detail::JsonValuesEqual(KV.Value, After))
+        {
+            Readback->SetField(KV.Key, After);
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32603,
+                FString::Printf(TEXT("WorldSettings property '%s' did not persist after set"), *KV.Key));
+        }
+        Readback->SetField(KV.Key, After);
+        ++SetCount;
+    }
+
     World->MarkPackageDirty();
 
     auto R = MakeShared<FJsonObject>();
-    R->SetBoolField  (TEXT("modified"),   true);
-    R->SetNumberField(TEXT("gravity_z"),  WS->WorldGravityZ);
-    R->SetNumberField(TEXT("kill_z"),     WS->KillZ);
+    R->SetBoolField  (TEXT("modified"),   SetCount > 0);
+    R->SetNumberField(TEXT("property_count"), SetCount);
+    R->SetStringField(TEXT("world_path"),  World->GetPathName());
+    R->SetStringField(TEXT("world_settings_class"), WS->GetClass()->GetPathName());
+    R->SetObjectField(TEXT("readback"),    Readback);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome LyraSetDefaultGameplayExperienceImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString ExperienceClass;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("experience_class"), ExperienceClass)
+        || ExperienceClass.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'experience_class'"));
+    }
+
+    FString LevelPath;
+    if (Args->TryGetStringField(TEXT("level_path"), LevelPath) && !LevelPath.IsEmpty())
+    {
+        auto LoadArgs = MakeShared<FJsonObject>();
+        LoadArgs->SetStringField(TEXT("path"), LevelPath);
+        bool bDiscardUnsaved = false;
+        Args->TryGetBoolField(TEXT("discard_unsaved"), bDiscardUnsaved);
+        LoadArgs->SetBoolField(TEXT("discard_unsaved"), bDiscardUnsaved);
+        FSageToolDispatch::FOutcome LoadOutcome = LevelLoadImpl(LoadArgs);
+        if (!LoadOutcome.bSuccess)
+        {
+            return LoadOutcome;
+        }
+    }
+
+    UWorld* World = GetEditorWorld();
+    if (!World) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no editor world"));
+
+    AWorldSettings* WS = World->GetWorldSettings();
+    if (!WS) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no WorldSettings"));
+
+    FProperty* Prop = WS->GetClass()->FindPropertyByName(TEXT("DefaultGameplayExperience"));
+    if (!Prop)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("%s does not expose DefaultGameplayExperience"),
+                            *WS->GetClass()->GetPathName()));
+    }
+    if (!Prop->HasAnyPropertyFlags(CPF_Edit))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("DefaultGameplayExperience is not editable"));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("LyraSetDefaultExperience", "Set Lyra Default Gameplay Experience"));
+    WS->Modify();
+    WS->PreEditChange(Prop);
+    if (!detail::SetUPropertyFromJson(WS, Prop, MakeShared<FJsonValueString>(ExperienceClass)))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("failed to set DefaultGameplayExperience"));
+    }
+    FPropertyChangedEvent ChangeEvent(Prop, EPropertyChangeType::ValueSet);
+    WS->PostEditChangeProperty(ChangeEvent);
+
+    TSharedPtr<FJsonValue> Readback = detail::GetUPropertyAsJson(WS, Prop);
+    if (!Readback.IsValid())
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("failed to read back DefaultGameplayExperience"));
+    }
+
+    World->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("modified"), true);
+    R->SetBoolField(TEXT("lyra_helper"), true);
+    R->SetStringField(TEXT("world_path"), World->GetPathName());
+    R->SetStringField(TEXT("world_settings_class"), WS->GetClass()->GetPathName());
+    R->SetStringField(TEXT("experience_class"), ExperienceClass);
+    R->SetField(TEXT("readback"), Readback);
+    R->SetBoolField(TEXT("bypassed_disable_edit_on_instance_guard"), true);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -765,8 +1320,8 @@ FSageToolDispatch::FOutcome LevelSetWorldSettingsImpl(const TSharedPtr<FJsonObje
 FSageToolDispatch::FOutcome LevelGetActorBoundsImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString Id;
-    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("actor_id"), Id))
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor_id'"));
+    if (!TryGetActorIdentifier(Args, Id))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor'"));
     AActor* A = detail::ResolveActor(Id);
     if (!A) return FSageToolDispatch::FOutcome::MakeError(-32602,
         FString::Printf(TEXT("actor not found: %s"), *Id));
@@ -1212,6 +1767,8 @@ void RegisterLevelTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("level.set_spline_points"),    GT(&LevelSetSplinePointsImpl));
     Dispatch.RegisterHandler(TEXT("level.set_actor_material"),   GT(&LevelSetActorMaterialImpl));
     Dispatch.RegisterHandler(TEXT("level.set_world_settings"),   GT(&LevelSetWorldSettingsImpl));
+    Dispatch.RegisterHandler(TEXT("lyra.set_default_gameplay_experience"),
+                                                                 GT(&LyraSetDefaultGameplayExperienceImpl));
     Dispatch.RegisterHandler(TEXT("level.set_water_body_property"), GT(&LevelSetWaterBodyPropertyImpl));
     Dispatch.RegisterHandler(TEXT("level.build_lighting"),       GT(&LevelBuildLightingImpl));
 

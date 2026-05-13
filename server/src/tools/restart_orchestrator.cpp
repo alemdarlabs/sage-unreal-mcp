@@ -11,8 +11,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <expected>
+#include <fstream>
 #include <optional>
 #include <thread>
+#include <string_view>
+#include <vector>
 
 #if defined(_WIN32)
 #  include <io.h>
@@ -36,18 +39,12 @@ namespace fs = std::filesystem;
 // Host platform binary suffix mirrors UAT BuildPlugin layout.
 #if defined(__APPLE__)
 constexpr const char* kPlatformDir = "Mac";
-constexpr const char* kPluginDylib = "UnrealEditor-SageBridge.dylib";
-constexpr const char* kPluginModules = "UnrealEditor.modules";
 constexpr const char* kUbtBuildScript = "Engine/Build/BatchFiles/Mac/Build.sh";
 #elif defined(__linux__)
 constexpr const char* kPlatformDir = "Linux";
-constexpr const char* kPluginDylib = "libUnrealEditor-SageBridge.so";
-constexpr const char* kPluginModules = "UnrealEditor.modules";
 constexpr const char* kUbtBuildScript = "Engine/Build/BatchFiles/Linux/Build.sh";
 #elif defined(_WIN32)
 constexpr const char* kPlatformDir = "Win64";
-constexpr const char* kPluginDylib = "UnrealEditor-SageBridge.dll";
-constexpr const char* kPluginModules = "UnrealEditor.modules";
 constexpr const char* kUbtBuildScript = "Engine/Build/BatchFiles/Build.bat";
 #else
 #  error "unsupported platform for restart_orchestrator"
@@ -56,6 +53,11 @@ constexpr const char* kUbtBuildScript = "Engine/Build/BatchFiles/Build.bat";
 struct ScriptResult {
     int         exitCode = -1;
     std::string lastOutput;  // tail of stdout+stderr for error context
+};
+
+struct EditorTargetResolution {
+    std::string target;
+    std::string source;
 };
 
 std::string quoteShellArg(const std::string& value) {
@@ -128,6 +130,257 @@ std::string buildPluginCommand(const fs::path& script, const fs::path& ueRoot) {
     cmd += quoteShellArg(script);
     return cmd;
 #endif
+}
+
+bool endsWith(std::string_view value, std::string_view suffix) {
+    return value.size() >= suffix.size()
+        && value.substr(value.size() - suffix.size()) == suffix;
+}
+
+std::string stripTargetCsSuffix(const fs::path& path) {
+    std::string name = path.filename().string();
+    constexpr std::string_view suffix = ".Target.cs";
+    if (endsWith(name, suffix)) {
+        name.resize(name.size() - suffix.size());
+    }
+    return name;
+}
+
+std::optional<EditorTargetResolution> resolveEditorTargetFromSource(
+    const fs::path& projectPath) {
+    const fs::path sourceDir = projectPath.parent_path() / "Source";
+    if (!fs::is_directory(sourceDir)) {
+        return std::nullopt;
+    }
+
+    const std::string preferred = projectPath.stem().string() + "Editor";
+    std::vector<fs::path> editorTargets;
+    std::error_code ec;
+    for (const fs::directory_entry& entry : fs::directory_iterator(sourceDir, ec)) {
+        if (ec || !entry.is_regular_file()) continue;
+        const std::string target = stripTargetCsSuffix(entry.path());
+        if (target == entry.path().filename().string()) continue;
+        if (!endsWith(target, "Editor")) continue;
+        if (target == preferred) {
+            return EditorTargetResolution{
+                target,
+                "Source target file: " + entry.path().string(),
+            };
+        }
+        editorTargets.push_back(entry.path());
+    }
+
+    if (editorTargets.size() == 1) {
+        return EditorTargetResolution{
+            stripTargetCsSuffix(editorTargets.front()),
+            "Source target file: " + editorTargets.front().string(),
+        };
+    }
+    return std::nullopt;
+}
+
+std::optional<EditorTargetResolution> resolveEditorTargetFromUProject(
+    const fs::path& projectPath) {
+    std::ifstream in(projectPath);
+    if (!in) {
+        return std::nullopt;
+    }
+
+    nlohmann::json project = nlohmann::json::parse(in, nullptr, false);
+    if (project.is_discarded() || !project.is_object()
+        || !project.contains("Modules") || !project["Modules"].is_array()) {
+        return std::nullopt;
+    }
+
+    const std::string preferred = projectPath.stem().string() + "Editor";
+    std::vector<std::string> editorModules;
+    for (const auto& module : project["Modules"]) {
+        if (!module.is_object()
+            || !module.contains("Name") || !module["Name"].is_string()
+            || !module.contains("Type") || !module["Type"].is_string()) {
+            continue;
+        }
+        if (module["Type"].get<std::string>() != "Editor") {
+            continue;
+        }
+
+        const std::string name = module["Name"].get<std::string>();
+        if (name == preferred) {
+            return EditorTargetResolution{name, ".uproject Modules[] Editor entry"};
+        }
+        editorModules.push_back(name);
+    }
+
+    if (editorModules.size() == 1) {
+        return EditorTargetResolution{
+            editorModules.front(),
+            ".uproject Modules[] Editor entry",
+        };
+    }
+    return std::nullopt;
+}
+
+EditorTargetResolution resolveEditorTarget(const fs::path& projectPath) {
+    if (auto fromSource = resolveEditorTargetFromSource(projectPath)) {
+        return *fromSource;
+    }
+    if (auto fromProject = resolveEditorTargetFromUProject(projectPath)) {
+        return *fromProject;
+    }
+    return EditorTargetResolution{
+        projectPath.stem().string() + "Editor",
+        "fallback: <ProjectName>Editor",
+    };
+}
+
+std::string buildProjectModulesCommand(const fs::path& buildScript,
+                                       const std::string& editorTarget,
+                                       const fs::path& projectPath) {
+#if defined(_WIN32)
+    // _popen runs through cmd.exe. A quoted .bat path as the first token can
+    // be parsed as a malformed command; `call` handles quoted batch paths.
+    std::string cmd = "call " + quoteShellArg(buildScript);
+#else
+    std::string cmd = quoteShellArg(buildScript);
+#endif
+    cmd += " " + editorTarget + " " + std::string{kPlatformDir}
+         + " Development -Project=" + quoteShellArg(projectPath)
+         + " -WaitMutex -NoHotReload";
+    return cmd;
+}
+
+mcp::ErrorObject restartError(mcp::ErrorCode code,
+                              std::string detail,
+                              const nlohmann::json& data) {
+    mcp::ErrorObject err = mcp::ErrorObject::fromCode(code, std::move(detail));
+    err.data = data;
+    return err;
+}
+
+bool pathIsInsideOrEqual(const fs::path& root, const fs::path& candidate) {
+    std::error_code ec;
+    const fs::path rootAbs = fs::absolute(root, ec).lexically_normal();
+    if (ec) return false;
+    const fs::path candAbs = fs::absolute(candidate, ec).lexically_normal();
+    if (ec) return false;
+    if (candAbs == rootAbs) return true;
+
+    const fs::path rel = candAbs.lexically_relative(rootAbs);
+    if (rel.empty() || rel.is_absolute()) return false;
+    for (const fs::path& part : rel) {
+        if (part == "..") return false;
+    }
+    return true;
+}
+
+std::optional<std::string> copyFileChecked(const fs::path& src,
+                                           const fs::path& dst,
+                                           const char* label) {
+    if (!fs::is_regular_file(src)) {
+        return std::string{label} + " source file not found: " + src.string();
+    }
+
+    std::error_code ec;
+    fs::create_directories(dst.parent_path(), ec);
+    if (ec) {
+        return std::string{label} + " create destination directory failed: "
+             + dst.parent_path().string() + ": " + ec.message();
+    }
+
+    fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+        return std::string{label} + " copy failed " + src.string() + " -> "
+             + dst.string() + ": " + ec.message();
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> replaceDirectoryChecked(const fs::path& src,
+                                                   const fs::path& dst,
+                                                   const fs::path& allowedRoot,
+                                                   const char* label) {
+    if (!fs::is_directory(src)) {
+        return std::string{label} + " source directory not found: " + src.string();
+    }
+    if (!pathIsInsideOrEqual(allowedRoot, dst)) {
+        return std::string{"refusing to replace "} + label
+             + " outside plugin root: " + dst.string();
+    }
+
+    std::error_code ec;
+    if (fs::exists(dst, ec)) {
+        fs::remove_all(dst, ec);
+        if (ec) {
+            return std::string{label} + " remove old destination failed: "
+                 + dst.string() + ": " + ec.message();
+        }
+    }
+
+    fs::create_directories(dst.parent_path(), ec);
+    if (ec) {
+        return std::string{label} + " create destination parent failed: "
+             + dst.parent_path().string() + ": " + ec.message();
+    }
+
+    fs::copy(src, dst,
+             fs::copy_options::recursive | fs::copy_options::overwrite_existing,
+             ec);
+    if (ec) {
+        return std::string{label} + " copy failed " + src.string() + " -> "
+             + dst.string() + ": " + ec.message();
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> deployPackagedPlugin(const fs::path& repoRoot,
+                                                const fs::path& pluginRoot,
+                                                nlohmann::json& result) {
+    const fs::path packagedRoot = repoRoot / "build" / "plugin";
+    const fs::path descriptorSrc = packagedRoot / "SageBridge.uplugin";
+    const fs::path descriptorDst = pluginRoot / "SageBridge.uplugin";
+    const fs::path binariesSrc = packagedRoot / "Binaries" / kPlatformDir;
+    const fs::path binariesDst = pluginRoot / "Binaries" / kPlatformDir;
+    const fs::path sourceSrc = packagedRoot / "Source";
+    const fs::path sourceDst = pluginRoot / "Source";
+
+    if (!pathIsInsideOrEqual(pluginRoot.parent_path(), pluginRoot)) {
+        return "refusing to deploy SageBridge outside the project Plugins directory: "
+             + pluginRoot.string();
+    }
+
+    if (auto err = copyFileChecked(descriptorSrc, descriptorDst, "plugin descriptor")) {
+        return err;
+    }
+
+    if (!fs::is_directory(binariesSrc)) {
+        return "packaged plugin binary directory not found: " + binariesSrc.string();
+    }
+
+    int binaryFileCount = 0;
+    for (const fs::directory_entry& entry : fs::directory_iterator(binariesSrc)) {
+        if (!entry.is_regular_file()) continue;
+        const fs::path dst = binariesDst / entry.path().filename();
+        if (auto err = copyFileChecked(entry.path(), dst, "plugin binary")) {
+            return err;
+        }
+        ++binaryFileCount;
+    }
+    if (binaryFileCount == 0) {
+        return "packaged plugin binary directory contained no files: "
+             + binariesSrc.string();
+    }
+
+    if (auto err = replaceDirectoryChecked(sourceSrc, sourceDst,
+                                           pluginRoot, "plugin Source")) {
+        return err;
+    }
+
+    result["plugin_descriptor_swapped"] = true;
+    result["plugin_binary_file_count"]  = binaryFileCount;
+    result["plugin_source_swapped"]     = true;
+    result["plugin_root"]               = pluginRoot.string();
+    result["plugin_binaries_dir"]       = binariesDst.string();
+    return std::nullopt;
 }
 
 // Run a shell command, capture combined stdout/stderr, return exit code.
@@ -286,9 +539,9 @@ mcp::Tool buildRestartEditorTool(bridge::BridgeServer& bridge, RestartConfig cfg
             {"save_dirty",               {{"type", "boolean"}}},
             {"rebuild_project_modules",  {{"type", "boolean"},
                                           {"description",
-                                              "Mac/Linux substitute for Live Coding: "
+                                              "Full restart substitute for Live Coding: "
                                               "between editor kill and relaunch, run "
-                                              "UBT to rebuild <Project>Editor target. "
+                                              "UBT to rebuild the resolved Editor target. "
                                               "Required after editing project C++ "
                                               "sources (added classes, modified UCLASS "
                                               "members, etc) — UE editor relaunch "
@@ -346,8 +599,7 @@ mcp::Tool buildRestartEditorTool(bridge::BridgeServer& bridge, RestartConfig cfg
 
         const auto projectPath  = session->project_path;
         const auto projectDir   = fs::path{projectPath}.parent_path();
-        const auto pluginInstall = projectDir / "Plugins" / "SageBridge"
-                                                / "Binaries" / kPlatformDir;
+        const auto pluginRoot    = projectDir / "Plugins" / "SageBridge";
         const auto editorPid    = static_cast<pid_t>(session->pid);
         const auto oldSessionId = session->session_id;
         const auto slotId       = session->slot_id;
@@ -356,7 +608,29 @@ mcp::Tool buildRestartEditorTool(bridge::BridgeServer& bridge, RestartConfig cfg
             {"slot_id",        slotId},
             {"old_session_id", oldSessionId},
             {"build_plugin",   buildPlugin},
+            {"rebuild_project_modules", rebuildProject},
+            {"editor_terminated", false},
         };
+
+        fs::path projectBuildScript;
+        EditorTargetResolution editorTarget;
+        if (rebuildProject) {
+            if (cfg.ueRoot.empty()) {
+                return std::unexpected(mcp::ErrorObject::fromCode(
+                    mcp::ErrorCode::InternalError,
+                    "rebuild_project_modules requires SAGE_UE_ROOT or "
+                    "RestartConfig::ueRoot to be set"));
+            }
+            projectBuildScript = cfg.ueRoot / kUbtBuildScript;
+            if (!fs::exists(projectBuildScript)) {
+                return std::unexpected(mcp::ErrorObject::fromCode(
+                    mcp::ErrorCode::InternalError,
+                    "UBT build script not found: " + projectBuildScript.string()));
+            }
+            editorTarget = resolveEditorTarget(fs::path{projectPath});
+            result["rebuild_project_target"] = editorTarget.target;
+            result["rebuild_project_target_source"] = editorTarget.source;
+        }
 
         // ---- Step 1: save_dirty (best-effort) --------------------------
         if (saveDirty) {
@@ -411,26 +685,17 @@ mcp::Tool buildRestartEditorTool(bridge::BridgeServer& bridge, RestartConfig cfg
         }
         result["kill_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
+        result["editor_terminated"] = true;
 
-        // ---- Step 4: swap plugin binary -------------------------------
+        // ---- Step 4: deploy packaged plugin ---------------------------
         if (buildPlugin) {
-            const auto srcDir = repoRoot / "build" / "plugin" / "Binaries"
-                                              / kPlatformDir;
-            for (const char* fname : {kPluginDylib, kPluginModules}) {
-                const auto src = srcDir / fname;
-                const auto dst = pluginInstall / fname;
-                std::error_code ec;
-                fs::create_directories(pluginInstall, ec);
-                fs::copy_file(src, dst,
-                              fs::copy_options::overwrite_existing, ec);
-                if (ec) {
-                    return std::unexpected(mcp::ErrorObject::fromCode(
-                        mcp::ErrorCode::InternalError,
-                        "dylib copy failed " + src.string() + " -> "
-                        + dst.string() + ": " + ec.message()));
-                }
+            if (const auto deployError = deployPackagedPlugin(repoRoot, pluginRoot, result)) {
+                return std::unexpected(restartError(
+                    mcp::ErrorCode::InternalError,
+                    *deployError,
+                    result));
             }
-            result["dylib_swapped"] = true;
+            result["plugin_deployed"] = true;
         }
 
         // ---- Step 4b: rebuild project modules (UBT) -------------------
@@ -441,26 +706,8 @@ mcp::Tool buildRestartEditorTool(bridge::BridgeServer& bridge, RestartConfig cfg
         // bp_get_cdo_properties on /Script/<Project>.<Class> fail with
         // "class not found".
         if (rebuildProject) {
-            if (cfg.ueRoot.empty()) {
-                return std::unexpected(mcp::ErrorObject::fromCode(
-                    mcp::ErrorCode::InternalError,
-                    "rebuild_project_modules requires SAGE_UE_ROOT or "
-                    "RestartConfig::ueRoot to be set"));
-            }
-            const auto buildScript = cfg.ueRoot / kUbtBuildScript;
-            if (!fs::exists(buildScript)) {
-                return std::unexpected(mcp::ErrorObject::fromCode(
-                    mcp::ErrorCode::InternalError,
-                    "UBT build script not found: " + buildScript.string()));
-            }
-
-            const auto projectName  = fs::path{projectPath}.stem().string();
-            const auto editorTarget = projectName + "Editor";
-
-            std::string cmd = quoteShellArg(buildScript) + " "
-                            + editorTarget + " " + std::string{kPlatformDir}
-                            + " Development -Project=" + quoteShellArg(projectPath) + " "
-                            + "-WaitMutex -NoHotReload";
+            const std::string cmd = buildProjectModulesCommand(
+                projectBuildScript, editorTarget.target, fs::path{projectPath});
 
             spdlog::info("restart_editor: rebuilding project module: {}", cmd);
             const auto t1 = std::chrono::steady_clock::now();
@@ -469,24 +716,28 @@ mcp::Tool buildRestartEditorTool(bridge::BridgeServer& bridge, RestartConfig cfg
                 std::chrono::steady_clock::now() - t1).count();
             result["rebuild_project_ms"]   = rebuildMs;
             result["rebuild_project_exit"] = pr.exitCode;
-            result["rebuild_project_target"] = editorTarget;
+            result["rebuild_project_target"] = editorTarget.target;
+            result["rebuild_project_target_source"] = editorTarget.source;
             if (pr.exitCode != 0) {
                 const auto tail = pr.lastOutput.size() > 3000
                     ? pr.lastOutput.substr(pr.lastOutput.size() - 3000)
                     : pr.lastOutput;
-                return std::unexpected(mcp::ErrorObject::fromCode(
+                return std::unexpected(restartError(
                     mcp::ErrorCode::InternalError,
                     "project rebuild failed (exit=" + std::to_string(pr.exitCode)
-                    + " target=" + editorTarget + "); tail:\n" + tail));
+                    + " target=" + editorTarget.target
+                    + " editor_terminated=true); tail:\n" + tail,
+                    result));
             }
             result["rebuild_project"] = true;
         }
 
         // ---- Step 5: relaunch ----------------------------------------
         if (!relaunchEditor(projectPath)) {
-            return std::unexpected(mcp::ErrorObject::fromCode(
+            return std::unexpected(restartError(
                 mcp::ErrorCode::InternalError,
-                "editor relaunch failed for " + projectPath));
+                "editor relaunch failed for " + projectPath,
+                result));
         }
 
         // ---- Step 6: wait for new handshake ---------------------------
@@ -498,10 +749,11 @@ mcp::Tool buildRestartEditorTool(bridge::BridgeServer& bridge, RestartConfig cfg
             result["handshake_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t1).count();
             if (newSessionId.empty()) {
-                return std::unexpected(mcp::ErrorObject::fromCode(
+                return std::unexpected(restartError(
                     mcp::ErrorCode::InternalError,
                     "editor relaunched but did not handshake within "
-                    + std::to_string(waitHandshakeS) + "s"));
+                    + std::to_string(waitHandshakeS) + "s",
+                    result));
             }
             result["new_session_id"] = newSessionId;
         }
@@ -514,13 +766,15 @@ mcp::Tool buildRestartEditorTool(bridge::BridgeServer& bridge, RestartConfig cfg
         .description = "Save dirty assets → (optionally) build plugin via UAT "
                        "→ terminate editor → swap plugin dylib → (optionally) "
                        "rebuild project modules via UBT → relaunch → wait for "
-                       "handshake. Mac/Linux's stand-in for Live Coding. "
+                       "handshake. Full-restart stand-in for Live Coding. "
                        "REQUIRES confirmed=true. Aborts before kill if plugin "
                        "build fails. Pass rebuild_project_modules=true after "
                        "editing project C++ sources (added classes / modified "
                        "UCLASS) — UE editor relaunch alone does NOT recompile "
-                       "project modules on Mac. Returns the new session_id on "
-                       "success along with build/rebuild durations.",
+                       "project modules. Resolves the real editor target from "
+                       "Source/*.Target.cs or .uproject Modules instead of "
+                       "assuming <ProjectName>Editor. Returns the new "
+                       "session_id on success along with build/rebuild durations.",
         .inputSchema = schema,
         .handler     = std::move(handler),
         .remote      = false,

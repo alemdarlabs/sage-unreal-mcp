@@ -19,6 +19,15 @@ namespace sage::tools
 namespace
 {
 
+bool TryGetActorIdentifier(const TSharedPtr<FJsonObject>& Args, FString& OutId)
+{
+    OutId.Reset();
+    return Args.IsValid()
+        && (Args->TryGetStringField(TEXT("actor_id"), OutId)
+            || Args->TryGetStringField(TEXT("actor"), OutId))
+        && !OutId.IsEmpty();
+}
+
 // ---- networking.set_replicates ---------------------------------------------
 
 FSageToolDispatch::FOutcome NetworkingSetReplicatesImpl(const TSharedPtr<FJsonObject>& Args)
@@ -81,14 +90,14 @@ FSageToolDispatch::FOutcome NetworkingConfigureNetFrequencyImpl(const TSharedPtr
 
     FScopedTransaction Tx(LOCTEXT("SetNetFreq", "Set Net Update Frequency"));
     A->Modify();
-    A->NetUpdateFrequency    = NetFreq;
-    A->MinNetUpdateFrequency = MinNetFreq;
+    A->SetNetUpdateFrequency(NetFreq);
+    A->SetMinNetUpdateFrequency(MinNetFreq);
     A->MarkPackageDirty();
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("actor_id"),              A->GetPathName());
-    R->SetNumberField(TEXT("net_update_frequency"),  A->NetUpdateFrequency);
-    R->SetNumberField(TEXT("min_net_update_frequency"), A->MinNetUpdateFrequency);
+    R->SetNumberField(TEXT("net_update_frequency"),  A->GetNetUpdateFrequency());
+    R->SetNumberField(TEXT("min_net_update_frequency"), A->GetMinNetUpdateFrequency());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -231,7 +240,7 @@ FSageToolDispatch::FOutcome NetworkingConfigureCullDistanceImpl(const TSharedPtr
 
     FScopedTransaction Tx(LOCTEXT("SetCull", "Set Net Cull Distance"));
     A->Modify();
-    A->NetCullDistanceSquared = CullDist * CullDist;
+    A->SetNetCullDistanceSquared(CullDist * CullDist);
     A->MarkPackageDirty();
 
     auto R = MakeShared<FJsonObject>();
@@ -301,8 +310,8 @@ FSageToolDispatch::FOutcome NetworkingSetReplicateMovementImpl(const TSharedPtr<
 FSageToolDispatch::FOutcome NetworkingGetInfoImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString ActorId;
-    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("actor_id"), ActorId))
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor_id'"));
+    if (!TryGetActorIdentifier(Args, ActorId))
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor'"));
 
     AActor* A = detail::ResolveActor(ActorId);
     if (!A) return FSageToolDispatch::FOutcome::MakeError(-32602,
@@ -315,10 +324,10 @@ FSageToolDispatch::FOutcome NetworkingGetInfoImpl(const TSharedPtr<FJsonObject>&
     R->SetBoolField  (TEXT("only_relevant_to_owner"),  A->bOnlyRelevantToOwner);
     R->SetBoolField  (TEXT("net_load_on_client"),      A->bNetLoadOnClient);
     R->SetBoolField  (TEXT("replicate_movement"),      A->IsReplicatingMovement());
-    R->SetNumberField(TEXT("net_update_frequency"),    A->NetUpdateFrequency);
-    R->SetNumberField(TEXT("min_net_update_frequency"),A->MinNetUpdateFrequency);
+    R->SetNumberField(TEXT("net_update_frequency"),    A->GetNetUpdateFrequency());
+    R->SetNumberField(TEXT("min_net_update_frequency"),A->GetMinNetUpdateFrequency());
     R->SetNumberField(TEXT("net_priority"),            A->NetPriority);
-    R->SetNumberField(TEXT("net_cull_distance"),       FMath::Sqrt(A->NetCullDistanceSquared));
+    R->SetNumberField(TEXT("net_cull_distance"),       FMath::Sqrt(A->GetNetCullDistanceSquared()));
 
     FString DormancyStr;
     switch (A->NetDormancy)

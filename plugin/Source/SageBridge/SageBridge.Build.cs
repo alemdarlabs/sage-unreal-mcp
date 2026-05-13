@@ -64,18 +64,26 @@ public class SageBridge : ModuleRules
             "NavigationSystem",
             // Blutility — EditorUtilityWidget / GlobalEditorUtilityBase class lookups
             "Blutility",
+            // Editor asset validation (editor.validate_assets).
+            "DataValidation",
             // GameplayTags — GConfig-based tag list / create operations
             "GameplayTags",
             // Enhanced Input — UInputMappingContext::MapKey + Trigger/Modifier
             // UClass set (Lyra Sage Gap #10). EnabledByDefault on every UE 5.7
             // project, so the hard dep is safe.
             "EnhancedInput",
+            // GameFeatureData AddComponents authoring (KaleGame P8 / Gap #30).
+            "GameFeatures",
             // AnimGraph + AnimGraphRuntime (Phase 4-r6 — Lyra Sage Gap #16/#20).
             // AnimGraph: UAnimGraphNode_*, UAnimationGraph, UAnimationStateMachineGraph,
             //            UAnimationStateMachineSchema, UAnimStateNode, UAnimStateTransitionNode.
             // AnimGraphRuntime: FAnimNode_* runtime structs (BlendSpace, BlendListByBool, ...).
             "AnimGraph",
             "AnimGraphRuntime",
+            // Animation data model modifiers + IK Retargeter editor APIs.
+            "AnimationModifiers",
+            "IKRig",
+            "IKRigEditor",
         });
         // Note: Niagara, PCG, Landscape, Foliage, GAS, MetaSound are loaded via
         // FindObject<UClass> at runtime — no hard Build.cs dep needed.

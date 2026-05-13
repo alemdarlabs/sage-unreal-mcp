@@ -8,10 +8,13 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Editor.h"
+#include "Engine/Blueprint.h"
 #include "EngineUtils.h"
+#include "Factories/BlueprintFactory.h"
 #include "IAssetTools.h"
 #include "ScopedTransaction.h"
 #include "UObject/Package.h"
+#include "UObject/SoftObjectPath.h"
 
 #define LOCTEXT_NAMESPACE "SageGas"
 
@@ -25,6 +28,32 @@ static UClass* FindGasClass(const TCHAR* Name)
     UClass* Cls = FindObject<UClass>(nullptr, Name);
     if (!Cls) Cls = LoadObject<UClass>(nullptr, Name);
     return Cls;
+}
+
+static UClass* ResolveClassLikePath(const FString& Path)
+{
+    if (Path.IsEmpty()) return nullptr;
+    if (UClass* Cls = FindObject<UClass>(nullptr, *Path))
+    {
+        return Cls;
+    }
+    if (UClass* Cls = LoadObject<UClass>(nullptr, *Path))
+    {
+        return Cls;
+    }
+
+    FSoftObjectPath Soft(Path);
+    UObject* Obj = Soft.ResolveObject();
+    if (!Obj) Obj = Soft.TryLoad();
+    if (UClass* Cls = Cast<UClass>(Obj))
+    {
+        return Cls;
+    }
+    if (UBlueprint* BP = Cast<UBlueprint>(Obj))
+    {
+        return BP->GeneratedClass;
+    }
+    return nullptr;
 }
 
 static FSageToolDispatch::FOutcome GasNotAvailable()
@@ -129,9 +158,26 @@ FSageToolDispatch::FOutcome GasCreateAbilityImpl(const TSharedPtr<FJsonObject>& 
     UClass* GaCls = FindGasClass(TEXT("/Script/GameplayAbilities.GameplayAbility"));
     if (!GaCls) return GasNotAvailable();
 
-    // Create as Blueprint
-    UClass* BpFacCls = FindObject<UClass>(nullptr, TEXT("/Script/UnrealEd.BlueprintFactory"));
-    if (!BpFacCls) BpFacCls = LoadObject<UClass>(nullptr, TEXT("/Script/UnrealEd.BlueprintFactory"));
+    FString ParentPath;
+    if (Args.IsValid())
+    {
+        Args->TryGetStringField(TEXT("parent"), ParentPath);
+        Args->TryGetStringField(TEXT("parent_class"), ParentPath);
+    }
+    UClass* ParentCls = ParentPath.IsEmpty()
+        ? GaCls
+        : ResolveClassLikePath(ParentPath);
+    if (!ParentCls)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("parent class not found: %s"), *ParentPath));
+    }
+    if (!ParentCls->IsChildOf(GaCls))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("parent class %s is not a subclass of %s"),
+                            *ParentCls->GetPathName(), *GaCls->GetPathName()));
+    }
 
     FString PackagePath, AssetName;
     if (!Path.Split(TEXT("/"), &PackagePath, &AssetName,
@@ -140,24 +186,22 @@ FSageToolDispatch::FOutcome GasCreateAbilityImpl(const TSharedPtr<FJsonObject>& 
 
     IAssetTools& AT = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
 
-    UFactory* Factory = nullptr;
-    if (BpFacCls)
-    {
-        Factory = NewObject<UFactory>(GetTransientPackage(), BpFacCls);
-        // Set parent class via reflection
-        FProperty* ParentProp = FindFProperty<FProperty>(Factory->GetClass(), TEXT("ParentClass"));
-        if (ParentProp)
-            detail::SetUPropertyFromJson(Factory, ParentProp,
-                MakeShared<FJsonValueString>(GaCls->GetPathName()));
-    }
+    UBlueprintFactory* Factory = NewObject<UBlueprintFactory>(GetTransientPackage());
+    Factory->ParentClass = ParentCls;
 
     UObject* NewObj = AT.CreateAsset(AssetName, PackagePath,
-        BpFacCls ? nullptr : GaCls, Factory);
+        UBlueprint::StaticClass(), Factory);
     if (!NewObj) return FSageToolDispatch::FOutcome::MakeError(-32000, TEXT("CreateAsset failed"));
+
+    UClass* ActualParent = ParentCls;
+    if (UBlueprint* BP = Cast<UBlueprint>(NewObj))
+    {
+        ActualParent = BP->ParentClass;
+    }
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"),         NewObj->GetPathName());
-    R->SetStringField(TEXT("parent_class"), TEXT("GameplayAbility"));
+    R->SetStringField(TEXT("parent_class"), ActualParent ? ActualParent->GetPathName() : ParentCls->GetPathName());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -305,8 +349,12 @@ FSageToolDispatch::FOutcome GasCreateCueImpl(const TSharedPtr<FJsonObject>& Args
 FSageToolDispatch::FOutcome GasGetInfoImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString ActorId;
-    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("actor_id"), ActorId))
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor_id'"));
+    if (!Args.IsValid())
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing args"));
+    Args->TryGetStringField(TEXT("actor_id"), ActorId);
+    if (ActorId.IsEmpty()) Args->TryGetStringField(TEXT("actor"), ActorId);
+    if (ActorId.IsEmpty())
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor'"));
 
     AActor* A = detail::ResolveActor(ActorId);
     if (!A) return FSageToolDispatch::FOutcome::MakeError(-32602,

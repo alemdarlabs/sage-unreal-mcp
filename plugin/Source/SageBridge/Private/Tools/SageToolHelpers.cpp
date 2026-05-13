@@ -5,13 +5,20 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Editor.h"
+#include "EditorSupportDelegates.h"
+#include "Engine/Blueprint.h"
+#include "Engine/World.h"
+#include "EngineUtils.h"
 #include "GameFramework/Actor.h"
+#include "IPythonScriptPlugin.h"
 #include "Math/Color.h"
 #include "Math/IntPoint.h"
 #include "Math/IntVector.h"
 #include "Math/Transform.h"
+#include "Misc/PackageName.h"
 #include "UObject/Class.h"
 #include "UObject/Field.h"
+#include "UObject/UObjectIterator.h"
 #include "UObject/SoftObjectPath.h"
 #include "UObject/UObjectGlobals.h"
 #include "UObject/UnrealType.h"
@@ -27,7 +34,51 @@ AActor* ResolveActor(const FString& ActorPath)
         return Cast<AActor>(Obj);
     }
     FSoftObjectPath SoftPath(ActorPath);
-    return Cast<AActor>(SoftPath.ResolveObject());
+    if (AActor* Resolved = Cast<AActor>(SoftPath.ResolveObject()))
+    {
+        return Resolved;
+    }
+
+    auto FindInWorld = [&ActorPath](UWorld* World) -> AActor*
+    {
+        if (!World) return nullptr;
+        for (TActorIterator<AActor> It(World); It; ++It)
+        {
+            AActor* Actor = *It;
+            if (!Actor) continue;
+            if (Actor->GetPathName() == ActorPath
+                || Actor->GetName() == ActorPath
+                || Actor->GetActorLabel() == ActorPath
+                || Actor->GetActorNameOrLabel() == ActorPath)
+            {
+                return Actor;
+            }
+        }
+        return nullptr;
+    };
+
+    if (AActor* Actor = FindInWorld(GEditor ? GEditor->GetEditorWorldContext().World() : nullptr))
+    {
+        return Actor;
+    }
+
+    if (GEngine)
+    {
+        for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+        {
+            if (Ctx.WorldType == EWorldType::PIE
+                || Ctx.WorldType == EWorldType::Game
+                || Ctx.WorldType == EWorldType::GamePreview)
+            {
+                if (AActor* Actor = FindInWorld(Ctx.World()))
+                {
+                    return Actor;
+                }
+            }
+        }
+    }
+
+    return nullptr;
 }
 
 UActorComponent* ResolveComponent(const FString& ComponentPath)
@@ -50,6 +101,106 @@ bool RejectIfPie(FSageToolDispatch::FOutcome& OutErr)
         return true;
     }
     return false;
+}
+
+FPythonReferenceCleanupReport CleanupPythonReferences(
+    bool bClearMainGlobals,
+    bool bIncludePieWorlds,
+    bool bIncludeEditorWorld,
+    bool bCollectUnrealGarbage)
+{
+    FPythonReferenceCleanupReport Report;
+    Report.bClearedMainGlobals = bClearMainGlobals;
+
+    TSet<UObject*> Roots;
+    auto AddRoot = [&Roots](UObject* Root)
+    {
+        if (Root && !Root->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+        {
+            Roots.Add(Root);
+        }
+    };
+
+    if (GEditor)
+    {
+        if (bIncludeEditorWorld)
+        {
+            AddRoot(GEditor->GetEditorWorldContext().World());
+        }
+        AddRoot(GEditor->PlayWorld);
+    }
+
+    if (bIncludePieWorlds)
+    {
+        for (TObjectIterator<UWorld> It; It; ++It)
+        {
+            UWorld* World = *It;
+            if (World && World->WorldType == EWorldType::PIE)
+            {
+                AddRoot(World);
+            }
+        }
+    }
+
+    for (UObject* Root : Roots)
+    {
+        FEditorSupportDelegates::PrepareToCleanseEditorObject.Broadcast(Root);
+        Report.CleansedRoots.Add(Root->GetPathName());
+    }
+    Report.CleansedRootCount = Report.CleansedRoots.Num();
+
+    IPythonScriptPlugin* Py = IPythonScriptPlugin::Get();
+    Report.bPythonAvailable = (Py && Py->IsPythonAvailable());
+    if (Report.bPythonAvailable)
+    {
+        FString Code;
+        if (bClearMainGlobals)
+        {
+            Code =
+                TEXT("import gc, sys\n")
+                TEXT("_sage_keep = {'__builtins__', '__doc__', '__loader__', '__name__', '__package__', '__spec__'}\n")
+                TEXT("_sage_main = sys.modules.get('__main__')\n")
+                TEXT("if _sage_main is not None:\n")
+                TEXT("    for _sage_key in list(vars(_sage_main).keys()):\n")
+                TEXT("        if _sage_key not in _sage_keep and not _sage_key.startswith('__'):\n")
+                TEXT("            try:\n")
+                TEXT("                delattr(_sage_main, _sage_key)\n")
+                TEXT("            except Exception:\n")
+                TEXT("                pass\n")
+                TEXT("gc.collect()\n");
+        }
+        else
+        {
+            Code = TEXT("import gc\ngc.collect()\n");
+        }
+
+        FPythonCommandEx Cmd;
+        Cmd.Command = Code;
+        Cmd.ExecutionMode = EPythonCommandExecutionMode::ExecuteFile;
+        Cmd.FileExecutionScope = EPythonFileExecutionScope::Public;
+        Report.bPythonCommandRan = true;
+        Report.bPythonCommandSucceeded = Py->ExecPythonCommandEx(Cmd);
+        if (!Report.bPythonCommandSucceeded)
+        {
+            for (const FPythonLogOutputEntry& E : Cmd.LogOutput)
+            {
+                if (!Report.Error.IsEmpty()) Report.Error += TEXT("\n");
+                Report.Error += E.Output;
+            }
+            if (Report.Error.IsEmpty())
+            {
+                Report.Error = TEXT("Python cleanup command failed");
+            }
+        }
+    }
+
+    if (bCollectUnrealGarbage)
+    {
+        CollectGarbage(RF_NoFlags, /*bPerformFullPurge=*/true);
+        Report.bCollectedUnrealGarbage = true;
+    }
+
+    return Report;
 }
 
 bool ParseVector3(const TSharedPtr<FJsonObject>& Args,
@@ -103,16 +254,126 @@ UObject* ResolveAssetPath(const FString& Path)
     return Soft.TryLoad();
 }
 
+FString CleanObjectPathString(FString Path)
+{
+    Path = Path.TrimStartAndEnd();
+    if (Path.Len() >= 2
+        && ((Path.StartsWith(TEXT("\"")) && Path.EndsWith(TEXT("\"")))
+            || (Path.StartsWith(TEXT("'")) && Path.EndsWith(TEXT("'")))))
+    {
+        Path = Path.Mid(1, Path.Len() - 2).TrimStartAndEnd();
+    }
+
+    int32 QuoteStart = INDEX_NONE;
+    int32 QuoteEnd = INDEX_NONE;
+    if (Path.FindChar(TEXT('\''), QuoteStart)
+        && Path.FindLastChar(TEXT('\''), QuoteEnd)
+        && QuoteEnd > QuoteStart)
+    {
+        Path = Path.Mid(QuoteStart + 1, QuoteEnd - QuoteStart - 1).TrimStartAndEnd();
+    }
+    return Path;
+}
+
+void AddClassPathCandidates(const FString& Path, TArray<FString>& Out)
+{
+    const FString CleanPath = CleanObjectPathString(Path);
+    if (CleanPath.IsEmpty())
+    {
+        return;
+    }
+    Out.AddUnique(CleanPath);
+
+    FString PackageName;
+    FString ObjectName;
+    if (CleanPath.Split(TEXT("."), &PackageName, &ObjectName, ESearchCase::CaseSensitive, ESearchDir::FromEnd))
+    {
+        if (!ObjectName.EndsWith(TEXT("_C")))
+        {
+            Out.AddUnique(CleanPath + TEXT("_C"));
+        }
+    }
+    else
+    {
+        FString Leaf = FPackageName::GetShortName(CleanPath);
+        if (!Leaf.IsEmpty())
+        {
+            Out.AddUnique(CleanPath + TEXT(".") + Leaf);
+            if (!Leaf.EndsWith(TEXT("_C")))
+            {
+                Out.AddUnique(CleanPath + TEXT(".") + Leaf + TEXT("_C"));
+            }
+        }
+    }
+}
+
 UClass* ResolveClassPath(const FString& Path, UClass* MetaClass)
 {
-    if (Path.IsEmpty()) return nullptr;
-    FSoftObjectPath Soft(Path);
-    UObject* Obj = Soft.ResolveObject();
-    if (!Obj) Obj = Soft.TryLoad();
-    UClass* AsClass = Cast<UClass>(Obj);
-    if (!AsClass) return nullptr;
-    if (MetaClass && !AsClass->IsChildOf(MetaClass)) return nullptr;
-    return AsClass;
+    TArray<FString> Candidates;
+    AddClassPathCandidates(Path, Candidates);
+    for (const FString& Candidate : Candidates)
+    {
+        UClass* AsClass = LoadClass<UObject>(nullptr, *Candidate);
+        if (!AsClass)
+        {
+            AsClass = StaticLoadClass(UObject::StaticClass(), nullptr, *Candidate);
+        }
+        if (!AsClass)
+        {
+            FSoftClassPath SoftClass(Candidate);
+            AsClass = SoftClass.TryLoadClass<UObject>();
+        }
+        if (!AsClass)
+        {
+            FSoftObjectPath Soft(Candidate);
+            UObject* Obj = Soft.ResolveObject();
+            if (!Obj)
+            {
+                Obj = Soft.TryLoad();
+            }
+            if (UBlueprint* Blueprint = Cast<UBlueprint>(Obj))
+            {
+                AsClass = Blueprint->GeneratedClass;
+            }
+            else
+            {
+                AsClass = Cast<UClass>(Obj);
+            }
+        }
+        if (AsClass && (!MetaClass || AsClass->IsChildOf(MetaClass)))
+        {
+            return AsClass;
+        }
+    }
+    return nullptr;
+}
+
+bool JsonValueToPathString(const TSharedPtr<FJsonValue>& Value, FString& Out)
+{
+    if (!Value.IsValid() || Value->Type == EJson::Null) return false;
+    if (Value->Type == EJson::String)
+    {
+        Out = CleanObjectPathString(Value->AsString());
+        return true;
+    }
+    if (Value->Type == EJson::Object)
+    {
+        const TSharedPtr<FJsonObject> Obj = Value->AsObject();
+        if (!Obj.IsValid()) return false;
+        const bool bFound = Obj->TryGetStringField(TEXT("ObjectPath"), Out)
+            || Obj->TryGetStringField(TEXT("object_path"), Out)
+            || Obj->TryGetStringField(TEXT("path"), Out)
+            || Obj->TryGetStringField(TEXT("_path"), Out)
+            || Obj->TryGetStringField(TEXT("ClassPath"), Out)
+            || Obj->TryGetStringField(TEXT("class_path"), Out)
+            || Obj->TryGetStringField(TEXT("class"), Out);
+        if (bFound)
+        {
+            Out = CleanObjectPathString(Out);
+        }
+        return bFound;
+    }
+    return false;
 }
 
 // Shorthand JSON form for the half-dozen UE math structs the agent uses
@@ -408,11 +669,16 @@ bool SetPropertyValueAtPtr(FProperty* Property, void* ValuePtr,
         // Distinguish UClass-typed (TSubclassOf is FClassProperty derived from this)
         if (FClassProperty* CP = CastField<FClassProperty>(Property))
         {
-            UClass* Cls = ResolveClassPath(Value->AsString(), CP->MetaClass);
+            FString Path;
+            if (!JsonValueToPathString(Value, Path)) return false;
+            UClass* Cls = ResolveClassPath(Path, CP->MetaClass);
+            if (!Cls) return false;
             CP->SetObjectPropertyValue(ValuePtr, Cls);
-            return Cls != nullptr;
+            return true;
         }
-        UObject* Obj = ResolveAssetPath(Value->AsString());
+        FString Path;
+        if (!JsonValueToPathString(Value, Path)) return false;
+        UObject* Obj = ResolveAssetPath(Path);
         if (Obj && !Obj->IsA(P->PropertyClass)) return false;
         P->SetObjectPropertyValue(ValuePtr, Obj);
         return true;
@@ -425,7 +691,9 @@ bool SetPropertyValueAtPtr(FProperty* Property, void* ValuePtr,
             P->SetPropertyValue(ValuePtr, FSoftObjectPtr{});
             return true;
         }
-        FSoftObjectPath Soft(Value->AsString());
+        FString Path;
+        if (!JsonValueToPathString(Value, Path)) return false;
+        FSoftObjectPath Soft(Path);
         // FSoftClassProperty is FSoftObjectProperty with a class meta — same path.
         P->SetPropertyValue(ValuePtr, FSoftObjectPtr(Soft));
         return true;
@@ -471,7 +739,19 @@ bool SetPropertyValueAtPtr(FProperty* Property, void* ValuePtr,
         // for nested asset refs but works for arbitrary plain USTRUCTs.
         if (Value->Type == EJson::String)
         {
-            const FString S = Value->AsString();
+            FString S = Value->AsString().TrimStartAndEnd();
+            if (S.Len() >= 2 && S.StartsWith(TEXT("\"")) && S.EndsWith(TEXT("\"")))
+            {
+                S = S.Mid(1, S.Len() - 2);
+                S.ReplaceInline(TEXT("\\\""), TEXT("\""));
+            }
+            if (S.StartsWith(TEXT("{")) || S.StartsWith(TEXT("[")))
+            {
+                UE_LOG(LogSageBridge, Warning,
+                       TEXT("[SageProp] refusing JSON-looking ImportText for %s: %s"),
+                       P->Struct ? *P->Struct->GetName() : TEXT("<null>"), *S);
+                return false;
+            }
             return P->Struct->ImportText(*S, ValuePtr, /*OwnerObject*/ nullptr,
                                           PPF_None, GError, P->Struct->GetName()) != nullptr;
         }

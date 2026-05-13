@@ -6,7 +6,9 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
 #include "AssetToolsModule.h"
+#include "Animation/AnimInstance.h"
 #include "Components/PrimitiveComponent.h"
+#include "Components/SkeletalMeshComponent.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Editor.h"
@@ -18,12 +20,15 @@
 #include "GameFramework/GameModeBase.h"
 #include "GameFramework/GameStateBase.h"
 #include "GameFramework/HUD.h"
+#include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
 #include "GameFramework/WorldSettings.h"
 #include "IAssetTools.h"
 #include "Kismet/GameplayStatics.h"
 #include "Kismet2/KismetEditorUtilities.h"
+#include "NavigationData.h"
+#include "NavigationSystem.h"
 #include "ScopedTransaction.h"
 
 // Enhanced Input — Lyra Sage Gap #10 IMC mapping CRUD.
@@ -45,6 +50,158 @@ namespace
 UWorld* GetEditorWorld()
 {
     return GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+}
+
+UWorld* GetPieWorld()
+{
+    if (!GEngine) return nullptr;
+    for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+    {
+        if (Ctx.WorldType == EWorldType::PIE)
+        {
+            return Ctx.World();
+        }
+    }
+    return nullptr;
+}
+
+TSharedRef<FJsonObject> ActorSummaryJson(AActor* Actor, bool bIncludeComponents, bool bIncludeActorProperties, bool bIncludeComponentProperties)
+{
+    auto Obj = MakeShared<FJsonObject>();
+    if (!Actor)
+    {
+        return Obj;
+    }
+    Obj->SetStringField(TEXT("actor_id"), Actor->GetPathName());
+    Obj->SetStringField(TEXT("path"), Actor->GetPathName());
+    Obj->SetStringField(TEXT("name"), Actor->GetName());
+    Obj->SetStringField(TEXT("label"), Actor->GetActorLabel());
+    Obj->SetStringField(TEXT("class"), Actor->GetClass()->GetPathName());
+    Obj->SetField(TEXT("location"), detail::Vec3ToJson(Actor->GetActorLocation()));
+    Obj->SetStringField(TEXT("owner"), Actor->GetOwner() ? Actor->GetOwner()->GetPathName() : FString());
+    Obj->SetStringField(TEXT("instigator"), Actor->GetInstigator() ? Actor->GetInstigator()->GetPathName() : FString());
+
+    if (bIncludeActorProperties)
+    {
+        auto Props = MakeShared<FJsonObject>();
+        int32 Count = 0;
+        for (TFieldIterator<FProperty> It(Actor->GetClass()); It && Count < 128; ++It)
+        {
+            FProperty* Prop = *It;
+            if (!Prop || Prop->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient)) continue;
+            if (TSharedPtr<FJsonValue> Value = detail::GetUPropertyAsJson(Actor, Prop))
+            {
+                Props->SetField(Prop->GetName(), Value);
+                ++Count;
+            }
+        }
+        Obj->SetObjectField(TEXT("properties"), Props);
+        Obj->SetNumberField(TEXT("property_count"), Count);
+    }
+
+    if (bIncludeComponents)
+    {
+        TArray<UActorComponent*> Components;
+        Actor->GetComponents(Components);
+        TArray<TSharedPtr<FJsonValue>> ComponentJson;
+        for (UActorComponent* Component : Components)
+        {
+            if (!Component) continue;
+            auto C = MakeShared<FJsonObject>();
+            C->SetStringField(TEXT("name"), Component->GetName());
+            C->SetStringField(TEXT("class"), Component->GetClass()->GetPathName());
+            C->SetStringField(TEXT("path"), Component->GetPathName());
+            C->SetBoolField(TEXT("registered"), Component->IsRegistered());
+            C->SetBoolField(TEXT("active"), Component->IsActive());
+            if (bIncludeComponentProperties)
+            {
+                auto Props = MakeShared<FJsonObject>();
+                int32 Count = 0;
+                for (TFieldIterator<FProperty> It(Component->GetClass()); It && Count < 96; ++It)
+                {
+                    FProperty* Prop = *It;
+                    if (!Prop || Prop->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient)) continue;
+                    if (TSharedPtr<FJsonValue> Value = detail::GetUPropertyAsJson(Component, Prop))
+                    {
+                        Props->SetField(Prop->GetName(), Value);
+                        ++Count;
+                    }
+                }
+                C->SetObjectField(TEXT("properties"), Props);
+                C->SetNumberField(TEXT("property_count"), Count);
+            }
+            ComponentJson.Add(MakeShared<FJsonValueObject>(C));
+        }
+        Obj->SetArrayField(TEXT("components"), ComponentJson);
+        Obj->SetNumberField(TEXT("component_count"), ComponentJson.Num());
+    }
+
+    return Obj;
+}
+
+bool ActorMatchesFilter(AActor* Actor, const FString& Filter, const FString& ClassFilter)
+{
+    if (!Actor) return false;
+    if (!ClassFilter.IsEmpty())
+    {
+        const FString ClassPath = Actor->GetClass()->GetPathName();
+        const FString ClassName = Actor->GetClass()->GetName();
+        if (!ClassPath.Contains(ClassFilter) && !ClassName.Contains(ClassFilter))
+        {
+            return false;
+        }
+    }
+    if (Filter.IsEmpty())
+    {
+        return true;
+    }
+    return Actor->GetPathName().Contains(Filter)
+        || Actor->GetName().Contains(Filter)
+        || Actor->GetActorLabel().Contains(Filter)
+        || Actor->GetActorNameOrLabel().Contains(Filter)
+        || Actor->GetClass()->GetName().Contains(Filter)
+        || Actor->GetClass()->GetPathName().Contains(Filter);
+}
+
+AActor* FindActorInPie(UWorld* PieWorld, const FString& ActorId)
+{
+    if (!PieWorld || ActorId.IsEmpty()) return nullptr;
+    if (AActor* Actor = detail::ResolveActor(ActorId))
+    {
+        return Actor;
+    }
+    for (TActorIterator<AActor> It(PieWorld); It; ++It)
+    {
+        AActor* Actor = *It;
+        if (!Actor) continue;
+        if (Actor->GetPathName() == ActorId
+            || Actor->GetName() == ActorId
+            || Actor->GetActorLabel() == ActorId
+            || Actor->GetActorNameOrLabel() == ActorId)
+        {
+            return Actor;
+        }
+    }
+    return nullptr;
+}
+
+USkeletalMeshComponent* FindSkeletalMeshComponent(AActor* Actor, const FString& ComponentName)
+{
+    if (!Actor) return nullptr;
+    TArray<USkeletalMeshComponent*> Meshes;
+    Actor->GetComponents<USkeletalMeshComponent>(Meshes);
+    if (!ComponentName.IsEmpty())
+    {
+        for (USkeletalMeshComponent* Mesh : Meshes)
+        {
+            if (Mesh && (Mesh->GetName() == ComponentName || Mesh->GetPathName() == ComponentName))
+            {
+                return Mesh;
+            }
+        }
+        return nullptr;
+    }
+    return Meshes.Num() > 0 ? Meshes[0] : nullptr;
 }
 
 // Creates a Blueprint asset from a native parent class
@@ -260,11 +417,15 @@ FSageToolDispatch::FOutcome ProjectToNavImpl(const TSharedPtr<FJsonObject>& Args
 {
     FVector Point = FVector::ZeroVector;
     detail::ParseVector3(Args, TEXT("location"), Point);
+    FVector QueryExtent(50.0, 50.0, 200.0);
+    if (Args.IsValid())
+    {
+        detail::ParseVector3(Args, TEXT("query_extent"), QueryExtent);
+        detail::ParseVector3(Args, TEXT("extent"), QueryExtent);
+    }
 
-    // Project via console command output
-    GEditor->Exec(GEditor->GetEditorWorldContext().World(),
-        *FString::Printf(TEXT("Navigation.ProjectPoint %g %g %g"),
-            Point.X, Point.Y, Point.Z), *GLog);
+    UWorld* World = GetEditorWorld();
+    if (!World) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no editor world"));
 
     auto R = MakeShared<FJsonObject>();
     R->SetArrayField(TEXT("input"), {
@@ -272,7 +433,39 @@ FSageToolDispatch::FOutcome ProjectToNavImpl(const TSharedPtr<FJsonObject>& Args
         MakeShared<FJsonValueNumber>(Point.Y),
         MakeShared<FJsonValueNumber>(Point.Z)
     });
-    R->SetStringField(TEXT("note"), TEXT("projection triggered; query nav mesh for result"));
+    R->SetField(TEXT("query_extent"), detail::Vec3ToJson(QueryExtent));
+
+    UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(World);
+    if (!NavSys)
+    {
+        R->SetBoolField(TEXT("success"), false);
+        R->SetStringField(TEXT("reason"), TEXT("no_navigation_system"));
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    ANavigationData* NavData = NavSys->GetDefaultNavDataInstance(FNavigationSystem::DontCreate);
+    if (!NavData)
+    {
+        R->SetBoolField(TEXT("success"), false);
+        R->SetStringField(TEXT("reason"), TEXT("no_navmesh"));
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FNavLocation Projected;
+    const bool bProjected = NavSys->ProjectPointToNavigation(
+        Point, Projected, QueryExtent, NavData);
+
+    R->SetBoolField(TEXT("success"), bProjected);
+    R->SetStringField(TEXT("nav_data"), NavData->GetPathName());
+    if (bProjected)
+    {
+        R->SetField(TEXT("projected_location"), detail::Vec3ToJson(Projected.Location));
+        R->SetNumberField(TEXT("node_ref"), static_cast<double>(Projected.NodeRef));
+    }
+    else
+    {
+        R->SetStringField(TEXT("reason"), TEXT("projection_failed"));
+    }
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -657,6 +850,91 @@ int32 FindMappingIndex(const UInputMappingContext* IMC,
     return -1;
 }
 
+void SetImcMappingDetails(TSharedPtr<FJsonObject> R,
+                          const FEnhancedActionKeyMapping& Mapping,
+                          int32 Index)
+{
+    R->SetNumberField(TEXT("index"), Index);
+    R->SetStringField(TEXT("action"),
+        Mapping.Action ? Mapping.Action->GetPathName() : TEXT(""));
+    R->SetStringField(TEXT("key"), Mapping.Key.GetFName().ToString());
+    R->SetNumberField(TEXT("trigger_count"), Mapping.Triggers.Num());
+    R->SetNumberField(TEXT("modifier_count"), Mapping.Modifiers.Num());
+
+    TArray<TSharedPtr<FJsonValue>> Triggers;
+    for (UInputTrigger* Trigger : Mapping.Triggers)
+    {
+        auto J = MakeShared<FJsonObject>();
+        if (Trigger)
+        {
+            J->SetStringField(TEXT("name"), Trigger->GetName());
+            J->SetStringField(TEXT("class"), Trigger->GetClass()->GetPathName());
+        }
+        Triggers.Add(MakeShared<FJsonValueObject>(J));
+    }
+    R->SetArrayField(TEXT("triggers"), Triggers);
+
+    TArray<TSharedPtr<FJsonValue>> Modifiers;
+    for (UInputModifier* Modifier : Mapping.Modifiers)
+    {
+        auto J = MakeShared<FJsonObject>();
+        if (Modifier)
+        {
+            J->SetStringField(TEXT("name"), Modifier->GetName());
+            J->SetStringField(TEXT("class"), Modifier->GetClass()->GetPathName());
+        }
+        Modifiers.Add(MakeShared<FJsonValueObject>(J));
+    }
+    R->SetArrayField(TEXT("modifiers"), Modifiers);
+}
+
+void CopyInstancedInputObjects(const FEnhancedActionKeyMapping& Source,
+                               FEnhancedActionKeyMapping& Target,
+                               UObject* Outer)
+{
+    Target.Triggers.Empty(Source.Triggers.Num());
+    for (UInputTrigger* Trigger : Source.Triggers)
+    {
+        UInputTrigger* Copy = Trigger
+            ? DuplicateObject<UInputTrigger>(Trigger, Outer)
+            : nullptr;
+        if (Copy) Copy->SetFlags(RF_Public | RF_Transactional);
+        Target.Triggers.Add(Copy);
+    }
+
+    Target.Modifiers.Empty(Source.Modifiers.Num());
+    for (UInputModifier* Modifier : Source.Modifiers)
+    {
+        UInputModifier* Copy = Modifier
+            ? DuplicateObject<UInputModifier>(Modifier, Outer)
+            : nullptr;
+        if (Copy) Copy->SetFlags(RF_Public | RF_Transactional);
+        Target.Modifiers.Add(Copy);
+    }
+}
+
+int32 RemapImcMappingViaTypedApi(UInputMappingContext* IMC,
+                                 int32 ExistingIndex,
+                                 UInputAction* OldAction,
+                                 FKey OldKey,
+                                 UInputAction* NewAction,
+                                 FKey NewKey)
+{
+    const FEnhancedActionKeyMapping Existing = IMC->GetMappings()[ExistingIndex];
+
+    IMC->UnmapKey(OldAction, OldKey);
+    FEnhancedActionKeyMapping& NewMapping = IMC->MapKey(NewAction, NewKey);
+    NewMapping = Existing;
+    NewMapping.Action = NewAction;
+    NewMapping.Key = NewKey;
+    CopyInstancedInputObjects(Existing, NewMapping, IMC);
+
+    IMC->PostEditChange();
+    IMC->MarkPackageDirty();
+
+    return FindMappingIndex(IMC, NewAction, NewKey);
+}
+
 FSageToolDispatch::FOutcome RemoveImcMappingImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FSageToolDispatch::FOutcome Reject;
@@ -678,6 +956,9 @@ FSageToolDispatch::FOutcome RemoveImcMappingImpl(const TSharedPtr<FJsonObject>& 
     UInputAction* IA = ResolveInputAction(ActionPath, Err);
     if (!IA)  return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
     const FKey K(*KeyName);
+    if (!K.IsValid())
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid FKey: %s"), *KeyName));
 
     const int32 Idx = FindMappingIndex(IMC, IA, K);
     if (Idx < 0)
@@ -735,6 +1016,9 @@ FSageToolDispatch::FOutcome SetImcMappingKeyImpl(const TSharedPtr<FJsonObject>& 
     if (!IA)  return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
 
     const FKey OldK(*OldKeyName), NewK(*NewKeyName);
+    if (!OldK.IsValid())
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid old FKey: %s"), *OldKeyName));
     if (!NewK.IsValid())
         return FSageToolDispatch::FOutcome::MakeError(-32602,
             FString::Printf(TEXT("invalid new FKey: %s"), *NewKeyName));
@@ -745,14 +1029,38 @@ FSageToolDispatch::FOutcome SetImcMappingKeyImpl(const TSharedPtr<FJsonObject>& 
             FString::Printf(TEXT("no mapping for action=%s old_key=%s"),
                             *IA->GetName(), *OldKeyName));
 
-    auto* Mappings = MutableMappings(IMC);
-    if (!Mappings) return FSageToolDispatch::FOutcome::MakeError(-32603,
-        TEXT("Mappings property reflection failed"));
+    bool bDryRun = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+
+    const FEnhancedActionKeyMapping Existing = IMC->GetMappings()[Idx];
+
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("asset_path"), IMC->GetPathName());
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        R->SetStringField(TEXT("planned_new_key"), NewKeyName);
+        SetImcMappingDetails(R, Existing, Idx);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    if (OldK == NewK)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("asset_path"), IMC->GetPathName());
+        R->SetStringField(TEXT("action"),     IA->GetPathName());
+        R->SetStringField(TEXT("old_key"),    OldKeyName);
+        R->SetStringField(TEXT("new_key"),    NewKeyName);
+        R->SetNumberField(TEXT("index"),      Idx);
+        R->SetBoolField  (TEXT("already"),    true);
+        R->SetBoolField  (TEXT("modified"),   false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
 
     FScopedTransaction Tx(LOCTEXT("SetImcMappingKey", "Sage: Set IMC Mapping Key"));
     IMC->Modify();
-    (*Mappings)[Idx].Key = NewK;
-    IMC->MarkPackageDirty();
+    const int32 NewIdx = RemapImcMappingViaTypedApi(IMC, Idx, IA, OldK, IA, NewK);
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("asset_path"), IMC->GetPathName());
@@ -760,6 +1068,8 @@ FSageToolDispatch::FOutcome SetImcMappingKeyImpl(const TSharedPtr<FJsonObject>& 
     R->SetStringField(TEXT("old_key"),    OldKeyName);
     R->SetStringField(TEXT("new_key"),    NewKeyName);
     R->SetNumberField(TEXT("index"),      Idx);
+    R->SetNumberField(TEXT("new_index"),  NewIdx);
+    R->SetBoolField  (TEXT("modified"),   true);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -788,20 +1098,47 @@ FSageToolDispatch::FOutcome SetImcMappingActionImpl(const TSharedPtr<FJsonObject
     if (!NewIA)       return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
 
     const FKey K(*KeyName);
+    if (!K.IsValid())
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid FKey: %s"), *KeyName));
     const int32 Idx = FindMappingIndex(IMC, OldIA, K);
     if (Idx < 0)
         return FSageToolDispatch::FOutcome::MakeError(-32602,
             FString::Printf(TEXT("no mapping for old_action=%s key=%s"),
                             *OldIA->GetName(), *KeyName));
 
-    auto* Mappings = MutableMappings(IMC);
-    if (!Mappings) return FSageToolDispatch::FOutcome::MakeError(-32603,
-        TEXT("Mappings property reflection failed"));
+    bool bDryRun = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+
+    const FEnhancedActionKeyMapping Existing = IMC->GetMappings()[Idx];
+
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("asset_path"), IMC->GetPathName());
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        R->SetStringField(TEXT("planned_new_action"), NewIA->GetPathName());
+        SetImcMappingDetails(R, Existing, Idx);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    if (OldIA == NewIA)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("asset_path"), IMC->GetPathName());
+        R->SetStringField(TEXT("old_action"), OldIA->GetPathName());
+        R->SetStringField(TEXT("new_action"), NewIA->GetPathName());
+        R->SetStringField(TEXT("key"),        KeyName);
+        R->SetNumberField(TEXT("index"),      Idx);
+        R->SetBoolField  (TEXT("already"),    true);
+        R->SetBoolField  (TEXT("modified"),   false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
 
     FScopedTransaction Tx(LOCTEXT("SetImcMappingAction", "Sage: Set IMC Mapping Action"));
     IMC->Modify();
-    (*Mappings)[Idx].Action = NewIA;
-    IMC->MarkPackageDirty();
+    const int32 NewIdx = RemapImcMappingViaTypedApi(IMC, Idx, OldIA, K, NewIA, K);
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("asset_path"), IMC->GetPathName());
@@ -809,6 +1146,8 @@ FSageToolDispatch::FOutcome SetImcMappingActionImpl(const TSharedPtr<FJsonObject
     R->SetStringField(TEXT("new_action"), NewIA->GetPathName());
     R->SetStringField(TEXT("key"),        KeyName);
     R->SetNumberField(TEXT("index"),      Idx);
+    R->SetNumberField(TEXT("new_index"),  NewIdx);
+    R->SetBoolField  (TEXT("modified"),   true);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1202,30 +1541,155 @@ FSageToolDispatch::FOutcome AddSmartObjectComponentImpl(const TSharedPtr<FJsonOb
 
 // ---- gameplay.inspect_pie --------------------------------------------------
 
-FSageToolDispatch::FOutcome InspectPieImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+FSageToolDispatch::FOutcome InspectPieImpl(const TSharedPtr<FJsonObject>& Args)
 {
     if (!GEditor || !GEditor->IsPlayingSessionInEditor())
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("PIE not running"));
 
-    UWorld* PieWorld = nullptr;
-    for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
-    {
-        if (Ctx.WorldType == EWorldType::PIE)
-        {
-            PieWorld = Ctx.World();
-            break;
-        }
-    }
+    UWorld* PieWorld = GetPieWorld();
     if (!PieWorld) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no PIE world"));
 
     int32 ActorCount = 0;
     for (TActorIterator<AActor> It(PieWorld); It; ++It) ++ActorCount;
+
+    FString ActorId;
+    if (Args.IsValid())
+    {
+        Args->TryGetStringField(TEXT("actor"), ActorId);
+        if (ActorId.IsEmpty()) Args->TryGetStringField(TEXT("actor_id"), ActorId);
+    }
+    bool bIncludeComponents = true;
+    bool bIncludeActorProperties = false;
+    bool bIncludeComponentProperties = false;
+    bool bIncludeActors = false;
+    int32 MaxActors = 128;
+    if (Args.IsValid())
+    {
+        Args->TryGetBoolField(TEXT("include_components"), bIncludeComponents);
+        Args->TryGetBoolField(TEXT("include_actor_properties"), bIncludeActorProperties);
+        Args->TryGetBoolField(TEXT("include_component_properties"), bIncludeComponentProperties);
+        Args->TryGetBoolField(TEXT("include_actors"), bIncludeActors);
+        Args->TryGetNumberField(TEXT("max"), MaxActors);
+    }
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("world"),        PieWorld->GetName());
     R->SetBoolField  (TEXT("is_paused"),    PieWorld->IsPaused());
     R->SetNumberField(TEXT("actor_count"),  ActorCount);
     R->SetNumberField(TEXT("time_seconds"), PieWorld->GetTimeSeconds());
+
+    if (!ActorId.IsEmpty())
+    {
+        AActor* Actor = FindActorInPie(PieWorld, ActorId);
+        if (!Actor)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("PIE actor not found: %s"), *ActorId));
+        }
+        R->SetObjectField(TEXT("actor"), ActorSummaryJson(Actor, bIncludeComponents, bIncludeActorProperties, bIncludeComponentProperties));
+    }
+    else if (bIncludeActors)
+    {
+        TArray<TSharedPtr<FJsonValue>> Actors;
+        for (TActorIterator<AActor> It(PieWorld); It && Actors.Num() < MaxActors; ++It)
+        {
+            Actors.Add(MakeShared<FJsonValueObject>(ActorSummaryJson(*It, false, false, false)));
+        }
+        R->SetArrayField(TEXT("actors"), Actors);
+        R->SetNumberField(TEXT("returned_actor_count"), Actors.Num());
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ListPieActorsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    UWorld* PieWorld = GetPieWorld();
+    if (!PieWorld) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("PIE not running"));
+
+    FString Filter, ClassFilter;
+    bool bIncludeComponents = false;
+    int32 MaxActors = 256;
+    if (Args.IsValid())
+    {
+        Args->TryGetStringField(TEXT("filter"), Filter);
+        Args->TryGetStringField(TEXT("class"), ClassFilter);
+        Args->TryGetStringField(TEXT("class_filter"), ClassFilter);
+        Args->TryGetBoolField(TEXT("include_components"), bIncludeComponents);
+        Args->TryGetNumberField(TEXT("max"), MaxActors);
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Actors;
+    int32 MatchedCount = 0;
+    for (TActorIterator<AActor> It(PieWorld); It; ++It)
+    {
+        AActor* Actor = *It;
+        if (!ActorMatchesFilter(Actor, Filter, ClassFilter)) continue;
+        ++MatchedCount;
+        if (Actors.Num() < MaxActors)
+        {
+            Actors.Add(MakeShared<FJsonValueObject>(ActorSummaryJson(Actor, bIncludeComponents, false, false)));
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("world"), PieWorld->GetName());
+    R->SetArrayField(TEXT("actors"), Actors);
+    R->SetNumberField(TEXT("matched_count"), MatchedCount);
+    R->SetNumberField(TEXT("returned_count"), Actors.Num());
+    R->SetStringField(TEXT("filter"), Filter);
+    R->SetStringField(TEXT("class_filter"), ClassFilter);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome GetLocalPlayerImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    UWorld* PieWorld = GetPieWorld();
+    if (!PieWorld) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("PIE not running"));
+
+    int32 PlayerIndex = 0;
+    if (Args.IsValid())
+    {
+        Args->TryGetNumberField(TEXT("player_index"), PlayerIndex);
+        Args->TryGetNumberField(TEXT("index"), PlayerIndex);
+    }
+
+    APlayerController* PC = UGameplayStatics::GetPlayerController(PieWorld, PlayerIndex);
+    if (!PC)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("local player controller not found: %d"), PlayerIndex));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("world"), PieWorld->GetName());
+    R->SetStringField(TEXT("world_path"), PieWorld->GetPathName());
+    R->SetStringField(TEXT("map_name"), PieWorld->GetMapName());
+    R->SetNumberField(TEXT("player_index"), PlayerIndex);
+    R->SetObjectField(TEXT("controller"), ActorSummaryJson(PC, false, false, false));
+    R->SetObjectField(TEXT("pawn"), ActorSummaryJson(PC->GetPawn(), true, false, false));
+    R->SetObjectField(TEXT("player_state"), ActorSummaryJson(PC->PlayerState, false, false, false));
+    R->SetStringField(TEXT("hud"), PC->GetHUD() ? PC->GetHUD()->GetPathName() : FString());
+    R->SetStringField(TEXT("game_state"), PieWorld->GetGameState() ? PieWorld->GetGameState()->GetPathName() : FString());
+    TArray<TSharedPtr<FJsonValue>> PieWorlds;
+    if (GEngine)
+    {
+        for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+        {
+            UWorld* World = Ctx.World();
+            if (Ctx.WorldType != EWorldType::PIE || !World)
+            {
+                continue;
+            }
+            auto W = MakeShared<FJsonObject>();
+            W->SetStringField(TEXT("name"), World->GetName());
+            W->SetStringField(TEXT("path"), World->GetPathName());
+            W->SetStringField(TEXT("map_name"), World->GetMapName());
+            W->SetBoolField(TEXT("selected"), World == PieWorld);
+            PieWorlds.Add(MakeShared<FJsonValueObject>(W));
+        }
+    }
+    R->SetArrayField(TEXT("pie_worlds"), PieWorlds);
+    R->SetNumberField(TEXT("pie_world_count"), PieWorlds.Num());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -1233,20 +1697,93 @@ FSageToolDispatch::FOutcome InspectPieImpl(const TSharedPtr<FJsonObject>& /*Args
 
 FSageToolDispatch::FOutcome GetPieAnimStateImpl(const TSharedPtr<FJsonObject>& Args)
 {
-    FString ActorId;
-    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("actor_id"), ActorId))
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor_id'"));
+    UWorld* PieWorld = GetPieWorld();
+    if (!PieWorld) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("PIE not running"));
+
+    FString ActorId, ComponentName;
+    if (!Args.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing args"));
+    }
+    Args->TryGetStringField(TEXT("actor_id"), ActorId);
+    if (ActorId.IsEmpty()) Args->TryGetStringField(TEXT("actor"), ActorId);
+    if (ActorId.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor'"));
+    }
+    Args->TryGetStringField(TEXT("mesh_component"), ComponentName);
+    Args->TryGetStringField(TEXT("component"), ComponentName);
+
+    AActor* Actor = FindActorInPie(PieWorld, ActorId);
+    if (!Actor)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("PIE actor not found: %s"), *ActorId));
+    }
+    USkeletalMeshComponent* Mesh = FindSkeletalMeshComponent(Actor, ComponentName);
+    if (!Mesh)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("actor has no matching SkeletalMeshComponent"));
+    }
+    UAnimInstance* Anim = Mesh->GetAnimInstance();
 
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("actor_id"), ActorId);
-    R->SetStringField(TEXT("note"), TEXT("use actor's SkeletalMeshComponent in PIE for anim state"));
+    R->SetStringField(TEXT("actor_id"), Actor->GetPathName());
+    R->SetStringField(TEXT("mesh_component"), Mesh->GetPathName());
+    R->SetStringField(TEXT("skeletal_mesh"), Mesh->GetSkeletalMeshAsset() ? Mesh->GetSkeletalMeshAsset()->GetPathName() : FString());
+    R->SetBoolField(TEXT("has_anim_instance"), Anim != nullptr);
+    if (Anim)
+    {
+        R->SetStringField(TEXT("anim_instance"), Anim->GetPathName());
+        R->SetStringField(TEXT("anim_class"), Anim->GetClass()->GetPathName());
+        R->SetBoolField(TEXT("root_motion_mode_valid"), true);
+    }
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 // ---- gameplay.get_pie_anim_properties / get_pie_subsystem_state -------------
 
 FSageToolDispatch::FOutcome GetPieAnimPropertiesImpl(const TSharedPtr<FJsonObject>& Args)
-{ return GetPieAnimStateImpl(Args); }
+{
+    FSageToolDispatch::FOutcome Base = GetPieAnimStateImpl(Args);
+    if (!Base.bSuccess || !Base.Result.IsValid())
+    {
+        return Base;
+    }
+
+    FString ActorId, ComponentName;
+    Args->TryGetStringField(TEXT("actor_id"), ActorId);
+    if (ActorId.IsEmpty()) Args->TryGetStringField(TEXT("actor"), ActorId);
+    Args->TryGetStringField(TEXT("mesh_component"), ComponentName);
+    Args->TryGetStringField(TEXT("component"), ComponentName);
+    UWorld* PieWorld = GetPieWorld();
+    AActor* Actor = FindActorInPie(PieWorld, ActorId);
+    USkeletalMeshComponent* Mesh = FindSkeletalMeshComponent(Actor, ComponentName);
+    UAnimInstance* Anim = Mesh ? Mesh->GetAnimInstance() : nullptr;
+    if (!Anim)
+    {
+        return Base;
+    }
+
+    int32 MaxProperties = 256;
+    Args->TryGetNumberField(TEXT("max"), MaxProperties);
+    TArray<TSharedPtr<FJsonValue>> Properties;
+    for (TFieldIterator<FProperty> It(Anim->GetClass()); It && Properties.Num() < MaxProperties; ++It)
+    {
+        FProperty* Prop = *It;
+        if (!Prop || Prop->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient)) continue;
+        auto P = MakeShared<FJsonObject>();
+        P->SetStringField(TEXT("name"), Prop->GetName());
+        if (TSharedPtr<FJsonValue> Value = detail::GetUPropertyAsJson(Anim, Prop))
+        {
+            P->SetField(TEXT("value"), Value);
+        }
+        Properties.Add(MakeShared<FJsonValueObject>(P));
+    }
+    Base.Result->SetArrayField(TEXT("properties"), Properties);
+    Base.Result->SetNumberField(TEXT("property_count"), Properties.Num());
+    return Base;
+}
 
 FSageToolDispatch::FOutcome GetPieSubsystemStateImpl(const TSharedPtr<FJsonObject>& Args)
 {
@@ -1514,6 +2051,8 @@ void RegisterGameplayTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("gameplay.add_smart_object_component"),GT(&AddSmartObjectComponentImpl));
     // PIE inspection
     Dispatch.RegisterHandler(TEXT("gameplay.inspect_pie"),            GT(&InspectPieImpl));
+    Dispatch.RegisterHandler(TEXT("gameplay.list_pie_actors"),        GT(&ListPieActorsImpl));
+    Dispatch.RegisterHandler(TEXT("gameplay.get_local_player"),       GT(&GetLocalPlayerImpl));
     Dispatch.RegisterHandler(TEXT("gameplay.get_pie_anim_state"),     GT(&GetPieAnimStateImpl));
     Dispatch.RegisterHandler(TEXT("gameplay.get_pie_anim_properties"),GT(&GetPieAnimPropertiesImpl));
     Dispatch.RegisterHandler(TEXT("gameplay.get_pie_subsystem_state"),GT(&GetPieSubsystemStateImpl));

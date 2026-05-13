@@ -194,6 +194,25 @@ Response MCPServer::onToolsList(Id id) {
                         "Use list_editors to discover available editors."},
                 };
             }
+            if (!schema["properties"].contains("async")) {
+                schema["properties"]["async"] = {
+                    {"type", "boolean"},
+                    {"description",
+                        "When true, start this remote editor tool as a detached "
+                        "Sage job and return {job_id,state} immediately. Poll "
+                        "with jobs.get/jobs.wait/jobs.logs. The plugin receives "
+                        "the same args with async removed."},
+                };
+            }
+            if (!schema["properties"].contains("job_timeout_seconds")) {
+                schema["properties"]["job_timeout_seconds"] = {
+                    {"type", "integer"},
+                    {"minimum", 1},
+                    {"maximum", 86400},
+                    {"description",
+                        "Detached job editor-dispatch timeout. Default 3600 seconds."},
+                };
+            }
         }
         // Phase 4-r5 export simplifier: every tool may opt into a stripped /
         // simplified response post-process. Server-side middleware — the
