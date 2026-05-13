@@ -810,6 +810,9 @@ FSageToolDispatch::FOutcome BpAddVariableImpl(const TSharedPtr<FJsonObject>& Arg
             }
         }
     }
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+    BP->MarkPackageDirty();
+
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("blueprint"), BP->GetName());
     R->SetStringField(TEXT("variable"),  VarName);

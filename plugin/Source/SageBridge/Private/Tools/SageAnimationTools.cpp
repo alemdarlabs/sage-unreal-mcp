@@ -8114,6 +8114,16 @@ bool TryConnectOwnerLocomotionPins(
             To ? *To->PinName.ToString() : TEXT("<null>"));
         return false;
     }
+    if (From->Direction != EGPD_Output || To->Direction != EGPD_Input)
+    {
+        Ctx.Error = FString::Printf(TEXT("%s connection direction mismatch: from=%s dir=%s to=%s dir=%s"),
+            *Context,
+            *From->PinName.ToString(),
+            From->Direction == EGPD_Input ? TEXT("input") : TEXT("output"),
+            *To->PinName.ToString(),
+            To->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
+        return false;
+    }
     if (bBreakInput)
     {
         To->Modify();
@@ -8342,6 +8352,27 @@ UK2Node_VariableGet* CreateOwnerLocomotionVariableGetNode(
     return Node;
 }
 
+UEdGraphPin* FindOwnerLocomotionVariableSetValuePin(UK2Node_VariableSet* Node, FName VariableName)
+{
+    if (!Node) return nullptr;
+    // VariableSet's assignment pin is an input; UK2Node_Variable::GetValuePin asserts on input pins.
+    if (UEdGraphPin* Pin = Node->FindPin(VariableName, EGPD_Input))
+    {
+        return Pin;
+    }
+
+    for (UEdGraphPin* Pin : Node->Pins)
+    {
+        if (Pin && Pin->Direction == EGPD_Input
+            && Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec
+            && Pin->PinName != UEdGraphSchema_K2::PN_Self)
+        {
+            return Pin;
+        }
+    }
+    return nullptr;
+}
+
 UK2Node_VariableSet* CreateOwnerLocomotionVariableSetNode(
     FOwnerLocomotionBuildContext& Ctx,
     FName VariableName,
@@ -8359,24 +8390,7 @@ UK2Node_VariableSet* CreateOwnerLocomotionVariableSetNode(
     MarkOwnerLocomotionNode(Node, Kind);
     AddOwnerLocomotionAuthoredNode(Ctx, Node, Kind);
 
-    OutValuePin = Node->GetValuePin();
-    if (!OutValuePin)
-    {
-        OutValuePin = Node->FindPin(VariableName, EGPD_Input);
-    }
-    if (!OutValuePin)
-    {
-        for (UEdGraphPin* Pin : Node->Pins)
-        {
-            if (Pin && Pin->Direction == EGPD_Input
-                && Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec
-                && Pin->PinName != UEdGraphSchema_K2::PN_Self)
-            {
-                OutValuePin = Pin;
-                break;
-            }
-        }
-    }
+    OutValuePin = FindOwnerLocomotionVariableSetValuePin(Node, VariableName);
     if (!OutValuePin)
     {
         Ctx.Error = FString::Printf(TEXT("value pin missing for variable set '%s': node=%s"),
