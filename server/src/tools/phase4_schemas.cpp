@@ -99,8 +99,18 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.read_anim_graph",
-        .description="Enumerate all nodes in an AnimBlueprint's anim graph (EventGraph + AnimGraph).",
-        .inputSchema=obj({{"path",str()}},{"path"}),
+        .description="Enumerate nodes in AnimBlueprint graph surfaces. Optional graph_name targets root AnimGraph, anim layer override graphs, state bound graphs, or transition rule graphs. include_properties/include_pins/include_connections add compact deep node readback; node_class, node_ids, and asset_substring filter large graphs.",
+        .inputSchema=obj({
+            {"path",str()},
+            {"graph_name",str()},
+            {"include_properties",bln()},
+            {"include_pins",bln()},
+            {"include_connections",bln()},
+            {"node_class",str()},
+            {"node_ids",arr()},
+            {"node_id",str()},
+            {"asset_substring",str()},
+        },{"path"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.set_anim_blueprint_skeleton",
@@ -230,6 +240,25 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
     reg(registry, Tool{.name="animation.read_state_machine",
         .description="Read a state machine's states and transitions from an AnimBlueprint.",
         .inputSchema=obj({{"path",str()},{"state_machine_name",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.read_state_graph",
+        .description="Inspect one AnimBlueprint state bound graph by state_machine_name plus state_name or state_id. Returns graph identity, nodes, pins/links, output pose source, reflected FAnimNode_* properties, animation asset references, and property-access bindings. Use this for loop/player-property debugging in states such as FastFlight or HoverStart.",
+        .inputSchema=obj({
+            {"path",str()},
+            {"state_machine_name",str()},
+            {"graph_name",str()},
+            {"state_name",str()},
+            {"state_id",str()},
+            {"include_properties",bln()},
+            {"include_pins",bln()},
+            {"include_connections",bln()},
+            {"include_t3d",bln()},
+            {"node_class",str()},
+            {"node_ids",arr()},
+            {"node_id",str()},
+            {"asset_substring",str()},
+        },{"path"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.add_state",
@@ -392,8 +421,13 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.remove_animgraph_node",
-        .description="Remove an AnimGraph node from a graph by FGuid id (returned by add_animgraph_node / list_animgraph_nodes). Disconnects all pins. Returns {removed: true}.",
-        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()}},{"path","node_id"}),
+        .description="Remove an AnimGraph node from a graph by FGuid id. State-machine nodes are guarded: owning/anchor nodes are rejected, while non-owning duplicate references are detached before removal so the shared state-machine graph is preserved. Use dry_run:true for diagnostics.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()},{"dry_run",bln()}},{"path","node_id"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.remove_state_machine_reference_node",
+        .description="Safely remove only a non-owning duplicate UAnimGraphNode_StateMachine reference. dry_run:true reports EditorStateMachineGraph path, outer chain, owner/anchor flags, reference_count, and whether deletion can proceed. Owning/anchor state-machine nodes are rejected instead of corrupting bound graph ownership.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()},{"dry_run",bln()}},{"path","node_id"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.connect_pose_pin",

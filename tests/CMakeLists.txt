@@ -8,6 +8,7 @@ add_executable(sage-tests
 )
 target_link_libraries(sage-tests
     PRIVATE sage-bridge
+            sage-tools
             Catch2::Catch2WithMain
             sage-warnings
             sage-sanitizers)

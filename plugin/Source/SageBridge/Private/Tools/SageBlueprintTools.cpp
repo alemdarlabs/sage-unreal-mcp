@@ -17,8 +17,14 @@
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
 #include "Animation/AnimBlueprint.h"
+#include "AnimationGraphSchema.h"
+#include "AnimationStateMachineGraph.h"
+#include "AnimGraphNode_StateMachineBase.h"
 #include "Animation/AnimNode_LinkedAnimLayer.h"
 #include "AnimGraphNode_LinkedAnimLayer.h"
+#include "AnimStateConduitNode.h"
+#include "AnimStateNode.h"
+#include "AnimStateNodeBase.h"
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -195,6 +201,105 @@ UEdGraph* FindFunctionGraph(UBlueprint* BP, const FString& FnName)
             return E.Graph;
     }
     return nullptr;
+}
+
+UEdGraph* FindAnimBlueprintGraphForHint(UBlueprint* BP, const FString& GraphName,
+                                        FString& OutKind, FString& OutStateMachine)
+{
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(BP);
+    if (!AnimBP || GraphName.IsEmpty()) return nullptr;
+
+    const FName Wanted(*GraphName);
+    TArray<UEdGraph*> AnimGraphs;
+    auto AddGraph = [&AnimGraphs](UEdGraph* Graph)
+    {
+        if (Graph && Graph->Schema
+            && Graph->Schema->IsChildOf(UAnimationGraphSchema::StaticClass()))
+        {
+            AnimGraphs.AddUnique(Graph);
+        }
+    };
+    for (UEdGraph* Graph : AnimBP->FunctionGraphs) AddGraph(Graph);
+    for (FBPInterfaceDescription& Impl : AnimBP->ImplementedInterfaces)
+    {
+        for (UEdGraph* Graph : Impl.Graphs) AddGraph(Graph);
+    }
+
+    for (UEdGraph* Graph : AnimGraphs)
+    {
+        if (!Graph) continue;
+        if (Graph->GetFName() == Wanted)
+        {
+            OutKind = TEXT("anim_graph");
+            return Graph;
+        }
+        for (UEdGraphNode* Node : Graph->Nodes)
+        {
+            UAnimGraphNode_StateMachineBase* SMNode =
+                Cast<UAnimGraphNode_StateMachineBase>(Node);
+            UAnimationStateMachineGraph* SMGraph = SMNode
+                ? Cast<UAnimationStateMachineGraph>(SMNode->EditorStateMachineGraph)
+                : nullptr;
+            if (!SMGraph) continue;
+
+            if (SMGraph->GetFName() == Wanted)
+            {
+                OutKind = TEXT("state_machine_graph");
+                OutStateMachine = SMGraph->GetName();
+                return SMGraph;
+            }
+
+            for (UEdGraphNode* SMGraphNode : SMGraph->Nodes)
+            {
+                UAnimStateNodeBase* State = Cast<UAnimStateNodeBase>(SMGraphNode);
+                if (!State) continue;
+                UEdGraph* Bound = nullptr;
+                if (UAnimStateNode* AsState = Cast<UAnimStateNode>(State))
+                {
+                    Bound = AsState->BoundGraph;
+                }
+                else if (UAnimStateConduitNode* AsConduit = Cast<UAnimStateConduitNode>(State))
+                {
+                    Bound = AsConduit->BoundGraph;
+                }
+                const FString StateName = State->GetStateName();
+                if (Bound && (Bound->GetFName() == Wanted
+                    || StateName.Equals(GraphName, ESearchCase::IgnoreCase)))
+                {
+                    OutKind = TEXT("state_bound_graph");
+                    OutStateMachine = SMGraph->GetName();
+                    return Bound;
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+FSageToolDispatch::FOutcome MakeAnimGraphHintError(
+    const FString& FunctionName,
+    const FString& Kind,
+    const FString& StateMachineName)
+{
+    TSharedPtr<FJsonObject> Err = MakeShared<FJsonObject>();
+    Err->SetNumberField(TEXT("code"), -32602);
+    Err->SetStringField(TEXT("message"),
+        FString::Printf(TEXT("function graph not found: %s; requested graph appears to be an AnimBlueprint %s, not a Blueprint function graph"),
+            *FunctionName, *Kind));
+
+    TSharedPtr<FJsonObject> Hint = MakeShared<FJsonObject>();
+    Hint->SetStringField(TEXT("tool"), Kind == TEXT("state_bound_graph")
+        ? TEXT("animation.read_state_graph")
+        : TEXT("animation.read_anim_graph"));
+    Hint->SetStringField(TEXT("graph_name"), FunctionName);
+    if (!StateMachineName.IsEmpty())
+    {
+        Hint->SetStringField(TEXT("state_machine_name"), StateMachineName);
+    }
+    Hint->SetStringField(TEXT("reason"),
+        TEXT("bp.read_function_graph only reads Blueprint K2 function/event/macro graphs"));
+    Err->SetObjectField(TEXT("hint"), Hint);
+    return FSageToolDispatch::FOutcome{false, nullptr, Err};
 }
 
 FString FlagsForVariable(const FBPVariableDescription& V)
@@ -566,8 +671,17 @@ FSageToolDispatch::FOutcome BpReadGraphImpl(const TSharedPtr<FJsonObject>& Args)
     UBlueprint* BP = ResolveBlueprint(Path);
     if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
     UEdGraph* Graph = FindFunctionGraph(BP, FnName);
-    if (!Graph) return FSageToolDispatch::FOutcome::MakeError(-32602,
-        FString::Printf(TEXT("function graph not found: %s"), *FnName));
+    if (!Graph)
+    {
+        FString AnimGraphKind;
+        FString StateMachineName;
+        if (FindAnimBlueprintGraphForHint(BP, FnName, AnimGraphKind, StateMachineName))
+        {
+            return MakeAnimGraphHintError(FnName, AnimGraphKind, StateMachineName);
+        }
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("function graph not found: %s"), *FnName));
+    }
 
     TArray<TSharedPtr<FJsonValue>> Nodes;
     for (UEdGraphNode* N : Graph->Nodes)

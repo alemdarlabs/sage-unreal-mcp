@@ -41,6 +41,7 @@
 // AnimGraph + state machine authoring (Phase 4-r6, Lyra Sage Gap #16/#17/#18)
 #include "AnimationGraph.h"
 #include "AnimationGraphSchema.h"
+#include "AnimationStateGraph.h"
 #include "AnimationStateMachineGraph.h"
 #include "AnimationStateMachineSchema.h"
 #include "AnimGraphNode_Base.h"
@@ -684,20 +685,155 @@ UEdGraph* FindAnimGraph(UAnimBlueprint* AnimBP)
     return nullptr;
 }
 
+void AddUniqueGraph(TArray<UEdGraph*>& Out, TSet<UEdGraph*>& Seen, UEdGraph* Graph)
+{
+    if (!Graph || Seen.Contains(Graph))
+    {
+        return;
+    }
+    Seen.Add(Graph);
+    Out.Add(Graph);
+}
+
+UEdGraph* GetStateBoundGraph(UAnimStateNodeBase* State)
+{
+    if (!State) return nullptr;
+    if (UAnimStateNode* AsState = Cast<UAnimStateNode>(State))
+    {
+        return AsState->BoundGraph;
+    }
+    if (UAnimStateConduitNode* AsConduit = Cast<UAnimStateConduitNode>(State))
+    {
+        return AsConduit->BoundGraph;
+    }
+    return nullptr;
+}
+
+FString GetStateDisplayName(UAnimStateNodeBase* State)
+{
+    if (!State) return FString();
+    FString Name = State->GetStateName();
+    if ((Name.IsEmpty() || Name == TEXT("BaseState")) && GetStateBoundGraph(State))
+    {
+        Name = GetStateBoundGraph(State)->GetFName().ToString();
+    }
+    return Name;
+}
+
+// Collect every AnimGraph-like graph that can legally contain UAnimGraphNode_*
+// nodes: the root AnimGraph, anim layer override graphs, and nested state
+// bound graphs reachable through state-machine nodes. Transition rule graphs
+// are intentionally not included here because they are K2 boolean graphs.
+void CollectAnimBlueprintAnimGraphs(UAnimBlueprint* AnimBP, TArray<UEdGraph*>& Out)
+{
+    Out.Reset();
+    if (!AnimBP) return;
+
+    TSet<UEdGraph*> Seen;
+    TFunction<void(UEdGraph*)> AddRecursive = [&](UEdGraph* Graph)
+    {
+        if (!Graph || Seen.Contains(Graph))
+        {
+            return;
+        }
+        AddUniqueGraph(Out, Seen, Graph);
+
+        for (UEdGraphNode* Node : Graph->Nodes)
+        {
+            UAnimGraphNode_StateMachineBase* SMNode =
+                Cast<UAnimGraphNode_StateMachineBase>(Node);
+            UAnimationStateMachineGraph* SMGraph = SMNode
+                ? Cast<UAnimationStateMachineGraph>(SMNode->EditorStateMachineGraph)
+                : nullptr;
+            if (!SMGraph) continue;
+
+            for (UEdGraphNode* SMGraphNode : SMGraph->Nodes)
+            {
+                if (UAnimStateNodeBase* State = Cast<UAnimStateNodeBase>(SMGraphNode))
+                {
+                    AddRecursive(GetStateBoundGraph(State));
+                }
+            }
+        }
+    };
+
+    for (UEdGraph* Graph : AnimBP->FunctionGraphs)
+    {
+        if (Graph && Graph->Schema
+            && Graph->Schema->IsChildOf(UAnimationGraphSchema::StaticClass()))
+        {
+            AddRecursive(Graph);
+        }
+    }
+
+    for (FBPInterfaceDescription& Impl : AnimBP->ImplementedInterfaces)
+    {
+        for (UEdGraph* Graph : Impl.Graphs)
+        {
+            if (Graph && Graph->Schema
+                && Graph->Schema->IsChildOf(UAnimationGraphSchema::StaticClass()))
+            {
+                AddRecursive(Graph);
+            }
+        }
+    }
+}
+
+struct FStateMachineReference
+{
+    UAnimGraphNode_StateMachineBase* Node = nullptr;
+    UEdGraph* ContainerGraph = nullptr;
+};
+
+TArray<FStateMachineReference> FindStateMachineReferences(
+    UAnimBlueprint* AnimBP,
+    const UAnimationStateMachineGraph* TargetGraph)
+{
+    TArray<FStateMachineReference> Refs;
+    TArray<UEdGraph*> Graphs;
+    CollectAnimBlueprintAnimGraphs(AnimBP, Graphs);
+    for (UEdGraph* Graph : Graphs)
+    {
+        if (!Graph) continue;
+        for (UEdGraphNode* Node : Graph->Nodes)
+        {
+            UAnimGraphNode_StateMachineBase* SMNode =
+                Cast<UAnimGraphNode_StateMachineBase>(Node);
+            if (!SMNode || !SMNode->EditorStateMachineGraph) continue;
+            if (TargetGraph && SMNode->EditorStateMachineGraph != TargetGraph) continue;
+            Refs.Add(FStateMachineReference{SMNode, Graph});
+        }
+    }
+    return Refs;
+}
+
+TArray<UAnimationStateMachineGraph*> CollectStateMachineGraphs(UAnimBlueprint* AnimBP)
+{
+    TArray<UAnimationStateMachineGraph*> Out;
+    TSet<UAnimationStateMachineGraph*> Seen;
+    for (const FStateMachineReference& Ref : FindStateMachineReferences(AnimBP, nullptr))
+    {
+        UAnimationStateMachineGraph* Graph = Ref.Node
+            ? Cast<UAnimationStateMachineGraph>(Ref.Node->EditorStateMachineGraph)
+            : nullptr;
+        if (!Graph || Seen.Contains(Graph)) continue;
+        Seen.Add(Graph);
+        Out.Add(Graph);
+    }
+    return Out;
+}
+
 // Locate a state machine sub-graph by name. State machines are stored as
-// EditorStateMachineGraph on UAnimGraphNode_StateMachineBase nodes inside the
-// AnimGraph (not directly on AnimBP->FunctionGraphs).
+// EditorStateMachineGraph on UAnimGraphNode_StateMachineBase nodes inside
+// AnimGraph-like graphs (not directly on AnimBP->FunctionGraphs).
 UAnimationStateMachineGraph* FindStateMachineGraph(UAnimBlueprint* AnimBP, const FName& Name)
 {
-    UEdGraph* AnimGraph = FindAnimGraph(AnimBP);
-    if (!AnimGraph) return nullptr;
-    for (UEdGraphNode* Node : AnimGraph->Nodes)
+    if (!AnimBP) return nullptr;
+    for (UAnimationStateMachineGraph* Graph : CollectStateMachineGraphs(AnimBP))
     {
-        UAnimGraphNode_StateMachineBase* SMNode = Cast<UAnimGraphNode_StateMachineBase>(Node);
-        if (SMNode && SMNode->EditorStateMachineGraph
-            && SMNode->EditorStateMachineGraph->GetFName() == Name)
+        if (Graph && Graph->GetFName() == Name)
         {
-            return Cast<UAnimationStateMachineGraph>(SMNode->EditorStateMachineGraph);
+            return Graph;
         }
     }
     return nullptr;
@@ -756,6 +892,35 @@ UEdGraphNode* FindAnimGraphOutput(UEdGraph* Graph)
 
 // Forward declarations for helpers defined later in the file (Cluster A core).
 UEdGraph* ResolveAnimGraphTarget(UAnimBlueprint* AnimBP, const FString& GraphName);
+
+struct FAnimGraphReadOptions
+{
+    bool bIncludeProperties = false;
+    bool bIncludePins = false;
+    bool bIncludeConnections = false;
+    FString NodeClassFilter;
+    FString AssetSubstringFilter;
+    TSet<FString> NodeIds;
+};
+
+void ReadAnimGraphOptions(
+    const TSharedPtr<FJsonObject>& Args,
+    FAnimGraphReadOptions& Options,
+    bool bDefaultProperties,
+    bool bDefaultPins,
+    bool bDefaultConnections);
+FString GraphKind(UEdGraph* Graph);
+TSharedPtr<FJsonObject> AnimGraphToJson(
+    UAnimBlueprint* AnimBP,
+    UEdGraph* Graph,
+    const FAnimGraphReadOptions& Options);
+UAnimStateNodeBase* ResolveStateNodeForRead(
+    UAnimBlueprint* AnimBP,
+    const FString& StateMachineName,
+    const FString& StateName,
+    const FString& StateId,
+    UAnimationStateMachineGraph*& OutSMGraph,
+    FString& OutError);
 
 // Pose-pin predicate. AnimGraph: PinCategory == PC_Struct, SubCategoryObject
 // == FPoseLink::StaticStruct() OR FComponentSpacePoseLink::StaticStruct().
@@ -851,7 +1016,7 @@ FString DescribePinsForError(const UEdGraphNode* Node)
     return Out;
 }
 
-TSharedPtr<FJsonObject> PinSummaryJson(const UEdGraphPin* Pin)
+TSharedPtr<FJsonObject> PinSummaryJson(const UEdGraphPin* Pin, bool bIncludeLinks = true)
 {
     TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
     if (!Pin)
@@ -866,6 +1031,10 @@ TSharedPtr<FJsonObject> PinSummaryJson(const UEdGraphPin* Pin)
     Obj->SetStringField(TEXT("subcategory"), Pin->PinType.PinSubCategory.ToString());
     Obj->SetStringField(TEXT("default_value"), Pin->DefaultValue);
     Obj->SetNumberField(TEXT("link_count"), Pin->LinkedTo.Num());
+    if (!bIncludeLinks)
+    {
+        return Obj;
+    }
     TArray<TSharedPtr<FJsonValue>> Links;
     for (const UEdGraphPin* Linked : Pin->LinkedTo)
     {
@@ -2597,6 +2766,10 @@ FSageToolDispatch::FOutcome ReadStateMachineImpl(const TSharedPtr<FJsonObject>& 
 
     FString SMName;
     Args->TryGetStringField(TEXT("name"), SMName);
+    if (SMName.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("state_machine_name"), SMName);
+    }
 
     // Resolve the SM sub-graph: explicit name or first one found in the AnimGraph.
     UAnimationStateMachineGraph* SMGraph = nullptr;
@@ -2640,19 +2813,7 @@ FSageToolDispatch::FOutcome ReadStateMachineImpl(const TSharedPtr<FJsonObject>& 
             auto Obj = MakeShared<FJsonObject>();
             Obj->SetStringField(TEXT("state_id"), S->NodeGuid.ToString(EGuidFormats::Digits));
             Obj->SetStringField(TEXT("class"),    S->GetClass()->GetName());
-            FString StateName;
-            if (UAnimStateAliasNode* AsAlias = Cast<UAnimStateAliasNode>(S))
-            {
-                StateName = AsAlias->GetStateName();
-            }
-            else if (UAnimStateNode* AsState = Cast<UAnimStateNode>(S))
-            {
-                StateName = AsState->GetStateName();
-            }
-            else if (UAnimStateConduitNode* AsCon = Cast<UAnimStateConduitNode>(S))
-            {
-                if (AsCon->BoundGraph) StateName = AsCon->BoundGraph->GetFName().ToString();
-            }
+            FString StateName = GetStateDisplayName(S);
             Obj->SetStringField(TEXT("name"), StateName);
             Obj->SetNumberField(TEXT("x"), S->NodePosX);
             Obj->SetNumberField(TEXT("y"), S->NodePosY);
@@ -2709,55 +2870,118 @@ FSageToolDispatch::FOutcome ReadAnimGraphImpl(const TSharedPtr<FJsonObject>& Arg
     // Optional graph name — default to the root AnimGraph.
     FString GraphName;
     Args->TryGetStringField(TEXT("graph_name"), GraphName);
+    FAnimGraphReadOptions Options;
+    ReadAnimGraphOptions(Args, Options,
+                         /*bDefaultProperties=*/false,
+                         /*bDefaultPins=*/false,
+                         /*bDefaultConnections=*/false);
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"), BP->GetPathName());
 
     TArray<TSharedPtr<FJsonValue>> Graphs;
-    auto EmitGraph = [&Graphs](UEdGraph* G)
+    auto EmitGraph = [&](UEdGraph* G)
     {
         if (!G) return;
-        auto GObj = MakeShared<FJsonObject>();
-        GObj->SetStringField(TEXT("name"),   G->GetFName().ToString());
-        GObj->SetStringField(TEXT("schema"), G->Schema ? G->Schema->GetName() : TEXT(""));
-
-        TArray<TSharedPtr<FJsonValue>> Nodes;
-        for (UEdGraphNode* N : G->Nodes)
-        {
-            if (!N) continue;
-            auto NObj = MakeShared<FJsonObject>();
-            NObj->SetStringField(TEXT("node_id"),  N->NodeGuid.ToString(EGuidFormats::Digits));
-            NObj->SetStringField(TEXT("class"),    N->GetClass()->GetPathName());
-            NObj->SetNumberField(TEXT("x"),        N->NodePosX);
-            NObj->SetNumberField(TEXT("y"),        N->NodePosY);
-            NObj->SetNumberField(TEXT("pin_count"),N->Pins.Num());
-            Nodes.Add(MakeShared<FJsonValueObject>(NObj));
-        }
-        GObj->SetArrayField(TEXT("nodes"), Nodes);
-        GObj->SetNumberField(TEXT("node_count"), Nodes.Num());
-        Graphs.Add(MakeShared<FJsonValueObject>(GObj));
+        Graphs.Add(MakeShared<FJsonValueObject>(AnimGraphToJson(BP, G, Options)));
     };
 
     if (!GraphName.IsEmpty())
     {
-        EmitGraph(ResolveAnimGraphTarget(BP, GraphName));
+        UEdGraph* TargetGraph = ResolveAnimGraphTarget(BP, GraphName);
+        if (!TargetGraph)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("graph '%s' not found"), *GraphName));
+        }
+        EmitGraph(TargetGraph);
     }
     else
     {
-        // Emit every UAnimationGraphSchema-bound graph and every state-machine
-        // sub-graph (via referencing UAnimGraphNode_StateMachineBase).
-        for (UEdGraph* G : BP->FunctionGraphs)
+        TArray<UEdGraph*> AnimGraphs;
+        CollectAnimBlueprintAnimGraphs(BP, AnimGraphs);
+        for (UEdGraph* G : AnimGraphs)
         {
-            if (G && G->Schema
-                && G->Schema->IsChildOf(UAnimationGraphSchema::StaticClass()))
-            {
-                EmitGraph(G);
-            }
+            EmitGraph(G);
         }
     }
 
     R->SetArrayField(TEXT("graphs"), Graphs);
     R->SetNumberField(TEXT("graph_count"), Graphs.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.read_state_graph
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome ReadStateGraphImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UAnimBlueprint* BP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!BP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+
+    FString SMName, StateName, StateId;
+    Args->TryGetStringField(TEXT("state_machine_name"), SMName);
+    if (SMName.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("graph_name"), SMName);
+    }
+    Args->TryGetStringField(TEXT("state_name"), StateName);
+    Args->TryGetStringField(TEXT("state_id"), StateId);
+    if (StateName.IsEmpty() && StateId.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'state_name' or 'state_id'"));
+    }
+
+    UAnimationStateMachineGraph* SMGraph = nullptr;
+    FString ResolveError;
+    UAnimStateNodeBase* State = ResolveStateNodeForRead(
+        BP, SMName, StateName, StateId, SMGraph, ResolveError);
+    if (!State)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, ResolveError);
+    }
+    UEdGraph* StateGraph = GetStateBoundGraph(State);
+    if (!StateGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("state '%s' has no bound graph"),
+                *GetStateDisplayName(State)));
+    }
+
+    FAnimGraphReadOptions Options;
+    ReadAnimGraphOptions(Args, Options,
+                         /*bDefaultProperties=*/true,
+                         /*bDefaultPins=*/true,
+                         /*bDefaultConnections=*/true);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), BP->GetPathName());
+    R->SetStringField(TEXT("state_machine_name"), SMGraph ? SMGraph->GetName() : FString());
+    R->SetStringField(TEXT("state_id"), State->NodeGuid.ToString(EGuidFormats::Digits));
+    R->SetStringField(TEXT("state_name"), GetStateDisplayName(State));
+    R->SetStringField(TEXT("state_class"), State->GetClass()->GetPathName());
+    R->SetStringField(TEXT("graph_name"), StateGraph->GetName());
+    R->SetStringField(TEXT("graph_kind"), GraphKind(StateGraph));
+    R->SetObjectField(TEXT("graph"), AnimGraphToJson(BP, StateGraph, Options));
+
+    bool bIncludeT3d = false;
+    Args->TryGetBoolField(TEXT("include_t3d"), bIncludeT3d);
+    if (bIncludeT3d)
+    {
+        R->SetStringField(TEXT("t3d_skip_reason"),
+            TEXT("animation.read_state_graph is compact JSON-only; use bp.full_dump(include_t3d:true) for clipboard T3D"));
+    }
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -6503,31 +6727,39 @@ UEdGraph* ResolveAnimGraphTarget(UAnimBlueprint* AnimBP, const FString& GraphNam
     // State bound-graph fallback — walk every state machine, every state,
     // match on either the BoundGraph's FName or the engine's GetStateName()
     // override (which the Persona graph editor displays).
-    if (UEdGraph* AnimGraph = FindAnimGraph(AnimBP))
     {
         const FName Wanted(*GraphName);
-        for (UEdGraphNode* N : AnimGraph->Nodes)
+        for (UAnimationStateMachineGraph* SMGraph : CollectStateMachineGraphs(AnimBP))
         {
-            UAnimGraphNode_StateMachineBase* SMNode = Cast<UAnimGraphNode_StateMachineBase>(N);
-            if (!SMNode || !SMNode->EditorStateMachineGraph) continue;
-            for (UEdGraphNode* SN : SMNode->EditorStateMachineGraph->Nodes)
+            if (!SMGraph) continue;
+            for (UEdGraphNode* SN : SMGraph->Nodes)
             {
                 UAnimStateNodeBase* State = Cast<UAnimStateNodeBase>(SN);
                 if (!State) continue;
-                UEdGraph* Bound = nullptr;
-                if (UAnimStateNode* AsState = Cast<UAnimStateNode>(State))
-                {
-                    Bound = AsState->BoundGraph;
-                }
-                else if (UAnimStateConduitNode* AsCon = Cast<UAnimStateConduitNode>(State))
-                {
-                    Bound = AsCon->BoundGraph;
-                }
+                UEdGraph* Bound = GetStateBoundGraph(State);
                 if (!Bound) continue;
                 if (Bound->GetFName() == Wanted
-                    || State->GetStateName().Equals(GraphName, ESearchCase::IgnoreCase))
+                    || State->NodeGuid.ToString(EGuidFormats::Digits).Equals(GraphName, ESearchCase::IgnoreCase)
+                    || GetStateDisplayName(State).Equals(GraphName, ESearchCase::IgnoreCase))
                 {
                     return Bound;
+                }
+            }
+        }
+    }
+    {
+        const FName Wanted(*GraphName);
+        for (UAnimationStateMachineGraph* SMGraph : CollectStateMachineGraphs(AnimBP))
+        {
+            if (!SMGraph) continue;
+            for (UEdGraphNode* SN : SMGraph->Nodes)
+            {
+                UAnimStateTransitionNode* Transition = Cast<UAnimStateTransitionNode>(SN);
+                if (!Transition || !Transition->BoundGraph) continue;
+                if (Transition->BoundGraph->GetFName() == Wanted
+                    || Transition->NodeGuid.ToString(EGuidFormats::Digits).Equals(GraphName, ESearchCase::IgnoreCase))
+                {
+                    return Transition->BoundGraph;
                 }
             }
         }
@@ -7397,6 +7629,515 @@ void AppendCustomAnimNodePropertiesToJson(UAnimGraphNode_Base* AnimNode,
     }
 }
 
+FString GraphKind(UEdGraph* Graph)
+{
+    if (!Graph) return TEXT("unknown");
+    if (Graph->IsA<UAnimationStateMachineGraph>()) return TEXT("state_machine");
+    if (Graph->IsA<UAnimationStateGraph>()) return TEXT("state_bound_graph");
+    if (Graph->IsA<UAnimationTransitionGraph>()) return TEXT("transition_rule_graph");
+    if (Graph->Schema && Graph->Schema->IsChildOf(UAnimationGraphSchema::StaticClass()))
+    {
+        return TEXT("anim_graph");
+    }
+    return TEXT("graph");
+}
+
+TArray<TSharedPtr<FJsonValue>> OuterChainJson(const UObject* Obj)
+{
+    TArray<TSharedPtr<FJsonValue>> Chain;
+    for (const UObject* Cur = Obj; Cur; Cur = Cur->GetOuter())
+    {
+        TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+        Entry->SetStringField(TEXT("name"), Cur->GetName());
+        Entry->SetStringField(TEXT("class"), Cur->GetClass()->GetPathName());
+        Entry->SetStringField(TEXT("path"), Cur->GetPathName());
+        Chain.Add(MakeShared<FJsonValueObject>(Entry));
+    }
+    return Chain;
+}
+
+TSharedPtr<FJsonObject> StateMachineReferenceJson(
+    UAnimBlueprint* AnimBP,
+    UAnimGraphNode_StateMachineBase* SMNode,
+    UEdGraph* ContainerGraph)
+{
+    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+    if (!SMNode)
+    {
+        Obj->SetBoolField(TEXT("found"), false);
+        return Obj;
+    }
+
+    UAnimationStateMachineGraph* SMGraph =
+        Cast<UAnimationStateMachineGraph>(SMNode->EditorStateMachineGraph);
+    const TArray<FStateMachineReference> Refs =
+        FindStateMachineReferences(AnimBP, SMGraph);
+    const bool bGraphOuterIsNode = SMGraph && SMGraph->GetOuter() == SMNode;
+    const bool bOwnerAnimGraphNode = SMGraph && SMGraph->OwnerAnimGraphNode == SMNode;
+
+    Obj->SetBoolField(TEXT("found"), true);
+    Obj->SetStringField(TEXT("node_id"), SMNode->NodeGuid.ToString(EGuidFormats::Digits));
+    Obj->SetStringField(TEXT("node_class"), SMNode->GetClass()->GetPathName());
+    Obj->SetStringField(TEXT("container_graph"),
+        ContainerGraph ? ContainerGraph->GetName() : FString());
+    Obj->SetBoolField(TEXT("has_state_machine_graph"), SMGraph != nullptr);
+    Obj->SetBoolField(TEXT("graph_outer_is_node"), bGraphOuterIsNode);
+    Obj->SetBoolField(TEXT("is_owner_anim_graph_node"), bOwnerAnimGraphNode);
+    Obj->SetNumberField(TEXT("reference_count"), Refs.Num());
+    Obj->SetBoolField(TEXT("safe_reference_delete"),
+        SMGraph != nullptr && Refs.Num() > 1 && !bGraphOuterIsNode && !bOwnerAnimGraphNode);
+
+    if (SMGraph)
+    {
+        Obj->SetStringField(TEXT("state_machine_name"), SMGraph->GetName());
+        Obj->SetStringField(TEXT("state_machine_path"), SMGraph->GetPathName());
+        Obj->SetStringField(TEXT("state_machine_outer"), SMGraph->GetOuter()
+            ? SMGraph->GetOuter()->GetPathName()
+            : FString());
+        Obj->SetArrayField(TEXT("state_machine_outer_chain"), OuterChainJson(SMGraph));
+        if (SMGraph->OwnerAnimGraphNode)
+        {
+            Obj->SetStringField(TEXT("owner_node_id"),
+                SMGraph->OwnerAnimGraphNode->NodeGuid.ToString(EGuidFormats::Digits));
+            Obj->SetStringField(TEXT("owner_node_graph"),
+                SMGraph->OwnerAnimGraphNode->GetGraph()
+                    ? SMGraph->OwnerAnimGraphNode->GetGraph()->GetName()
+                    : FString());
+        }
+    }
+
+    TArray<TSharedPtr<FJsonValue>> RefArr;
+    for (const FStateMachineReference& Ref : Refs)
+    {
+        if (!Ref.Node) continue;
+        TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("node_id"), Ref.Node->NodeGuid.ToString(EGuidFormats::Digits));
+        R->SetStringField(TEXT("graph"), Ref.ContainerGraph ? Ref.ContainerGraph->GetName() : FString());
+        R->SetBoolField(TEXT("graph_outer_is_node"),
+            SMGraph != nullptr && SMGraph->GetOuter() == Ref.Node);
+        R->SetBoolField(TEXT("is_owner_anim_graph_node"),
+            SMGraph != nullptr && SMGraph->OwnerAnimGraphNode == Ref.Node);
+        RefArr.Add(MakeShared<FJsonValueObject>(R));
+    }
+    Obj->SetArrayField(TEXT("references"), RefArr);
+    return Obj;
+}
+
+TArray<TSharedPtr<FJsonValue>> CollectAnimNodeAssetReferences(UAnimGraphNode_Base* AnimNode)
+{
+    TArray<TSharedPtr<FJsonValue>> Assets;
+    if (!AnimNode) return Assets;
+
+    FStructProperty* NodeStructProp = nullptr;
+    void* NodeStructPtr = nullptr;
+    if (!GetAnimNodeStructTarget(AnimNode, NodeStructProp, NodeStructPtr)
+        || !NodeStructProp || !NodeStructProp->Struct || !NodeStructPtr)
+    {
+        return Assets;
+    }
+
+    auto AddAsset = [&Assets](const FProperty* Property, const FString& Path, const UObject* Obj)
+    {
+        if (Path.IsEmpty() && !Obj) return;
+        TSharedPtr<FJsonObject> A = MakeShared<FJsonObject>();
+        A->SetStringField(TEXT("property"), Property ? Property->GetName() : FString());
+        if (!Path.IsEmpty()) A->SetStringField(TEXT("path"), Path);
+        if (Obj)
+        {
+            A->SetStringField(TEXT("path"), Obj->GetPathName());
+            A->SetStringField(TEXT("class"), Obj->GetClass()->GetPathName());
+            A->SetStringField(TEXT("name"), Obj->GetName());
+        }
+        Assets.Add(MakeShared<FJsonValueObject>(A));
+    };
+
+    for (TFieldIterator<FProperty> It(NodeStructProp->Struct); It; ++It)
+    {
+        FProperty* Property = *It;
+        if (!Property) continue;
+        const void* ValuePtr = Property->ContainerPtrToValuePtr<void>(NodeStructPtr);
+        if (!ValuePtr) continue;
+
+        if (const FSoftObjectProperty* SoftProp = CastField<FSoftObjectProperty>(Property))
+        {
+            const FString Path = SoftProp->GetPropertyValue(ValuePtr).ToString();
+            if (!Path.IsEmpty())
+            {
+                AddAsset(Property, Path, nullptr);
+            }
+            continue;
+        }
+
+        if (const FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(Property))
+        {
+            UObject* Obj = ObjProp->GetObjectPropertyValue(ValuePtr);
+            if (Obj && Obj->IsA<UAnimationAsset>())
+            {
+                AddAsset(Property, FString(), Obj);
+            }
+        }
+    }
+    return Assets;
+}
+
+void ReadAnimGraphOptions(
+    const TSharedPtr<FJsonObject>& Args,
+    FAnimGraphReadOptions& Options,
+    bool bDefaultProperties,
+    bool bDefaultPins,
+    bool bDefaultConnections)
+{
+    Options.bIncludeProperties = bDefaultProperties;
+    Options.bIncludePins = bDefaultPins;
+    Options.bIncludeConnections = bDefaultConnections;
+    if (Args.IsValid())
+    {
+        Args->TryGetBoolField(TEXT("include_properties"), Options.bIncludeProperties);
+        Args->TryGetBoolField(TEXT("include_pins"), Options.bIncludePins);
+        Args->TryGetBoolField(TEXT("include_connections"), Options.bIncludeConnections);
+        Args->TryGetStringField(TEXT("node_class"), Options.NodeClassFilter);
+        if (Options.NodeClassFilter.IsEmpty())
+        {
+            Args->TryGetStringField(TEXT("class"), Options.NodeClassFilter);
+        }
+        Args->TryGetStringField(TEXT("asset_substring"), Options.AssetSubstringFilter);
+        FString SingleNodeId;
+        if (Args->TryGetStringField(TEXT("node_id"), SingleNodeId) && !SingleNodeId.IsEmpty())
+        {
+            Options.NodeIds.Add(SingleNodeId);
+        }
+        const TArray<TSharedPtr<FJsonValue>>* NodeIdValues = nullptr;
+        if (Args->TryGetArrayField(TEXT("node_ids"), NodeIdValues) && NodeIdValues)
+        {
+            for (const TSharedPtr<FJsonValue>& Value : *NodeIdValues)
+            {
+                if (Value.IsValid() && Value->Type == EJson::String && !Value->AsString().IsEmpty())
+                {
+                    Options.NodeIds.Add(Value->AsString());
+                }
+            }
+        }
+    }
+    if (Options.bIncludeConnections)
+    {
+        Options.bIncludePins = true;
+    }
+}
+
+bool NodePassesAnimGraphFilters(
+    UEdGraphNode* Node,
+    const FAnimGraphReadOptions& Options,
+    const TArray<TSharedPtr<FJsonValue>>& AssetRefs)
+{
+    if (!Node) return false;
+    const FString NodeId = Node->NodeGuid.ToString(EGuidFormats::Digits);
+    if (Options.NodeIds.Num() > 0 && !Options.NodeIds.Contains(NodeId))
+    {
+        return false;
+    }
+    if (!Options.NodeClassFilter.IsEmpty())
+    {
+        const FString ClassPath = Node->GetClass()->GetPathName();
+        const FString ClassName = Node->GetClass()->GetName();
+        if (!ClassPath.Contains(Options.NodeClassFilter, ESearchCase::IgnoreCase)
+            && !ClassName.Contains(Options.NodeClassFilter, ESearchCase::IgnoreCase))
+        {
+            return false;
+        }
+    }
+    if (!Options.AssetSubstringFilter.IsEmpty())
+    {
+        bool bMatched = false;
+        for (const TSharedPtr<FJsonValue>& Value : AssetRefs)
+        {
+            TSharedPtr<FJsonObject> Obj = Value.IsValid() ? Value->AsObject() : nullptr;
+            if (!Obj.IsValid())
+            {
+                continue;
+            }
+            FString Path;
+            if (Obj->TryGetStringField(TEXT("path"), Path)
+                && Path.Contains(Options.AssetSubstringFilter, ESearchCase::IgnoreCase))
+            {
+                bMatched = true;
+                break;
+            }
+        }
+        if (!bMatched)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+void AppendAnimNodeDeepReadback(
+    UAnimGraphNode_Base* AnimNode,
+    TSharedPtr<FJsonObject>& Obj,
+    const FAnimGraphReadOptions& Options,
+    const TArray<TSharedPtr<FJsonValue>>& AssetRefs)
+{
+    if (!AnimNode || !Obj.IsValid()) return;
+
+    if (UScriptStruct* FNodeType = AnimNode->GetFNodeType())
+    {
+        Obj->SetStringField(TEXT("fnode_type"), FNodeType->GetPathName());
+    }
+
+    Obj->SetArrayField(TEXT("animation_assets"), AssetRefs);
+    Obj->SetNumberField(TEXT("animation_asset_count"), AssetRefs.Num());
+
+    if (!Options.bIncludeProperties)
+    {
+        return;
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Properties;
+    FStructProperty* NodeStructProp = nullptr;
+    void* NodeStructPtr = nullptr;
+    if (GetAnimNodeStructTarget(AnimNode, NodeStructProp, NodeStructPtr)
+        && NodeStructProp && NodeStructProp->Struct)
+    {
+        Obj->SetStringField(TEXT("inner_struct"), NodeStructProp->Struct->GetPathName());
+        for (TFieldIterator<FProperty> It(NodeStructProp->Struct); It; ++It)
+        {
+            FProperty* Property = *It;
+            if (!Property) continue;
+            Properties.Add(MakeShared<FJsonValueObject>(
+                AnimNodePropertyToJson(AnimNode, Property, NodeStructPtr)));
+        }
+    }
+    AppendCustomAnimNodePropertiesToJson(AnimNode, Properties);
+
+    TArray<TSharedPtr<FJsonValue>> Bindings;
+    int32 BindingCount = 0;
+    UObject* BindingObj = GetAnimNodeBindingObject(AnimNode);
+    ReadBindingMapEntries(BindingObj, Bindings, BindingCount);
+    if (BindingObj)
+    {
+        Obj->SetStringField(TEXT("binding_class"), BindingObj->GetClass()->GetPathName());
+    }
+    Obj->SetNumberField(TEXT("property_count"), Properties.Num());
+    Obj->SetNumberField(TEXT("binding_count"), BindingCount);
+    Obj->SetArrayField(TEXT("properties"), Properties);
+    Obj->SetArrayField(TEXT("bindings"), Bindings);
+}
+
+TSharedPtr<FJsonObject> AnimGraphNodeToJson(
+    UAnimBlueprint* AnimBP,
+    UEdGraph* Graph,
+    UEdGraphNode* Node,
+    const FAnimGraphReadOptions& Options,
+    const TArray<TSharedPtr<FJsonValue>>& AssetRefs)
+{
+    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+    Obj->SetStringField(TEXT("node_id"), Node->NodeGuid.ToString(EGuidFormats::Digits));
+    Obj->SetStringField(TEXT("class"), Node->GetClass()->GetPathName());
+    Obj->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::ListView).ToString());
+    Obj->SetNumberField(TEXT("x"), Node->NodePosX);
+    Obj->SetNumberField(TEXT("y"), Node->NodePosY);
+    Obj->SetNumberField(TEXT("pin_count"), Node->Pins.Num());
+
+    const TCHAR* Kind = TEXT("other");
+    if (Node->IsA<UAnimGraphNode_StateMachineBase>())         Kind = TEXT("state_machine");
+    else if (Node->IsA<UAnimGraphNode_AssetPlayerBase>())     Kind = TEXT("asset_player");
+    else if (Node->IsA<UAnimGraphNode_BlendListBase>())       Kind = TEXT("blend_list");
+    else if (Node->IsA<UAnimGraphNode_SkeletalControlBase>()) Kind = TEXT("bone_control");
+    else if (Node->IsA<UAnimGraphNode_Base>())                Kind = TEXT("anim_node");
+    Obj->SetStringField(TEXT("kind"), Kind);
+
+    if (Options.bIncludePins)
+    {
+        TArray<TSharedPtr<FJsonValue>> Pins;
+        for (const UEdGraphPin* Pin : Node->Pins)
+        {
+            if (!Pin) continue;
+            Pins.Add(MakeShared<FJsonValueObject>(
+                PinSummaryJson(Pin, Options.bIncludeConnections)));
+        }
+        Obj->SetArrayField(TEXT("pins"), Pins);
+    }
+
+    if (UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(Node))
+    {
+        AppendAnimNodeDeepReadback(AnimNode, Obj, Options, AssetRefs);
+    }
+
+    if (UAnimGraphNode_StateMachineBase* SMNode = Cast<UAnimGraphNode_StateMachineBase>(Node))
+    {
+        Obj->SetObjectField(TEXT("state_machine"),
+            StateMachineReferenceJson(AnimBP, SMNode, Graph));
+    }
+
+    return Obj;
+}
+
+TSharedPtr<FJsonObject> OutputPosePathJson(UEdGraph* Graph)
+{
+    TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+    UEdGraphNode* OutputNode = FindAnimGraphOutput(Graph);
+    Obj->SetBoolField(TEXT("found"), OutputNode != nullptr);
+    if (!OutputNode)
+    {
+        return Obj;
+    }
+
+    Obj->SetStringField(TEXT("output_node_id"),
+        OutputNode->NodeGuid.ToString(EGuidFormats::Digits));
+    Obj->SetStringField(TEXT("output_node_class"), OutputNode->GetClass()->GetPathName());
+    UEdGraphPin* OutputIn = FindFirstInputPosePin(OutputNode);
+    Obj->SetObjectField(TEXT("input_pin"), PinSummaryJson(OutputIn));
+
+    TArray<TSharedPtr<FJsonValue>> Sources;
+    if (OutputIn)
+    {
+        for (UEdGraphPin* Linked : OutputIn->LinkedTo)
+        {
+            if (!Linked) continue;
+            UEdGraphNode* SourceNode = Linked->GetOwningNode();
+            TSharedPtr<FJsonObject> Source = MakeShared<FJsonObject>();
+            Source->SetStringField(TEXT("pin"), Linked->PinName.ToString());
+            if (SourceNode)
+            {
+                Source->SetStringField(TEXT("node_id"),
+                    SourceNode->NodeGuid.ToString(EGuidFormats::Digits));
+                Source->SetStringField(TEXT("node_class"), SourceNode->GetClass()->GetPathName());
+                Source->SetStringField(TEXT("title"),
+                    SourceNode->GetNodeTitle(ENodeTitleType::ListView).ToString());
+            }
+            Sources.Add(MakeShared<FJsonValueObject>(Source));
+        }
+    }
+    Obj->SetArrayField(TEXT("sources"), Sources);
+    Obj->SetNumberField(TEXT("source_count"), Sources.Num());
+    return Obj;
+}
+
+TSharedPtr<FJsonObject> AnimGraphToJson(
+    UAnimBlueprint* AnimBP,
+    UEdGraph* Graph,
+    const FAnimGraphReadOptions& Options)
+{
+    TSharedPtr<FJsonObject> GObj = MakeShared<FJsonObject>();
+    if (!Graph)
+    {
+        GObj->SetBoolField(TEXT("found"), false);
+        return GObj;
+    }
+
+    GObj->SetBoolField(TEXT("found"), true);
+    GObj->SetStringField(TEXT("name"), Graph->GetFName().ToString());
+    GObj->SetStringField(TEXT("graph"), Graph->GetName());
+    GObj->SetStringField(TEXT("graph_class"), Graph->GetClass()->GetPathName());
+    GObj->SetStringField(TEXT("kind"), GraphKind(Graph));
+    GObj->SetStringField(TEXT("schema"), Graph->Schema ? Graph->Schema->GetPathName() : FString());
+    GObj->SetArrayField(TEXT("outer_chain"), OuterChainJson(Graph));
+
+    TArray<TSharedPtr<FJsonValue>> Nodes;
+    for (UEdGraphNode* Node : Graph->Nodes)
+    {
+        if (!Node) continue;
+        TArray<TSharedPtr<FJsonValue>> AssetRefs;
+        if (UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(Node))
+        {
+            AssetRefs = CollectAnimNodeAssetReferences(AnimNode);
+        }
+        if (!NodePassesAnimGraphFilters(Node, Options, AssetRefs))
+        {
+            continue;
+        }
+        Nodes.Add(MakeShared<FJsonValueObject>(
+            AnimGraphNodeToJson(AnimBP, Graph, Node, Options, AssetRefs)));
+    }
+
+    GObj->SetArrayField(TEXT("nodes"), Nodes);
+    GObj->SetNumberField(TEXT("node_count"), Nodes.Num());
+    GObj->SetObjectField(TEXT("output_pose"), OutputPosePathJson(Graph));
+    return GObj;
+}
+
+UAnimStateNodeBase* ResolveStateNodeForRead(
+    UAnimBlueprint* AnimBP,
+    const FString& StateMachineName,
+    const FString& StateName,
+    const FString& StateId,
+    UAnimationStateMachineGraph*& OutSMGraph,
+    FString& OutError)
+{
+    OutSMGraph = nullptr;
+    if (!AnimBP)
+    {
+        OutError = TEXT("not a UAnimBlueprint");
+        return nullptr;
+    }
+
+    TArray<UAnimationStateMachineGraph*> CandidateSMs;
+    if (!StateMachineName.IsEmpty())
+    {
+        if (UAnimationStateMachineGraph* SM = FindStateMachineGraph(AnimBP, FName(*StateMachineName)))
+        {
+            CandidateSMs.Add(SM);
+        }
+        else
+        {
+            OutError = FString::Printf(TEXT("state machine not found: %s"), *StateMachineName);
+            return nullptr;
+        }
+    }
+    else
+    {
+        CandidateSMs = CollectStateMachineGraphs(AnimBP);
+    }
+
+    TArray<UAnimStateNodeBase*> Matches;
+    TArray<UAnimationStateMachineGraph*> MatchSMs;
+    for (UAnimationStateMachineGraph* SMGraph : CandidateSMs)
+    {
+        if (!SMGraph) continue;
+        UAnimStateNodeBase* ById = !StateId.IsEmpty()
+            ? FindStateNodeByGuid(SMGraph, StateId)
+            : nullptr;
+        if (ById)
+        {
+            Matches.Add(ById);
+            MatchSMs.Add(SMGraph);
+            continue;
+        }
+        if (StateName.IsEmpty()) continue;
+        for (UEdGraphNode* Node : SMGraph->Nodes)
+        {
+            UAnimStateNodeBase* State = Cast<UAnimStateNodeBase>(Node);
+            if (!State) continue;
+            UEdGraph* Bound = GetStateBoundGraph(State);
+            if (GetStateDisplayName(State).Equals(StateName, ESearchCase::IgnoreCase)
+                || State->GetName().Equals(StateName, ESearchCase::IgnoreCase)
+                || (Bound && Bound->GetName().Equals(StateName, ESearchCase::IgnoreCase)))
+            {
+                Matches.Add(State);
+                MatchSMs.Add(SMGraph);
+            }
+        }
+    }
+
+    if (Matches.Num() == 0)
+    {
+        OutError = StateId.IsEmpty()
+            ? FString::Printf(TEXT("state not found: %s"), *StateName)
+            : FString::Printf(TEXT("state_id not found: %s"), *StateId);
+        return nullptr;
+    }
+    if (Matches.Num() > 1)
+    {
+        OutError = FString::Printf(
+            TEXT("state graph lookup is ambiguous: %d states match; pass state_machine_name or state_id"),
+            Matches.Num());
+        return nullptr;
+    }
+
+    OutSMGraph = MatchSMs[0];
+    return Matches[0];
+}
+
 // ---------------------------------------------------------------------------
 // animation.add_animgraph_node
 // ---------------------------------------------------------------------------
@@ -7486,10 +8227,9 @@ FSageToolDispatch::FOutcome AddAnimGraphNodeImpl(const TSharedPtr<FJsonObject>& 
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
-// ---------------------------------------------------------------------------
-// animation.remove_animgraph_node
-// ---------------------------------------------------------------------------
-FSageToolDispatch::FOutcome RemoveAnimGraphNodeImpl(const TSharedPtr<FJsonObject>& Args)
+FSageToolDispatch::FOutcome RemoveAnimGraphNodeShared(
+    const TSharedPtr<FJsonObject>& Args,
+    bool bRequireStateMachineNode)
 {
     FSageToolDispatch::FOutcome Reject;
     if (detail::RejectIfPie(Reject)) return Reject;
@@ -7504,6 +8244,8 @@ FSageToolDispatch::FOutcome RemoveAnimGraphNodeImpl(const TSharedPtr<FJsonObject
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'node_id'"));
     }
     Args->TryGetStringField(TEXT("graph_name"), GraphName);
+    bool bDryRun = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
 
     UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
     if (!AnimBP)
@@ -7524,15 +8266,116 @@ FSageToolDispatch::FOutcome RemoveAnimGraphNodeImpl(const TSharedPtr<FJsonObject
             FString::Printf(TEXT("node_id not found: %s"), *NodeId));
     }
 
+    UAnimGraphNode_StateMachineBase* SMNode = Cast<UAnimGraphNode_StateMachineBase>(Node);
+    if (bRequireStateMachineNode && !SMNode)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("node_id %s is not a UAnimGraphNode_StateMachineBase"), *NodeId));
+    }
+
+    UAnimationStateMachineGraph* SMGraph = SMNode
+        ? Cast<UAnimationStateMachineGraph>(SMNode->EditorStateMachineGraph)
+        : nullptr;
+    const TArray<FStateMachineReference> SMRefs =
+        SMNode ? FindStateMachineReferences(AnimBP, SMGraph) : TArray<FStateMachineReference>();
+    const bool bSMGraphOuterIsNode = SMGraph && SMGraph->GetOuter() == SMNode;
+    const bool bSMOwnerNode = SMGraph && SMGraph->OwnerAnimGraphNode == SMNode;
+    const bool bSafeSMReferenceDelete =
+        SMNode && SMGraph && SMRefs.Num() > 1 && !bSMGraphOuterIsNode && !bSMOwnerNode;
+
+    auto BuildResponse = [&](bool bRemoved, const FString& Mode, const FString& Reason)
+    {
+        TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("node_id"), NodeId);
+        R->SetStringField(TEXT("graph"), TargetGraph->GetName());
+        R->SetBoolField(TEXT("removed"), bRemoved);
+        R->SetBoolField(TEXT("dry_run"), bDryRun);
+        if (!Mode.IsEmpty()) R->SetStringField(TEXT("mode"), Mode);
+        if (!Reason.IsEmpty()) R->SetStringField(TEXT("reason"), Reason);
+        if (SMNode)
+        {
+            R->SetObjectField(TEXT("state_machine"),
+                StateMachineReferenceJson(AnimBP, SMNode, TargetGraph));
+            R->SetBoolField(TEXT("can_remove"), !SMGraph || bSafeSMReferenceDelete);
+        }
+        else
+        {
+            R->SetBoolField(TEXT("can_remove"), true);
+        }
+        return R;
+    };
+
+    if (bDryRun)
+    {
+        FString Reason;
+        FString Mode = TEXT("remove_node");
+        if (SMNode)
+        {
+            if (!SMGraph)
+            {
+                Reason = TEXT("state-machine node has no EditorStateMachineGraph; normal node removal is safe");
+                Mode = TEXT("remove_null_state_machine_node");
+            }
+            else if (bSafeSMReferenceDelete)
+            {
+                Reason = TEXT("non-owning duplicate state-machine reference; removal will detach the graph pointer before RemoveNode");
+                Mode = TEXT("detach_state_machine_reference");
+            }
+            else
+            {
+                Reason = TEXT("state-machine graph appears owned/anchored by this node or has no replacement reference; deletion is rejected");
+                Mode = TEXT("reject_state_machine_anchor_delete");
+            }
+        }
+        return FSageToolDispatch::FOutcome::MakeSuccess(BuildResponse(false, Mode, Reason));
+    }
+
+    if (SMNode && SMGraph && !bSafeSMReferenceDelete)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(
+                TEXT("refusing to remove state-machine graph anchor/reference node %s: graph=%s references=%d graph_outer_is_node=%s owner_anim_graph_node=%s; call animation.remove_state_machine_reference_node with dry_run:true for diagnostics and remove only non-owning duplicate references"),
+                *NodeId,
+                *SMGraph->GetPathName(),
+                SMRefs.Num(),
+                bSMGraphOuterIsNode ? TEXT("true") : TEXT("false"),
+                bSMOwnerNode ? TEXT("true") : TEXT("false")));
+    }
+
     FScopedTransaction Tx(LOCTEXT("RemoveAGNode", "Sage: Remove AnimGraph Node"));
     AnimBP->Modify();
+    TargetGraph->Modify();
+    if (SMNode && SMGraph && bSafeSMReferenceDelete)
+    {
+        // UAnimGraphNode_StateMachineBase::DestroyNode always removes
+        // EditorStateMachineGraph. For non-owning duplicate references, clear
+        // the pointer first so RemoveNode deletes only the visual reference.
+        SMNode->Modify();
+        SMNode->EditorStateMachineGraph = nullptr;
+    }
     FBlueprintEditorUtils::RemoveNode(AnimBP, Node, /*bDontRecompile=*/true);
     FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
 
-    auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("node_id"),  NodeId);
-    R->SetBoolField  (TEXT("removed"),  true);
-    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    const FString Mode = SMNode && SMGraph && bSafeSMReferenceDelete
+        ? TEXT("detach_state_machine_reference")
+        : TEXT("remove_node");
+    return FSageToolDispatch::FOutcome::MakeSuccess(BuildResponse(true, Mode, FString()));
+}
+
+// ---------------------------------------------------------------------------
+// animation.remove_animgraph_node
+// ---------------------------------------------------------------------------
+FSageToolDispatch::FOutcome RemoveAnimGraphNodeImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return RemoveAnimGraphNodeShared(Args, /*bRequireStateMachineNode=*/false);
+}
+
+// ---------------------------------------------------------------------------
+// animation.remove_state_machine_reference_node
+// ---------------------------------------------------------------------------
+FSageToolDispatch::FOutcome RemoveStateMachineReferenceNodeImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return RemoveAnimGraphNodeShared(Args, /*bRequireStateMachineNode=*/true);
 }
 
 // ---------------------------------------------------------------------------
@@ -7650,6 +8493,136 @@ FSageToolDispatch::FOutcome DisconnectPosePinImpl(const TSharedPtr<FJsonObject>&
 //   array   → FVector / FRotator / FLinearColor (size-tagged)
 //   object  → reserved for nested struct (deferred to richer reflection tool)
 
+bool ExtractLayerSetupValue(const FString& Text, const TCHAR* Key, FString& OutValue)
+{
+    const FString Needle = FString::Printf(TEXT("%s="), Key);
+    const int32 KeyIndex = Text.Find(Needle, ESearchCase::IgnoreCase);
+    if (KeyIndex == INDEX_NONE)
+    {
+        return false;
+    }
+
+    int32 ValueStart = KeyIndex + Needle.Len();
+    while (ValueStart < Text.Len() && FChar::IsWhitespace(Text[ValueStart]))
+    {
+        ++ValueStart;
+    }
+
+    if (ValueStart >= Text.Len())
+    {
+        return false;
+    }
+
+    if (Text[ValueStart] == TEXT('"'))
+    {
+        const int32 QuoteStart = ValueStart + 1;
+        int32 QuoteEnd = INDEX_NONE;
+        for (int32 Index = QuoteStart; Index < Text.Len(); ++Index)
+        {
+            if (Text[Index] == TEXT('"'))
+            {
+                QuoteEnd = Index;
+                break;
+            }
+        }
+        if (QuoteEnd != INDEX_NONE)
+        {
+            OutValue = Text.Mid(QuoteStart, QuoteEnd - QuoteStart);
+            return true;
+        }
+    }
+
+    int32 ValueEnd = ValueStart;
+    while (ValueEnd < Text.Len()
+        && Text[ValueEnd] != TEXT(',')
+        && Text[ValueEnd] != TEXT(')')
+        && Text[ValueEnd] != TEXT(']'))
+    {
+        ++ValueEnd;
+    }
+
+    OutValue = Text.Mid(ValueStart, ValueEnd - ValueStart).TrimStartAndEnd();
+    return !OutValue.IsEmpty();
+}
+
+bool SetLayeredBoneBlendLayerSetup(FArrayProperty* LayerSetupProperty, void* LayerSetupValuePtr, const TSharedPtr<FJsonValue>& Value, FString& OutError)
+{
+    if ((LayerSetupProperty == nullptr) || (LayerSetupValuePtr == nullptr) || !Value.IsValid() || (Value->Type != EJson::String))
+    {
+        OutError = TEXT("LayerSetup writer requires a string value and valid array target");
+        return false;
+    }
+
+    FStructProperty* LayerStructProperty = CastField<FStructProperty>(LayerSetupProperty->Inner);
+    if ((LayerStructProperty == nullptr) || (LayerStructProperty->Struct == nullptr))
+    {
+        OutError = TEXT("LayerSetup inner property is not an FInputBlendPose struct");
+        return false;
+    }
+
+    FArrayProperty* BranchFiltersProperty = FindFProperty<FArrayProperty>(LayerStructProperty->Struct, TEXT("BranchFilters"));
+    if (BranchFiltersProperty == nullptr)
+    {
+        OutError = FString::Printf(TEXT("BranchFilters array not found on %s"), *LayerStructProperty->Struct->GetName());
+        return false;
+    }
+
+    FStructProperty* BranchFilterStructProperty = CastField<FStructProperty>(BranchFiltersProperty->Inner);
+    if ((BranchFilterStructProperty == nullptr) || (BranchFilterStructProperty->Struct == nullptr))
+    {
+        OutError = TEXT("BranchFilters inner property is not an FBranchFilter struct");
+        return false;
+    }
+
+    FNameProperty* BoneNameProperty = FindFProperty<FNameProperty>(BranchFilterStructProperty->Struct, TEXT("BoneName"));
+    FIntProperty* BlendDepthProperty = FindFProperty<FIntProperty>(BranchFilterStructProperty->Struct, TEXT("BlendDepth"));
+    if ((BoneNameProperty == nullptr) || (BlendDepthProperty == nullptr))
+    {
+        OutError = FString::Printf(TEXT("BoneName/BlendDepth properties not found on %s"), *BranchFilterStructProperty->Struct->GetName());
+        return false;
+    }
+
+    FString Text = Value->AsString().TrimStartAndEnd();
+    if (Text.Len() >= 2 && Text.StartsWith(TEXT("\"")) && Text.EndsWith(TEXT("\"")))
+    {
+        Text = Text.Mid(1, Text.Len() - 2);
+        Text.ReplaceInline(TEXT("\\\""), TEXT("\""));
+    }
+
+    FString BoneNameText;
+    if (!ExtractLayerSetupValue(Text, TEXT("BoneName"), BoneNameText))
+    {
+        BoneNameText = TEXT("spine_01");
+    }
+
+    FString BlendDepthText;
+    int32 BlendDepth = 10;
+    if (ExtractLayerSetupValue(Text, TEXT("BlendDepth"), BlendDepthText))
+    {
+        BlendDepth = FCString::Atoi(*BlendDepthText);
+    }
+
+    FScriptArrayHelper LayerSetupHelper(LayerSetupProperty, LayerSetupValuePtr);
+    LayerSetupHelper.EmptyValues();
+    const int32 LayerIndex = LayerSetupHelper.AddValue();
+    void* LayerValuePtr = LayerSetupHelper.GetRawPtr(LayerIndex);
+
+    void* BranchFiltersValuePtr = BranchFiltersProperty->ContainerPtrToValuePtr<void>(LayerValuePtr);
+    FScriptArrayHelper BranchFiltersHelper(BranchFiltersProperty, BranchFiltersValuePtr);
+    BranchFiltersHelper.EmptyValues();
+    const int32 BranchIndex = BranchFiltersHelper.AddValue();
+    void* BranchFilterValuePtr = BranchFiltersHelper.GetRawPtr(BranchIndex);
+
+    BoneNameProperty->SetPropertyValue(
+        BoneNameProperty->ContainerPtrToValuePtr<void>(BranchFilterValuePtr),
+        FName(*BoneNameText));
+    BlendDepthProperty->SetPropertyValue(
+        BlendDepthProperty->ContainerPtrToValuePtr<void>(BranchFilterValuePtr),
+        BlendDepth);
+
+    return true;
+}
+
 FSageToolDispatch::FOutcome SetAnimNodePropertyImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FSageToolDispatch::FOutcome Reject;
@@ -7736,10 +8709,29 @@ FSageToolDispatch::FOutcome SetAnimNodePropertyImpl(const TSharedPtr<FJsonObject
     AnimNode->Modify();
 
     void* TargetValuePtr = TargetProp->ContainerPtrToValuePtr<void>(TargetContainer);
-    const bool bWritten = detail::SetPropertyValueAtPtr(TargetProp, TargetValuePtr, Val);
+    bool bWritten = false;
+    bool bLayerSetupWriteAttempted = false;
+    FString LayerSetupWriteError;
+    if (FArrayProperty* ArrayProperty = CastField<FArrayProperty>(TargetProp))
+    {
+        if ((PropName == TEXT("LayerSetup"))
+            && (AnimNode->GetClass()->GetName() == TEXT("AnimGraphNode_LayeredBoneBlend")))
+        {
+            bLayerSetupWriteAttempted = true;
+            bWritten = SetLayeredBoneBlendLayerSetup(ArrayProperty, TargetValuePtr, Val, LayerSetupWriteError);
+        }
+    }
+    if (!bWritten)
+    {
+        bWritten = detail::SetPropertyValueAtPtr(TargetProp, TargetValuePtr, Val);
+    }
     if (!bWritten)
     {
         Tx.Cancel();
+        if (bLayerSetupWriteAttempted && !LayerSetupWriteError.IsEmpty())
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, LayerSetupWriteError);
+        }
         return FSageToolDispatch::FOutcome::MakeError(-32602,
             FString::Printf(TEXT("could not coerce JSON value into property %s (%s)"),
                             *PropName, *TargetProp->GetClass()->GetName()));
@@ -7977,6 +8969,8 @@ FSageToolDispatch::FOutcome ReadAnimNodePropertiesImpl(const TSharedPtr<FJsonObj
     int32 BindingCount = 0;
     UObject* BindingObj = GetAnimNodeBindingObject(AnimNode);
     ReadBindingMapEntries(BindingObj, Bindings, BindingCount);
+    const TArray<TSharedPtr<FJsonValue>> AssetRefs =
+        CollectAnimNodeAssetReferences(AnimNode);
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("node_id"), NodeId);
@@ -7997,9 +8991,11 @@ FSageToolDispatch::FOutcome ReadAnimNodePropertiesImpl(const TSharedPtr<FJsonObj
     R->SetNumberField(TEXT("pin_count"), Pins.Num());
     R->SetNumberField(TEXT("property_count"), Properties.Num());
     R->SetNumberField(TEXT("binding_count"), BindingCount);
+    R->SetNumberField(TEXT("animation_asset_count"), AssetRefs.Num());
     R->SetArrayField(TEXT("pins"), Pins);
     R->SetArrayField(TEXT("properties"), Properties);
     R->SetArrayField(TEXT("bindings"), Bindings);
+    R->SetArrayField(TEXT("animation_assets"), AssetRefs);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -9204,6 +10200,18 @@ FSageToolDispatch::FOutcome ListAnimGraphNodesImpl(const TSharedPtr<FJsonObject>
         else if (N->IsA<UAnimGraphNode_SkeletalControlBase>())  Kind = TEXT("bone_control");
         else if (N->IsA<UAnimGraphNode_Base>())                 Kind = TEXT("anim_node");
         Obj->SetStringField(TEXT("kind"), Kind);
+        if (UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(N))
+        {
+            const TArray<TSharedPtr<FJsonValue>> AssetRefs =
+                CollectAnimNodeAssetReferences(AnimNode);
+            Obj->SetArrayField(TEXT("animation_assets"), AssetRefs);
+            Obj->SetNumberField(TEXT("animation_asset_count"), AssetRefs.Num());
+        }
+        if (UAnimGraphNode_StateMachineBase* SMNode = Cast<UAnimGraphNode_StateMachineBase>(N))
+        {
+            Obj->SetObjectField(TEXT("state_machine"),
+                StateMachineReferenceJson(AnimBP, SMNode, TargetGraph));
+        }
         NodesArr.Add(MakeShared<FJsonValueObject>(Obj));
     }
 
@@ -9538,12 +10546,17 @@ FSageToolDispatch::FOutcome AddStateMachineNodeImpl(const TSharedPtr<FJsonObject
     Ctx.Graph->AddNode(Node, /*bUserAction=*/false, /*bSelectNewNode=*/false);
     Node->AllocateDefaultPins();
     Node->EditorStateMachineGraph = ExistingSM;
+    Node->NodeComment = FString::Printf(TEXT("SAGE_STATE_MACHINE_REFERENCE:%s"), *SMName);
+    Node->bCommentBubblePinned = false;
+    Node->bCommentBubbleVisible = false;
     FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Ctx.AnimBP);
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("node_id"),                Node->NodeGuid.ToString(EGuidFormats::Digits));
     R->SetStringField(TEXT("class"),                  Node->GetClass()->GetPathName());
     R->SetStringField(TEXT("state_machine_name"),     SMName);
+    R->SetObjectField(TEXT("state_machine"),
+        StateMachineReferenceJson(Ctx.AnimBP, Node, Ctx.Graph));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -14593,6 +15606,7 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.get_physics_asset"),          GT(&GetPhysicsAssetImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_state_machine"),         GT(&ReadStateMachineImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_anim_graph"),            GT(&ReadAnimGraphImpl));
+    Dispatch.RegisterHandler(TEXT("animation.read_state_graph"),           GT(&ReadStateGraphImpl));
     Dispatch.RegisterHandler(TEXT("animation.list_modifiers"),             GT(&ListModifiersImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_bone_track"),            GT(&ReadBoneTrackImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_animation_curves"),       GT(&ReadAnimationCurvesImpl));
@@ -14646,6 +15660,7 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     // Phase 4-r6 Cluster A (AnimGraph node creation core)
     Dispatch.RegisterHandler(TEXT("animation.add_animgraph_node"),         GT(&AddAnimGraphNodeImpl));
     Dispatch.RegisterHandler(TEXT("animation.remove_animgraph_node"),      GT(&RemoveAnimGraphNodeImpl));
+    Dispatch.RegisterHandler(TEXT("animation.remove_state_machine_reference_node"), GT(&RemoveStateMachineReferenceNodeImpl));
     Dispatch.RegisterHandler(TEXT("animation.connect_pose_pin"),           GT(&ConnectPosePinImpl));
     Dispatch.RegisterHandler(TEXT("animation.disconnect_pose_pin"),        GT(&DisconnectPosePinImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_anim_node_property"),     GT(&SetAnimNodePropertyImpl));

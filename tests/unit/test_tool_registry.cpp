@@ -1,6 +1,7 @@
 #include "mcp/error_codes.h"
 #include "mcp/tool.h"
 #include "mcp/tool_registry.h"
+#include "tools/phase4_schemas.h"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -213,4 +214,42 @@ TEST_CASE("ToolRegistry remote dispatcher exception -> InternalError",
     auto outcome = reg.dispatch("rt", nlohmann::json::object());
     REQUIRE_FALSE(outcome.has_value());
     REQUIRE(outcome.error().code == ErrorCode::InternalError);
+}
+
+TEST_CASE("Phase4 animation graph gap tools expose compact schemas",
+          "[tools][phase4][animation]") {
+    ToolRegistry reg;
+    sage::tools::registerPhase4Schemas(reg);
+
+    const auto tools = reg.list();
+    auto findTool = [&tools](const std::string& name) -> const Tool* {
+        for (const auto& tool : tools) {
+            if (tool.name == name) return &tool;
+        }
+        return nullptr;
+    };
+
+    const Tool* readStateGraph = findTool("animation.read_state_graph");
+    REQUIRE(readStateGraph != nullptr);
+    REQUIRE(readStateGraph->inputSchema["properties"].contains("state_machine_name"));
+    REQUIRE(readStateGraph->inputSchema["properties"].contains("state_name"));
+    REQUIRE(readStateGraph->inputSchema["properties"].contains("state_id"));
+    REQUIRE(readStateGraph->inputSchema["properties"].contains("include_properties"));
+    REQUIRE(readStateGraph->inputSchema["properties"].contains("include_connections"));
+    REQUIRE(readStateGraph->inputSchema["properties"].contains("asset_substring"));
+    REQUIRE(readStateGraph->inputSchema["required"] == nlohmann::json::array({"path"}));
+
+    const Tool* readAnimGraph = findTool("animation.read_anim_graph");
+    REQUIRE(readAnimGraph != nullptr);
+    REQUIRE(readAnimGraph->inputSchema["properties"].contains("graph_name"));
+    REQUIRE(readAnimGraph->inputSchema["properties"].contains("node_ids"));
+
+    const Tool* removeRef = findTool("animation.remove_state_machine_reference_node");
+    REQUIRE(removeRef != nullptr);
+    REQUIRE(removeRef->inputSchema["properties"].contains("dry_run"));
+    REQUIRE(removeRef->inputSchema["required"] == nlohmann::json::array({"path", "node_id"}));
+
+    const Tool* removeNode = findTool("animation.remove_animgraph_node");
+    REQUIRE(removeNode != nullptr);
+    REQUIRE(removeNode->inputSchema["properties"].contains("dry_run"));
 }
