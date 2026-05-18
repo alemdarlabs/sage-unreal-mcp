@@ -92,3 +92,112 @@ D:\Steamworks\sage-unreal-mcp\.claude\notes\gap-inbox.md
 - Closed sweep 2026-05-04: CLOSED; 7 inbox gaps plus one silent regression closed, 72 net tools added, destructive confirmations and stub honesty rules hardened.
 
 ## Open Detailed Gaps
+
+### Kale Gap 2026-05-18 animation.set_anim_node_property cannot author LayeredBoneBlend BlendMask arrays
+
+Status: OPEN
+
+Blocked task:
+
+Kale flight hover weapon-pose ownership needs `ABP_FlightAnimLayers.FullBody_FlightLocomotion` to blend the incoming Lyra/item `SourcePose` upper body over the flight hover pose. The Lyra-equivalent graphs use `FAnimNode_LayeredBoneBlend` in `BlendMask` mode with mesh blend profiles such as:
+
+```text
+/Game/Characters/Heroes/Mannequin/Meshes/SK_Mannequin.SK_Mannequin:UpperBodyMask
+/Game/Characters/Heroes/Mannequin/Meshes/SK_Mannequin.SK_Mannequin:UpperBodyLowerBodySplitMask
+```
+
+Sage can currently create/connect the node and can set simple enum/scalar properties, but cannot write the `BlendMasks` `TArray<TObjectPtr<UBlendProfile>>` property. This forced the Kale implementation to use a fallback `BranchFilter(spine_01, BlendDepth=10)` instead of exact Lyra `BlendMask` parity.
+
+Observed repro:
+
+In `D:\GameDev\Kale`, target node:
+
+```text
+Asset: /FlightCore/Animations/ABP_FlightAnimLayers.ABP_FlightAnimLayers
+Graph: FullBody_FlightLocomotion
+Node: AD456B3E4F2E1B5ABE5EB4953A2D55D9
+Class: AnimGraphNode_LayeredBoneBlend
+```
+
+This worked:
+
+```json
+{
+  "tool": "animation.set_anim_node_property",
+  "property": "BlendMode",
+  "value": "BlendMask"
+}
+```
+
+These failed with `could not coerce JSON value into property BlendMasks (ArrayProperty)`:
+
+```json
+["/Game/Characters/Heroes/Mannequin/Meshes/SK_Mannequin.SK_Mannequin:UpperBodyMask"]
+["/Script/Engine.BlendProfile'/Game/Characters/Heroes/Mannequin/Meshes/SK_Mannequin.SK_Mannequin:UpperBodyMask'"]
+("/Script/Engine.BlendProfile'/Game/Characters/Heroes/Mannequin/Meshes/SK_Mannequin.SK_Mannequin:UpperBodyMask'")
+```
+
+Additional risk:
+
+Switching `BlendMode` to `BlendMask` before the failed `BlendMasks` write left the node in a partially changed state. The dogfood session had to restore `BlendMode=BranchFilter` and rewrite:
+
+```json
+LayerSetup = [{"BranchFilters":[{"BoneName":"spine_01","BlendDepth":10}]}]
+```
+
+Expected Sage behavior:
+
+- `animation.set_anim_node_property` should coerce object-reference array entries for `TArray<TObjectPtr<UBlendProfile>>` / `TArray<UBlendProfile*>`.
+- It should resolve blend profile subobject paths like `SkeletalMeshAsset.SkeletalMeshAsset:UpperBodyMask`.
+- It should validate that each resolved object is a `UBlendProfile`.
+- It should preserve the previous node state if any element fails to resolve/coerce.
+- It should reconstruct the anim graph node and mark/compile/validate in the same canonical way as other AnimGraph property edits.
+
+Preferred implementation shape:
+
+Either harden generic reflected array/object coercion in `animation.set_anim_node_property`, or add a dedicated convenience tool:
+
+```text
+animation.set_layered_bone_blend_config
+```
+
+Suggested args:
+
+```json
+{
+  "path": "/FlightCore/Animations/ABP_FlightAnimLayers.ABP_FlightAnimLayers",
+  "graph_name": "FullBody_FlightLocomotion",
+  "node_id": "AD456B3E4F2E1B5ABE5EB4953A2D55D9",
+  "blend_mode": "BlendMask",
+  "blend_masks": [
+    "/Game/Characters/Heroes/Mannequin/Meshes/SK_Mannequin.SK_Mannequin:UpperBodyMask"
+  ],
+  "blend_weights": [1.0],
+  "mesh_space_rotation_blend": true,
+  "curve_blend_option": "Override",
+  "compile": true,
+  "save": false
+}
+```
+
+Acceptance criteria:
+
+1. The tool can set an existing `AnimGraphNode_LayeredBoneBlend` from `BranchFilter` to `BlendMask` with one or more blend profile entries.
+2. Readback through `animation.read_anim_node_properties` reports `BlendMode=BlendMask` and `BlendMasks` containing the exact blend profile path.
+3. The tool can switch the same node back to `BranchFilter` with `LayerSetup` restored, without stale `BlendMasks` causing compile issues.
+4. Failed blend profile resolution returns an MCP error and leaves the node's previous `BlendMode`, `BlendMasks`, `LayerSetup`, and `BlendWeights` intact.
+5. `bp_validate` and `bp_compile` pass after a successful write.
+6. Array length is validated against the node's blend pose count, with a clear error when the number of masks/weights does not match.
+7. Dogfood verification: update the Kale flight hover upper-body blend node to use `UpperBodyMask` instead of the temporary `BranchFilter`, then confirm readback and compile.
+
+Current workaround:
+
+Kale currently uses a safe but less exact fallback:
+
+```text
+BlendMode=BranchFilter
+LayerSetup=(BranchFilters=((BoneName="spine_01", BlendDepth=10)))
+BlendWeights=(1.0)
+```
+
+This unblocks hover weapon pose testing, but it is not exact Lyra `BlendMask` parity and should be replaced after this Sage gap is fixed.
