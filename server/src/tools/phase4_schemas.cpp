@@ -78,9 +78,34 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .inputSchema=obj({{"path",str()}},{"path"}),
         .handler=nullptr,.remote=true});
 
+    reg(registry, Tool{.name="animation.inspect_skeleton",
+        .description="Inspect a USkeleton, USkeletalMesh, or UAnimationAsset skeleton with full hierarchy, optional ref pose, skeleton/mesh path, and bone filter.",
+        .inputSchema=obj({{"path",str()},{"skeleton",str()},{"skeletal_mesh",str()},{"include_ref_pose",bln()},{"bone",str()},{"bones",arr()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.inspect_ref_pose",
+        .description="Return local/global reference-pose transforms for selected bones or every bone on a USkeleton, USkeletalMesh, or UAnimationAsset.",
+        .inputSchema=obj({{"path",str()},{"skeleton",str()},{"skeletal_mesh",str()},{"bone",str()},{"bones",arr()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.list_skeletons",
+        .description="List USkeleton assets in a content folder with query/max_results filters and optional bone-count details.",
+        .inputSchema=obj({{"path",str()},{"query",str()},{"max_results",i32()},{"include_details",bln()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.read_blend_profiles",
+        .description="Read skeleton-owned UBlendProfile entries, including BlendMask profiles used by LayeredBoneBlend BlendMask mode.",
+        .inputSchema=obj({{"skeleton",str()},{"path",str()},{"skeletal_mesh",str()},{"name",str()},{"profile_name",str()},{"blend_masks_only",bln()}}),
+        .handler=nullptr,.remote=true});
+
     reg(registry, Tool{.name="animation.list_skeletal_meshes",
         .description="List skeletal meshes optionally filtered by skeleton asset.",
         .inputSchema=obj({{"skeleton",str()},{"max_results",i32()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.find_animations",
+        .description="Find animation assets in a folder. type/class supports all, sequence, montage, blendspace, animblueprint. Returns compact AssetRegistry rows.",
+        .inputSchema=obj({{"path",str()},{"folder",str()},{"query",str()},{"class",str()},{"type",str()},{"max_results",i32()},{"include_skeleton",bln()}}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.list_sockets",
@@ -142,9 +167,24 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .inputSchema=obj({{"path",str()}},{"path"}),
         .handler=nullptr,.remote=true});
 
+    reg(registry, Tool{.name="animation.inspect_animation",
+        .description="Inspect one animation asset. For AnimSequence returns length, sample rate, frame/key counts, skeleton, root motion, tracks, and curve counts.",
+        .inputSchema=obj({{"path",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
     reg(registry, Tool{.name="animation.read_bone_track",
         .description="Read frame-complete per-bone key data from an AnimSequence. Optional frame/start_frame/end_frame trims returned keys.",
         .inputSchema=obj({{"path",str()},{"bone",str()},{"frame",i32()},{"start_frame",i32()},{"end_frame",i32()}},{"path","bone"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.sample_bone_tracks",
+        .description="Sample selected bone tracks from an AnimSequence by frames/times or an automatic max_samples stride.",
+        .inputSchema=obj({{"path",str()},{"bone",str()},{"bones",arr()},{"frames",arr()},{"times",arr()},{"max_samples",i32()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.compare_retarget_bones",
+        .description="Compare source and target skeleton-like assets by bone presence and reference-pose transform deltas.",
+        .inputSchema=obj({{"source",str()},{"source_path",str()},{"source_skeleton",str()},{"target",str()},{"target_path",str()},{"target_skeleton",str()},{"bone",str()},{"bones",arr()}}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.read_animation_curves",
@@ -163,13 +203,38 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.set_root_motion",
-        .description="Enable/disable root motion locking on an AnimSequence.",
-        .inputSchema=obj({{"path",str()},{"enabled",bln()}},{"path","enabled"}),
+        .description="Enable/disable root motion on one AnimSequence or assets[], with root_lock/lock_type, force_root_lock, dry_run, and optional save.",
+        .inputSchema=obj({{"path",str()},{"assets",arr()},{"enabled",bln()},{"lock_type",str()},{"root_lock",str()},{"force_root_lock",bln()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.save_animation_asset",
+        .description="Save one loaded UAnimationAsset through EditorAssetSubsystem and return save readback.",
+        .inputSchema=obj({{"path",str()}},{"path"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.bake_root_motion_from_bone",
         .description="Bake motion from a source bone track into the sequence root bone track. Requires confirmed:true unless dry_run:true.",
         .inputSchema=obj({{"path",str()},{"bone",str()},{"source_bone",str()},{"root_bone",str()},{"confirmed",bln()},{"dry_run",bln()},{"relative",bln()},{"zero_source_translation",bln()},{"enable_root_motion",bln()}},{"path","bone"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.copy_bone_tracks",
+        .description="Copy raw bone animation tracks from one AnimSequence to another with per-bone compatibility diagnostics.",
+        .inputSchema=obj({{"source",str()},{"source_anim",str()},{"target",str()},{"target_anim",str()},{"path",str()},{"bone",str()},{"bones",arr()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.diagnose_retarget_animation",
+        .description="Run retarget-oriented sequence diagnostics: missing tracks, root-motion summary, large position pops, and quaternion flip counts.",
+        .inputSchema=obj({{"path",str()},{"bone",str()},{"bones",arr()},{"pop_threshold",num()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.add_skeleton_bone",
+        .description="Safely add/merge a skeleton bone from an existing skeletal mesh via USkeleton::MergeAllBonesToBoneTree. Requires confirmed:true unless dry_run:true.",
+        .inputSchema=obj({{"skeleton",str()},{"path",str()},{"bone",str()},{"bone_name",str()},{"name",str()},{"source_skeletal_mesh",str()},{"dry_run",bln()},{"validate_only",bln()},{"confirmed",bln()},{"save",bln()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.create_blend_mask",
+        .description="Create or update a skeleton-owned BlendMask UBlendProfile such as UpperBodyMask or LowerBodyMask. entries[] contains {bone, scale?, recursive?}; default scale=1 and recursive=true.",
+        .inputSchema=obj({{"skeleton",str()},{"path",str()},{"skeletal_mesh",str()},{"name",str()},{"profile_name",str()},{"mask_name",str()},{"entries",arr()},{"clear_existing",bln()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.create_sequence",
@@ -297,43 +362,133 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.create_ik_rig",
-        .description="Create an IKRig definition asset bound to a skeleton.",
-        .inputSchema=obj({{"path",str()},{"skeleton",str()}},{"path","skeleton"}),
+        .description="Create an IKRig definition asset. Prefer skeletal_mesh/skeletal_mesh_path; legacy skeleton is accepted only as a skeletal mesh alias. Optional retarget_root and chains[] author the retarget definition during creation.",
+        .inputSchema=obj({{"path",str()},{"skeletal_mesh",str()},{"skeletal_mesh_path",str()},{"mesh",str()},{"mesh_path",str()},{"skeleton",str()},{"retarget_root",str()},{"chains",arr()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.read_ik_rig",
-        .description="Read an IKRig: goals, solvers, chains, and retarget chains.",
+        .description="Read an IKRig via UIKRigController: skeletal mesh, retarget root, chains, goals, solvers, excluded bones, and ref-pose bone summary.",
         .inputSchema=obj({{"path",str()}},{"path"}),
         .handler=nullptr,.remote=true});
 
+    reg(registry, Tool{.name="animation.add_ik_retarget_chain",
+        .description="Add a retarget chain to an IKRig. Accepts name/chain_name, start_bone, end_bone, optional goal, dry_run, and save.",
+        .inputSchema=obj({{"path",str()},{"name",str()},{"chain_name",str()},{"start_bone",str()},{"start",str()},{"end_bone",str()},{"end",str()},{"goal",str()},{"goal_name",str()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.remove_ik_retarget_chain",
+        .description="Remove a retarget chain from an IKRig by name/chain_name.",
+        .inputSchema=obj({{"path",str()},{"name",str()},{"chain_name",str()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.rename_ik_retarget_chain",
+        .description="Rename an IKRig retarget chain and return full readback.",
+        .inputSchema=obj({{"path",str()},{"name",str()},{"chain_name",str()},{"new_name",str()},{"to",str()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.set_ik_retarget_chain_bones",
+        .description="Set start_bone and/or end_bone for an IKRig retarget chain.",
+        .inputSchema=obj({{"path",str()},{"name",str()},{"chain_name",str()},{"start_bone",str()},{"start",str()},{"end_bone",str()},{"end",str()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.set_ik_retarget_chain_goal",
+        .description="Set or clear the IK goal assigned to an IKRig retarget chain.",
+        .inputSchema=obj({{"path",str()},{"name",str()},{"chain_name",str()},{"goal",str()},{"goal_name",str()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.set_ik_retarget_root",
+        .description="Set the retarget root bone on an IKRig.",
+        .inputSchema=obj({{"path",str()},{"root_bone",str()},{"retarget_root",str()},{"bone",str()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.auto_generate_ik_retarget_definition",
+        .description="Run UE's IKRig auto retarget definition generator. dry_run returns generated template diagnostics without applying.",
+        .inputSchema=obj({{"path",str()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.auto_generate_ik_fbik",
+        .description="Run UE's IKRig auto FBIK setup generator. dry_run reports the generated outcome without applying.",
+        .inputSchema=obj({{"path",str()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
     reg(registry, Tool{.name="animation.create_ik_retargeter",
-        .description="Create an IKRetargeter asset linking source and target IKRigs.",
-        .inputSchema=obj({{"path",str()},{"source_ik_rig",str()},{"target_ik_rig",str()}},{"path","source_ik_rig","target_ik_rig"}),
+        .description="Create an IKRetargeter asset linking source and target IKRigs, then optionally add default ops, assign rigs to ops, auto-map chains, clean, save, and return readback.",
+        .inputSchema=obj({{"path",str()},{"source_ik_rig",str()},{"target_ik_rig",str()},{"add_default_ops",bln()},{"assign_ops",bln()},{"assign_ik_rigs",bln()},{"clean_asset",bln()},{"auto_map",bln()},{"auto_map_type",str()},{"force_remap",bln()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path","source_ik_rig","target_ik_rig"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.read_ik_retargeter",
-        .description="Read IK Retargeter rigs, preview meshes, ops, chain mappings, and retarget poses.",
+        .description="Read IK Retargeter rigs, preview meshes, op-stack details, parent op relationships, chain mappings, FK/IK chain settings, and retarget poses.",
         .inputSchema=obj({{"path",str()}},{"path"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.set_ik_retargeter_rigs",
-        .description="Assign source/target IKRigs and optional preview meshes on an IK Retargeter; can add default ops and automap chains.",
-        .inputSchema=obj({{"path",str()},{"source_ik_rig",str()},{"target_ik_rig",str()},{"source_preview_mesh",str()},{"target_preview_mesh",str()},{"add_default_ops",bln()},{"auto_map",bln()},{"auto_map_type",str()},{"force_remap",bln()}},{"path"}),
+        .description="Assign source/target IKRigs and optional preview meshes on an IK Retargeter; can add default ops, assign rigs to ops, clean chain maps, auto-map chains, save, dry-run, and return before/after readback.",
+        .inputSchema=obj({{"path",str()},{"source_ik_rig",str()},{"target_ik_rig",str()},{"source_preview_mesh",str()},{"target_preview_mesh",str()},{"add_default_ops",bln()},{"assign_ops",bln()},{"assign_ik_rigs",bln()},{"clean_asset",bln()},{"clean_chain_maps",bln()},{"auto_map",bln()},{"auto_map_type",str()},{"force_remap",bln()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.setup_ik_retargeter_ops",
+        .description="Run canonical IK Retargeter setup: add default ops, assign IKRigs to ops, clean chain maps, auto-map chains, and clean the asset. Supports op_name, dry_run, and save.",
+        .inputSchema=obj({{"path",str()},{"add_default_ops",bln()},{"assign_ik_rigs",bln()},{"clean_asset",bln()},{"clean_chain_maps",bln()},{"auto_map",bln()},{"auto_map_type",str()},{"force_remap",bln()},{"op_name",str()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.add_ik_retargeter_op",
+        .description="Add an IK Retargeter op by op_type alias or /Script/IKRig struct path. Optional op_name, parent_op_name, run_initial_setup, dry_run, and save.",
+        .inputSchema=obj({{"path",str()},{"op_type",str()},{"type",str()},{"struct",str()},{"class",str()},{"op_name",str()},{"name",str()},{"parent_op_name",str()},{"parent",str()},{"run_initial_setup",bln()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.remove_ik_retargeter_op",
+        .description="Remove an IK Retargeter op by index/op_index or op_name/name. Removing a parent removes its child ops as Unreal does in the editor.",
+        .inputSchema=obj({{"path",str()},{"index",num()},{"op_index",num()},{"op_name",str()},{"name",str()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.move_ik_retargeter_op",
+        .description="Move an IK Retargeter op in the stack by index/op_name to to_index. Unreal may clamp or reorder for parent-child constraints.",
+        .inputSchema=obj({{"path",str()},{"index",num()},{"op_index",num()},{"op_name",str()},{"name",str()},{"to_index",num()},{"target_index",num()},{"new_index",num()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.set_ik_retargeter_op_enabled",
+        .description="Enable or disable an IK Retargeter op by index/op_index or op_name/name.",
+        .inputSchema=obj({{"path",str()},{"index",num()},{"op_index",num()},{"op_name",str()},{"name",str()},{"enabled",bln()},{"enable",bln()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.auto_map_ik_retargeter_chains",
+        .description="Auto-map IK Retargeter source/target chains across all chain-mapping ops or a specific op_name. auto_map_type: fuzzy, exact, or clear.",
+        .inputSchema=obj({{"path",str()},{"op_name",str()},{"name",str()},{"auto_map_type",str()},{"force_remap",bln()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.reset_ik_retargeter_chain_settings",
+        .description="Reset per-chain settings for a target chain in one IK Retargeter op or across all ops.",
+        .inputSchema=obj({{"path",str()},{"target_chain",str()},{"chain",str()},{"chain_name",str()},{"op_name",str()},{"name",str()},{"all_ops",bln()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.set_ik_retargeter_fk_chain_settings",
+        .description="Edit FK Chains op settings for one target chain: enable_fk, rotation_mode, rotation_alpha, translation_mode, translation_alpha. If op_name/index is omitted, the first FK Chains op is used.",
+        .inputSchema=obj({{"path",str()},{"target_chain",str()},{"chain",str()},{"chain_name",str()},{"op_name",str()},{"name",str()},{"index",num()},{"op_index",num()},{"enable_fk",bln()},{"enabled",bln()},{"rotation_mode",str()},{"fk_rotation_mode",str()},{"rotation_alpha",num()},{"fk_rotation_alpha",num()},{"translation_mode",str()},{"fk_translation_mode",str()},{"translation_alpha",num()},{"fk_translation_alpha",num()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.set_ik_retargeter_chain_mapping",
-        .description="Map one target retarget chain to a source chain on an IK Retargeter op.",
-        .inputSchema=obj({{"path",str()},{"target_chain",str()},{"source_chain",str()},{"op_name",str()}},{"path","target_chain"}),
+        .description="Map one target retarget chain to a source chain on an IK Retargeter op. Returns verified GetSourceChain readback; supports dry_run and save.",
+        .inputSchema=obj({{"path",str()},{"target_chain",str()},{"source_chain",str()},{"op_name",str()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path","target_chain"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.set_ik_retargeter_pose",
-        .description="Create/select/edit an IK Retargeter source or target retarget pose, including root offset and per-bone rotation offsets.",
-        .inputSchema=obj({{"path",str()},{"side",str()},{"pose_name",str()},{"create",bln()},{"current",bln()},{"root_offset",vec3()},{"bone_rotations",arr()}},{"path","side"}),
+        .description="Create/select/remove/duplicate/rename/reset/auto-align/snap an IK Retargeter source or target retarget pose, including root offset and per-bone rotation offsets.",
+        .inputSchema=obj({{"path",str()},{"side",str()},{"pose_name",str()},{"pose",str()},{"create",bln()},{"remove",bln()},{"delete",bln()},{"duplicate",bln()},{"rename",bln()},{"reset",bln()},{"current",bln()},{"set_current",bln()},{"new_name",str()},{"to",str()},{"old_name",str()},{"from",str()},{"from_pose",str()},{"duplicate_from",str()},{"source_pose",str()},{"root_offset",vec3()},{"bone_rotations",arr()},{"reset_bones",arr()},{"bones",arr()},{"auto_align",bln()},{"align_method",str()},{"align_bones",arr()},{"snap_to_ground",bln()},{"reference_bone",str()},{"ground_bone",str()},{"bone",str()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path","side"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.retarget_animations",
         .description="Batch duplicate and retarget animation assets through a UIKRetargeter. Supports dry_run, overwrite, destination_path, prefix/suffix, and search/replace.",
         .inputSchema=obj({{"path",str()},{"assets",arr()},{"source_mesh",str()},{"target_mesh",str()},{"destination_path",str()},{"destination_package",str()},{"dry_run",bln()},{"overwrite",bln()},{"include_referenced_assets",bln()},{"use_source_path",bln()},{"prefix",str()},{"suffix",str()},{"search",str()},{"replace",str()}},{"path","assets"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.import_fbx_animation",
+        .description="Import one FBX animation onto a target USkeleton. Alias over the FBX animation import path with retarget-domain naming.",
+        .inputSchema=obj({{"file",str()},{"destination",str()},{"skeleton",str()},{"replace_existing",bln()},{"sample_rate",num()},{"snap_to_frame",bln()}},{"file","destination","skeleton"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.batch_import_fbx_animations",
+        .description="Import all matching FBX animation files from a directory into a destination content folder with per-file diagnostics.",
+        .inputSchema=obj({{"directory",str()},{"folder",str()},{"destination",str()},{"skeleton",str()},{"pattern",str()},{"recursive",bln()},{"replace_existing",bln()},{"dry_run",bln()},{"validate_only",bln()}},{"destination","skeleton"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.list_control_rig_variables",
@@ -445,6 +600,27 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()},{"property",str()},{"value",nlohmann::json::object()}},{"path","node_id","property","value"}),
         .handler=nullptr,.remote=true});
 
+    reg(registry, Tool{.name="animation.set_layered_bone_blend_config",
+        .description="Configure an existing UAnimGraphNode_LayeredBoneBlend atomically. Supports BlendMask mode with blend_masks[] resolving UBlendProfile subobject paths like SkeletalMesh.SkeletalMesh:UpperBodyMask, BranchFilter mode with layer_setup[], blend_weights[], mesh/root/scale-space blend flags, curve_blend_option, compile, save, dry_run/validate_only, and readback. Fails before mutation if masks/layers/weights do not match the node's blend pose count.",
+        .inputSchema=obj({
+            {"path",str()},
+            {"graph_name",str()},
+            {"node_id",str()},
+            {"blend_mode",str()},
+            {"blend_masks",arr()},
+            {"layer_setup",arr()},
+            {"blend_weights",arr()},
+            {"mesh_space_rotation_blend",bln()},
+            {"root_space_rotation_blend",bln()},
+            {"mesh_space_scale_blend",bln()},
+            {"curve_blend_option",str()},
+            {"compile",bln()},
+            {"save",bln()},
+            {"dry_run",bln()},
+            {"validate_only",bln()},
+        },{"path","node_id"}),
+        .handler=nullptr,.remote=true});
+
     reg(registry, Tool{.name="animation.bind_anim_node_property",
         .description="Bind a UAnimGraphNode_* exposed input property to an AnimBlueprint property path using UE 5.7 AnimGraphNodeBinding/PropertyAccess metadata. Supports direct variable paths and struct members (for example expression:'FlightLean.X' or {var:'FlightLean', member:'X'}). The target pin is exposed when it is an optional input, including custom-property pins on linked anim layer call sites, existing pin links are broken, and the binding is visible through animation.read_anim_node_properties. Legacy `variable` string remains accepted.",
         .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()},{"property",str()},{"expression",bindingExpr()},{"variable",str()}},{"path","node_id","property"}),
@@ -453,6 +629,36 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
     reg(registry, Tool{.name="animation.read_anim_node_properties",
         .description="Inspect one AnimGraph node's inner FAnimNode_* reflected properties, custom property pins (for example linked-layer ALI scalar inputs), pins, and UE 5.7 exposed-input bindings. Use after bind_anim_node_property to verify property paths, pin visibility, link counts, and binding_count before compiling/validating the AnimBP.",
         .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()}},{"path","node_id"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.add_retarget_pose_from_mesh_node",
+        .description="Spawn a UAnimGraphNode_RetargetPoseFromMesh in an AnimBlueprint graph and optionally apply the same IKRetargeter/profile/source-mode fields accepted by set_retarget_pose_from_mesh_node.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"x",num()},{"y",num()},{"ik_retargeter",str()},{"retargeter",str()},{"ik_retargeter_asset",str()},{"source_mode",str()},{"retarget_from",str()},{"expose_source_mesh_pin",bln()},{"lod_threshold",i32()},{"ik_lod_threshold",i32()},{"suppress_warnings",bln()},{"target_pose",str()},{"source_pose",str()},{"force_ik_off",bln()},{"compile",bln()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.set_retarget_pose_from_mesh_node",
+        .description="Configure an existing Retarget Pose From Mesh AnimGraph node: IKRetargeterAsset, source mode, source mesh pin visibility, LOD thresholds, warnings flag, and basic FRetargetProfile pose overrides.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()},{"ik_retargeter",str()},{"retargeter",str()},{"ik_retargeter_asset",str()},{"source_mode",str()},{"retarget_from",str()},{"expose_source_mesh_pin",bln()},{"lod_threshold",i32()},{"ik_lod_threshold",i32()},{"suppress_warnings",bln()},{"target_pose",str()},{"source_pose",str()},{"force_ik_off",bln()},{"dry_run",bln()},{"validate_only",bln()},{"compile",bln()},{"save",bln()}},{"path","node_id"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.read_retarget_pose_from_mesh_node",
+        .description="Read a Retarget Pose From Mesh AnimGraph node: IKRetargeter asset, source mode, LOD settings, suppress-warnings flag, source-mesh pin visibility, and custom retarget profile.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()}},{"path","node_id"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.read_retarget_profile",
+        .description="Read an FRetargetProfile either from a Retarget Pose From Mesh node (path+node_id) or copied from a UIKRetargeter asset (retargeter/ik_retargeter).",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()},{"retargeter",str()},{"ik_retargeter",str()},{"ik_retargeter_asset",str()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.set_retarget_profile",
+        .description="Write basic FRetargetProfile overrides on a Retarget Pose From Mesh node. Supports target_pose, source_pose, force_ik_off, dry_run, compile, and save.",
+        .inputSchema=obj({{"path",str()},{"graph_name",str()},{"node_id",str()},{"target_pose",str()},{"source_pose",str()},{"force_ik_off",bln()},{"dry_run",bln()},{"validate_only",bln()},{"compile",bln()},{"save",bln()}},{"path","node_id"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="animation.copy_retarget_profile_from_asset",
+        .description="Copy the default FRetargetProfile from a UIKRetargeter asset and optionally apply it to a Retarget Pose From Mesh node.",
+        .inputSchema=obj({{"retargeter",str()},{"ik_retargeter",str()},{"ik_retargeter_asset",str()},{"path",str()},{"graph_name",str()},{"node_id",str()},{"dry_run",bln()},{"compile",bln()},{"save",bln()}}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.set_owner_locomotion_update",
@@ -2106,6 +2312,37 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
     // asset.add_array_element — Lyra Sage Gap #11
     // ========================================================================
 
+    reg(registry, Tool{.name="bp.set_cdo_instanced_array_element",
+        .description="Upsert one instanced UObject entry in a Blueprint CDO "
+                     "TArray, including WidgetBlueprint CDO arrays such as "
+                     "TArray<TObjectPtr<ULyraReticleProvider>>. Resolves "
+                     "`path` to the generated class CDO, validates that the "
+                     "target property is an instanced UObject array, creates "
+                     "the subobject with `class_name`, applies reflected "
+                     "`element_value` fields, and returns recursive readback. "
+                     "Default behavior is idempotent: existing entries are "
+                     "matched by `match_fields`, or by Presentation+WidgetClass "
+                     "when those fields are present, otherwise all supplied "
+                     "fields, and updated instead of duplicated. Supports dry_run/"
+                     "validate_only, optional compile, and optional save.",
+        .inputSchema=obj({
+            {"path",str()},
+            {"array_property",str()},
+            {"property",str()},
+            {"class_name",str()},
+            {"element_value",anyObj()},
+            {"value",anyObj()},
+            {"properties",anyObj()},
+            {"match_fields",arr()},
+            {"update_existing",bln()},
+            {"allow_empty",bln()},
+            {"validate_only",bln()},
+            {"dry_run",bln()},
+            {"compile",bln()},
+            {"save",bln()},
+        },{"path"}),
+        .handler=nullptr,.remote=true});
+
     reg(registry, Tool{.name="asset.add_array_element",
         .description="Append a single element to a UPROPERTY TArray on an "
                      "asset's CDO. Pairs with Sage's recursive FStructProperty "
@@ -2298,6 +2535,21 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
             {"client",bln()},
             {"server",bln()},
         },{"path","actor_class","component_class"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="gamefeature.add_widget_entry",
+        .description="Add Lyra UGameFeatureAction_AddWidgets HUD extension entries safely on a UGameFeatureData asset. Accepts slot_id+widget_class for FLyraHUDElementEntry and/or layer_id+layout_class for FLyraHUDLayoutRequest, validates gameplay tags and UUserWidget/CommonActivatableWidget classes, creates the AddWidgets action when requested, is idempotent by tag+class, supports dry_run/validate_only and save, and returns full Widgets/Layout readback.",
+        .inputSchema=obj({
+            {"path",str()},
+            {"slot_id",str()},
+            {"widget_class",str()},
+            {"layer_id",str()},
+            {"layout_class",str()},
+            {"create_action_if_missing",bln()},
+            {"dry_run",bln()},
+            {"validate_only",bln()},
+            {"save",bln()},
+        },{"path"}),
         .handler=nullptr,.remote=true});
 
     // ========================================================================

@@ -26,6 +26,9 @@ D:\Steamworks\sage-unreal-mcp\.claude\notes\gap-inbox.md
 
 ## Implemented / Closed Summary
 
+- Kale Gap 2026-05-21 WidgetBlueprint CDO instanced UObject array authoring: FIXED in source and packaged; added `bp.set_cdo_instanced_array_element` to upsert `EditAnywhere, Instanced` UObject array entries on Blueprint/WidgetBlueprint generated-class CDOs. The tool resolves Blueprint asset paths to CDOs, validates instanced UObject array shape and subclass compatibility, creates or updates the subobject idempotently by `match_fields`, or by `Presentation` + `WidgetClass` for reticle-provider style data, applies reflected property values including enums and class refs, supports `dry_run`/`validate_only`/`compile`/`save`, returns recursive readback, and surfaces typed applied/failed/unknown field errors. `bp.get_cdo_properties` now also accepts Blueprint asset paths and supports `recurse_instanced`/`max_depth` CDO readback for provider arrays. Verified by debug `sage-server` build, rebuilt `sage-tests` + 37/37 ctest, tool audit, and UE BuildPlugin.
+- Kale Gap 2026-05-21 GameFeature AddWidgets HUD entries: FIXED in source and packaged; added `gamefeature.add_widget_entry` to author Lyra `UGameFeatureAction_AddWidgets` HUD extension entries via runtime reflection without a hard LyraGame dependency. The tool validates `UUserWidget`/CommonActivatableWidget class paths and existing GameplayTags, creates the AddWidgets action when requested, writes `Widgets` and optional `Layout` entries idempotently by tag+class, supports `dry_run`/`validate_only`/`save`, preserves existing actions and entries, and returns full readback. Verified by debug `sage-server` build, rebuilt `sage-tests` + 37/37 ctest, tool audit, and UE BuildPlugin.
+- Kale Gap 2026-05-18 LayeredBoneBlend BlendMask arrays: FIXED in source and packaged; added `animation.set_layered_bone_blend_config` for atomic `FAnimNode_LayeredBoneBlend` config edits, including `BlendMask` mode, `UBlendProfile` subobject resolution from `SkeletalMesh.SkeletalMesh:MaskName` or class-qualified paths, BlendMask validation, `BlendWeights` length checks, BranchFilter `LayerSetup` restoration, mesh/root/scale blend flags, curve blend option, compile/save, dry-run validation, and before/after readback. Failed profile or length validation now returns before mutation, avoiding the partial `BlendMode` state from the repro. Verified by debug `sage-server` build, rebuilt `sage-tests` + 37/37 ctest, tool audit, and UE BuildPlugin.
 - Kale Gap 2026-05-17 AnimBP state bound graph inspection: FIXED in source and packaged; added `animation.read_state_graph` for state-machine state bound graphs with graph identity, outer chain, node kind/title/coordinates, optional pins/links, reflected `FAnimNode_*` properties, animation asset references, property-access bindings, output pose source, ambiguity handling, and node/class/asset filters. `animation.read_anim_graph` now targets root/layer/state/transition graphs by `graph_name`, `animation.read_anim_node_properties` and `animation.list_animgraph_nodes` expose animation asset readback, and `bp.read_function_graph` returns an anim-graph hint instead of only `function graph not found` for AnimBP state graphs. Verified by debug server schema tests and UE BuildPlugin.
 - Kale Gap 2026-05-15 animation.remove_animgraph_node state-machine graph ownership corruption: FIXED in source and packaged; state-machine nodes now report `EditorStateMachineGraph` path/name, outer chain, owner/anchor flags, reference count, and safe-delete status. `animation.remove_animgraph_node` rejects owning/anchor `UAnimGraphNode_StateMachineBase` removal, safely detaches non-owning duplicate references before `RemoveNode`, and new `animation.remove_state_machine_reference_node` provides dry-run diagnostics for this cleanup. `animation.add_state_machine_node` marks Sage-authored reference nodes and returns ownership readback. Verified by debug server schema tests and UE BuildPlugin.
 - Kale Gap 2026-05-13 animation.set_owner_locomotion_update pin connection crash: CLOSED/VERIFIED in Kale dogfood; FIXED in source, packaged, and deployed to `D:\Steamworks\Kale` and `D:\Steamworks\HeroFlight`; owner-locomotion value pins are no longer held through a mutable `TMap` pointer after reallocation, vector/bool/dot helpers now validate missing source pins before creating or connecting K2 nodes, and pin resolution failures return MCP errors instead of crashing the editor. Verified by UE BuildPlugin, deployed DLL hash match, and a clean Kale repro where `animation.set_owner_locomotion_update` authored all nine owner-locomotion assignments with `compiled:true` and no editor disconnect.
@@ -93,111 +96,119 @@ D:\Steamworks\sage-unreal-mcp\.claude\notes\gap-inbox.md
 
 ## Open Detailed Gaps
 
-### Kale Gap 2026-05-18 animation.set_anim_node_property cannot author LayeredBoneBlend BlendMask arrays
+### Sage Gap 2026-05-30 Animation retargeting parity backlog
+
+Status: IMPLEMENTED IN SOURCE/PACKAGE - RUNTIME DOGFOOD + DEPLOY PENDING
+
+Blocked task:
+- Source gap was closed in the Sage plugin/server implementation. Runtime editor dogfood and downstream project deployment are still pending; do not mark this as production-proven until the round-trip scenario below is run against a live editor/project.
+
+Observed gaps:
+- `animation.create_ik_rig` schema/handler now accept mesh-oriented inputs plus root/chains/dry-run/save/readback.
+- `animation.read_ik_rig` now uses `UIKRigController` readback for mesh, root, chains, goals, solvers, excluded bones, and validation state.
+- IK Rig retarget chain authoring is implemented: add/remove/rename chain, set start/end/goal, set root, auto-generate retarget definition, and auto-generate FBIK.
+- Retargeter op-stack authoring is implemented: setup ops, add/remove/move/enable op, standalone auto-map, chain reset, FK setting write, FK/IK settings readback, and expanded pose operations.
+- FBX/import/discovery helpers are implemented: single FBX animation import alias, batch FBX import, animation discovery, explicit save, root-motion batch options, and copy-bone-track repair.
+- Skeleton-owned BlendMask creation/readback is implemented for UpperBody/LowerBody mask workflows via `animation.create_blend_mask` and `animation.read_blend_profiles`.
+- Retarget diagnostics are implemented: inspect animation metadata, compare bones, sample bone tracks, and diagnose root-motion/missing-track/pop/quaternion-flip issues.
+- Runtime retarget graph/profile support is implemented for `Retarget Pose From Mesh`: add/read/set node, assign `IKRetargeterAsset`, source mode/pin/LOD/warnings, and read/write/copy `FRetargetProfile` overrides.
+
+Target function list:
+
+Skeleton / ref pose / discovery:
+- [x] `animation.inspect_skeleton` or a fully equivalent `animation.get_skeleton_info` parity mode: skeleton or skeletal mesh path in, full hierarchy/ref skeleton out.
+- [x] `animation.inspect_ref_pose`: per-bone ref-pose transform with position, rotation quaternion/euler, parent index, optional bone filter.
+- [x] `animation.list_skeletons`: content-folder skeleton discovery with recursion/filtering.
+- [x] `animation.create_blend_mask`: create/update skeleton-owned BlendMask profiles such as `UpperBodyMask` / `LowerBodyMask`.
+- [x] `animation.read_blend_profiles`: read skeleton-owned BlendProfile / BlendMask entries and per-bone scales.
+- [x] `animation.add_skeleton_bone`: safe reference-skeleton bone add with parent/transform validation, transaction, save/readback.
+- [x] `animation.copy_bone_tracks`: copy selected raw bone animation tracks from source anim to target anim with skeleton/bone compatibility diagnostics.
+
+IK Rig authoring:
+- [x] Fix `animation.create_ik_rig` schema and implementation to accept `skeletal_mesh`/`skeletal_mesh_path`, optional `retarget_root`, optional `chains[]`, `dry_run`, `save`, and readback.
+- [x] Replace `animation.read_ik_rig` placeholder with real `UIKRigController` readback: skeletal mesh, retarget root, chains, goals, solvers, excluded bones, bone settings summary, warnings.
+- [x] `animation.add_ik_retarget_chain`: wraps `UIKRigController::AddRetargetChain`.
+- [x] `animation.remove_ik_retarget_chain`: wraps `UIKRigController::RemoveRetargetChain`.
+- [x] `animation.rename_ik_retarget_chain`: wraps `UIKRigController::RenameRetargetChain`.
+- [x] `animation.set_ik_retarget_chain_bones`: wraps start/end setters and validates chain coverage.
+- [x] `animation.set_ik_retarget_chain_goal`: wraps `SetRetargetChainGoal`.
+- [x] `animation.set_ik_retarget_root`: wraps `SetRetargetRoot`.
+- [x] `animation.auto_generate_ik_retarget_definition`: wraps `ApplyAutoGeneratedRetargetDefinition` / `AutoGenerateRetargetDefinition` and returns generated chains/root/results.
+- [x] `animation.auto_generate_ik_fbik`: wraps `ApplyAutoFBIK` / `AutoGenerateFBIK` and returns solver/goal changes.
+
+IK Retargeter authoring:
+- [x] Keep and harden `animation.create_ik_retargeter` with post-create `AddDefaultOps`, `AssignIKRigToAllOps`, `AutoMapChains`, `CleanAsset`, save/readback options.
+- [x] Keep and harden `animation.read_ik_retargeter` to include op-stack details, op names/types/enabled state, parent relationships, chain mappings, FK settings, IK settings, profiles, and pose data.
+- [x] Keep and harden `animation.set_ik_retargeter_rigs` with standalone `assign_ops`, `clean_asset`, `auto_map`, and full before/after readback.
+- [x] `animation.setup_ik_retargeter_ops`: add default ops, remove duplicate ops if present, assign source/target IK rigs to all ops, auto-map chains, clean asset.
+- [x] `animation.add_ik_retargeter_op`: wraps `UIKRetargeterController::AddRetargetOp`.
+- [x] `animation.remove_ik_retargeter_op`: wraps `RemoveRetargetOp` with child-op diagnostics.
+- [x] `animation.move_ik_retargeter_op`: wraps `MoveRetargetOpInStack`.
+- [x] `animation.set_ik_retargeter_op_enabled`: wraps `SetRetargetOpEnabled`.
+- [x] `animation.auto_map_ik_retargeter_chains`: standalone wrapper over `AutoMapChains` with `Exact`/`Fuzzy`/`Clear`, `force_remap`, and optional `op_name`.
+- [x] Keep and harden `animation.set_ik_retargeter_chain_mapping`: map source chain to target chain and verify through `GetChainMapping`/`GetSourceChain`.
+- [x] `animation.reset_ik_retargeter_chain_settings`: wraps `ResetChainSettingsToDefault` / `ResetChainSettingsInAllOps`.
+- [x] `animation.set_ik_retargeter_fk_chain_settings`: configure FK chain translation/rotation modes, alpha, enable flag, especially pelvis/hips/root `GloballyScaled` safety.
+- [x] Keep and expand `animation.set_ik_retargeter_pose`: add remove/duplicate/rename/reset pose support, auto-align all/bones, snap bone to ground, root offset, bone rotation offsets, and readback.
+
+FBX import / batch retarget workflow:
+- [x] `animation.import_fbx_animation`: import one FBX animation onto a skeleton with sample-rate and snap-to-frame options.
+- [x] `animation.batch_import_fbx_animations`: import all matching FBX files from a directory with per-file diagnostics.
+- [x] `animation.find_animations`: list animation assets in a folder with recursion/class filters.
+- [x] `animation.save_animation_asset`: explicit save wrapper for retarget-created or repaired assets.
+- [x] Keep and harden `animation.retarget_animations`: keep dry-run/conflict reporting, add parity with `DuplicateAndRetarget` where useful, root-motion auto-enable pattern, destination move/readback, and created-asset validation.
+- [x] Keep and harden `animation.set_root_motion`: support one asset and batch paths, root-lock mode, force-root-lock options where UE exposes them.
+
+Inspection / diagnostics:
+- [x] `animation.inspect_animation`: metadata for sequence length, frames, sample rate, skeleton, root motion, additive flags, curve/track counts.
+- [x] `animation.compare_retarget_bones`: compare source/target bone presence and reference-pose transform deltas.
+- [x] `animation.sample_bone_tracks`: raw per-frame bone transform samples for selected bones/frames.
+- [x] `animation.diagnose_retarget_animation`: automated health check for root-motion mismatch, position pops, quaternion flips, missing tracks, unmapped chains, and suspicious scale.
+
+Runtime retargeting / AnimGraph profile:
+- [x] `animation.add_retarget_pose_from_mesh_node`: author `UAnimGraphNode_RetargetPoseFromMesh` in an AnimBlueprint graph.
+- [x] `animation.set_retarget_pose_from_mesh_node`: assign `IKRetargeterAsset`, source mode, exposed source mesh pin, LOD thresholds, IK LOD threshold, suppress-warnings flag.
+- [x] `animation.read_retarget_pose_from_mesh_node`: return node asset refs, source mode, pins, LOD settings, and compile warnings.
+- [x] `animation.read_retarget_profile`: read `FRetargetProfile`, pose overrides, force-IK-off, and op profiles.
+- [x] `animation.set_retarget_profile`: write profile overrides using UE 5.7 op-profile API instead of deprecated global/root/chain settings where possible.
+- [x] `animation.copy_retarget_profile_from_asset`: expose `URetargetProfileLibrary::CopyRetargetProfileFromRetargetAsset` behavior for runtime/profile authoring.
+
+Acceptance criteria:
+- [x] `tools/list` exposes valid JSON schemas for all new/changed tools; registry-level tests cover schema validity and required/optional fields.
+- [x] Existing misleading contracts are fixed without breaking old clients silently: legacy args are accepted where practical and reported in readback as aliases/deprecated.
+- [x] All Unreal editor mutations run on the GameThread through the existing `GT(...)`/`RunOnGameThread` path, use `FScopedTransaction`, mark packages dirty only after real mutation, and support `dry_run`/`validate_only` for risky writes.
+- [x] Every writer returns structured before/after or authoritative readback plus `skipped`/`warnings`/`failures`; no silent partial success.
+- [ ] Round-trip dogfood proves: create IK Rig from skeletal mesh + root + chains, read it back, create Retargeter, setup ops, auto-map chains, configure FK pelvis/hips/root, retarget at least one animation, inspect result, and run diagnostics.
+- [ ] Deployed DLL hash verification before calling this production-closed.
+
+Verification completed:
+- `scripts\build-server.ps1 debug -Target sage-tests` rebuilt `sage-tests`.
+- `ctest --test-dir build\debug --output-on-failure` passed 37/37.
+- `scripts\build-server.ps1 debug -Target sage-server` rebuilt `sage-server.exe`.
+- `scripts\audit-tools.ps1` reports 640 server tools, 622 plugin handlers, zero plugin-without-schema, zero schema/plugin stubs, and only expected local `jobs.*` schema-only tools.
+- `scripts\build-plugin.ps1` packaged the Win64 plugin successfully under `build\plugin`.
+
+Remaining verification before production-close:
+- Live editor round-trip dogfood using a real skeletal mesh/source-target pair.
+- Deploy packaged `SageBridge` to target project(s), restart/reload editor as needed, and hash-check the deployed `UnrealEditor-SageBridge.dll`.
+
+### Sage Gap 2026-05-30 Control Rig real authoring/readback surface
 
 Status: OPEN
 
 Blocked task:
+- `animation.list_control_rig_variables` is currently a placeholder that only points users to `bp.list_variables`; it does not inspect a `UControlRigBlueprint`, `URigHierarchy`, controls, spaces, curves, hierarchy transforms, RigVM graphs, or preview mesh. This means Sage cannot yet honestly claim "Control Rig'i kontrol edebilirim" beyond generic Blueprint variable tooling.
 
-Kale flight hover weapon-pose ownership needs `ABP_FlightAnimLayers.FullBody_FlightLocomotion` to blend the incoming Lyra/item `SourcePose` upper body over the flight hover pose. The Lyra-equivalent graphs use `FAnimNode_LayeredBoneBlend` in `BlendMask` mode with mesh blend profiles such as:
-
-```text
-/Game/Characters/Heroes/Mannequin/Meshes/SK_Mannequin.SK_Mannequin:UpperBodyMask
-/Game/Characters/Heroes/Mannequin/Meshes/SK_Mannequin.SK_Mannequin:UpperBodyLowerBodySplitMask
-```
-
-Sage can currently create/connect the node and can set simple enum/scalar properties, but cannot write the `BlendMasks` `TArray<TObjectPtr<UBlendProfile>>` property. This forced the Kale implementation to use a fallback `BranchFilter(spine_01, BlendDepth=10)` instead of exact Lyra `BlendMask` parity.
-
-Observed repro:
-
-In `D:\GameDev\Kale`, target node:
-
-```text
-Asset: /FlightCore/Animations/ABP_FlightAnimLayers.ABP_FlightAnimLayers
-Graph: FullBody_FlightLocomotion
-Node: AD456B3E4F2E1B5ABE5EB4953A2D55D9
-Class: AnimGraphNode_LayeredBoneBlend
-```
-
-This worked:
-
-```json
-{
-  "tool": "animation.set_anim_node_property",
-  "property": "BlendMode",
-  "value": "BlendMask"
-}
-```
-
-These failed with `could not coerce JSON value into property BlendMasks (ArrayProperty)`:
-
-```json
-["/Game/Characters/Heroes/Mannequin/Meshes/SK_Mannequin.SK_Mannequin:UpperBodyMask"]
-["/Script/Engine.BlendProfile'/Game/Characters/Heroes/Mannequin/Meshes/SK_Mannequin.SK_Mannequin:UpperBodyMask'"]
-("/Script/Engine.BlendProfile'/Game/Characters/Heroes/Mannequin/Meshes/SK_Mannequin.SK_Mannequin:UpperBodyMask'")
-```
-
-Additional risk:
-
-Switching `BlendMode` to `BlendMask` before the failed `BlendMasks` write left the node in a partially changed state. The dogfood session had to restore `BlendMode=BranchFilter` and rewrite:
-
-```json
-LayerSetup = [{"BranchFilters":[{"BoneName":"spine_01","BlendDepth":10}]}]
-```
-
-Expected Sage behavior:
-
-- `animation.set_anim_node_property` should coerce object-reference array entries for `TArray<TObjectPtr<UBlendProfile>>` / `TArray<UBlendProfile*>`.
-- It should resolve blend profile subobject paths like `SkeletalMeshAsset.SkeletalMeshAsset:UpperBodyMask`.
-- It should validate that each resolved object is a `UBlendProfile`.
-- It should preserve the previous node state if any element fails to resolve/coerce.
-- It should reconstruct the anim graph node and mark/compile/validate in the same canonical way as other AnimGraph property edits.
-
-Preferred implementation shape:
-
-Either harden generic reflected array/object coercion in `animation.set_anim_node_property`, or add a dedicated convenience tool:
-
-```text
-animation.set_layered_bone_blend_config
-```
-
-Suggested args:
-
-```json
-{
-  "path": "/FlightCore/Animations/ABP_FlightAnimLayers.ABP_FlightAnimLayers",
-  "graph_name": "FullBody_FlightLocomotion",
-  "node_id": "AD456B3E4F2E1B5ABE5EB4953A2D55D9",
-  "blend_mode": "BlendMask",
-  "blend_masks": [
-    "/Game/Characters/Heroes/Mannequin/Meshes/SK_Mannequin.SK_Mannequin:UpperBodyMask"
-  ],
-  "blend_weights": [1.0],
-  "mesh_space_rotation_blend": true,
-  "curve_blend_option": "Override",
-  "compile": true,
-  "save": false
-}
-```
+Required function list:
+- [ ] `controlrig.read`: resolve `UControlRigBlueprint`, return preview mesh, generated class, hierarchy counts, controls, bones, nulls, curves, connectors, sockets, and root elements.
+- [ ] `controlrig.list_controls`: return control names, type, parent, shape/color metadata, visibility, initial/current local/global transforms, offset/shape transforms, and limits.
+- [ ] `controlrig.set_preview_mesh`: wrap `UControlRigBlueprintEditorLibrary::SetPreviewMesh` with save/readback.
+- [ ] `controlrig.set_control_transform`: edit hierarchy control transforms through `URigHierarchy` / controller API with dry-run, transaction, compile/save, and readback.
+- [ ] `controlrig.add_control` / `controlrig.remove_control`: safe hierarchy mutation via `URigHierarchyController`, with validation and before/after dump.
+- [ ] RigVM graph read/write follow-up: node list, pins, links, unit node add/remove, function library calls, compile diagnostics.
 
 Acceptance criteria:
-
-1. The tool can set an existing `AnimGraphNode_LayeredBoneBlend` from `BranchFilter` to `BlendMask` with one or more blend profile entries.
-2. Readback through `animation.read_anim_node_properties` reports `BlendMode=BlendMask` and `BlendMasks` containing the exact blend profile path.
-3. The tool can switch the same node back to `BranchFilter` with `LayerSetup` restored, without stale `BlendMasks` causing compile issues.
-4. Failed blend profile resolution returns an MCP error and leaves the node's previous `BlendMode`, `BlendMasks`, `LayerSetup`, and `BlendWeights` intact.
-5. `bp_validate` and `bp_compile` pass after a successful write.
-6. Array length is validated against the node's blend pose count, with a clear error when the number of masks/weights does not match.
-7. Dogfood verification: update the Kale flight hover upper-body blend node to use `UpperBodyMask` instead of the temporary `BranchFilter`, then confirm readback and compile.
-
-Current workaround:
-
-Kale currently uses a safe but less exact fallback:
-
-```text
-BlendMode=BranchFilter
-LayerSetup=(BranchFilters=((BoneName="spine_01", BlendDepth=10)))
-BlendWeights=(1.0)
-```
-
-This unblocks hover weapon pose testing, but it is not exact Lyra `BlendMask` parity and should be replaced after this Sage gap is fixed.
+- No placeholder "use bp.list_variables" response remains for Control Rig-specific tools.
+- Tool schemas and handlers are paired; `scripts\audit-tools.ps1` shows no schema/handler mismatch.
+- UE BuildPlugin proves ControlRig/ControlRigDeveloper/ControlRigEditor module dependencies are correct.
+- Live dogfood on a Control Rig asset proves read controls, set one control transform, compile/save, and read back the changed transform.

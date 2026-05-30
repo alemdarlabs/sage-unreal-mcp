@@ -13,6 +13,7 @@
 #include "Animation/AnimationAsset.h"
 #include "Animation/BlendSpace.h"
 #include "Animation/BlendSpace1D.h"
+#include "Animation/BlendProfile.h"
 #include "Animation/Skeleton.h"
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -69,6 +70,8 @@
 #include "Animation/AnimNodeBase.h"  // FPoseLink for pose-pin category check
 #include "BoneControllers/AnimNode_SkeletalControlBase.h"  // FComponentSpacePoseLink
 #include "Animation/AnimNode_SequencePlayer.h"  // FAnimNode_SequencePlayer for inner Node mutation
+#include "AnimNodes/AnimNode_RetargetPoseFromMesh.h"
+#include "AnimNodes/AnimNode_LayeredBoneBlend.h"
 #include "EdGraphSchema_K2.h"
 #include "K2Node_CallFunction.h"
 #include "K2Node_DynamicCast.h"
@@ -84,8 +87,16 @@
 #include "Misc/PackageName.h"
 #include "RetargetEditor/IKRetargetBatchOperation.h"
 #include "RetargetEditor/IKRetargeterController.h"
+#include "Retargeter/IKRetargetChainMapping.h"
 #include "Retargeter/IKRetargeter.h"
+#include "Retargeter/IKRetargetOps.h"
+#include "Retargeter/RetargetOps/FKChainsOp.h"
+#include "Retargeter/RetargetOps/IKChainsOp.h"
+#include "RigEditor/IKRigAutoCharacterizer.h"
+#include "RigEditor/IKRigAutoFBIK.h"
+#include "RigEditor/IKRigController.h"
 #include "Rig/IKRigDefinition.h"
+#include "Rig/IKRigSkeleton.h"
 
 // IAnimationDataController for AnimSequence curve add (UE 5.5+ canonical path)
 #include "Animation/AnimData/IAnimationDataController.h"
@@ -189,6 +200,30 @@ FString ExtractObjectPathString(const TSharedPtr<FJsonValue>& Value)
         && LastQuote > FirstQuote)
     {
         Raw = Raw.Mid(FirstQuote + 1, LastQuote - FirstQuote - 1);
+    }
+    return Raw;
+}
+
+FString CleanObjectReferenceLiteral(FString Raw)
+{
+    Raw = Raw.TrimStartAndEnd();
+    while (Raw.Len() >= 2 && Raw.StartsWith(TEXT("(")) && Raw.EndsWith(TEXT(")")))
+    {
+        Raw = Raw.Mid(1, Raw.Len() - 2).TrimStartAndEnd();
+    }
+    if (Raw.Len() >= 2
+        && ((Raw.StartsWith(TEXT("\"")) && Raw.EndsWith(TEXT("\"")))
+            || (Raw.StartsWith(TEXT("'")) && Raw.EndsWith(TEXT("'")))))
+    {
+        Raw = Raw.Mid(1, Raw.Len() - 2).TrimStartAndEnd();
+    }
+    int32 FirstQuote = INDEX_NONE;
+    int32 LastQuote = INDEX_NONE;
+    if (Raw.FindChar(TEXT('\''), FirstQuote)
+        && Raw.FindLastChar(TEXT('\''), LastQuote)
+        && LastQuote > FirstQuote)
+    {
+        Raw = Raw.Mid(FirstQuote + 1, LastQuote - FirstQuote - 1).TrimStartAndEnd();
     }
     return Raw;
 }
@@ -562,6 +597,219 @@ void AppendAssetDataJson(const FAssetData& AssetData, TArray<TSharedPtr<FJsonVal
     Obj->SetStringField(TEXT("asset_name"), AssetData.AssetName.ToString());
     Obj->SetStringField(TEXT("class"), AssetData.AssetClassPath.ToString());
     Out.Add(MakeShared<FJsonValueObject>(Obj));
+}
+
+FString AssetPathOrEmpty(const UObject* Obj)
+{
+    return Obj ? Obj->GetPathName() : FString();
+}
+
+bool TryGetAnyStringField(const TSharedPtr<FJsonObject>& Args, const TArray<const TCHAR*>& Names, FString& Out)
+{
+    if (!Args.IsValid())
+    {
+        return false;
+    }
+    for (const TCHAR* Name : Names)
+    {
+        FString Value;
+        if (Args->TryGetStringField(Name, Value) && !Value.TrimStartAndEnd().IsEmpty())
+        {
+            Out = Value.TrimStartAndEnd();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TrySaveLoadedAssetIfRequested(UObject* Asset, bool bSave, TSharedRef<FJsonObject> Result)
+{
+    Result->SetBoolField(TEXT("save_requested"), bSave);
+    if (!bSave)
+    {
+        return true;
+    }
+    if (!Asset)
+    {
+        Result->SetStringField(TEXT("save_error"), TEXT("asset is null"));
+        return false;
+    }
+    UEditorAssetSubsystem* AssetSubsystem = GEditor
+        ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>()
+        : nullptr;
+    if (!AssetSubsystem)
+    {
+        Result->SetStringField(TEXT("save_error"), TEXT("EditorAssetSubsystem unavailable"));
+        return false;
+    }
+    const bool bSaved = AssetSubsystem->SaveLoadedAsset(Asset, /*bOnlyIfIsDirty=*/false);
+    Result->SetBoolField(TEXT("saved"), bSaved);
+    if (!bSaved)
+    {
+        Result->SetStringField(TEXT("save_error"), FString::Printf(TEXT("SaveLoadedAsset returned false for %s"), *Asset->GetPathName()));
+    }
+    return bSaved;
+}
+
+TArray<TSharedPtr<FJsonValue>> NamesToJsonArray(const TArray<FName>& Names)
+{
+    TArray<TSharedPtr<FJsonValue>> Out;
+    for (const FName& Name : Names)
+    {
+        Out.Add(MakeShared<FJsonValueString>(Name.ToString()));
+    }
+    return Out;
+}
+
+TSharedRef<FJsonObject> IKRigChainToJson(const FBoneChain& Chain, const UIKRigController* Controller)
+{
+    auto Obj = MakeShared<FJsonObject>();
+    Obj->SetStringField(TEXT("name"), Chain.ChainName.ToString());
+    Obj->SetStringField(TEXT("start_bone"), Chain.StartBone.BoneName.ToString());
+    Obj->SetStringField(TEXT("end_bone"), Chain.EndBone.BoneName.ToString());
+    Obj->SetStringField(TEXT("goal"), Chain.IKGoalName.ToString());
+    if (Controller)
+    {
+        TSet<int32> ChainIndices;
+        Obj->SetBoolField(TEXT("valid"), Controller->ValidateChain(Chain.ChainName, nullptr, ChainIndices));
+        Obj->SetNumberField(TEXT("bone_count"), ChainIndices.Num());
+    }
+    return Obj;
+}
+
+TSharedRef<FJsonObject> IKRigToJson(UIKRigDefinition* Rig, UIKRigController* Controller)
+{
+    auto R = MakeShared<FJsonObject>();
+    if (!Rig)
+    {
+        R->SetBoolField(TEXT("valid"), false);
+        return R;
+    }
+
+    R->SetBoolField(TEXT("valid"), true);
+    R->SetStringField(TEXT("path"), Rig->GetPathName());
+    R->SetStringField(TEXT("class"), Rig->GetClass()->GetName());
+    R->SetStringField(TEXT("preview_skeletal_mesh"), Rig->PreviewSkeletalMesh.ToSoftObjectPath().ToString());
+
+    USkeletalMesh* Mesh = Controller ? Controller->GetSkeletalMesh() : Rig->PreviewSkeletalMesh.LoadSynchronous();
+    R->SetStringField(TEXT("skeletal_mesh"), AssetPathOrEmpty(Mesh));
+    R->SetStringField(TEXT("retarget_root"), Controller ? Controller->GetRetargetRoot().ToString() : Rig->GetPelvis().ToString());
+
+    const FIKRigSkeleton& RigSkeleton = Controller ? Controller->GetIKRigSkeleton() : Rig->GetSkeleton();
+    R->SetNumberField(TEXT("bone_count"), RigSkeleton.BoneNames.Num());
+    TArray<TSharedPtr<FJsonValue>> Bones;
+    for (int32 BoneIndex = 0; BoneIndex < RigSkeleton.BoneNames.Num(); ++BoneIndex)
+    {
+        auto Bone = MakeShared<FJsonObject>();
+        Bone->SetStringField(TEXT("name"), RigSkeleton.BoneNames[BoneIndex].ToString());
+        Bone->SetNumberField(TEXT("index"), BoneIndex);
+        Bone->SetNumberField(TEXT("parent_index"), RigSkeleton.ParentIndices.IsValidIndex(BoneIndex) ? RigSkeleton.ParentIndices[BoneIndex] : INDEX_NONE);
+        Bone->SetBoolField(TEXT("excluded"), RigSkeleton.IsBoneExcluded(BoneIndex));
+        if (RigSkeleton.RefPoseGlobal.IsValidIndex(BoneIndex))
+        {
+            Bone->SetObjectField(TEXT("ref_pose_global"), TransformToJsonObject(RigSkeleton.RefPoseGlobal[BoneIndex]));
+        }
+        Bones.Add(MakeShared<FJsonValueObject>(Bone));
+    }
+    R->SetArrayField(TEXT("bones"), Bones);
+    R->SetArrayField(TEXT("excluded_bones"), NamesToJsonArray(RigSkeleton.ExcludedBones));
+
+    TArray<TSharedPtr<FJsonValue>> Chains;
+    const TArray<FBoneChain>& RetargetChains = Controller ? Controller->GetRetargetChains() : Rig->GetRetargetChains();
+    for (const FBoneChain& Chain : RetargetChains)
+    {
+        Chains.Add(MakeShared<FJsonValueObject>(IKRigChainToJson(Chain, Controller)));
+    }
+    R->SetArrayField(TEXT("chains"), Chains);
+    R->SetNumberField(TEXT("chain_count"), Chains.Num());
+
+    TArray<TSharedPtr<FJsonValue>> Goals;
+    const TArray<UIKRigEffectorGoal*>& AllGoals = Controller ? Controller->GetAllGoals() : Rig->GetGoalArray();
+    for (const UIKRigEffectorGoal* Goal : AllGoals)
+    {
+        if (!Goal)
+        {
+            continue;
+        }
+        auto GoalObj = MakeShared<FJsonObject>();
+        GoalObj->SetStringField(TEXT("name"), Goal->GoalName.ToString());
+        GoalObj->SetStringField(TEXT("bone"), Goal->BoneName.ToString());
+        GoalObj->SetNumberField(TEXT("position_alpha"), Goal->PositionAlpha);
+        GoalObj->SetNumberField(TEXT("rotation_alpha"), Goal->RotationAlpha);
+        GoalObj->SetObjectField(TEXT("current_transform"), TransformToJsonObject(Goal->CurrentTransform));
+        GoalObj->SetObjectField(TEXT("initial_transform"), TransformToJsonObject(Goal->InitialTransform));
+#if WITH_EDITORONLY_DATA
+        GoalObj->SetBoolField(TEXT("expose_position"), Goal->bExposePosition);
+        GoalObj->SetBoolField(TEXT("expose_rotation"), Goal->bExposeRotation);
+#endif
+        Goals.Add(MakeShared<FJsonValueObject>(GoalObj));
+    }
+    R->SetArrayField(TEXT("goals"), Goals);
+    R->SetNumberField(TEXT("goal_count"), Goals.Num());
+
+    TArray<TSharedPtr<FJsonValue>> Solvers;
+    const int32 NumSolvers = Controller ? Controller->GetNumSolvers() : Rig->GetSolverStructs().Num();
+    for (int32 SolverIndex = 0; SolverIndex < NumSolvers; ++SolverIndex)
+    {
+        auto SolverObj = MakeShared<FJsonObject>();
+        SolverObj->SetNumberField(TEXT("index"), SolverIndex);
+        if (Controller)
+        {
+            SolverObj->SetStringField(TEXT("name"), Controller->GetSolverUniqueName(SolverIndex));
+            SolverObj->SetBoolField(TEXT("enabled"), Controller->GetSolverEnabled(SolverIndex));
+            SolverObj->SetStringField(TEXT("start_bone"), Controller->GetStartBone(SolverIndex).ToString());
+            SolverObj->SetStringField(TEXT("end_bone"), Controller->GetEndBone(SolverIndex).ToString());
+            if (const FInstancedStruct* SolverStruct = Controller->GetSolverStructAtIndex(SolverIndex))
+            {
+                SolverObj->SetStringField(TEXT("struct"), SolverStruct->GetScriptStruct() ? SolverStruct->GetScriptStruct()->GetPathName() : FString());
+            }
+        }
+        else if (Rig->GetSolverStructs().IsValidIndex(SolverIndex))
+        {
+            const FInstancedStruct& SolverStruct = Rig->GetSolverStructs()[SolverIndex];
+            SolverObj->SetStringField(TEXT("struct"), SolverStruct.GetScriptStruct() ? SolverStruct.GetScriptStruct()->GetPathName() : FString());
+        }
+        Solvers.Add(MakeShared<FJsonValueObject>(SolverObj));
+    }
+    R->SetArrayField(TEXT("solvers"), Solvers);
+    R->SetNumberField(TEXT("solver_count"), Solvers.Num());
+
+    TArray<TSharedPtr<FJsonValue>> Warnings;
+    if (!Controller)
+    {
+        Warnings.Add(MakeShared<FJsonValueString>(TEXT("UIKRigController unavailable; returned direct asset readback only")));
+    }
+    if (!Mesh)
+    {
+        Warnings.Add(MakeShared<FJsonValueString>(TEXT("IK Rig has no preview skeletal mesh")));
+    }
+    R->SetArrayField(TEXT("warnings"), Warnings);
+    return R;
+}
+
+FSageToolDispatch::FOutcome ResolveIKRigController(
+    const TSharedPtr<FJsonObject>& Args,
+    UIKRigDefinition*& OutRig,
+    UIKRigController*& OutController)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    OutRig = Cast<UIKRigDefinition>(ResolveAsset(Path));
+    if (!OutRig)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UIKRigDefinition: %s"), *Path));
+    }
+    OutController = UIKRigController::GetController(OutRig);
+    if (!OutController)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("failed to get IK Rig controller: %s"), *Path));
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(MakeShared<FJsonObject>());
 }
 
 FString RichCurveInterpToString(ERichCurveInterpMode Mode)
@@ -2714,6 +2962,636 @@ FSageToolDispatch::FOutcome ListSkeletalMeshesImpl(const TSharedPtr<FJsonObject>
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+const FReferenceSkeleton* ResolveReferenceSkeletonLike(
+    const FString& Path,
+    UObject*& OutAsset,
+    USkeleton*& OutSkeleton,
+    USkeletalMesh*& OutMesh,
+    FString& OutError)
+{
+    OutAsset = ResolveAsset(Path);
+    OutSkeleton = nullptr;
+    OutMesh = nullptr;
+    if (!OutAsset)
+    {
+        OutError = FString::Printf(TEXT("asset not found: %s"), *Path);
+        return nullptr;
+    }
+    if (USkeleton* Skeleton = Cast<USkeleton>(OutAsset))
+    {
+        OutSkeleton = Skeleton;
+        return &Skeleton->GetReferenceSkeleton();
+    }
+    if (USkeletalMesh* Mesh = Cast<USkeletalMesh>(OutAsset))
+    {
+        OutMesh = Mesh;
+        OutSkeleton = Mesh->GetSkeleton();
+        return &Mesh->GetRefSkeleton();
+    }
+    if (UAnimationAsset* Anim = Cast<UAnimationAsset>(OutAsset))
+    {
+        OutSkeleton = Anim->GetSkeleton();
+        if (OutSkeleton)
+        {
+            return &OutSkeleton->GetReferenceSkeleton();
+        }
+        OutError = FString::Printf(TEXT("animation asset has no skeleton: %s"), *Path);
+        return nullptr;
+    }
+    OutError = FString::Printf(TEXT("not a USkeleton, USkeletalMesh, or UAnimationAsset: %s"), *Path);
+    return nullptr;
+}
+
+TArray<FTransform> BuildGlobalRefPose(const FReferenceSkeleton& RefSkel)
+{
+    TArray<FTransform> Global;
+    const TArray<FTransform>& Local = RefSkel.GetRefBonePose();
+    Global.SetNum(Local.Num());
+    for (int32 Index = 0; Index < Local.Num(); ++Index)
+    {
+        const int32 ParentIndex = RefSkel.GetParentIndex(Index);
+        Global[Index] = ParentIndex != INDEX_NONE && Global.IsValidIndex(ParentIndex)
+            ? Local[Index] * Global[ParentIndex]
+            : Local[Index];
+    }
+    return Global;
+}
+
+TSharedRef<FJsonObject> RefBoneToJson(
+    const FReferenceSkeleton& RefSkel,
+    int32 BoneIndex,
+    const TArray<FTransform>* GlobalPose = nullptr,
+    const USkeleton* Skeleton = nullptr)
+{
+    auto Bone = MakeShared<FJsonObject>();
+    const FName BoneName = RefSkel.GetBoneName(BoneIndex);
+    const int32 ParentIndex = RefSkel.GetParentIndex(BoneIndex);
+    Bone->SetNumberField(TEXT("index"), BoneIndex);
+    Bone->SetStringField(TEXT("name"), BoneName.ToString());
+    Bone->SetNumberField(TEXT("parent_index"), ParentIndex);
+    Bone->SetStringField(TEXT("parent_name"),
+        ParentIndex != INDEX_NONE ? RefSkel.GetBoneName(ParentIndex).ToString() : FString());
+    if (RefSkel.GetRefBonePose().IsValidIndex(BoneIndex))
+    {
+        Bone->SetObjectField(TEXT("local_ref_pose"), TransformToJsonObject(RefSkel.GetRefBonePose()[BoneIndex]));
+    }
+    if (GlobalPose && GlobalPose->IsValidIndex(BoneIndex))
+    {
+        Bone->SetObjectField(TEXT("global_ref_pose"), TransformToJsonObject((*GlobalPose)[BoneIndex]));
+    }
+    if (Skeleton)
+    {
+        Bone->SetStringField(TEXT("translation_retargeting"),
+            RetargetModeToString(Skeleton->GetBoneTranslationRetargetingMode(BoneIndex)));
+    }
+    return Bone;
+}
+
+TSet<FName> ReadBoneNameFilter(const TSharedPtr<FJsonObject>& Args)
+{
+    TSet<FName> Filter;
+    FString SingleBone;
+    if (Args.IsValid() && Args->TryGetStringField(TEXT("bone"), SingleBone) && !SingleBone.IsEmpty())
+    {
+        Filter.Add(FName(*SingleBone));
+    }
+    TArray<FString> BoneStrings;
+    ReadStringArrayField(Args, TEXT("bones"), BoneStrings);
+    for (const FString& Bone : BoneStrings)
+    {
+        if (!Bone.IsEmpty())
+        {
+            Filter.Add(FName(*Bone));
+        }
+    }
+    return Filter;
+}
+
+FString NormalizeToken(FString Raw);
+
+// ---------------------------------------------------------------------------
+// animation.inspect_skeleton
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome InspectSkeletonImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("path"), TEXT("skeleton"), TEXT("skeletal_mesh") }, Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+
+    UObject* Asset = nullptr;
+    USkeleton* Skeleton = nullptr;
+    USkeletalMesh* Mesh = nullptr;
+    FString Error;
+    const FReferenceSkeleton* RefSkel = ResolveReferenceSkeletonLike(Path, Asset, Skeleton, Mesh, Error);
+    if (!RefSkel)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    bool bIncludeRefPose = true;
+    Args->TryGetBoolField(TEXT("include_ref_pose"), bIncludeRefPose);
+    const TSet<FName> BoneFilter = ReadBoneNameFilter(Args);
+    TArray<FTransform> GlobalPose = bIncludeRefPose ? BuildGlobalRefPose(*RefSkel) : TArray<FTransform>();
+
+    TArray<TSharedPtr<FJsonValue>> Bones;
+    TArray<TSharedPtr<FJsonValue>> BoneNames;
+    for (int32 Index = 0; Index < RefSkel->GetNum(); ++Index)
+    {
+        const FName BoneName = RefSkel->GetBoneName(Index);
+        BoneNames.Add(MakeShared<FJsonValueString>(BoneName.ToString()));
+        if (BoneFilter.Num() > 0 && !BoneFilter.Contains(BoneName))
+        {
+            continue;
+        }
+        Bones.Add(MakeShared<FJsonValueObject>(RefBoneToJson(
+            *RefSkel,
+            Index,
+            bIncludeRefPose ? &GlobalPose : nullptr,
+            Skeleton)));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Asset->GetPathName());
+    R->SetStringField(TEXT("asset_type"), Asset->GetClass()->GetName());
+    R->SetStringField(TEXT("skeleton"), Skeleton ? Skeleton->GetPathName() : FString());
+    R->SetStringField(TEXT("skeletal_mesh"), Mesh ? Mesh->GetPathName() : FString());
+    R->SetNumberField(TEXT("num_bones"), RefSkel->GetNum());
+    R->SetArrayField(TEXT("bone_names"), BoneNames);
+    R->SetArrayField(TEXT("bones"), Bones);
+    R->SetNumberField(TEXT("returned_bone_count"), Bones.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.inspect_ref_pose
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome InspectRefPoseImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("path"), TEXT("skeleton"), TEXT("skeletal_mesh") }, Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+
+    UObject* Asset = nullptr;
+    USkeleton* Skeleton = nullptr;
+    USkeletalMesh* Mesh = nullptr;
+    FString Error;
+    const FReferenceSkeleton* RefSkel = ResolveReferenceSkeletonLike(Path, Asset, Skeleton, Mesh, Error);
+    if (!RefSkel)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    const TSet<FName> BoneFilter = ReadBoneNameFilter(Args);
+    TArray<FTransform> GlobalPose = BuildGlobalRefPose(*RefSkel);
+    TArray<TSharedPtr<FJsonValue>> Bones;
+    TArray<TSharedPtr<FJsonValue>> Missing;
+    for (const FName& Requested : BoneFilter)
+    {
+        if (RefSkel->FindBoneIndex(Requested) == INDEX_NONE)
+        {
+            Missing.Add(MakeShared<FJsonValueString>(Requested.ToString()));
+        }
+    }
+    for (int32 Index = 0; Index < RefSkel->GetNum(); ++Index)
+    {
+        const FName BoneName = RefSkel->GetBoneName(Index);
+        if (BoneFilter.Num() > 0 && !BoneFilter.Contains(BoneName))
+        {
+            continue;
+        }
+        Bones.Add(MakeShared<FJsonValueObject>(RefBoneToJson(*RefSkel, Index, &GlobalPose, Skeleton)));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Asset->GetPathName());
+    R->SetStringField(TEXT("skeleton"), Skeleton ? Skeleton->GetPathName() : FString());
+    R->SetStringField(TEXT("skeletal_mesh"), Mesh ? Mesh->GetPathName() : FString());
+    R->SetArrayField(TEXT("bones"), Bones);
+    R->SetNumberField(TEXT("count"), Bones.Num());
+    R->SetArrayField(TEXT("missing_bones"), Missing);
+    R->SetNumberField(TEXT("missing_count"), Missing.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.list_skeletons
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome ListSkeletonsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path = TEXT("/Game");
+    FString Query;
+    int32 MaxResults = 200;
+    bool bIncludeDetails = false;
+    if (Args.IsValid())
+    {
+        Args->TryGetStringField(TEXT("path"), Path);
+        Args->TryGetStringField(TEXT("query"), Query);
+        double MaxD = MaxResults;
+        if (Args->TryGetNumberField(TEXT("max_results"), MaxD))
+        {
+            MaxResults = FMath::Max(1, static_cast<int32>(MaxD));
+        }
+        Args->TryGetBoolField(TEXT("include_details"), bIncludeDetails);
+    }
+
+    FARFilter Filter;
+    Filter.PackagePaths.Add(FName(*Path));
+    Filter.bRecursivePaths = true;
+    Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.Skeleton")));
+    TArray<FAssetData> Found;
+    GetAssetRegistry().GetAssets(Filter, Found);
+
+    TArray<TSharedPtr<FJsonValue>> Items;
+    int32 MatchedTotal = 0;
+    for (const FAssetData& AssetData : Found)
+    {
+        if (!Query.IsEmpty() &&
+            !AssetData.AssetName.ToString().Contains(Query) &&
+            !AssetData.GetObjectPathString().Contains(Query))
+        {
+            continue;
+        }
+        ++MatchedTotal;
+        if (Items.Num() >= MaxResults)
+        {
+            continue;
+        }
+        auto Obj = MakeShared<FJsonObject>();
+        Obj->SetStringField(TEXT("name"), AssetData.AssetName.ToString());
+        Obj->SetStringField(TEXT("path"), AssetData.GetSoftObjectPath().ToString());
+        if (bIncludeDetails)
+        {
+            if (USkeleton* Skeleton = Cast<USkeleton>(AssetData.GetAsset()))
+            {
+                Obj->SetNumberField(TEXT("num_bones"), Skeleton->GetReferenceSkeleton().GetNum());
+            }
+        }
+        Items.Add(MakeShared<FJsonValueObject>(Obj));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Path);
+    R->SetStringField(TEXT("query"), Query);
+    R->SetArrayField(TEXT("skeletons"), Items);
+    R->SetNumberField(TEXT("count"), Items.Num());
+    R->SetNumberField(TEXT("matched_total"), MatchedTotal);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+USkeleton* ResolveSkeletonForProfile(const FString& Path, UObject*& OutAsset, FString& OutError)
+{
+    OutAsset = ResolveAsset(Path);
+    if (!OutAsset)
+    {
+        OutError = FString::Printf(TEXT("asset not found: %s"), *Path);
+        return nullptr;
+    }
+    if (USkeleton* Skeleton = Cast<USkeleton>(OutAsset))
+    {
+        return Skeleton;
+    }
+    if (USkeletalMesh* Mesh = Cast<USkeletalMesh>(OutAsset))
+    {
+        if (USkeleton* Skeleton = Mesh->GetSkeleton())
+        {
+            return Skeleton;
+        }
+        OutError = FString::Printf(TEXT("skeletal mesh has no skeleton: %s"), *Path);
+        return nullptr;
+    }
+    if (UAnimationAsset* Anim = Cast<UAnimationAsset>(OutAsset))
+    {
+        if (USkeleton* Skeleton = Anim->GetSkeleton())
+        {
+            return Skeleton;
+        }
+        OutError = FString::Printf(TEXT("animation asset has no skeleton: %s"), *Path);
+        return nullptr;
+    }
+    OutError = FString::Printf(TEXT("not a USkeleton, USkeletalMesh, or UAnimationAsset: %s"), *Path);
+    return nullptr;
+}
+
+TSharedRef<FJsonObject> BlendProfileToJson(UBlendProfile* Profile)
+{
+    auto Obj = MakeShared<FJsonObject>();
+    if (!Profile)
+    {
+        Obj->SetBoolField(TEXT("valid"), false);
+        return Obj;
+    }
+    USkeleton* Skeleton = Profile->GetSkeleton();
+    Obj->SetBoolField(TEXT("valid"), true);
+    Obj->SetStringField(TEXT("name"), Profile->GetName());
+    Obj->SetStringField(TEXT("path"), Profile->GetPathName());
+    Obj->SetStringField(TEXT("skeleton"), Skeleton ? Skeleton->GetPathName() : FString());
+    Obj->SetStringField(TEXT("mode"), Profile->IsBlendMask() ? TEXT("BlendMask") : TEXT("BlendProfile"));
+    Obj->SetBoolField(TEXT("is_blend_mask"), Profile->IsBlendMask());
+    TArray<TSharedPtr<FJsonValue>> Entries;
+    for (const FBlendProfileBoneEntry& Entry : Profile->ProfileEntries)
+    {
+        auto EntryObj = MakeShared<FJsonObject>();
+        EntryObj->SetStringField(TEXT("bone"), Entry.BoneReference.BoneName.ToString());
+        EntryObj->SetNumberField(TEXT("scale"), Entry.BlendScale);
+        if (Skeleton)
+        {
+            EntryObj->SetNumberField(TEXT("bone_index"),
+                Skeleton->GetReferenceSkeleton().FindBoneIndex(Entry.BoneReference.BoneName));
+        }
+        Entries.Add(MakeShared<FJsonValueObject>(EntryObj));
+    }
+    Obj->SetArrayField(TEXT("entries"), Entries);
+    Obj->SetNumberField(TEXT("entry_count"), Entries.Num());
+    return Obj;
+}
+
+// ---------------------------------------------------------------------------
+// animation.read_blend_profiles
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome ReadBlendProfilesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("skeleton"), TEXT("path"), TEXT("skeletal_mesh") }, Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
+    }
+    UObject* Asset = nullptr;
+    FString Error;
+    USkeleton* Skeleton = ResolveSkeletonForProfile(Path, Asset, Error);
+    if (!Skeleton)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+    FString Name;
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("name"), TEXT("profile_name") }, Name);
+    bool bBlendMasksOnly = false;
+    Args->TryGetBoolField(TEXT("blend_masks_only"), bBlendMasksOnly);
+
+    TArray<TSharedPtr<FJsonValue>> Profiles;
+    for (TObjectPtr<UBlendProfile> ProfilePtr : Skeleton->BlendProfiles)
+    {
+        UBlendProfile* Profile = ProfilePtr.Get();
+        if (!Profile)
+        {
+            continue;
+        }
+        if (!Name.IsEmpty() && Profile->GetFName() != FName(*Name))
+        {
+            continue;
+        }
+        if (bBlendMasksOnly && !Profile->IsBlendMask())
+        {
+            continue;
+        }
+        Profiles.Add(MakeShared<FJsonValueObject>(BlendProfileToJson(Profile)));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+    R->SetStringField(TEXT("source_asset"), Asset ? Asset->GetPathName() : FString());
+    R->SetArrayField(TEXT("profiles"), Profiles);
+    R->SetNumberField(TEXT("count"), Profiles.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.create_blend_mask
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome CreateBlendMaskImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    FString Name;
+    if (!Args.IsValid() || !TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("skeleton"), TEXT("path"), TEXT("skeletal_mesh") }, Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
+    }
+    if (!TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("name"), TEXT("profile_name"), TEXT("mask_name") }, Name) || Name.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+    }
+
+    UObject* Asset = nullptr;
+    FString Error;
+    USkeleton* Skeleton = ResolveSkeletonForProfile(Path, Asset, Error);
+    if (!Skeleton)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    bool bDryRun = false;
+    bool bSave = false;
+    bool bClearExisting = true;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    Args->TryGetBoolField(TEXT("clear_existing"), bClearExisting);
+
+    const TArray<TSharedPtr<FJsonValue>>* EntriesArg = nullptr;
+    Args->TryGetArrayField(TEXT("entries"), EntriesArg);
+    if (!EntriesArg || EntriesArg->Num() == 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing non-empty 'entries' array; each entry needs {bone, scale, recursive?}"));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Planned;
+    const FReferenceSkeleton& RefSkel = Skeleton->GetReferenceSkeleton();
+    for (const TSharedPtr<FJsonValue>& Value : *EntriesArg)
+    {
+        const TSharedPtr<FJsonObject>* Obj = nullptr;
+        if (!Value.IsValid() || !Value->TryGetObject(Obj) || !Obj || !(*Obj).IsValid())
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("entries[] must contain objects"));
+        }
+        FString Bone;
+        if (!(*Obj)->TryGetStringField(TEXT("bone"), Bone) || Bone.IsEmpty())
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("entries[].bone is required"));
+        }
+        const int32 BoneIndex = RefSkel.FindBoneIndex(FName(*Bone));
+        if (BoneIndex == INDEX_NONE)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("bone not found on skeleton: %s"), *Bone));
+        }
+        double Scale = 1.0;
+        (*Obj)->TryGetNumberField(TEXT("scale"), Scale);
+        bool bRecursive = true;
+        (*Obj)->TryGetBoolField(TEXT("recursive"), bRecursive);
+        auto PlannedObj = MakeShared<FJsonObject>();
+        PlannedObj->SetStringField(TEXT("bone"), Bone);
+        PlannedObj->SetNumberField(TEXT("bone_index"), BoneIndex);
+        PlannedObj->SetNumberField(TEXT("scale"), Scale);
+        PlannedObj->SetBoolField(TEXT("recursive"), bRecursive);
+        Planned.Add(MakeShared<FJsonValueObject>(PlannedObj));
+    }
+
+    UBlendProfile* Existing = Skeleton->GetBlendProfile(FName(*Name));
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+        R->SetStringField(TEXT("name"), Name);
+        R->SetBoolField(TEXT("exists"), Existing != nullptr);
+        R->SetBoolField(TEXT("clear_existing"), bClearExisting);
+        R->SetArrayField(TEXT("planned_entries"), Planned);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageCreateBlendMask", "Sage: Create Blend Mask"));
+    Skeleton->Modify();
+    UBlendProfile* Profile = Existing ? Existing : Skeleton->CreateNewBlendProfile(FName(*Name));
+    if (!Profile)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("failed to create blend mask: %s"), *Name));
+    }
+    Profile->Modify();
+    Profile->Mode = EBlendProfileMode::BlendMask;
+    Profile->SetSkeleton(Skeleton);
+    if (bClearExisting)
+    {
+        Profile->ProfileEntries.Reset();
+    }
+    for (const TSharedPtr<FJsonValue>& Value : *EntriesArg)
+    {
+        const TSharedPtr<FJsonObject>* Obj = nullptr;
+        Value->TryGetObject(Obj);
+        FString Bone;
+        (*Obj)->TryGetStringField(TEXT("bone"), Bone);
+        double Scale = 1.0;
+        (*Obj)->TryGetNumberField(TEXT("scale"), Scale);
+        bool bRecursive = true;
+        (*Obj)->TryGetBoolField(TEXT("recursive"), bRecursive);
+        Profile->SetBoneBlendScale(FName(*Bone), static_cast<float>(Scale), bRecursive, /*bCreate=*/true);
+    }
+    Profile->CleanupBoneEntries();
+    Skeleton->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+    R->SetStringField(TEXT("source_asset"), Asset ? Asset->GetPathName() : FString());
+    R->SetBoolField(TEXT("created"), Existing == nullptr);
+    R->SetBoolField(TEXT("updated"), Existing != nullptr);
+    R->SetBoolField(TEXT("clear_existing"), bClearExisting);
+    R->SetObjectField(TEXT("profile"), BlendProfileToJson(Profile));
+    R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Skeleton, bSave, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.add_skeleton_bone
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome AddSkeletonBoneImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString SkeletonPath, BoneName, SourceMeshPath;
+    if (!Args.IsValid() || !TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("skeleton"), TEXT("path") }, SkeletonPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
+    }
+    if (!TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("bone"), TEXT("bone_name"), TEXT("name") }, BoneName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'bone'"));
+    }
+    Args->TryGetStringField(TEXT("source_skeletal_mesh"), SourceMeshPath);
+
+    USkeleton* Skeleton = Cast<USkeleton>(ResolveAsset(SkeletonPath));
+    if (!Skeleton)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a USkeleton: %s"), *SkeletonPath));
+    }
+    if (Skeleton->GetReferenceSkeleton().FindBoneIndex(FName(*BoneName)) != INDEX_NONE)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+        R->SetStringField(TEXT("bone"), BoneName);
+        R->SetBoolField(TEXT("already"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    bool bDryRun = false;
+    bool bConfirmed = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    if (SourceMeshPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("safe standalone parent/transform bone insertion is not exposed by UE; pass source_skeletal_mesh to merge a bone from an existing skeletal mesh"));
+    }
+
+    USkeletalMesh* SourceMesh = Cast<USkeletalMesh>(ResolveAsset(SourceMeshPath));
+    if (!SourceMesh)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a USkeletalMesh: %s"), *SourceMeshPath));
+    }
+    if (SourceMesh->GetRefSkeleton().FindBoneIndex(FName(*BoneName)) == INDEX_NONE)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("bone not found on source_skeletal_mesh: %s"), *BoneName));
+    }
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+        R->SetStringField(TEXT("source_skeletal_mesh"), SourceMesh->GetPathName());
+        R->SetStringField(TEXT("bone"), BoneName);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+    if (!bConfirmed)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("destructive skeleton hierarchy mutation; pass confirmed:true after dry_run"));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageAddSkeletonBone", "Sage: Add Skeleton Bone From Mesh"));
+    Skeleton->Modify();
+    const bool bMerged = Skeleton->MergeAllBonesToBoneTree(SourceMesh, /*bShowProgress=*/false);
+    const bool bAdded = Skeleton->GetReferenceSkeleton().FindBoneIndex(FName(*BoneName)) != INDEX_NONE;
+    if (!bMerged || !bAdded)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("MergeAllBonesToBoneTree did not add bone: %s"), *BoneName));
+    }
+    Skeleton->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+    R->SetStringField(TEXT("source_skeletal_mesh"), SourceMesh->GetPathName());
+    R->SetStringField(TEXT("bone"), BoneName);
+    R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Skeleton, bSave, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---------------------------------------------------------------------------
 // animation.get_physics_asset
 // ---------------------------------------------------------------------------
@@ -3296,6 +4174,595 @@ FSageToolDispatch::FOutcome ReadPoseSearchDatabaseImpl(const TSharedPtr<FJsonObj
     R->SetStringField(TEXT("class"), Asset->GetClass()->GetName());
     R->SetStringField(TEXT("note"),
         TEXT("deep PoseSearch database inspection requires the PoseSearch plugin editor API"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.find_animations
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome FindAnimationsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path = TEXT("/Game");
+    FString Query;
+    FString ClassFilter;
+    int32 MaxResults = 200;
+    bool bIncludeSkeleton = true;
+    if (Args.IsValid())
+    {
+        Args->TryGetStringField(TEXT("path"), Path);
+        Args->TryGetStringField(TEXT("folder"), Path);
+        Args->TryGetStringField(TEXT("query"), Query);
+        Args->TryGetStringField(TEXT("class"), ClassFilter);
+        Args->TryGetStringField(TEXT("type"), ClassFilter);
+        double MaxD = MaxResults;
+        if (Args->TryGetNumberField(TEXT("max_results"), MaxD))
+        {
+            MaxResults = FMath::Max(1, static_cast<int32>(MaxD));
+        }
+        Args->TryGetBoolField(TEXT("include_skeleton"), bIncludeSkeleton);
+    }
+
+    FARFilter Filter;
+    Filter.PackagePaths.Add(FName(*Path));
+    Filter.bRecursivePaths = true;
+    const FString ClassKey = NormalizeToken(ClassFilter);
+    if (ClassKey.IsEmpty() || ClassKey == TEXT("all"))
+    {
+        Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.AnimSequence")));
+        Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.AnimMontage")));
+        Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.BlendSpace")));
+        Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.BlendSpace1D")));
+        Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.AnimBlueprint")));
+    }
+    else if (ClassKey == TEXT("sequence") || ClassKey == TEXT("animsequence"))
+    {
+        Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.AnimSequence")));
+    }
+    else if (ClassKey == TEXT("montage") || ClassKey == TEXT("animmontage"))
+    {
+        Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.AnimMontage")));
+    }
+    else if (ClassKey == TEXT("blendspace"))
+    {
+        Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.BlendSpace")));
+        Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.BlendSpace1D")));
+    }
+    else if (ClassKey == TEXT("animblueprint") || ClassKey == TEXT("abp"))
+    {
+        Filter.ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine.AnimBlueprint")));
+    }
+    else
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("unsupported class/type filter: %s"), *ClassFilter));
+    }
+
+    TArray<FAssetData> Found;
+    GetAssetRegistry().GetAssets(Filter, Found);
+
+    TArray<TSharedPtr<FJsonValue>> Items;
+    int32 MatchedTotal = 0;
+    for (const FAssetData& AssetData : Found)
+    {
+        if (!Query.IsEmpty() &&
+            !AssetData.AssetName.ToString().Contains(Query) &&
+            !AssetData.GetObjectPathString().Contains(Query))
+        {
+            continue;
+        }
+        ++MatchedTotal;
+        if (Items.Num() >= MaxResults)
+        {
+            continue;
+        }
+        auto Obj = MakeShared<FJsonObject>();
+        Obj->SetStringField(TEXT("name"), AssetData.AssetName.ToString());
+        Obj->SetStringField(TEXT("path"), AssetData.GetSoftObjectPath().ToString());
+        Obj->SetStringField(TEXT("class"), AssetData.AssetClassPath.ToString());
+        if (bIncludeSkeleton)
+        {
+            if (FAssetTagValueRef SkeletonTag = AssetData.TagsAndValues.FindTag(TEXT("Skeleton")); SkeletonTag.IsSet())
+            {
+                Obj->SetStringField(TEXT("skeleton_tag"), SkeletonTag.GetValue());
+            }
+        }
+        Items.Add(MakeShared<FJsonValueObject>(Obj));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Path);
+    R->SetStringField(TEXT("query"), Query);
+    R->SetStringField(TEXT("class_filter"), ClassFilter);
+    R->SetArrayField(TEXT("animations"), Items);
+    R->SetNumberField(TEXT("count"), Items.Num());
+    R->SetNumberField(TEXT("matched_total"), MatchedTotal);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.inspect_animation
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome InspectAnimationImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UAnimationAsset* Asset = Cast<UAnimationAsset>(ResolveAsset(Path));
+    if (!Asset)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimationAsset: %s"), *Path));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Asset->GetPathName());
+    R->SetStringField(TEXT("class"), Asset->GetClass()->GetName());
+    R->SetStringField(TEXT("skeleton"), Asset->GetSkeleton() ? Asset->GetSkeleton()->GetPathName() : FString());
+    if (UAnimSequence* Seq = Cast<UAnimSequence>(Asset))
+    {
+        const IAnimationDataModel* Model = Seq->GetDataModel();
+        R->SetNumberField(TEXT("play_length"), Seq->GetPlayLength());
+        R->SetNumberField(TEXT("rate_scale"), Seq->RateScale);
+        R->SetBoolField(TEXT("root_motion_enabled"), Seq->bEnableRootMotion);
+        R->SetBoolField(TEXT("additive"), Seq->IsValidAdditive());
+        if (Model)
+        {
+            R->SetNumberField(TEXT("duration"), Model->GetPlayLength());
+            R->SetNumberField(TEXT("sample_rate"), Model->GetFrameRate().AsDecimal());
+            R->SetNumberField(TEXT("number_of_frames"), Model->GetNumberOfFrames());
+            R->SetNumberField(TEXT("number_of_keys"), Model->GetNumberOfKeys());
+            int32 FloatCurves = 0, TransformCurves = 0, Attributes = 0;
+            GetAnimCurveCounts(Seq, FloatCurves, TransformCurves, Attributes);
+            R->SetNumberField(TEXT("float_curve_count"), FloatCurves);
+            R->SetNumberField(TEXT("transform_curve_count"), TransformCurves);
+            R->SetNumberField(TEXT("attribute_count"), Attributes);
+            TArray<FName> TrackNames;
+            Model->GetBoneTrackNames(TrackNames);
+            R->SetArrayField(TEXT("track_names"), NamesToJsonArray(TrackNames));
+            R->SetNumberField(TEXT("track_count"), TrackNames.Num());
+        }
+        AddRootMotionSummary(R, Seq);
+    }
+    else if (UAnimMontage* Montage = Cast<UAnimMontage>(Asset))
+    {
+        R->SetNumberField(TEXT("play_length"), Montage->GetPlayLength());
+        R->SetNumberField(TEXT("section_count"), Montage->CompositeSections.Num());
+        R->SetNumberField(TEXT("slot_track_count"), Montage->SlotAnimTracks.Num());
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.sample_bone_tracks
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome SampleBoneTracksImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(Path));
+    if (!Seq)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimSequence: %s"), *Path));
+    }
+    const IAnimationDataModel* Model = Seq->GetDataModel();
+    if (!Model)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("sequence has no animation data model"));
+    }
+
+    TSet<FName> BoneFilter = ReadBoneNameFilter(Args);
+    if (BoneFilter.Num() == 0)
+    {
+        FString RootBone = Seq->GetSkeleton() && Seq->GetSkeleton()->GetReferenceSkeleton().GetNum() > 0
+            ? Seq->GetSkeleton()->GetReferenceSkeleton().GetBoneName(0).ToString()
+            : FString(TEXT("root"));
+        BoneFilter.Add(FName(*RootBone));
+    }
+
+    TArray<int32> Frames;
+    const TArray<TSharedPtr<FJsonValue>>* FrameValues = nullptr;
+    if (Args->TryGetArrayField(TEXT("frames"), FrameValues) && FrameValues)
+    {
+        for (const TSharedPtr<FJsonValue>& Value : *FrameValues)
+        {
+            if (Value.IsValid() && Value->Type == EJson::Number)
+            {
+                Frames.Add(FMath::RoundToInt(Value->AsNumber()));
+            }
+        }
+    }
+    const TArray<TSharedPtr<FJsonValue>>* TimeValues = nullptr;
+    if (Args->TryGetArrayField(TEXT("times"), TimeValues) && TimeValues)
+    {
+        const double Rate = Model->GetFrameRate().AsDecimal();
+        for (const TSharedPtr<FJsonValue>& Value : *TimeValues)
+        {
+            if (Value.IsValid() && Value->Type == EJson::Number)
+            {
+                Frames.Add(Rate > 0.0 ? FMath::RoundToInt(Value->AsNumber() * Rate) : 0);
+            }
+        }
+    }
+    if (Frames.Num() == 0)
+    {
+        int32 MaxSamples = 20;
+        double MaxD = MaxSamples;
+        if (Args->TryGetNumberField(TEXT("max_samples"), MaxD))
+        {
+            MaxSamples = FMath::Max(1, static_cast<int32>(MaxD));
+        }
+        const int32 LastFrame = FMath::Max(0, Model->GetNumberOfFrames());
+        const int32 Step = FMath::Max(1, LastFrame / MaxSamples);
+        for (int32 Frame = 0; Frame <= LastFrame && Frames.Num() < MaxSamples; Frame += Step)
+        {
+            Frames.Add(Frame);
+        }
+    }
+
+    TArray<TSharedPtr<FJsonValue>> BoneResults;
+    const double Rate = Model->GetFrameRate().AsDecimal();
+    for (const FName& BoneName : BoneFilter)
+    {
+        auto BoneObj = MakeShared<FJsonObject>();
+        BoneObj->SetStringField(TEXT("bone"), BoneName.ToString());
+        const bool bHasTrack = Model->IsValidBoneTrackName(BoneName);
+        BoneObj->SetBoolField(TEXT("has_track"), bHasTrack);
+        TArray<TSharedPtr<FJsonValue>> Samples;
+        if (bHasTrack)
+        {
+            for (int32 Frame : Frames)
+            {
+                const int32 ClampedFrame = FMath::Clamp(Frame, 0, Model->GetNumberOfFrames());
+                const FTransform T = Model->GetBoneTrackTransform(BoneName, FFrameNumber(ClampedFrame));
+                auto Sample = TransformToJsonObject(T);
+                Sample->SetNumberField(TEXT("frame"), ClampedFrame);
+                Sample->SetNumberField(TEXT("time"), Rate > 0.0 ? static_cast<double>(ClampedFrame) / Rate : 0.0);
+                Samples.Add(MakeShared<FJsonValueObject>(Sample));
+            }
+        }
+        BoneObj->SetArrayField(TEXT("samples"), Samples);
+        BoneObj->SetNumberField(TEXT("sample_count"), Samples.Num());
+        BoneResults.Add(MakeShared<FJsonValueObject>(BoneObj));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Seq->GetPathName());
+    R->SetArrayField(TEXT("bones"), BoneResults);
+    R->SetNumberField(TEXT("bone_count"), BoneResults.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.compare_retarget_bones
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome CompareRetargetBonesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString SourcePath, TargetPath;
+    if (!Args.IsValid() ||
+        !TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("source"), TEXT("source_path"), TEXT("source_skeleton") }, SourcePath) ||
+        !TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("target"), TEXT("target_path"), TEXT("target_skeleton") }, TargetPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'source' or 'target'"));
+    }
+
+    UObject* SourceAsset = nullptr;
+    UObject* TargetAsset = nullptr;
+    USkeleton* SourceSkeleton = nullptr;
+    USkeleton* TargetSkeleton = nullptr;
+    USkeletalMesh* SourceMesh = nullptr;
+    USkeletalMesh* TargetMesh = nullptr;
+    FString Error;
+    const FReferenceSkeleton* SourceRef = ResolveReferenceSkeletonLike(SourcePath, SourceAsset, SourceSkeleton, SourceMesh, Error);
+    if (!SourceRef)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+    const FReferenceSkeleton* TargetRef = ResolveReferenceSkeletonLike(TargetPath, TargetAsset, TargetSkeleton, TargetMesh, Error);
+    if (!TargetRef)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    TSet<FName> BoneFilter = ReadBoneNameFilter(Args);
+    if (BoneFilter.Num() == 0)
+    {
+        for (int32 Index = 0; Index < SourceRef->GetNum(); ++Index)
+        {
+            BoneFilter.Add(SourceRef->GetBoneName(Index));
+        }
+        for (int32 Index = 0; Index < TargetRef->GetNum(); ++Index)
+        {
+            BoneFilter.Add(TargetRef->GetBoneName(Index));
+        }
+    }
+
+    TArray<FTransform> SourceGlobal = BuildGlobalRefPose(*SourceRef);
+    TArray<FTransform> TargetGlobal = BuildGlobalRefPose(*TargetRef);
+    TArray<TSharedPtr<FJsonValue>> Rows;
+    int32 MissingSource = 0;
+    int32 MissingTarget = 0;
+    int32 Common = 0;
+    for (const FName& BoneName : BoneFilter)
+    {
+        const int32 SourceIndex = SourceRef->FindBoneIndex(BoneName);
+        const int32 TargetIndex = TargetRef->FindBoneIndex(BoneName);
+        auto Row = MakeShared<FJsonObject>();
+        Row->SetStringField(TEXT("bone"), BoneName.ToString());
+        Row->SetNumberField(TEXT("source_index"), SourceIndex);
+        Row->SetNumberField(TEXT("target_index"), TargetIndex);
+        Row->SetBoolField(TEXT("source_found"), SourceIndex != INDEX_NONE);
+        Row->SetBoolField(TEXT("target_found"), TargetIndex != INDEX_NONE);
+        if (SourceIndex == INDEX_NONE) ++MissingSource;
+        if (TargetIndex == INDEX_NONE) ++MissingTarget;
+        if (SourceIndex != INDEX_NONE && TargetIndex != INDEX_NONE)
+        {
+            ++Common;
+            const FVector Delta = TargetGlobal[TargetIndex].GetTranslation() - SourceGlobal[SourceIndex].GetTranslation();
+            Row->SetField(TEXT("ref_pose_translation_delta"), detail::Vec3ToJson(Delta));
+            Row->SetNumberField(TEXT("ref_pose_translation_distance"), Delta.Size());
+            Row->SetNumberField(TEXT("ref_pose_rotation_angle_delta_degrees"),
+                FMath::RadiansToDegrees(SourceGlobal[SourceIndex].GetRotation().AngularDistance(TargetGlobal[TargetIndex].GetRotation())));
+        }
+        Rows.Add(MakeShared<FJsonValueObject>(Row));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("source"), SourceAsset->GetPathName());
+    R->SetStringField(TEXT("target"), TargetAsset->GetPathName());
+    R->SetArrayField(TEXT("bones"), Rows);
+    R->SetNumberField(TEXT("count"), Rows.Num());
+    R->SetNumberField(TEXT("common_count"), Common);
+    R->SetNumberField(TEXT("missing_source_count"), MissingSource);
+    R->SetNumberField(TEXT("missing_target_count"), MissingTarget);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.copy_bone_tracks
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome CopyBoneTracksImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString SourcePath, TargetPath;
+    if (!Args.IsValid() ||
+        !TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("source"), TEXT("source_anim") }, SourcePath) ||
+        !TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("target"), TEXT("target_anim"), TEXT("path") }, TargetPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing source/target animation"));
+    }
+    UAnimSequence* SourceSeq = Cast<UAnimSequence>(ResolveAsset(SourcePath));
+    UAnimSequence* TargetSeq = Cast<UAnimSequence>(ResolveAsset(TargetPath));
+    if (!SourceSeq || !TargetSeq)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("source and target must be UAnimSequence assets"));
+    }
+    const IAnimationDataModel* SourceModel = SourceSeq->GetDataModel();
+    if (!SourceModel)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("source sequence has no animation data model"));
+    }
+
+    TSet<FName> BoneFilter = ReadBoneNameFilter(Args);
+    if (BoneFilter.Num() == 0)
+    {
+        TArray<FName> TrackNames;
+        SourceModel->GetBoneTrackNames(TrackNames);
+        for (const FName& Name : TrackNames)
+        {
+            BoneFilter.Add(Name);
+        }
+    }
+
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    TArray<TSharedPtr<FJsonValue>> Results;
+    int32 Copied = 0;
+    int32 Failed = 0;
+    IAnimationDataController* TargetController = bDryRun ? nullptr : &TargetSeq->GetController();
+    TUniquePtr<IAnimationDataController::FScopedBracket> Bracket;
+    if (TargetController)
+    {
+        TargetSeq->Modify();
+        Bracket = MakeUnique<IAnimationDataController::FScopedBracket>(
+            TargetController,
+            LOCTEXT("SageCopyBoneTracks", "Sage: Copy Bone Tracks"));
+    }
+    for (const FName& BoneName : BoneFilter)
+    {
+        auto Row = MakeShared<FJsonObject>();
+        Row->SetStringField(TEXT("bone"), BoneName.ToString());
+        const FBoneAnimationTrack* SourceTrack = SourceModel->FindBoneTrackByName(BoneName);
+        const bool bTargetHasBone = TargetSeq->GetSkeleton() &&
+            TargetSeq->GetSkeleton()->GetReferenceSkeleton().FindBoneIndex(BoneName) != INDEX_NONE;
+        Row->SetBoolField(TEXT("source_track_found"), SourceTrack != nullptr);
+        Row->SetBoolField(TEXT("target_bone_found"), bTargetHasBone);
+        if (!SourceTrack || !bTargetHasBone)
+        {
+            Row->SetStringField(TEXT("status"), TEXT("skipped"));
+            ++Failed;
+        }
+        else if (bDryRun)
+        {
+            Row->SetStringField(TEXT("status"), TEXT("dry_run"));
+        }
+        else
+        {
+            if (!TargetSeq->GetDataModel() || !TargetSeq->GetDataModel()->IsValidBoneTrackName(BoneName))
+            {
+                TargetController->AddBoneCurve(BoneName, false);
+            }
+            const FRawAnimSequenceTrack& Raw = SourceTrack->InternalTrackData;
+            const bool bOk = TargetController->SetBoneTrackKeys(
+                BoneName,
+                Raw.PosKeys,
+                Raw.RotKeys,
+                Raw.ScaleKeys,
+                false);
+            Row->SetStringField(TEXT("status"), bOk ? TEXT("copied") : TEXT("failed"));
+            Row->SetNumberField(TEXT("pos_key_count"), Raw.PosKeys.Num());
+            Row->SetNumberField(TEXT("rot_key_count"), Raw.RotKeys.Num());
+            Row->SetNumberField(TEXT("scale_key_count"), Raw.ScaleKeys.Num());
+            bOk ? ++Copied : ++Failed;
+        }
+        Results.Add(MakeShared<FJsonValueObject>(Row));
+    }
+
+    if (!bDryRun)
+    {
+        TargetSeq->RefreshCacheData();
+        TargetSeq->MarkPackageDirty();
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("source"), SourceSeq->GetPathName());
+    R->SetStringField(TEXT("target"), TargetSeq->GetPathName());
+    R->SetArrayField(TEXT("results"), Results);
+    R->SetNumberField(TEXT("copied"), Copied);
+    R->SetNumberField(TEXT("failed"), Failed);
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    R->SetBoolField(TEXT("modified"), !bDryRun && Copied > 0);
+    TrySaveLoadedAssetIfRequested(TargetSeq, bSave && !bDryRun && Copied > 0, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.diagnose_retarget_animation
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome DiagnoseRetargetAnimationImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(Path));
+    if (!Seq)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimSequence: %s"), *Path));
+    }
+    const IAnimationDataModel* Model = Seq->GetDataModel();
+    if (!Model)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("sequence has no animation data model"));
+    }
+
+    double PopThreshold = 50.0;
+    Args->TryGetNumberField(TEXT("pop_threshold"), PopThreshold);
+    TSet<FName> BoneFilter = ReadBoneNameFilter(Args);
+    if (BoneFilter.Num() == 0 && Seq->GetSkeleton() && Seq->GetSkeleton()->GetReferenceSkeleton().GetNum() > 0)
+    {
+        BoneFilter.Add(Seq->GetSkeleton()->GetReferenceSkeleton().GetBoneName(0));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Issues;
+    TArray<TSharedPtr<FJsonValue>> BoneReports;
+    for (const FName& BoneName : BoneFilter)
+    {
+        auto BoneReport = MakeShared<FJsonObject>();
+        BoneReport->SetStringField(TEXT("bone"), BoneName.ToString());
+        const bool bHasTrack = Model->IsValidBoneTrackName(BoneName);
+        BoneReport->SetBoolField(TEXT("has_track"), bHasTrack);
+        if (!bHasTrack)
+        {
+            auto Issue = MakeShared<FJsonObject>();
+            Issue->SetStringField(TEXT("type"), TEXT("missing_track"));
+            Issue->SetStringField(TEXT("bone"), BoneName.ToString());
+            Issues.Add(MakeShared<FJsonValueObject>(Issue));
+            BoneReports.Add(MakeShared<FJsonValueObject>(BoneReport));
+            continue;
+        }
+
+        int32 PopCount = 0;
+        int32 FlipCount = 0;
+        FTransform Prev = Model->GetBoneTrackTransform(BoneName, FFrameNumber(0));
+        for (int32 Frame = 1; Frame <= Model->GetNumberOfFrames(); ++Frame)
+        {
+            const FTransform Current = Model->GetBoneTrackTransform(BoneName, FFrameNumber(Frame));
+            if ((Current.GetTranslation() - Prev.GetTranslation()).Size() > PopThreshold)
+            {
+                ++PopCount;
+            }
+            if ((Current.GetRotation() | Prev.GetRotation()) < 0.0)
+            {
+                ++FlipCount;
+            }
+            Prev = Current;
+        }
+        BoneReport->SetNumberField(TEXT("position_pop_count"), PopCount);
+        BoneReport->SetNumberField(TEXT("quaternion_flip_count"), FlipCount);
+        if (PopCount > 0)
+        {
+            auto Issue = MakeShared<FJsonObject>();
+            Issue->SetStringField(TEXT("type"), TEXT("position_pop"));
+            Issue->SetStringField(TEXT("bone"), BoneName.ToString());
+            Issue->SetNumberField(TEXT("count"), PopCount);
+            Issues.Add(MakeShared<FJsonValueObject>(Issue));
+        }
+        if (FlipCount > 0)
+        {
+            auto Issue = MakeShared<FJsonObject>();
+            Issue->SetStringField(TEXT("type"), TEXT("quaternion_flip"));
+            Issue->SetStringField(TEXT("bone"), BoneName.ToString());
+            Issue->SetNumberField(TEXT("count"), FlipCount);
+            Issues.Add(MakeShared<FJsonValueObject>(Issue));
+        }
+        BoneReports.Add(MakeShared<FJsonValueObject>(BoneReport));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Seq->GetPathName());
+    R->SetStringField(TEXT("skeleton"), Seq->GetSkeleton() ? Seq->GetSkeleton()->GetPathName() : FString());
+    R->SetNumberField(TEXT("duration"), Model->GetPlayLength());
+    R->SetNumberField(TEXT("sample_rate"), Model->GetFrameRate().AsDecimal());
+    R->SetNumberField(TEXT("number_of_frames"), Model->GetNumberOfFrames());
+    R->SetBoolField(TEXT("root_motion_enabled"), Seq->bEnableRootMotion);
+    AddRootMotionSummary(R, Seq);
+    R->SetArrayField(TEXT("bone_reports"), BoneReports);
+    R->SetArrayField(TEXT("issues"), Issues);
+    R->SetNumberField(TEXT("issue_count"), Issues.Num());
+    R->SetBoolField(TEXT("ok"), Issues.Num() == 0);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.save_animation_asset
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome SaveAnimationAssetImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UObject* Asset = ResolveAsset(Path);
+    if (!Asset || !Asset->IsA<UAnimationAsset>())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimationAsset: %s"), *Path));
+    }
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Asset->GetPathName());
+    TrySaveLoadedAssetIfRequested(Asset, true, R);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -4982,6 +6449,115 @@ FSageToolDispatch::FOutcome CreateIKRigImpl(const TSharedPtr<FJsonObject>& Args)
     }
 
     // IKRig class lives in the IKRig plugin — do a soft class lookup
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    FString SkMeshPath;
+    TryGetAnyStringField(Args,
+        TArray<const TCHAR*>{ TEXT("skeletal_mesh"), TEXT("skeletal_mesh_path"), TEXT("mesh"), TEXT("mesh_path") },
+        SkMeshPath);
+    FString LegacySkeletonPath;
+    Args->TryGetStringField(TEXT("skeleton"), LegacySkeletonPath);
+
+    USkeletalMesh* SK = nullptr;
+    TArray<TSharedPtr<FJsonValue>> Warnings;
+    if (!SkMeshPath.IsEmpty())
+    {
+        SK = Cast<USkeletalMesh>(ResolveAsset(SkMeshPath));
+        if (!SK)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("not a USkeletalMesh: %s"), *SkMeshPath));
+        }
+    }
+    else if (!LegacySkeletonPath.IsEmpty())
+    {
+        SK = Cast<USkeletalMesh>(ResolveAsset(LegacySkeletonPath));
+        if (SK)
+        {
+            SkMeshPath = LegacySkeletonPath;
+            Warnings.Add(MakeShared<FJsonValueString>(
+                TEXT("'skeleton' was treated as a legacy skeletal mesh alias; prefer 'skeletal_mesh'")));
+        }
+        else
+        {
+            Warnings.Add(MakeShared<FJsonValueString>(
+                TEXT("'skeleton' is deprecated for create_ik_rig and cannot initialize an IK Rig without a skeletal mesh; prefer 'skeletal_mesh'")));
+        }
+    }
+
+    FString RetargetRoot;
+    Args->TryGetStringField(TEXT("retarget_root"), RetargetRoot);
+    const FReferenceSkeleton* RefSkeleton = SK ? &SK->GetRefSkeleton() : nullptr;
+    if (RefSkeleton && !RetargetRoot.IsEmpty() && RefSkeleton->FindBoneIndex(FName(*RetargetRoot)) == INDEX_NONE)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("retarget_root bone not found on skeletal mesh: %s"), *RetargetRoot));
+    }
+
+    struct FPendingIKChain
+    {
+        FString Name;
+        FString StartBone;
+        FString EndBone;
+        FString Goal;
+    };
+    TArray<FPendingIKChain> PendingChains;
+    const TArray<TSharedPtr<FJsonValue>>* ChainValues = nullptr;
+    if (Args->TryGetArrayField(TEXT("chains"), ChainValues) && ChainValues)
+    {
+        for (int32 ChainIndex = 0; ChainIndex < ChainValues->Num(); ++ChainIndex)
+        {
+            const TSharedPtr<FJsonValue>& ChainValue = (*ChainValues)[ChainIndex];
+            const TSharedPtr<FJsonObject>* ChainObj = nullptr;
+            if (!ChainValue.IsValid() || !ChainValue->TryGetObject(ChainObj) || !ChainObj || !(*ChainObj).IsValid())
+            {
+                return FSageToolDispatch::FOutcome::MakeError(-32602,
+                    FString::Printf(TEXT("chains[%d] must be an object"), ChainIndex));
+            }
+
+            FPendingIKChain Pending;
+            if (!TryGetAnyStringField(*ChainObj, TArray<const TCHAR*>{ TEXT("name"), TEXT("chain_name") }, Pending.Name))
+            {
+                return FSageToolDispatch::FOutcome::MakeError(-32602,
+                    FString::Printf(TEXT("chains[%d] missing 'name'"), ChainIndex));
+            }
+            TryGetAnyStringField(*ChainObj, TArray<const TCHAR*>{ TEXT("start_bone"), TEXT("start") }, Pending.StartBone);
+            TryGetAnyStringField(*ChainObj, TArray<const TCHAR*>{ TEXT("end_bone"), TEXT("end") }, Pending.EndBone);
+            TryGetAnyStringField(*ChainObj, TArray<const TCHAR*>{ TEXT("goal"), TEXT("goal_name") }, Pending.Goal);
+            if (RefSkeleton)
+            {
+                if (!Pending.StartBone.IsEmpty() && RefSkeleton->FindBoneIndex(FName(*Pending.StartBone)) == INDEX_NONE)
+                {
+                    return FSageToolDispatch::FOutcome::MakeError(-32602,
+                        FString::Printf(TEXT("chains[%d].start_bone not found: %s"), ChainIndex, *Pending.StartBone));
+                }
+                if (!Pending.EndBone.IsEmpty() && RefSkeleton->FindBoneIndex(FName(*Pending.EndBone)) == INDEX_NONE)
+                {
+                    return FSageToolDispatch::FOutcome::MakeError(-32602,
+                        FString::Printf(TEXT("chains[%d].end_bone not found: %s"), ChainIndex, *Pending.EndBone));
+                }
+            }
+            PendingChains.Add(MoveTemp(Pending));
+        }
+    }
+
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Path);
+        R->SetStringField(TEXT("skeletal_mesh"), SkMeshPath);
+        R->SetStringField(TEXT("retarget_root"), RetargetRoot);
+        R->SetNumberField(TEXT("chain_count"), PendingChains.Num());
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        R->SetArrayField(TEXT("warnings"), Warnings);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
     UClass* IKRigClass = FindObject<UClass>(nullptr, TEXT("/Script/IKRig.IKRigDefinition"));
     if (!IKRigClass) IKRigClass = LoadObject<UClass>(nullptr, TEXT("/Script/IKRig.IKRigDefinition"));
     if (!IKRigClass)
@@ -5000,13 +6576,11 @@ FSageToolDispatch::FOutcome CreateIKRigImpl(const TSharedPtr<FJsonObject>& Args)
     if (!FacClass) FacClass = LoadObject<UClass>(nullptr, TEXT("/Script/IKRigEditor.IKRigDefinitionFactory"));
     if (FacClass) Fac = NewObject<UFactory>(GetTransientPackage(), FacClass);
 
-    FString SkMeshPath;
-    if (Fac && Args->TryGetStringField(TEXT("skeletal_mesh_path"), SkMeshPath) && !SkMeshPath.IsEmpty())
+    if (Fac && SK)
     {
-        USkeletalMesh* SK = Cast<USkeletalMesh>(ResolveAsset(SkMeshPath));
         FObjectPropertyBase* MeshProp = CastField<FObjectPropertyBase>(
             Fac->GetClass()->FindPropertyByName(TEXT("SkeletalMesh")));
-        if (MeshProp && SK)
+        if (MeshProp)
         {
             MeshProp->SetObjectPropertyValue(MeshProp->ContainerPtrToValuePtr<void>(Fac), SK);
         }
@@ -5021,9 +6595,42 @@ FSageToolDispatch::FOutcome CreateIKRigImpl(const TSharedPtr<FJsonObject>& Args)
     }
     Created->MarkPackageDirty();
 
-    auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("path"),  Created->GetPathName());
-    R->SetStringField(TEXT("class"), Created->GetClass()->GetName());
+    UIKRigDefinition* Rig = Cast<UIKRigDefinition>(Created);
+    UIKRigController* Controller = Rig ? UIKRigController::GetController(Rig) : nullptr;
+    if (Rig && Controller)
+    {
+        Rig->Modify();
+        if (SK)
+        {
+            Controller->SetSkeletalMesh(SK);
+        }
+        if (!RetargetRoot.IsEmpty())
+        {
+            Controller->SetRetargetRoot(FName(*RetargetRoot));
+        }
+        for (const FPendingIKChain& Chain : PendingChains)
+        {
+            Controller->AddRetargetChain(
+                FName(*Chain.Name),
+                FName(*Chain.StartBone),
+                FName(*Chain.EndBone),
+                FName(*Chain.Goal));
+        }
+        Controller->SortRetargetChains();
+        Controller->BroadcastNeedsReinitialized();
+        Rig->MarkPackageDirty();
+    }
+
+    TSharedRef<FJsonObject> R = Rig ? IKRigToJson(Rig, Controller) : MakeShared<FJsonObject>();
+    if (!Rig)
+    {
+        R->SetStringField(TEXT("path"), Created->GetPathName());
+        R->SetStringField(TEXT("class"), Created->GetClass()->GetName());
+    }
+    R->SetBoolField(TEXT("created"), true);
+    R->SetBoolField(TEXT("modified"), true);
+    R->SetArrayField(TEXT("warnings"), Warnings);
+    TrySaveLoadedAssetIfRequested(Created, bSave, R);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -5039,18 +6646,398 @@ FSageToolDispatch::FOutcome ReadIKRigImpl(const TSharedPtr<FJsonObject>& Args)
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
     }
 
-    UObject* Asset = ResolveAsset(Path);
-    if (!Asset)
+    UIKRigDefinition* Rig = Cast<UIKRigDefinition>(ResolveAsset(Path));
+    if (!Rig)
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602,
             TEXT("asset not found — ensure IK Rig plugin is enabled"));
     }
 
+    UIKRigController* Controller = UIKRigController::GetController(Rig);
+    TSharedRef<FJsonObject> R = IKRigToJson(Rig, Controller);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AddIKRetargetChainImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRigDefinition* Rig = nullptr;
+    UIKRigController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRigController(Args, Rig, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    FString ChainName, StartBone, EndBone, GoalName;
+    if (!TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("name"), TEXT("chain_name") }, ChainName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+    }
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("start_bone"), TEXT("start") }, StartBone);
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("end_bone"), TEXT("end") }, EndBone);
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("goal"), TEXT("goal_name") }, GoalName);
+
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Rig->GetPathName());
+        R->SetStringField(TEXT("name"), ChainName);
+        R->SetStringField(TEXT("start_bone"), StartBone);
+        R->SetStringField(TEXT("end_bone"), EndBone);
+        R->SetStringField(TEXT("goal"), GoalName);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageAddIKRetargetChain", "Sage: Add IK Retarget Chain"));
+    Rig->Modify();
+    const FName AddedName = Controller->AddRetargetChain(FName(*ChainName), FName(*StartBone), FName(*EndBone), FName(*GoalName));
+    Controller->SortRetargetChains();
+    Controller->BroadcastNeedsReinitialized();
+    Rig->MarkPackageDirty();
+
+    TSharedRef<FJsonObject> R = IKRigToJson(Rig, Controller);
+    R->SetStringField(TEXT("added_chain"), AddedName.ToString());
+    R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Rig, bSave, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome RemoveIKRetargetChainImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRigDefinition* Rig = nullptr;
+    UIKRigController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRigController(Args, Rig, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    FString ChainName;
+    if (!TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("name"), TEXT("chain_name") }, ChainName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+    }
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Rig->GetPathName());
+        R->SetStringField(TEXT("name"), ChainName);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageRemoveIKRetargetChain", "Sage: Remove IK Retarget Chain"));
+    Rig->Modify();
+    const bool bRemoved = Controller->RemoveRetargetChain(FName(*ChainName));
+    if (!bRemoved)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("retarget chain not found: %s"), *ChainName));
+    }
+    Controller->BroadcastNeedsReinitialized();
+    Rig->MarkPackageDirty();
+
+    TSharedRef<FJsonObject> R = IKRigToJson(Rig, Controller);
+    R->SetStringField(TEXT("removed_chain"), ChainName);
+    R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Rig, bSave, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome RenameIKRetargetChainImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRigDefinition* Rig = nullptr;
+    UIKRigController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRigController(Args, Rig, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    FString ChainName, NewName;
+    if (!TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("name"), TEXT("chain_name") }, ChainName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+    }
+    if (!TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("new_name"), TEXT("to") }, NewName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'new_name'"));
+    }
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    FScopedTransaction Tx(LOCTEXT("SageRenameIKRetargetChain", "Sage: Rename IK Retarget Chain"));
+    Rig->Modify();
+    const FName ActualName = Controller->RenameRetargetChain(FName(*ChainName), FName(*NewName));
+    if (ActualName == FName(*ChainName))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("failed to rename retarget chain: %s"), *ChainName));
+    }
+    Rig->MarkPackageDirty();
+    TSharedRef<FJsonObject> R = IKRigToJson(Rig, Controller);
+    R->SetStringField(TEXT("old_name"), ChainName);
+    R->SetStringField(TEXT("new_name"), ActualName.ToString());
+    R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Rig, bSave, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetIKRetargetChainBonesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRigDefinition* Rig = nullptr;
+    UIKRigController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRigController(Args, Rig, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    FString ChainName, StartBone, EndBone;
+    if (!TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("name"), TEXT("chain_name") }, ChainName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+    }
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("start_bone"), TEXT("start") }, StartBone);
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("end_bone"), TEXT("end") }, EndBone);
+    if (StartBone.IsEmpty() && EndBone.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'start_bone' or 'end_bone'"));
+    }
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    FScopedTransaction Tx(LOCTEXT("SageSetIKRetargetChainBones", "Sage: Set IK Retarget Chain Bones"));
+    Rig->Modify();
+    bool bOk = true;
+    if (!StartBone.IsEmpty())
+    {
+        bOk &= Controller->SetRetargetChainStartBone(FName(*ChainName), FName(*StartBone));
+    }
+    if (!EndBone.IsEmpty())
+    {
+        bOk &= Controller->SetRetargetChainEndBone(FName(*ChainName), FName(*EndBone));
+    }
+    if (!bOk)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("failed to update retarget chain bones: %s"), *ChainName));
+    }
+    Controller->SortRetargetChains();
+    Controller->BroadcastNeedsReinitialized();
+    Rig->MarkPackageDirty();
+
+    TSharedRef<FJsonObject> R = IKRigToJson(Rig, Controller);
+    R->SetStringField(TEXT("updated_chain"), ChainName);
+    R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Rig, bSave, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetIKRetargetChainGoalImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRigDefinition* Rig = nullptr;
+    UIKRigController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRigController(Args, Rig, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    FString ChainName, GoalName;
+    if (!TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("name"), TEXT("chain_name") }, ChainName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+    }
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("goal"), TEXT("goal_name") }, GoalName);
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    FScopedTransaction Tx(LOCTEXT("SageSetIKRetargetChainGoal", "Sage: Set IK Retarget Chain Goal"));
+    Rig->Modify();
+    if (!Controller->SetRetargetChainGoal(FName(*ChainName), FName(*GoalName)))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("failed to update retarget chain goal: %s"), *ChainName));
+    }
+    Controller->BroadcastNeedsReinitialized();
+    Rig->MarkPackageDirty();
+
+    TSharedRef<FJsonObject> R = IKRigToJson(Rig, Controller);
+    R->SetStringField(TEXT("updated_chain"), ChainName);
+    R->SetStringField(TEXT("goal"), Controller->GetRetargetChainGoal(FName(*ChainName)).ToString());
+    R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Rig, bSave, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetIKRetargetRootImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRigDefinition* Rig = nullptr;
+    UIKRigController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRigController(Args, Rig, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    FString RootBone;
+    if (!TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("root_bone"), TEXT("retarget_root"), TEXT("bone") }, RootBone))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'root_bone'"));
+    }
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    FScopedTransaction Tx(LOCTEXT("SageSetIKRetargetRoot", "Sage: Set IK Retarget Root"));
+    Rig->Modify();
+    if (!Controller->SetRetargetRoot(FName(*RootBone)))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("failed to set retarget root: %s"), *RootBone));
+    }
+    Controller->BroadcastNeedsReinitialized();
+    Rig->MarkPackageDirty();
+
+    TSharedRef<FJsonObject> R = IKRigToJson(Rig, Controller);
+    R->SetStringField(TEXT("retarget_root"), Controller->GetRetargetRoot().ToString());
+    R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Rig, bSave, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AutoGenerateIKRetargetDefinitionImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRigDefinition* Rig = nullptr;
+    UIKRigController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRigController(Args, Rig, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    FAutoCharacterizeResults Results;
+    Controller->AutoGenerateRetargetDefinition(Results);
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("path"),  Asset->GetPathName());
-    R->SetStringField(TEXT("class"), Asset->GetClass()->GetName());
-    R->SetStringField(TEXT("note"),
-        TEXT("deep IKRig inspection requires the IKRig plugin editor API"));
+    R->SetStringField(TEXT("path"), Rig->GetPathName());
+    R->SetBoolField(TEXT("used_template"), Results.bUsedTemplate);
+    R->SetStringField(TEXT("best_template"), Results.BestTemplateName.ToString());
+    R->SetNumberField(TEXT("best_matching_bones"), Results.BestNumMatchingBones);
+    R->SetNumberField(TEXT("best_template_score"), Results.BestPercentageOfTemplateScore);
+    R->SetArrayField(TEXT("missing_bones"), NamesToJsonArray(Results.MissingBones));
+    R->SetArrayField(TEXT("bones_with_missing_parent"), NamesToJsonArray(Results.BonesWithMissingParent));
+    TArray<TSharedPtr<FJsonValue>> ExpandedChains;
+    for (const TPair<FName, int32>& Pair : Results.ExpandedChains)
+    {
+        auto Item = MakeShared<FJsonObject>();
+        Item->SetStringField(TEXT("chain"), Pair.Key.ToString());
+        Item->SetNumberField(TEXT("expanded_by"), Pair.Value);
+        ExpandedChains.Add(MakeShared<FJsonValueObject>(Item));
+    }
+    R->SetArrayField(TEXT("expanded_chains"), ExpandedChains);
+    R->SetNumberField(TEXT("generated_chain_count"), Results.AutoRetargetDefinition.RetargetDefinition.BoneChains.Num());
+    R->SetStringField(TEXT("generated_root"), Results.AutoRetargetDefinition.RetargetDefinition.RootBone.ToString());
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    if (bDryRun)
+    {
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageAutoGenerateIKRetargetDefinition", "Sage: Auto Generate IK Retarget Definition"));
+    Rig->Modify();
+    const bool bApplied = Controller->ApplyAutoGeneratedRetargetDefinition();
+    if (!bApplied)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("ApplyAutoGeneratedRetargetDefinition failed"));
+    }
+    Controller->BroadcastNeedsReinitialized();
+    Rig->MarkPackageDirty();
+
+    R->SetBoolField(TEXT("applied"), bApplied);
+    R->SetBoolField(TEXT("modified"), true);
+    R->SetObjectField(TEXT("readback"), IKRigToJson(Rig, Controller));
+    TrySaveLoadedAssetIfRequested(Rig, bSave, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FString AutoFBIKOutcomeToString(EAutoFBIKResult Outcome)
+{
+    switch (Outcome)
+    {
+    case EAutoFBIKResult::AllOk:               return TEXT("AllOk");
+    case EAutoFBIKResult::MissingMesh:         return TEXT("MissingMesh");
+    case EAutoFBIKResult::UnknownSkeletonType: return TEXT("UnknownSkeletonType");
+    case EAutoFBIKResult::MissingChains:       return TEXT("MissingChains");
+    case EAutoFBIKResult::MissingRootBone:     return TEXT("MissingRootBone");
+    default:                                   return TEXT("Unknown");
+    }
+}
+
+FSageToolDispatch::FOutcome AutoGenerateIKFBIKImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRigDefinition* Rig = nullptr;
+    UIKRigController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRigController(Args, Rig, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    FAutoFBIKResults Results;
+    Controller->AutoGenerateFBIK(Results);
+    if (!bDryRun)
+    {
+        FScopedTransaction Tx(LOCTEXT("SageAutoGenerateIKFBIK", "Sage: Auto Generate IK FBIK"));
+        Rig->Modify();
+        if (!Controller->ApplyAutoFBIK())
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32603,
+                FString::Printf(TEXT("ApplyAutoFBIK failed: %s"), *AutoFBIKOutcomeToString(Results.Outcome)));
+        }
+        Controller->BroadcastNeedsReinitialized();
+        Rig->MarkPackageDirty();
+    }
+
+    TSharedRef<FJsonObject> R = IKRigToJson(Rig, Controller);
+    R->SetStringField(TEXT("outcome"), AutoFBIKOutcomeToString(Results.Outcome));
+    R->SetArrayField(TEXT("missing_chains"), NamesToJsonArray(Results.MissingChains));
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    R->SetBoolField(TEXT("modified"), !bDryRun);
+    TrySaveLoadedAssetIfRequested(Rig, bSave && !bDryRun, R);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -5063,49 +7050,134 @@ FSageToolDispatch::FOutcome SetRootMotionImpl(const TSharedPtr<FJsonObject>& Arg
     FSageToolDispatch::FOutcome Reject;
     if (detail::RejectIfPie(Reject)) return Reject;
 
+    if (!Args.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing args"));
+    }
+
+    TArray<FString> Paths;
     FString Path;
+    if (Args->TryGetStringField(TEXT("path"), Path) && !Path.IsEmpty())
+    {
+        Paths.Add(Path);
+    }
+    TArray<FString> ArrayPaths;
+    ReadStringArrayField(Args, TEXT("assets"), ArrayPaths);
+    for (const FString& Item : ArrayPaths)
+    {
+        if (!Item.IsEmpty())
+        {
+            Paths.AddUnique(Item);
+        }
+    }
+    if (Paths.Num() == 0)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path' or 'assets'"));
+    }
+
     bool bEnabled = false;
-    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
-    {
-        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
-    }
-    Args->TryGetBoolField(TEXT("enabled"), bEnabled);
-
-    UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(Path));
-    if (!Seq)
-    {
-        return FSageToolDispatch::FOutcome::MakeError(-32602,
-            FString::Printf(TEXT("not a UAnimSequence: %s"), *Path));
-    }
-
-    FScopedTransaction Tx(LOCTEXT("SetRootMotion", "Set Root Motion"));
-    Seq->Modify();
-    Seq->bEnableRootMotion = bEnabled;
+    bool bHaveEnabled = Args->TryGetBoolField(TEXT("enabled"), bEnabled);
+    bool bForceRootLock = false;
+    bool bHaveForceRootLock = Args->TryGetBoolField(TEXT("force_root_lock"), bForceRootLock);
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
 
     FString LockTypeStr;
-    if (Args->TryGetStringField(TEXT("lock_type"), LockTypeStr) && !LockTypeStr.IsEmpty())
+    if (!Args->TryGetStringField(TEXT("lock_type"), LockTypeStr))
     {
-        FProperty* LockProp = Seq->GetClass()->FindPropertyByName(TEXT("RootMotionRootLock"));
-        if (LockProp)
+        Args->TryGetStringField(TEXT("root_lock"), LockTypeStr);
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Results;
+    int32 Modified = 0;
+    int32 Failed = 0;
+    auto RootLockToString = [](ERootMotionRootLock::Type Mode) -> FString
+    {
+        switch (Mode)
         {
-            FByteProperty* ByteProp = CastField<FByteProperty>(LockProp);
-            if (ByteProp && ByteProp->Enum)
+        case ERootMotionRootLock::RefPose:        return TEXT("RefPose");
+        case ERootMotionRootLock::AnimFirstFrame: return TEXT("AnimFirstFrame");
+        case ERootMotionRootLock::Zero:           return TEXT("Zero");
+        default:                                  return TEXT("Unknown");
+        }
+    };
+    FScopedTransaction Tx(LOCTEXT("SetRootMotion", "Set Root Motion"));
+    for (const FString& SeqPath : Paths)
+    {
+        auto Row = MakeShared<FJsonObject>();
+        Row->SetStringField(TEXT("path"), SeqPath);
+        UAnimSequence* Seq = Cast<UAnimSequence>(ResolveAsset(SeqPath));
+        if (!Seq)
+        {
+            Row->SetStringField(TEXT("status"), TEXT("failed"));
+            Row->SetStringField(TEXT("reason"), TEXT("not a UAnimSequence"));
+            Results.Add(MakeShared<FJsonValueObject>(Row));
+            ++Failed;
+            continue;
+        }
+        Row->SetStringField(TEXT("resolved_path"), Seq->GetPathName());
+        Row->SetBoolField(TEXT("before_enabled"), Seq->bEnableRootMotion);
+        Row->SetBoolField(TEXT("before_force_root_lock"), Seq->bForceRootLock);
+        Row->SetStringField(TEXT("before_lock_type"), RootLockToString(Seq->RootMotionRootLock));
+        if (bDryRun)
+        {
+            Row->SetStringField(TEXT("status"), TEXT("dry_run"));
+            Row->SetBoolField(TEXT("modified"), false);
+            Results.Add(MakeShared<FJsonValueObject>(Row));
+            continue;
+        }
+
+        Seq->Modify();
+        if (bHaveEnabled)
+        {
+            Seq->bEnableRootMotion = bEnabled;
+        }
+        if (bHaveForceRootLock)
+        {
+            Seq->bForceRootLock = bForceRootLock;
+        }
+        if (!LockTypeStr.IsEmpty())
+        {
+            FProperty* LockProp = Seq->GetClass()->FindPropertyByName(TEXT("RootMotionRootLock"));
+            if (LockProp)
             {
-                int64 Val = ByteProp->Enum->GetValueByNameString(LockTypeStr);
-                if (Val != INDEX_NONE)
+                FByteProperty* ByteProp = CastField<FByteProperty>(LockProp);
+                if (ByteProp && ByteProp->Enum)
                 {
-                    ByteProp->SetPropertyValue(LockProp->ContainerPtrToValuePtr<void>(Seq),
-                                               static_cast<uint8>(Val));
+                    int64 Val = ByteProp->Enum->GetValueByNameString(LockTypeStr);
+                    if (Val != INDEX_NONE)
+                    {
+                        ByteProp->SetPropertyValue(LockProp->ContainerPtrToValuePtr<void>(Seq),
+                                                   static_cast<uint8>(Val));
+                    }
                 }
             }
         }
+        Seq->MarkPackageDirty();
+        ++Modified;
+
+        Row->SetStringField(TEXT("status"), TEXT("updated"));
+        Row->SetBoolField(TEXT("enabled"), Seq->bEnableRootMotion);
+        Row->SetBoolField(TEXT("force_root_lock"), Seq->bForceRootLock);
+        Row->SetStringField(TEXT("lock_type"), RootLockToString(Seq->RootMotionRootLock));
+        Row->SetBoolField(TEXT("modified"), true);
+        if (bSave)
+        {
+            TrySaveLoadedAssetIfRequested(Seq, true, Row);
+        }
+        Results.Add(MakeShared<FJsonValueObject>(Row));
     }
 
-    Seq->MarkPackageDirty();
-
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("path"),    Seq->GetPathName());
-    R->SetBoolField  (TEXT("enabled"), Seq->bEnableRootMotion);
+    R->SetArrayField(TEXT("results"), Results);
+    R->SetNumberField(TEXT("count"), Paths.Num());
+    R->SetNumberField(TEXT("modified"), Modified);
+    R->SetNumberField(TEXT("failed"), Failed);
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    R->SetBoolField(TEXT("save"), bSave);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -5301,6 +7373,11 @@ FSageToolDispatch::FOutcome CreateCompositeImpl(const TSharedPtr<FJsonObject>& A
 // animation.create_ik_retargeter
 // ---------------------------------------------------------------------------
 
+bool ParseAutoMapChainType(const FString& Raw, EAutoMapChainType& Out);
+void AddIKRetargeterReadback(UIKRetargeter* Retargeter, TSharedRef<FJsonObject> Result);
+TSharedRef<FJsonObject> FKChainSettingsToJson(const FRetargetFKChainSettings& Settings);
+TSharedRef<FJsonObject> IKChainSettingsToJson(const FRetargetIKChainSettings& Settings);
+
 FSageToolDispatch::FOutcome CreateIKRetargeterImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FSageToolDispatch::FOutcome Reject;
@@ -5310,6 +7387,72 @@ FSageToolDispatch::FOutcome CreateIKRetargeterImpl(const TSharedPtr<FJsonObject>
     if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    bool bDryRun = false;
+    bool bSave = false;
+    bool bAddDefaultOps = true;
+    bool bAssignOps = true;
+    bool bCleanAsset = true;
+    bool bAutoMap = true;
+    bool bForceRemap = true;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    Args->TryGetBoolField(TEXT("add_default_ops"), bAddDefaultOps);
+    Args->TryGetBoolField(TEXT("assign_ops"), bAssignOps);
+    Args->TryGetBoolField(TEXT("assign_ik_rigs"), bAssignOps);
+    Args->TryGetBoolField(TEXT("clean_asset"), bCleanAsset);
+    Args->TryGetBoolField(TEXT("auto_map"), bAutoMap);
+    Args->TryGetBoolField(TEXT("force_remap"), bForceRemap);
+    FString AutoMapTypeString = TEXT("fuzzy");
+    Args->TryGetStringField(TEXT("auto_map_type"), AutoMapTypeString);
+    EAutoMapChainType AutoMapType = EAutoMapChainType::Fuzzy;
+    if (!ParseAutoMapChainType(AutoMapTypeString, AutoMapType))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid auto_map_type: %s"), *AutoMapTypeString));
+    }
+
+    FString SourcePath;
+    FString TargetPath;
+    Args->TryGetStringField(TEXT("source_ik_rig"), SourcePath);
+    Args->TryGetStringField(TEXT("target_ik_rig"), TargetPath);
+    UIKRigDefinition* SourceRig = nullptr;
+    UIKRigDefinition* TargetRig = nullptr;
+    if (!SourcePath.IsEmpty())
+    {
+        SourceRig = Cast<UIKRigDefinition>(ResolveAsset(SourcePath));
+        if (!SourceRig)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("not a source UIKRigDefinition: %s"), *SourcePath));
+        }
+    }
+    if (!TargetPath.IsEmpty())
+    {
+        TargetRig = Cast<UIKRigDefinition>(ResolveAsset(TargetPath));
+        if (!TargetRig)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("not a target UIKRigDefinition: %s"), *TargetPath));
+        }
+    }
+
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Path);
+        R->SetStringField(TEXT("source_ik_rig"), SourcePath);
+        R->SetStringField(TEXT("target_ik_rig"), TargetPath);
+        R->SetBoolField(TEXT("add_default_ops"), bAddDefaultOps);
+        R->SetBoolField(TEXT("assign_ops"), bAssignOps);
+        R->SetBoolField(TEXT("clean_asset"), bCleanAsset);
+        R->SetBoolField(TEXT("auto_map"), bAutoMap);
+        R->SetStringField(TEXT("auto_map_type"), AutoMapTypeString);
+        R->SetBoolField(TEXT("force_remap"), bForceRemap);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
     }
 
     UClass* RetargetClass = FindObject<UClass>(nullptr, TEXT("/Script/IKRig.IKRetargeter"));
@@ -5331,22 +7474,23 @@ FSageToolDispatch::FOutcome CreateIKRetargeterImpl(const TSharedPtr<FJsonObject>
     if (FacClass)
     {
         Fac = NewObject<UFactory>(GetTransientPackage(), FacClass);
-        FString SourcePath, TargetPath;
-        if (Args->TryGetStringField(TEXT("source_ik_rig"), SourcePath) && !SourcePath.IsEmpty())
+        if (SourceRig)
         {
-            UObject* SrcRig = ResolveAsset(SourcePath);
             FObjectPropertyBase* SrcProp = CastField<FObjectPropertyBase>(
                 Fac->GetClass()->FindPropertyByName(TEXT("SourceIKRigAsset")));
-            if (SrcProp && SrcRig)
-                SrcProp->SetObjectPropertyValue(SrcProp->ContainerPtrToValuePtr<void>(Fac), SrcRig);
+            if (SrcProp)
+            {
+                SrcProp->SetObjectPropertyValue(SrcProp->ContainerPtrToValuePtr<void>(Fac), SourceRig);
+            }
         }
-        if (Args->TryGetStringField(TEXT("target_ik_rig"), TargetPath) && !TargetPath.IsEmpty())
+        if (TargetRig)
         {
-            UObject* TgtRig = ResolveAsset(TargetPath);
             FObjectPropertyBase* TgtProp = CastField<FObjectPropertyBase>(
                 Fac->GetClass()->FindPropertyByName(TEXT("TargetIKRigAsset")));
-            if (TgtProp && TgtRig)
-                TgtProp->SetObjectPropertyValue(TgtProp->ContainerPtrToValuePtr<void>(Fac), TgtRig);
+            if (TgtProp)
+            {
+                TgtProp->SetObjectPropertyValue(TgtProp->ContainerPtrToValuePtr<void>(Fac), TargetRig);
+            }
         }
     }
 
@@ -5358,10 +7502,61 @@ FSageToolDispatch::FOutcome CreateIKRetargeterImpl(const TSharedPtr<FJsonObject>
             FString::Printf(TEXT("failed to create IKRetargeter at %s"), *Path));
     }
     Created->MarkPackageDirty();
+    if (UIKRetargeter* CreatedRetargeter = Cast<UIKRetargeter>(Created))
+    {
+        if (UIKRetargeterController* Controller = UIKRetargeterController::GetController(CreatedRetargeter))
+        {
+            CreatedRetargeter->Modify();
+            if (SourceRig)
+            {
+                Controller->SetIKRig(ERetargetSourceOrTarget::Source, SourceRig);
+            }
+            if (TargetRig)
+            {
+                Controller->SetIKRig(ERetargetSourceOrTarget::Target, TargetRig);
+            }
+            if (bAddDefaultOps)
+            {
+                Controller->AddDefaultOps();
+            }
+            if (bAssignOps)
+            {
+                if (const UIKRigDefinition* ActiveSourceRig = Controller->GetIKRig(ERetargetSourceOrTarget::Source))
+                {
+                    Controller->AssignIKRigToAllOps(ERetargetSourceOrTarget::Source, ActiveSourceRig);
+                }
+                if (const UIKRigDefinition* ActiveTargetRig = Controller->GetIKRig(ERetargetSourceOrTarget::Target))
+                {
+                    Controller->AssignIKRigToAllOps(ERetargetSourceOrTarget::Target, ActiveTargetRig);
+                }
+            }
+            if (bAutoMap)
+            {
+                Controller->AutoMapChains(AutoMapType, bForceRemap);
+            }
+            if (bCleanAsset)
+            {
+                Controller->CleanAsset();
+            }
+            CreatedRetargeter->MarkPackageDirty();
+        }
+    }
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"),  Created->GetPathName());
     R->SetStringField(TEXT("class"), Created->GetClass()->GetName());
+    R->SetBoolField(TEXT("add_default_ops"), bAddDefaultOps);
+    R->SetBoolField(TEXT("assign_ops"), bAssignOps);
+    R->SetBoolField(TEXT("clean_asset"), bCleanAsset);
+    R->SetBoolField(TEXT("auto_map"), bAutoMap);
+    R->SetStringField(TEXT("auto_map_type"), AutoMapTypeString);
+    R->SetBoolField(TEXT("force_remap"), bForceRemap);
+    R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Created, bSave, R);
+    if (UIKRetargeter* CreatedRetargeter = Cast<UIKRetargeter>(Created))
+    {
+        AddIKRetargeterReadback(CreatedRetargeter, R);
+    }
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -5389,7 +7584,6 @@ FSageToolDispatch::FOutcome ReadIKRetargeterImpl(const TSharedPtr<FJsonObject>& 
     {
         return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("failed to get IK Retargeter controller"));
     }
-    Controller->CleanAsset();
 
     auto AssetPathOrEmpty = [](const UObject* Obj) -> FString
     {
@@ -5456,12 +7650,55 @@ FSageToolDispatch::FOutcome ReadIKRetargeterImpl(const TSharedPtr<FJsonObject>& 
         OpObj->SetNumberField(TEXT("index"), I);
         OpObj->SetStringField(TEXT("name"), OpName.ToString());
         OpObj->SetBoolField(TEXT("enabled"), Controller->GetRetargetOpEnabled(I));
+        OpObj->SetNumberField(TEXT("parent_index"), Controller->GetParentOpIndex(I));
+        OpObj->SetStringField(TEXT("parent_op_name"), Controller->GetParentOpByName(OpName).ToString());
+        if (const FIKRetargetOpBase* Op = Controller->GetRetargetOpByIndex(I))
+        {
+            if (const UScriptStruct* OpType = Op->GetType())
+            {
+                OpObj->SetStringField(TEXT("type"), OpType->GetPathName());
+            }
+            if (const UScriptStruct* ParentType = Op->GetParentOpType())
+            {
+                OpObj->SetStringField(TEXT("parent_type"), ParentType->GetPathName());
+            }
+        }
         if (FInstancedStruct* OpStruct = Controller->GetRetargetOpStructAtIndex(I))
         {
             if (const UScriptStruct* ScriptStruct = OpStruct->GetScriptStruct())
             {
                 OpObj->SetStringField(TEXT("struct"), ScriptStruct->GetPathName());
             }
+        }
+        if (UIKRetargetFKChainsController* FKController = Cast<UIKRetargetFKChainsController>(Controller->GetOpController(I)))
+        {
+            const FIKRetargetFKChainsOpSettings FKSettings = FKController->GetSettings();
+            TArray<TSharedPtr<FJsonValue>> FKChains;
+            for (const FRetargetFKChainSettings& ChainSettings : FKSettings.ChainsToRetarget)
+            {
+                FKChains.Add(MakeShared<FJsonValueObject>(FKChainSettingsToJson(ChainSettings)));
+            }
+            auto FKObj = MakeShared<FJsonObject>();
+            FKObj->SetArrayField(TEXT("chains"), FKChains);
+            FKObj->SetNumberField(TEXT("chain_count"), FKChains.Num());
+            OpObj->SetObjectField(TEXT("fk_settings"), FKObj);
+        }
+        if (UIKRetargetIKChainsController* IKController = Cast<UIKRetargetIKChainsController>(Controller->GetOpController(I)))
+        {
+            const FIKRetargetIKChainsOpSettings IKSettings = IKController->GetSettings();
+            TArray<TSharedPtr<FJsonValue>> IKChains;
+            for (const FRetargetIKChainSettings& ChainSettings : IKSettings.ChainsToRetarget)
+            {
+                IKChains.Add(MakeShared<FJsonValueObject>(IKChainSettingsToJson(ChainSettings)));
+            }
+            auto IKObj = MakeShared<FJsonObject>();
+            IKObj->SetArrayField(TEXT("chains"), IKChains);
+            IKObj->SetNumberField(TEXT("chain_count"), IKChains.Num());
+            IKObj->SetBoolField(TEXT("draw_final_goals"), IKSettings.bDrawFinalGoals);
+            IKObj->SetBoolField(TEXT("draw_source_locations"), IKSettings.bDrawSourceLocations);
+            IKObj->SetNumberField(TEXT("goal_draw_size"), IKSettings.GoalDrawSize);
+            IKObj->SetNumberField(TEXT("goal_draw_thickness"), IKSettings.GoalDrawThickness);
+            OpObj->SetObjectField(TEXT("ik_settings"), IKObj);
         }
         Ops.Add(MakeShared<FJsonValueObject>(OpObj));
 
@@ -5494,6 +7731,378 @@ FSageToolDispatch::FOutcome ReadIKRetargeterImpl(const TSharedPtr<FJsonObject>& 
     R->SetObjectField(TEXT("source_poses"), PoseSideToJson(ERetargetSourceOrTarget::Source));
     R->SetObjectField(TEXT("target_poses"), PoseSideToJson(ERetargetSourceOrTarget::Target));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FString NormalizeToken(FString Raw)
+{
+    Raw = Raw.TrimStartAndEnd();
+    Raw.ReplaceInline(TEXT(" "), TEXT(""));
+    Raw.ReplaceInline(TEXT("_"), TEXT(""));
+    Raw.ReplaceInline(TEXT("-"), TEXT(""));
+    Raw.ReplaceInline(TEXT("."), TEXT(""));
+    Raw.ToLowerInline();
+    return Raw;
+}
+
+bool TryGetAnyBoolField(const TSharedPtr<FJsonObject>& Args, const TArray<const TCHAR*>& Names, bool& Out)
+{
+    if (!Args.IsValid())
+    {
+        return false;
+    }
+    for (const TCHAR* Name : Names)
+    {
+        bool Value = false;
+        if (Args->TryGetBoolField(Name, Value))
+        {
+            Out = Value;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TryGetAnyNumberField(const TSharedPtr<FJsonObject>& Args, const TArray<const TCHAR*>& Names, double& Out)
+{
+    if (!Args.IsValid())
+    {
+        return false;
+    }
+    for (const TCHAR* Name : Names)
+    {
+        double Value = 0.0;
+        if (Args->TryGetNumberField(Name, Value))
+        {
+            Out = Value;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TryGetAnyIntField(const TSharedPtr<FJsonObject>& Args, const TArray<const TCHAR*>& Names, int32& Out)
+{
+    double Value = 0.0;
+    if (!TryGetAnyNumberField(Args, Names, Value))
+    {
+        return false;
+    }
+    Out = FMath::RoundToInt(Value);
+    return true;
+}
+
+bool ParseAutoMapChainType(const FString& Raw, EAutoMapChainType& Out)
+{
+    const FString Key = NormalizeToken(Raw);
+    if (Key.IsEmpty() || Key == TEXT("fuzzy") || Key == TEXT("best") || Key == TEXT("levenshtein"))
+    {
+        Out = EAutoMapChainType::Fuzzy;
+        return true;
+    }
+    if (Key == TEXT("exact") || Key == TEXT("name"))
+    {
+        Out = EAutoMapChainType::Exact;
+        return true;
+    }
+    if (Key == TEXT("clear") || Key == TEXT("none") || Key == TEXT("reset"))
+    {
+        Out = EAutoMapChainType::Clear;
+        return true;
+    }
+    return false;
+}
+
+bool ParseRetargetAutoAlignMethod(const FString& Raw, ERetargetAutoAlignMethod& Out)
+{
+    const FString Key = NormalizeToken(Raw);
+    if (Key.IsEmpty() || Key == TEXT("chaintochain") || Key == TEXT("chain") || Key == TEXT("direction"))
+    {
+        Out = ERetargetAutoAlignMethod::ChainToChain;
+        return true;
+    }
+    if (Key == TEXT("localrotationaxes") || Key == TEXT("localaxes") || Key == TEXT("local"))
+    {
+        Out = ERetargetAutoAlignMethod::LocalRotationAxes;
+        return true;
+    }
+    if (Key == TEXT("globalrotationaxes") || Key == TEXT("globalaxes") || Key == TEXT("global"))
+    {
+        Out = ERetargetAutoAlignMethod::GlobalRotationAxes;
+        return true;
+    }
+    if (Key == TEXT("meshtomesh") || Key == TEXT("mesh"))
+    {
+        Out = ERetargetAutoAlignMethod::MeshToMesh;
+        return true;
+    }
+    return false;
+}
+
+bool ParseFKRotationMode(const FString& Raw, EFKChainRotationMode& Out)
+{
+    const FString Key = NormalizeToken(Raw);
+    if (Key == TEXT("none"))
+    {
+        Out = EFKChainRotationMode::None;
+        return true;
+    }
+    if (Key.IsEmpty() || Key == TEXT("interpolated") || Key == TEXT("interpolate"))
+    {
+        Out = EFKChainRotationMode::Interpolated;
+        return true;
+    }
+    if (Key == TEXT("onetoone") || Key == TEXT("1to1"))
+    {
+        Out = EFKChainRotationMode::OneToOne;
+        return true;
+    }
+    if (Key == TEXT("onetoonereversed") || Key == TEXT("1to1reversed") || Key == TEXT("reversed"))
+    {
+        Out = EFKChainRotationMode::OneToOneReversed;
+        return true;
+    }
+    if (Key == TEXT("matchchain"))
+    {
+        Out = EFKChainRotationMode::MatchChain;
+        return true;
+    }
+    if (Key == TEXT("matchscaledchain"))
+    {
+        Out = EFKChainRotationMode::MatchScaledChain;
+        return true;
+    }
+    if (Key == TEXT("copylocal"))
+    {
+        Out = EFKChainRotationMode::CopyLocal;
+        return true;
+    }
+    return false;
+}
+
+bool ParseFKTranslationMode(const FString& Raw, EFKChainTranslationMode& Out)
+{
+    const FString Key = NormalizeToken(Raw);
+    if (Key.IsEmpty() || Key == TEXT("none"))
+    {
+        Out = EFKChainTranslationMode::None;
+        return true;
+    }
+    if (Key == TEXT("globallyscaled") || Key == TEXT("scaled"))
+    {
+        Out = EFKChainTranslationMode::GloballyScaled;
+        return true;
+    }
+    if (Key == TEXT("absolute"))
+    {
+        Out = EFKChainTranslationMode::Absolute;
+        return true;
+    }
+    if (Key == TEXT("stretchbonelengthuniformly") || Key == TEXT("stretchuniform"))
+    {
+        Out = EFKChainTranslationMode::StretchBoneLengthUniformly;
+        return true;
+    }
+    if (Key == TEXT("stretchbonelengthnonuniformly") || Key == TEXT("stretchnonuniform"))
+    {
+        Out = EFKChainTranslationMode::StretchBoneLengthNonUniformly;
+        return true;
+    }
+    if (Key == TEXT("orientandscale"))
+    {
+        Out = EFKChainTranslationMode::OrientAndScale;
+        return true;
+    }
+    return false;
+}
+
+FString NormalizeIKRetargetOpType(const FString& Raw)
+{
+    FString Type = Raw.TrimStartAndEnd();
+    if (Type.StartsWith(TEXT("/Script/")))
+    {
+        return Type;
+    }
+
+    const FString Key = NormalizeToken(Type);
+    static const TMap<FString, FString> Aliases = {
+        {TEXT("pelvis"), TEXT("/Script/IKRig.IKRetargetPelvisMotionOp")},
+        {TEXT("pelvismotion"), TEXT("/Script/IKRig.IKRetargetPelvisMotionOp")},
+        {TEXT("fk"), TEXT("/Script/IKRig.IKRetargetFKChainsOp")},
+        {TEXT("fkchains"), TEXT("/Script/IKRig.IKRetargetFKChainsOp")},
+        {TEXT("ik"), TEXT("/Script/IKRig.IKRetargetIKChainsOp")},
+        {TEXT("ikchains"), TEXT("/Script/IKRig.IKRetargetIKChainsOp")},
+        {TEXT("ikgoals"), TEXT("/Script/IKRig.IKRetargetIKChainsOp")},
+        {TEXT("runik"), TEXT("/Script/IKRig.IKRetargetRunIKRigOp")},
+        {TEXT("runikrig"), TEXT("/Script/IKRig.IKRetargetRunIKRigOp")},
+        {TEXT("iksolve"), TEXT("/Script/IKRig.IKRetargetRunIKRigOp")},
+        {TEXT("root"), TEXT("/Script/IKRig.IKRetargetRootMotionOp")},
+        {TEXT("rootmotion"), TEXT("/Script/IKRig.IKRetargetRootMotionOp")},
+        {TEXT("copypose"), TEXT("/Script/IKRig.IKRetargetCopyBasePoseOp")},
+        {TEXT("copybasepose"), TEXT("/Script/IKRig.IKRetargetCopyBasePoseOp")},
+        {TEXT("additivepose"), TEXT("/Script/IKRig.IKRetargetAdditivePoseOp")},
+        {TEXT("pinbone"), TEXT("/Script/IKRig.IKRetargetPinBoneOp")},
+        {TEXT("pinbones"), TEXT("/Script/IKRig.IKRetargetPinBoneOp")},
+        {TEXT("polevector"), TEXT("/Script/IKRig.IKRetargetAlignPoleVectorOp")},
+        {TEXT("alignpolevector"), TEXT("/Script/IKRig.IKRetargetAlignPoleVectorOp")},
+        {TEXT("floor"), TEXT("/Script/IKRig.IKRetargetFloorConstraintOp")},
+        {TEXT("floorconstraint"), TEXT("/Script/IKRig.IKRetargetFloorConstraintOp")},
+        {TEXT("stretch"), TEXT("/Script/IKRig.IKRetargetStretchChainOp")},
+        {TEXT("stretchchain"), TEXT("/Script/IKRig.IKRetargetStretchChainOp")},
+        {TEXT("stride"), TEXT("/Script/IKRig.IKRetargetStrideWarpingOp")},
+        {TEXT("stridewarping"), TEXT("/Script/IKRig.IKRetargetStrideWarpingOp")},
+        {TEXT("speedplant"), TEXT("/Script/IKRig.IKRetargetSpeedPlantingOp")},
+        {TEXT("speedplanting"), TEXT("/Script/IKRig.IKRetargetSpeedPlantingOp")},
+        {TEXT("scalesource"), TEXT("/Script/IKRig.IKRetargetScaleSourceOp")},
+        {TEXT("filterbone"), TEXT("/Script/IKRig.IKRetargetFilterBoneOp")},
+        {TEXT("filterbones"), TEXT("/Script/IKRig.IKRetargetFilterBoneOp")},
+        {TEXT("curveremap"), TEXT("/Script/IKRig.IKRetargetCurveRemapOp")},
+        {TEXT("remapcurves"), TEXT("/Script/IKRig.IKRetargetCurveRemapOp")},
+    };
+    if (const FString* Mapped = Aliases.Find(Key))
+    {
+        return *Mapped;
+    }
+    if (Type.StartsWith(TEXT("IKRetarget")))
+    {
+        return FString::Printf(TEXT("/Script/IKRig.%s"), *Type);
+    }
+    return FString::Printf(TEXT("/Script/IKRig.IKRetarget%sOp"), *Type);
+}
+
+UScriptStruct* ResolveIKRetargetOpStruct(const FString& Raw, FString& OutPath)
+{
+    OutPath = NormalizeIKRetargetOpType(Raw);
+    UScriptStruct* OpStruct = FindObject<UScriptStruct>(nullptr, *OutPath);
+    if (!OpStruct)
+    {
+        OpStruct = LoadObject<UScriptStruct>(nullptr, *OutPath);
+    }
+    return OpStruct;
+}
+
+FSageToolDispatch::FOutcome ResolveIKRetargeterController(
+    const TSharedPtr<FJsonObject>& Args,
+    UIKRetargeter*& OutRetargeter,
+    UIKRetargeterController*& OutController)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+
+    OutRetargeter = Cast<UIKRetargeter>(ResolveAsset(Path));
+    if (!OutRetargeter)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UIKRetargeter: %s"), *Path));
+    }
+    OutController = UIKRetargeterController::GetController(OutRetargeter);
+    if (!OutController)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("failed to get IK Retargeter controller"));
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(MakeShared<FJsonObject>());
+}
+
+bool TryResolveIKRetargeterOpIndex(
+    const TSharedPtr<FJsonObject>& Args,
+    UIKRetargeterController* Controller,
+    int32& OutIndex,
+    FString& OutError)
+{
+    if (!Controller)
+    {
+        OutError = TEXT("IK Retargeter controller unavailable");
+        return false;
+    }
+    if (TryGetAnyIntField(Args, TArray<const TCHAR*>{ TEXT("index"), TEXT("op_index") }, OutIndex))
+    {
+        if (OutIndex >= 0 && OutIndex < Controller->GetNumRetargetOps())
+        {
+            return true;
+        }
+        OutError = FString::Printf(TEXT("retarget op index out of range: %d"), OutIndex);
+        return false;
+    }
+
+    FString OpName;
+    if (TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("op_name"), TEXT("name") }, OpName))
+    {
+        OutIndex = Controller->GetIndexOfOpByName(FName(*OpName));
+        if (OutIndex != INDEX_NONE)
+        {
+            return true;
+        }
+        OutError = FString::Printf(TEXT("retarget op not found: %s"), *OpName);
+        return false;
+    }
+
+    OutError = TEXT("missing 'index' or 'op_name'");
+    return false;
+}
+
+int32 FindFirstFKRetargetOpIndex(UIKRetargeterController* Controller)
+{
+    if (!Controller)
+    {
+        return INDEX_NONE;
+    }
+    for (int32 Index = 0; Index < Controller->GetNumRetargetOps(); ++Index)
+    {
+        FInstancedStruct* OpStruct = Controller->GetRetargetOpStructAtIndex(Index);
+        const UScriptStruct* ScriptStruct = OpStruct ? OpStruct->GetScriptStruct() : nullptr;
+        if (ScriptStruct && ScriptStruct->IsChildOf(FIKRetargetFKChainsOp::StaticStruct()))
+        {
+            return Index;
+        }
+    }
+    return INDEX_NONE;
+}
+
+void AddIKRetargeterReadback(UIKRetargeter* Retargeter, TSharedRef<FJsonObject> Result)
+{
+    if (!Retargeter)
+    {
+        return;
+    }
+    auto Args = MakeShared<FJsonObject>();
+    Args->SetStringField(TEXT("path"), Retargeter->GetPathName());
+    FSageToolDispatch::FOutcome Snapshot = ReadIKRetargeterImpl(Args);
+    if (Snapshot.bSuccess && Snapshot.Result.IsValid())
+    {
+        Result->SetObjectField(TEXT("readback"), Snapshot.Result.ToSharedRef());
+    }
+}
+
+TSharedRef<FJsonObject> FKChainSettingsToJson(const FRetargetFKChainSettings& Settings)
+{
+    auto Obj = MakeShared<FJsonObject>();
+    Obj->SetStringField(TEXT("target_chain"), Settings.TargetChainName.ToString());
+    Obj->SetBoolField(TEXT("enable_fk"), Settings.EnableFK);
+    Obj->SetStringField(TEXT("rotation_mode"), StaticEnum<EFKChainRotationMode>()->GetNameStringByValue(static_cast<int64>(Settings.RotationMode)));
+    Obj->SetNumberField(TEXT("rotation_alpha"), Settings.RotationAlpha);
+    Obj->SetStringField(TEXT("translation_mode"), StaticEnum<EFKChainTranslationMode>()->GetNameStringByValue(static_cast<int64>(Settings.TranslationMode)));
+    Obj->SetNumberField(TEXT("translation_alpha"), Settings.TranslationAlpha);
+    return Obj;
+}
+
+TSharedRef<FJsonObject> IKChainSettingsToJson(const FRetargetIKChainSettings& Settings)
+{
+    auto Obj = MakeShared<FJsonObject>();
+    Obj->SetStringField(TEXT("target_chain"), Settings.TargetChainName.ToString());
+    Obj->SetBoolField(TEXT("enable_ik"), Settings.EnableIK);
+    Obj->SetNumberField(TEXT("blend_to_source"), Settings.BlendToSource);
+    Obj->SetNumberField(TEXT("blend_to_source_translation"), Settings.BlendToSourceTranslation);
+    Obj->SetNumberField(TEXT("blend_to_source_rotation"), Settings.BlendToSourceRotation);
+    Obj->SetField(TEXT("blend_to_source_weights"), detail::Vec3ToJson(Settings.BlendToSourceWeights));
+    Obj->SetBoolField(TEXT("apply_pelvis_offset_to_source_goals"), Settings.ApplyPelvisOffsetToSourceGoals);
+    Obj->SetField(TEXT("static_offset"), detail::Vec3ToJson(Settings.StaticOffset));
+    Obj->SetField(TEXT("static_local_offset"), detail::Vec3ToJson(Settings.StaticLocalOffset));
+    Obj->SetField(TEXT("static_rotation_offset"), detail::Rot3ToJson(Settings.StaticRotationOffset));
+    Obj->SetNumberField(TEXT("scale_vertical"), Settings.ScaleVertical);
+    Obj->SetNumberField(TEXT("extension"), Settings.Extension);
+    return Obj;
 }
 
 // ---------------------------------------------------------------------------
@@ -5565,21 +8174,65 @@ FSageToolDispatch::FOutcome SetIKRetargeterRigsImpl(const TSharedPtr<FJsonObject
     }
 
     bool bAddDefaultOps = true;
+    bool bAssignOps = true;
+    bool bCleanAsset = true;
+    bool bCleanChainMaps = false;
     bool bAutoMap = true;
     bool bForceRemap = true;
+    bool bDryRun = false;
+    bool bSave = false;
     Args->TryGetBoolField(TEXT("add_default_ops"), bAddDefaultOps);
+    Args->TryGetBoolField(TEXT("assign_ops"), bAssignOps);
+    Args->TryGetBoolField(TEXT("assign_ik_rigs"), bAssignOps);
+    Args->TryGetBoolField(TEXT("clean_asset"), bCleanAsset);
+    Args->TryGetBoolField(TEXT("clean_chain_maps"), bCleanChainMaps);
     Args->TryGetBoolField(TEXT("auto_map"), bAutoMap);
     Args->TryGetBoolField(TEXT("force_remap"), bForceRemap);
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
     FString AutoMapTypeString = TEXT("fuzzy");
     Args->TryGetStringField(TEXT("auto_map_type"), AutoMapTypeString);
     EAutoMapChainType AutoMapType = EAutoMapChainType::Fuzzy;
-    if (AutoMapTypeString.Equals(TEXT("exact"), ESearchCase::IgnoreCase))
+    if (!ParseAutoMapChainType(AutoMapTypeString, AutoMapType))
     {
-        AutoMapType = EAutoMapChainType::Exact;
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid auto_map_type: %s"), *AutoMapTypeString));
     }
-    else if (AutoMapTypeString.Equals(TEXT("clear"), ESearchCase::IgnoreCase))
+
+    TSharedPtr<FJsonObject> Before;
     {
-        AutoMapType = EAutoMapChainType::Clear;
+        auto SnapshotArgs = MakeShared<FJsonObject>();
+        SnapshotArgs->SetStringField(TEXT("path"), Retargeter->GetPathName());
+        FSageToolDispatch::FOutcome Snapshot = ReadIKRetargeterImpl(SnapshotArgs);
+        if (Snapshot.bSuccess && Snapshot.Result.IsValid())
+        {
+            Before = Snapshot.Result;
+        }
+    }
+
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+        R->SetStringField(TEXT("source_ik_rig"), SourceRigPath);
+        R->SetStringField(TEXT("target_ik_rig"), TargetRigPath);
+        R->SetStringField(TEXT("source_preview_mesh"), SourceMeshPath);
+        R->SetStringField(TEXT("target_preview_mesh"), TargetMeshPath);
+        R->SetBoolField(TEXT("add_default_ops"), bAddDefaultOps);
+        R->SetBoolField(TEXT("assign_ops"), bAssignOps);
+        R->SetBoolField(TEXT("clean_asset"), bCleanAsset);
+        R->SetBoolField(TEXT("clean_chain_maps"), bCleanChainMaps);
+        R->SetBoolField(TEXT("auto_map"), bAutoMap);
+        R->SetStringField(TEXT("auto_map_type"), AutoMapTypeString);
+        R->SetBoolField(TEXT("force_remap"), bForceRemap);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        if (Before.IsValid())
+        {
+            R->SetObjectField(TEXT("before"), Before.ToSharedRef());
+        }
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
     }
 
     FScopedTransaction Tx(LOCTEXT("SageSetIKRetargeterRigs", "Sage: Set IK Retargeter Rigs"));
@@ -5604,11 +8257,29 @@ FSageToolDispatch::FOutcome SetIKRetargeterRigsImpl(const TSharedPtr<FJsonObject
     {
         Controller->AddDefaultOps();
     }
+    if (bAssignOps)
+    {
+        if (const UIKRigDefinition* ActiveSourceRig = Controller->GetIKRig(ERetargetSourceOrTarget::Source))
+        {
+            Controller->AssignIKRigToAllOps(ERetargetSourceOrTarget::Source, ActiveSourceRig);
+        }
+        if (const UIKRigDefinition* ActiveTargetRig = Controller->GetIKRig(ERetargetSourceOrTarget::Target))
+        {
+            Controller->AssignIKRigToAllOps(ERetargetSourceOrTarget::Target, ActiveTargetRig);
+        }
+    }
+    if (bCleanChainMaps)
+    {
+        Controller->CleanChainMaps();
+    }
     if (bAutoMap)
     {
         Controller->AutoMapChains(AutoMapType, bForceRemap);
     }
-    Controller->CleanAsset();
+    if (bCleanAsset)
+    {
+        Controller->CleanAsset();
+    }
     Retargeter->MarkPackageDirty();
 
     auto R = MakeShared<FJsonObject>();
@@ -5618,9 +8289,679 @@ FSageToolDispatch::FOutcome SetIKRetargeterRigsImpl(const TSharedPtr<FJsonObject
     R->SetStringField(TEXT("target_ik_rig"), Controller->GetIKRig(ERetargetSourceOrTarget::Target)
         ? Controller->GetIKRig(ERetargetSourceOrTarget::Target)->GetPathName() : FString());
     R->SetBoolField(TEXT("add_default_ops"), bAddDefaultOps);
+    R->SetBoolField(TEXT("assign_ops"), bAssignOps);
+    R->SetBoolField(TEXT("clean_asset"), bCleanAsset);
+    R->SetBoolField(TEXT("clean_chain_maps"), bCleanChainMaps);
     R->SetBoolField(TEXT("auto_map"), bAutoMap);
+    R->SetStringField(TEXT("auto_map_type"), AutoMapTypeString);
     R->SetBoolField(TEXT("force_remap"), bForceRemap);
     R->SetBoolField(TEXT("modified"), true);
+    if (Before.IsValid())
+    {
+        R->SetObjectField(TEXT("before"), Before.ToSharedRef());
+    }
+    TrySaveLoadedAssetIfRequested(Retargeter, bSave, R);
+    AddIKRetargeterReadback(Retargeter, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.setup_ik_retargeter_ops
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome SetupIKRetargeterOpsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRetargeter* Retargeter = nullptr;
+    UIKRetargeterController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRetargeterController(Args, Retargeter, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    bool bDryRun = false;
+    bool bSave = false;
+    bool bAddDefaultOps = true;
+    bool bAssignRigs = true;
+    bool bCleanAsset = true;
+    bool bCleanChainMaps = true;
+    bool bAutoMap = true;
+    bool bForceRemap = true;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    Args->TryGetBoolField(TEXT("add_default_ops"), bAddDefaultOps);
+    Args->TryGetBoolField(TEXT("assign_ik_rigs"), bAssignRigs);
+    Args->TryGetBoolField(TEXT("clean_asset"), bCleanAsset);
+    Args->TryGetBoolField(TEXT("clean_chain_maps"), bCleanChainMaps);
+    Args->TryGetBoolField(TEXT("auto_map"), bAutoMap);
+    Args->TryGetBoolField(TEXT("force_remap"), bForceRemap);
+
+    FString AutoMapTypeString = TEXT("fuzzy");
+    Args->TryGetStringField(TEXT("auto_map_type"), AutoMapTypeString);
+    EAutoMapChainType AutoMapType = EAutoMapChainType::Fuzzy;
+    if (!ParseAutoMapChainType(AutoMapTypeString, AutoMapType))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid auto_map_type: %s"), *AutoMapTypeString));
+    }
+
+    FString OpName;
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("op_name"), TEXT("name") }, OpName);
+
+    const int32 BeforeOps = Controller->GetNumRetargetOps();
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+        R->SetNumberField(TEXT("op_count_before"), BeforeOps);
+        R->SetBoolField(TEXT("add_default_ops"), bAddDefaultOps);
+        R->SetBoolField(TEXT("assign_ik_rigs"), bAssignRigs);
+        R->SetBoolField(TEXT("clean_asset"), bCleanAsset);
+        R->SetBoolField(TEXT("clean_chain_maps"), bCleanChainMaps);
+        R->SetBoolField(TEXT("auto_map"), bAutoMap);
+        R->SetBoolField(TEXT("force_remap"), bForceRemap);
+        R->SetStringField(TEXT("op_name"), OpName);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageSetupIKRetargeterOps", "Sage: Setup IK Retargeter Ops"));
+    Retargeter->Modify();
+    if (bAddDefaultOps)
+    {
+        Controller->AddDefaultOps();
+    }
+    if (bAssignRigs)
+    {
+        if (const UIKRigDefinition* SourceRig = Controller->GetIKRig(ERetargetSourceOrTarget::Source))
+        {
+            Controller->AssignIKRigToAllOps(ERetargetSourceOrTarget::Source, SourceRig);
+        }
+        if (const UIKRigDefinition* TargetRig = Controller->GetIKRig(ERetargetSourceOrTarget::Target))
+        {
+            Controller->AssignIKRigToAllOps(ERetargetSourceOrTarget::Target, TargetRig);
+        }
+    }
+    if (bCleanChainMaps)
+    {
+        Controller->CleanChainMaps(OpName.IsEmpty() ? NAME_None : FName(*OpName));
+    }
+    if (bAutoMap)
+    {
+        Controller->AutoMapChains(AutoMapType, bForceRemap, OpName.IsEmpty() ? NAME_None : FName(*OpName));
+    }
+    if (bCleanAsset)
+    {
+        Controller->CleanAsset();
+    }
+    Retargeter->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+    R->SetNumberField(TEXT("op_count_before"), BeforeOps);
+    R->SetNumberField(TEXT("op_count_after"), Controller->GetNumRetargetOps());
+    R->SetBoolField(TEXT("add_default_ops"), bAddDefaultOps);
+    R->SetBoolField(TEXT("assign_ik_rigs"), bAssignRigs);
+    R->SetBoolField(TEXT("clean_asset"), bCleanAsset);
+    R->SetBoolField(TEXT("clean_chain_maps"), bCleanChainMaps);
+    R->SetBoolField(TEXT("auto_map"), bAutoMap);
+    R->SetBoolField(TEXT("force_remap"), bForceRemap);
+    R->SetStringField(TEXT("op_name"), OpName);
+    R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Retargeter, bSave, R);
+    AddIKRetargeterReadback(Retargeter, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.add_ik_retargeter_op
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome AddIKRetargeterOpImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRetargeter* Retargeter = nullptr;
+    UIKRetargeterController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRetargeterController(Args, Retargeter, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    FString RawType;
+    if (!TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("op_type"), TEXT("type"), TEXT("struct"), TEXT("class") }, RawType))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'op_type'"));
+    }
+
+    FString NormalizedType;
+    UScriptStruct* OpStruct = ResolveIKRetargetOpStruct(RawType, NormalizedType);
+    if (!OpStruct)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("retarget op struct not found: %s"), *NormalizedType));
+    }
+
+    FString ParentName;
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("parent_op_name"), TEXT("parent") }, ParentName);
+    FString RequestedName;
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("op_name"), TEXT("name") }, RequestedName);
+    bool bRunInitialSetup = true;
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("run_initial_setup"), bRunInitialSetup);
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+        R->SetStringField(TEXT("op_type"), NormalizedType);
+        R->SetStringField(TEXT("parent_op_name"), ParentName);
+        R->SetStringField(TEXT("requested_name"), RequestedName);
+        R->SetBoolField(TEXT("run_initial_setup"), bRunInitialSetup);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageAddIKRetargeterOp", "Sage: Add IK Retargeter Op"));
+    Retargeter->Modify();
+    int32 OpIndex = Controller->AddRetargetOp(OpStruct, ParentName.IsEmpty() ? NAME_None : FName(*ParentName));
+    if (OpIndex == INDEX_NONE)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("failed to add retarget op: %s"), *NormalizedType));
+    }
+    FName ActualName = Controller->GetOpName(OpIndex);
+    if (!RequestedName.IsEmpty())
+    {
+        ActualName = Controller->SetOpName(FName(*RequestedName), OpIndex);
+        OpIndex = Controller->GetIndexOfOpByName(ActualName);
+    }
+    if (bRunInitialSetup && OpIndex != INDEX_NONE)
+    {
+        Controller->RunOpInitialSetup(OpIndex);
+    }
+    Controller->CleanAsset();
+    Retargeter->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+    R->SetStringField(TEXT("op_type"), NormalizedType);
+    R->SetNumberField(TEXT("index"), OpIndex);
+    R->SetStringField(TEXT("op_name"), ActualName.ToString());
+    R->SetStringField(TEXT("parent_op_name"), Controller->GetParentOpByName(ActualName).ToString());
+    R->SetBoolField(TEXT("run_initial_setup"), bRunInitialSetup);
+    R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Retargeter, bSave, R);
+    AddIKRetargeterReadback(Retargeter, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.remove_ik_retargeter_op
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome RemoveIKRetargeterOpImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRetargeter* Retargeter = nullptr;
+    UIKRetargeterController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRetargeterController(Args, Retargeter, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    int32 OpIndex = INDEX_NONE;
+    FString Error;
+    if (!TryResolveIKRetargeterOpIndex(Args, Controller, OpIndex, Error))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    const FName OpName = Controller->GetOpName(OpIndex);
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+        R->SetNumberField(TEXT("index"), OpIndex);
+        R->SetStringField(TEXT("op_name"), OpName.ToString());
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageRemoveIKRetargeterOp", "Sage: Remove IK Retargeter Op"));
+    Retargeter->Modify();
+    const bool bRemoved = Controller->RemoveRetargetOp(OpIndex);
+    if (!bRemoved)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("failed to remove retarget op: %s"), *OpName.ToString()));
+    }
+    Controller->CleanAsset();
+    Retargeter->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+    R->SetNumberField(TEXT("removed_index"), OpIndex);
+    R->SetStringField(TEXT("removed_op_name"), OpName.ToString());
+    R->SetBoolField(TEXT("removed"), true);
+    R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Retargeter, bSave, R);
+    AddIKRetargeterReadback(Retargeter, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.move_ik_retargeter_op
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome MoveIKRetargeterOpImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRetargeter* Retargeter = nullptr;
+    UIKRetargeterController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRetargeterController(Args, Retargeter, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    int32 FromIndex = INDEX_NONE;
+    FString Error;
+    if (!TryResolveIKRetargeterOpIndex(Args, Controller, FromIndex, Error))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    int32 ToIndex = INDEX_NONE;
+    if (!TryGetAnyIntField(Args, TArray<const TCHAR*>{ TEXT("to_index"), TEXT("target_index"), TEXT("new_index") }, ToIndex))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'to_index'"));
+    }
+
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    const FName OpName = Controller->GetOpName(FromIndex);
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+        R->SetStringField(TEXT("op_name"), OpName.ToString());
+        R->SetNumberField(TEXT("from_index"), FromIndex);
+        R->SetNumberField(TEXT("to_index"), ToIndex);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageMoveIKRetargeterOp", "Sage: Move IK Retargeter Op"));
+    Retargeter->Modify();
+    const bool bMoved = Controller->MoveRetargetOpInStack(FromIndex, ToIndex);
+    if (!bMoved)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("failed to move retarget op '%s' to index %d"), *OpName.ToString(), ToIndex));
+    }
+    Retargeter->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+    R->SetStringField(TEXT("op_name"), OpName.ToString());
+    R->SetNumberField(TEXT("from_index"), FromIndex);
+    R->SetNumberField(TEXT("requested_to_index"), ToIndex);
+    R->SetNumberField(TEXT("actual_index"), Controller->GetIndexOfOpByName(OpName));
+    R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Retargeter, bSave, R);
+    AddIKRetargeterReadback(Retargeter, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.set_ik_retargeter_op_enabled
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome SetIKRetargeterOpEnabledImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRetargeter* Retargeter = nullptr;
+    UIKRetargeterController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRetargeterController(Args, Retargeter, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    int32 OpIndex = INDEX_NONE;
+    FString Error;
+    if (!TryResolveIKRetargeterOpIndex(Args, Controller, OpIndex, Error))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    bool bEnabled = true;
+    if (!TryGetAnyBoolField(Args, TArray<const TCHAR*>{ TEXT("enabled"), TEXT("enable") }, bEnabled))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'enabled'"));
+    }
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    const FName OpName = Controller->GetOpName(OpIndex);
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+        R->SetNumberField(TEXT("index"), OpIndex);
+        R->SetStringField(TEXT("op_name"), OpName.ToString());
+        R->SetBoolField(TEXT("enabled"), bEnabled);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageSetIKRetargeterOpEnabled", "Sage: Set IK Retargeter Op Enabled"));
+    Retargeter->Modify();
+    const bool bOk = Controller->SetRetargetOpEnabled(OpIndex, bEnabled);
+    if (!bOk)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            FString::Printf(TEXT("failed to set enabled on retarget op: %s"), *OpName.ToString()));
+    }
+    Retargeter->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+    R->SetNumberField(TEXT("index"), OpIndex);
+    R->SetStringField(TEXT("op_name"), OpName.ToString());
+    R->SetBoolField(TEXT("enabled"), Controller->GetRetargetOpEnabled(OpIndex));
+    R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Retargeter, bSave, R);
+    AddIKRetargeterReadback(Retargeter, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.auto_map_ik_retargeter_chains
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome AutoMapIKRetargeterChainsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRetargeter* Retargeter = nullptr;
+    UIKRetargeterController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRetargeterController(Args, Retargeter, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    FString AutoMapTypeString = TEXT("fuzzy");
+    Args->TryGetStringField(TEXT("auto_map_type"), AutoMapTypeString);
+    EAutoMapChainType AutoMapType = EAutoMapChainType::Fuzzy;
+    if (!ParseAutoMapChainType(AutoMapTypeString, AutoMapType))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("invalid auto_map_type: %s"), *AutoMapTypeString));
+    }
+
+    FString OpName;
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("op_name"), TEXT("name") }, OpName);
+    bool bForceRemap = true;
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("force_remap"), bForceRemap);
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+        R->SetStringField(TEXT("auto_map_type"), AutoMapTypeString);
+        R->SetStringField(TEXT("op_name"), OpName);
+        R->SetBoolField(TEXT("force_remap"), bForceRemap);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageAutoMapIKRetargeterChains", "Sage: Auto Map IK Retargeter Chains"));
+    Retargeter->Modify();
+    Controller->AutoMapChains(AutoMapType, bForceRemap, OpName.IsEmpty() ? NAME_None : FName(*OpName));
+    Retargeter->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+    R->SetStringField(TEXT("auto_map_type"), AutoMapTypeString);
+    R->SetStringField(TEXT("op_name"), OpName);
+    R->SetBoolField(TEXT("force_remap"), bForceRemap);
+    R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Retargeter, bSave, R);
+    AddIKRetargeterReadback(Retargeter, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.reset_ik_retargeter_chain_settings
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome ResetIKRetargeterChainSettingsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRetargeter* Retargeter = nullptr;
+    UIKRetargeterController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRetargeterController(Args, Retargeter, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    FString TargetChain;
+    if (!TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("target_chain"), TEXT("chain"), TEXT("chain_name") }, TargetChain))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'target_chain'"));
+    }
+
+    FString OpName;
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("op_name"), TEXT("name") }, OpName);
+    bool bAllOps = OpName.IsEmpty();
+    Args->TryGetBoolField(TEXT("all_ops"), bAllOps);
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+        R->SetStringField(TEXT("target_chain"), TargetChain);
+        R->SetStringField(TEXT("op_name"), OpName);
+        R->SetBoolField(TEXT("all_ops"), bAllOps);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageResetIKRetargeterChainSettings", "Sage: Reset IK Retargeter Chain Settings"));
+    Retargeter->Modify();
+    if (bAllOps)
+    {
+        Controller->ResetChainSettingsInAllOps(FName(*TargetChain));
+    }
+    else
+    {
+        Controller->ResetChainSettingsToDefault(FName(*TargetChain), FName(*OpName));
+    }
+    Retargeter->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+    R->SetStringField(TEXT("target_chain"), TargetChain);
+    R->SetStringField(TEXT("op_name"), OpName);
+    R->SetBoolField(TEXT("all_ops"), bAllOps);
+    R->SetBoolField(TEXT("modified"), true);
+    if (!bAllOps)
+    {
+        R->SetBoolField(TEXT("at_default"), Controller->AreChainSettingsAtDefault(FName(*TargetChain), FName(*OpName)));
+    }
+    TrySaveLoadedAssetIfRequested(Retargeter, bSave, R);
+    AddIKRetargeterReadback(Retargeter, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.set_ik_retargeter_fk_chain_settings
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome SetIKRetargeterFKChainSettingsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRetargeter* Retargeter = nullptr;
+    UIKRetargeterController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRetargeterController(Args, Retargeter, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    FString TargetChain;
+    if (!TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("target_chain"), TEXT("chain"), TEXT("chain_name") }, TargetChain))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'target_chain'"));
+    }
+
+    int32 OpIndex = INDEX_NONE;
+    FString OpError;
+    FString OpName;
+    if (TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("op_name"), TEXT("name") }, OpName) ||
+        TryGetAnyIntField(Args, TArray<const TCHAR*>{ TEXT("index"), TEXT("op_index") }, OpIndex))
+    {
+        if (!TryResolveIKRetargeterOpIndex(Args, Controller, OpIndex, OpError))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, OpError);
+        }
+    }
+    else
+    {
+        OpIndex = FindFirstFKRetargetOpIndex(Controller);
+        if (OpIndex == INDEX_NONE)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("no FK Chains op found; add default ops or pass op_name/index"));
+        }
+    }
+
+    UIKRetargetFKChainsController* FKController = Cast<UIKRetargetFKChainsController>(Controller->GetOpController(OpIndex));
+    if (!FKController)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("retarget op is not an FK Chains op: %s"), *Controller->GetOpName(OpIndex).ToString()));
+    }
+
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    FIKRetargetFKChainsOpSettings Settings = FKController->GetSettings();
+    int32 ChainIndex = Settings.ChainsToRetarget.IndexOfByPredicate(
+        [&TargetChain](const FRetargetFKChainSettings& Item)
+        {
+            return Item.TargetChainName == FName(*TargetChain);
+        });
+    if (ChainIndex == INDEX_NONE)
+    {
+        ChainIndex = Settings.ChainsToRetarget.Add(FRetargetFKChainSettings(FName(*TargetChain)));
+    }
+    FRetargetFKChainSettings Updated = Settings.ChainsToRetarget[ChainIndex];
+
+    bool bEnableFK = Updated.EnableFK;
+    if (TryGetAnyBoolField(Args, TArray<const TCHAR*>{ TEXT("enable_fk"), TEXT("enabled") }, bEnableFK))
+    {
+        Updated.EnableFK = bEnableFK;
+    }
+
+    FString RotationModeString;
+    if (TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("rotation_mode"), TEXT("fk_rotation_mode") }, RotationModeString))
+    {
+        EFKChainRotationMode Mode = Updated.RotationMode;
+        if (!ParseFKRotationMode(RotationModeString, Mode))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("invalid rotation_mode: %s"), *RotationModeString));
+        }
+        Updated.RotationMode = Mode;
+    }
+
+    FString TranslationModeString;
+    if (TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("translation_mode"), TEXT("fk_translation_mode") }, TranslationModeString))
+    {
+        EFKChainTranslationMode Mode = Updated.TranslationMode;
+        if (!ParseFKTranslationMode(TranslationModeString, Mode))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("invalid translation_mode: %s"), *TranslationModeString));
+        }
+        Updated.TranslationMode = Mode;
+    }
+
+    double Number = 0.0;
+    if (TryGetAnyNumberField(Args, TArray<const TCHAR*>{ TEXT("rotation_alpha"), TEXT("fk_rotation_alpha") }, Number))
+    {
+        Updated.RotationAlpha = Number;
+    }
+    if (TryGetAnyNumberField(Args, TArray<const TCHAR*>{ TEXT("translation_alpha"), TEXT("fk_translation_alpha") }, Number))
+    {
+        Updated.TranslationAlpha = Number;
+    }
+
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+        R->SetNumberField(TEXT("op_index"), OpIndex);
+        R->SetStringField(TEXT("op_name"), Controller->GetOpName(OpIndex).ToString());
+        R->SetObjectField(TEXT("settings"), FKChainSettingsToJson(Updated));
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageSetIKRetargeterFKChainSettings", "Sage: Set IK Retargeter FK Chain Settings"));
+    Retargeter->Modify();
+    Settings.ChainsToRetarget[ChainIndex] = Updated;
+    FKController->SetSettings(Settings);
+    FPropertyChangedEvent Event(nullptr, EPropertyChangeType::ValueSet);
+    Controller->OnOpPropertyChanged(Controller->GetOpName(OpIndex), Event);
+    Retargeter->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+    R->SetNumberField(TEXT("op_index"), OpIndex);
+    R->SetStringField(TEXT("op_name"), Controller->GetOpName(OpIndex).ToString());
+    R->SetObjectField(TEXT("settings"), FKChainSettingsToJson(Updated));
+    R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Retargeter, bSave, R);
+    AddIKRetargeterReadback(Retargeter, R);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -5647,6 +8988,11 @@ FSageToolDispatch::FOutcome SetIKRetargeterChainMappingImpl(const TSharedPtr<FJs
         SourceChain = TEXT("None");
     }
     Args->TryGetStringField(TEXT("op_name"), OpName);
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
 
     UIKRetargeter* Retargeter = Cast<UIKRetargeter>(ResolveAsset(Path));
     if (!Retargeter)
@@ -5660,23 +9006,42 @@ FSageToolDispatch::FOutcome SetIKRetargeterChainMappingImpl(const TSharedPtr<FJs
         return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("failed to get IK Retargeter controller"));
     }
 
+    const FName TargetChainName(*TargetChain);
+    const FName OpFName(*OpName);
+    const FName BeforeSource = Controller->GetSourceChain(TargetChainName, OpFName);
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+        R->SetStringField(TEXT("target_chain"), TargetChain);
+        R->SetStringField(TEXT("source_chain"), SourceChain);
+        R->SetStringField(TEXT("before_source_chain"), BeforeSource.ToString());
+        R->SetStringField(TEXT("op_name"), OpName);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
     FScopedTransaction Tx(LOCTEXT("SageSetIKRetargeterChainMapping", "Sage: Set IK Retargeter Chain Mapping"));
     Retargeter->Modify();
-    const bool bOk = Controller->SetSourceChain(FName(*SourceChain), FName(*TargetChain), FName(*OpName));
-    Retargeter->MarkPackageDirty();
+    const bool bOk = Controller->SetSourceChain(FName(*SourceChain), TargetChainName, OpFName);
     if (!bOk)
     {
         Tx.Cancel();
         return FSageToolDispatch::FOutcome::MakeError(-32602,
             FString::Printf(TEXT("failed to map target chain '%s' to source chain '%s'"), *TargetChain, *SourceChain));
     }
+    Retargeter->MarkPackageDirty();
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"), Retargeter->GetPathName());
     R->SetStringField(TEXT("target_chain"), TargetChain);
-    R->SetStringField(TEXT("source_chain"), Controller->GetSourceChain(FName(*TargetChain), FName(*OpName)).ToString());
+    R->SetStringField(TEXT("source_chain"), Controller->GetSourceChain(TargetChainName, OpFName).ToString());
+    R->SetStringField(TEXT("before_source_chain"), BeforeSource.ToString());
     R->SetStringField(TEXT("op_name"), OpName);
     R->SetBoolField(TEXT("modified"), true);
+    TrySaveLoadedAssetIfRequested(Retargeter, bSave, R);
+    AddIKRetargeterReadback(Retargeter, R);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -5703,35 +9068,159 @@ FSageToolDispatch::FOutcome SetIKRetargeterPoseImpl(const TSharedPtr<FJsonObject
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("side must be 'source' or 'target'"));
     }
-    Args->TryGetStringField(TEXT("pose_name"), PoseName);
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("pose_name"), TEXT("pose") }, PoseName);
 
-    UIKRetargeter* Retargeter = Cast<UIKRetargeter>(ResolveAsset(Path));
-    if (!Retargeter)
-    {
-        return FSageToolDispatch::FOutcome::MakeError(-32602,
-            FString::Printf(TEXT("not a UIKRetargeter: %s"), *Path));
-    }
-    UIKRetargeterController* Controller = UIKRetargeterController::GetController(Retargeter);
-    if (!Controller)
-    {
-        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("failed to get IK Retargeter controller"));
-    }
+    UIKRetargeter* Retargeter = nullptr;
+    UIKRetargeterController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRetargeterController(Args, Retargeter, Controller);
+    if (!Resolved.bSuccess) return Resolved;
 
     bool bCreate = false;
+    bool bRemove = false;
+    bool bDuplicate = false;
+    bool bRename = false;
+    bool bReset = false;
+    bool bAutoAlign = false;
+    bool bSnapToGround = false;
     bool bSetCurrent = true;
+    bool bDryRun = false;
+    bool bSave = false;
     Args->TryGetBoolField(TEXT("create"), bCreate);
+    Args->TryGetBoolField(TEXT("remove"), bRemove);
+    Args->TryGetBoolField(TEXT("delete"), bRemove);
+    Args->TryGetBoolField(TEXT("duplicate"), bDuplicate);
+    Args->TryGetBoolField(TEXT("rename"), bRename);
+    Args->TryGetBoolField(TEXT("reset"), bReset);
+    Args->TryGetBoolField(TEXT("auto_align"), bAutoAlign);
+    Args->TryGetBoolField(TEXT("snap_to_ground"), bSnapToGround);
     Args->TryGetBoolField(TEXT("current"), bSetCurrent);
+    Args->TryGetBoolField(TEXT("set_current"), bSetCurrent);
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    FString NewPoseName;
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("new_name"), TEXT("to") }, NewPoseName);
+    FString SourcePoseName;
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("from_pose"), TEXT("duplicate_from"), TEXT("source_pose") }, SourcePoseName);
+    FString OldPoseName;
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("old_name"), TEXT("from") }, OldPoseName);
+
+    TArray<FString> ResetBoneStrings;
+    if (!ReadStringArrayField(Args, TEXT("reset_bones"), ResetBoneStrings))
+    {
+        ReadStringArrayField(Args, TEXT("bones"), ResetBoneStrings);
+    }
+    TArray<FString> AlignBoneStrings;
+    if (!ReadStringArrayField(Args, TEXT("align_bones"), AlignBoneStrings))
+    {
+        ReadStringArrayField(Args, TEXT("bones"), AlignBoneStrings);
+    }
+
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+        R->SetStringField(TEXT("side"), RetargetSideToString(Side));
+        R->SetStringField(TEXT("pose_name"), PoseName);
+        R->SetStringField(TEXT("new_name"), NewPoseName);
+        R->SetBoolField(TEXT("create"), bCreate);
+        R->SetBoolField(TEXT("remove"), bRemove);
+        R->SetBoolField(TEXT("duplicate"), bDuplicate);
+        R->SetBoolField(TEXT("rename"), bRename);
+        R->SetBoolField(TEXT("reset"), bReset);
+        R->SetBoolField(TEXT("auto_align"), bAutoAlign);
+        R->SetBoolField(TEXT("snap_to_ground"), bSnapToGround);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
     FScopedTransaction Tx(LOCTEXT("SageSetIKRetargeterPose", "Sage: Set IK Retargeter Pose"));
     Retargeter->Modify();
+
+    bool bModified = false;
+    FString Action;
+
+    if (bRemove)
+    {
+        if (PoseName.IsEmpty())
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'pose_name' for remove=true"));
+        }
+        if (!Controller->RemoveRetargetPose(FName(*PoseName), Side))
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("retarget pose not found: %s"), *PoseName));
+        }
+        bSetCurrent = false;
+        bModified = true;
+        Action = TEXT("remove");
+    }
+
+    if (bDuplicate)
+    {
+        if (SourcePoseName.IsEmpty())
+        {
+            SourcePoseName = PoseName;
+        }
+        if (SourcePoseName.IsEmpty() || NewPoseName.IsEmpty())
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("duplicate=true requires pose_name/from_pose and new_name"));
+        }
+        const FName Duplicated = Controller->DuplicateRetargetPose(FName(*SourcePoseName), FName(*NewPoseName), Side);
+        if (Duplicated == NAME_None)
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("retarget pose not found: %s"), *SourcePoseName));
+        }
+        PoseName = Duplicated.ToString();
+        bSetCurrent = true;
+        bModified = true;
+        Action = TEXT("duplicate");
+    }
+
+    if (bRename)
+    {
+        if (OldPoseName.IsEmpty())
+        {
+            OldPoseName = PoseName;
+        }
+        if (OldPoseName.IsEmpty() || NewPoseName.IsEmpty())
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("rename=true requires pose_name/old_name and new_name"));
+        }
+        if (!Controller->RenameRetargetPose(FName(*OldPoseName), FName(*NewPoseName), Side))
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("retarget pose not found: %s"), *OldPoseName));
+        }
+        PoseName = NewPoseName;
+        bModified = true;
+        Action = TEXT("rename");
+    }
+
     if (bCreate)
     {
         if (PoseName.IsEmpty())
         {
+            Tx.Cancel();
             return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'pose_name' for create=true"));
         }
         PoseName = Controller->CreateRetargetPose(FName(*PoseName), Side).ToString();
         bSetCurrent = true;
+        bModified = true;
+        Action = TEXT("create");
     }
+
     if (!PoseName.IsEmpty() && bSetCurrent)
     {
         if (!Controller->SetCurrentRetargetPose(FName(*PoseName), Side))
@@ -5740,12 +9229,32 @@ FSageToolDispatch::FOutcome SetIKRetargeterPoseImpl(const TSharedPtr<FJsonObject
             return FSageToolDispatch::FOutcome::MakeError(-32602,
                 FString::Printf(TEXT("retarget pose not found: %s"), *PoseName));
         }
+        bModified = true;
+    }
+
+    if (bReset)
+    {
+        const FName PoseToReset = PoseName.IsEmpty()
+            ? Controller->GetCurrentRetargetPoseName(Side)
+            : FName(*PoseName);
+        TArray<FName> ResetBones;
+        for (const FString& Bone : ResetBoneStrings)
+        {
+            if (!Bone.IsEmpty())
+            {
+                ResetBones.Add(FName(*Bone));
+            }
+        }
+        Controller->ResetRetargetPose(PoseToReset, ResetBones, Side);
+        bModified = true;
+        Action = Action.IsEmpty() ? TEXT("reset") : Action;
     }
 
     FVector RootOffset;
     if (ReadVectorArray(Args, TEXT("root_offset"), RootOffset))
     {
         Controller->SetRootOffsetInRetargetPose(RootOffset, Side);
+        bModified = true;
     }
 
     int32 RotationCount = 0;
@@ -5775,17 +9284,68 @@ FSageToolDispatch::FOutcome SetIKRetargeterPoseImpl(const TSharedPtr<FJsonObject
             }
             Controller->SetRotationOffsetForRetargetPoseBone(FName(*BoneName), Rotation, Side);
             ++RotationCount;
+            bModified = true;
         }
     }
-    Retargeter->MarkPackageDirty();
+
+    if (bAutoAlign)
+    {
+        FString MethodString = TEXT("chain_to_chain");
+        Args->TryGetStringField(TEXT("align_method"), MethodString);
+        ERetargetAutoAlignMethod Method = ERetargetAutoAlignMethod::ChainToChain;
+        if (!ParseRetargetAutoAlignMethod(MethodString, Method))
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("invalid align_method: %s"), *MethodString));
+        }
+        TArray<FName> AlignBones;
+        for (const FString& Bone : AlignBoneStrings)
+        {
+            if (!Bone.IsEmpty())
+            {
+                AlignBones.Add(FName(*Bone));
+            }
+        }
+        if (AlignBones.Num() > 0)
+        {
+            Controller->AutoAlignBones(AlignBones, Method, Side);
+        }
+        else
+        {
+            Controller->AutoAlignAllBones(Side, Method);
+        }
+        bModified = true;
+        Action = Action.IsEmpty() ? TEXT("auto_align") : Action;
+    }
+
+    if (bSnapToGround)
+    {
+        FString ReferenceBone;
+        TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("reference_bone"), TEXT("ground_bone"), TEXT("bone") }, ReferenceBone);
+        FName ReferenceBoneName = ReferenceBone.IsEmpty()
+            ? Controller->GetPelvisBone(Side)
+            : FName(*ReferenceBone);
+        Controller->SnapBoneToGround(ReferenceBoneName, Side);
+        bModified = true;
+        Action = Action.IsEmpty() ? TEXT("snap_to_ground") : Action;
+    }
+
+    if (bModified)
+    {
+        Retargeter->MarkPackageDirty();
+    }
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"), Retargeter->GetPathName());
     R->SetStringField(TEXT("side"), RetargetSideToString(Side));
+    R->SetStringField(TEXT("action"), Action);
     R->SetStringField(TEXT("current_pose"), Controller->GetCurrentRetargetPoseName(Side).ToString());
     R->SetField(TEXT("root_offset"), detail::Vec3ToJson(Controller->GetRootOffsetInRetargetPose(Side)));
     R->SetNumberField(TEXT("bone_rotation_count"), RotationCount);
-    R->SetBoolField(TEXT("modified"), true);
+    R->SetBoolField(TEXT("modified"), bModified);
+    TrySaveLoadedAssetIfRequested(Retargeter, bSave && bModified, R);
+    AddIKRetargeterReadback(Retargeter, R);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -7038,16 +10598,6 @@ void ExposeAllCustomPropertyPins(UAnimGraphNode_Base* AnimNode,
         AnimNode->Modify();
         AnimNode->ReconstructNode();
     }
-}
-
-TArray<TSharedPtr<FJsonValue>> NamesToJsonArray(const TArray<FName>& Names)
-{
-    TArray<TSharedPtr<FJsonValue>> Arr;
-    for (const FName& Name : Names)
-    {
-        Arr.Add(MakeShared<FJsonValueString>(Name.ToString()));
-    }
-    return Arr;
 }
 
 UObject* GetAnimNodeBindingObject(const UAnimGraphNode_Base* AnimNode)
@@ -8763,6 +12313,627 @@ FSageToolDispatch::FOutcome SetAnimNodePropertyImpl(const TSharedPtr<FJsonObject
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+bool ParseLayeredBoneBlendMode(const FString& Text,
+                               ELayeredBoneBlendMode& OutMode,
+                               FString& OutErr)
+{
+    const FString Clean = Text.TrimStartAndEnd();
+    if (Clean.Equals(TEXT("BlendMask"), ESearchCase::IgnoreCase)
+        || Clean.EndsWith(TEXT("::BlendMask"), ESearchCase::IgnoreCase))
+    {
+        OutMode = ELayeredBoneBlendMode::BlendMask;
+        return true;
+    }
+    if (Clean.Equals(TEXT("BranchFilter"), ESearchCase::IgnoreCase)
+        || Clean.EndsWith(TEXT("::BranchFilter"), ESearchCase::IgnoreCase))
+    {
+        OutMode = ELayeredBoneBlendMode::BranchFilter;
+        return true;
+    }
+    OutErr = FString::Printf(TEXT("invalid blend_mode '%s'; expected BlendMask or BranchFilter"),
+                             *Text);
+    return false;
+}
+
+FString LayeredBoneBlendModeToString(ELayeredBoneBlendMode Mode)
+{
+    return Mode == ELayeredBoneBlendMode::BlendMask
+        ? TEXT("BlendMask")
+        : TEXT("BranchFilter");
+}
+
+bool ParseCurveBlendOption(const FString& Text,
+                           ECurveBlendOption::Type& OutOption,
+                           FString& OutErr)
+{
+    const FString Clean = Text.TrimStartAndEnd();
+    struct FEntry { const TCHAR* Name; ECurveBlendOption::Type Value; };
+    const FEntry Entries[] = {
+        { TEXT("Override"), ECurveBlendOption::Override },
+        { TEXT("DoNotOverride"), ECurveBlendOption::DoNotOverride },
+        { TEXT("NormalizeByWeight"), ECurveBlendOption::NormalizeByWeight },
+        { TEXT("BlendByWeight"), ECurveBlendOption::BlendByWeight },
+        { TEXT("UseBasePose"), ECurveBlendOption::UseBasePose },
+        { TEXT("UseMaxValue"), ECurveBlendOption::UseMaxValue },
+        { TEXT("UseMinValue"), ECurveBlendOption::UseMinValue },
+    };
+    for (const FEntry& Entry : Entries)
+    {
+        if (Clean.Equals(Entry.Name, ESearchCase::IgnoreCase)
+            || Clean.EndsWith(FString::Printf(TEXT("::%s"), Entry.Name),
+                              ESearchCase::IgnoreCase))
+        {
+            OutOption = Entry.Value;
+            return true;
+        }
+    }
+    OutErr = FString::Printf(TEXT("invalid curve_blend_option '%s'"), *Text);
+    return false;
+}
+
+FString CurveBlendOptionToString(ECurveBlendOption::Type Option)
+{
+    switch (Option)
+    {
+    case ECurveBlendOption::Override: return TEXT("Override");
+    case ECurveBlendOption::DoNotOverride: return TEXT("DoNotOverride");
+    case ECurveBlendOption::NormalizeByWeight: return TEXT("NormalizeByWeight");
+    case ECurveBlendOption::BlendByWeight: return TEXT("BlendByWeight");
+    case ECurveBlendOption::UseBasePose: return TEXT("UseBasePose");
+    case ECurveBlendOption::UseMaxValue: return TEXT("UseMaxValue");
+    case ECurveBlendOption::UseMinValue: return TEXT("UseMinValue");
+    default: return FString::FromInt(static_cast<int32>(Option));
+    }
+}
+
+UBlendProfile* ResolveBlendProfileReference(const FString& RawPath,
+                                            FString& OutErr)
+{
+    const FString Clean = CleanObjectReferenceLiteral(RawPath);
+    if (Clean.IsEmpty())
+    {
+        OutErr = TEXT("empty blend profile path");
+        return nullptr;
+    }
+
+    if (UObject* Obj = ResolveAsset(Clean))
+    {
+        if (UBlendProfile* Profile = Cast<UBlendProfile>(Obj))
+        {
+            if (!Profile->IsBlendMask())
+            {
+                OutErr = FString::Printf(TEXT("%s is a UBlendProfile but not a BlendMask"),
+                                         *Clean);
+                return nullptr;
+            }
+            return Profile;
+        }
+        if (!Clean.Contains(TEXT(":")))
+        {
+            OutErr = FString::Printf(TEXT("%s resolved to %s, not UBlendProfile"),
+                                     *Clean, *Obj->GetClass()->GetPathName());
+            return nullptr;
+        }
+        // Some subobject paths resolve the owner asset before the profile
+        // subobject is materialized. Continue into the owner/profile-name path.
+    }
+
+    FString OwnerPath;
+    FString ProfileName;
+    if (!Clean.Split(TEXT(":"), &OwnerPath, &ProfileName,
+                     ESearchCase::CaseSensitive, ESearchDir::FromEnd)
+        || OwnerPath.IsEmpty() || ProfileName.IsEmpty())
+    {
+        OutErr = FString::Printf(TEXT("blend profile not found: %s"), *Clean);
+        return nullptr;
+    }
+
+    UObject* Owner = ResolveAssetOrPackage(OwnerPath);
+    USkeleton* Skeleton = Cast<USkeleton>(Owner);
+    if (!Skeleton)
+    {
+        if (USkeletalMesh* Mesh = Cast<USkeletalMesh>(Owner))
+        {
+            Skeleton = Mesh->GetSkeleton();
+        }
+    }
+    if (!Skeleton)
+    {
+        OutErr = FString::Printf(TEXT("blend profile owner %s is not a USkeleton or USkeletalMesh"),
+                                 *OwnerPath);
+        return nullptr;
+    }
+
+    UBlendProfile* Profile = Skeleton->GetBlendProfile(FName(*ProfileName));
+    if (!Profile)
+    {
+        OutErr = FString::Printf(TEXT("blend profile %s not found on skeleton %s"),
+                                 *ProfileName, *Skeleton->GetPathName());
+        return nullptr;
+    }
+    if (!Profile->IsBlendMask())
+    {
+        OutErr = FString::Printf(TEXT("%s:%s is a UBlendProfile but not a BlendMask"),
+                                 *OwnerPath, *ProfileName);
+        return nullptr;
+    }
+    return Profile;
+}
+
+bool ParseBlendMaskArray(const TSharedPtr<FJsonValue>& Value,
+                         TArray<TObjectPtr<UBlendProfile>>& OutMasks,
+                         TArray<TSharedPtr<FJsonValue>>& OutResolved,
+                         FString& OutErr)
+{
+    if (!Value.IsValid() || Value->Type != EJson::Array)
+    {
+        OutErr = TEXT("blend_masks must be an array of UBlendProfile paths");
+        return false;
+    }
+    const TArray<TSharedPtr<FJsonValue>>& Arr = Value->AsArray();
+    OutMasks.Reset();
+    OutResolved.Reset();
+    for (int32 i = 0; i < Arr.Num(); ++i)
+    {
+        FString Path;
+        if (!Arr[i].IsValid() || !Arr[i]->TryGetString(Path))
+        {
+            OutErr = FString::Printf(TEXT("blend_masks[%d] must be a string path"), i);
+            return false;
+        }
+        UBlendProfile* Profile = ResolveBlendProfileReference(Path, OutErr);
+        if (!Profile) return false;
+        OutMasks.Add(Profile);
+        auto Row = MakeShared<FJsonObject>();
+        Row->SetStringField(TEXT("requested_path"), Path);
+        Row->SetStringField(TEXT("resolved_path"), FSoftObjectPath(Profile).ToString());
+        Row->SetStringField(TEXT("name"), Profile->GetName());
+        OutResolved.Add(MakeShared<FJsonValueObject>(Row));
+    }
+    return true;
+}
+
+bool ParseFloatArrayValue(const TSharedPtr<FJsonValue>& Value,
+                          TArray<float>& OutValues,
+                          FString& OutErr)
+{
+    if (!Value.IsValid() || Value->Type != EJson::Array)
+    {
+        OutErr = TEXT("blend_weights must be an array of numbers");
+        return false;
+    }
+    OutValues.Reset();
+    const TArray<TSharedPtr<FJsonValue>>& Arr = Value->AsArray();
+    for (int32 i = 0; i < Arr.Num(); ++i)
+    {
+        if (!Arr[i].IsValid())
+        {
+            OutErr = FString::Printf(TEXT("blend_weights[%d] is null"), i);
+            return false;
+        }
+        OutValues.Add(static_cast<float>(Arr[i]->AsNumber()));
+    }
+    return true;
+}
+
+bool ParseBranchFilterObject(const TSharedPtr<FJsonObject>& Obj,
+                             FBranchFilter& OutFilter,
+                             FString& OutErr)
+{
+    if (!Obj.IsValid())
+    {
+        OutErr = TEXT("BranchFilter entry must be an object");
+        return false;
+    }
+    FString BoneName;
+    if (!Obj->TryGetStringField(TEXT("BoneName"), BoneName))
+    {
+        Obj->TryGetStringField(TEXT("bone_name"), BoneName);
+    }
+    if (BoneName.IsEmpty())
+    {
+        OutErr = TEXT("BranchFilter entry missing BoneName");
+        return false;
+    }
+    double Depth = 0.0;
+    if (!Obj->TryGetNumberField(TEXT("BlendDepth"), Depth))
+    {
+        Obj->TryGetNumberField(TEXT("blend_depth"), Depth);
+    }
+    OutFilter.BoneName = FName(*BoneName);
+    OutFilter.BlendDepth = static_cast<int32>(Depth);
+    return true;
+}
+
+bool ParseLayerSetupArray(const TSharedPtr<FJsonValue>& Value,
+                          TArray<FInputBlendPose>& OutLayerSetup,
+                          FString& OutErr)
+{
+    OutLayerSetup.Reset();
+    if (!Value.IsValid())
+    {
+        OutErr = TEXT("layer_setup is null");
+        return false;
+    }
+    if (Value->Type == EJson::String)
+    {
+        FString Text = Value->AsString().TrimStartAndEnd();
+        if (Text.Len() >= 2 && Text.StartsWith(TEXT("\"")) && Text.EndsWith(TEXT("\"")))
+        {
+            Text = Text.Mid(1, Text.Len() - 2);
+            Text.ReplaceInline(TEXT("\\\""), TEXT("\""));
+        }
+        FString BoneNameText;
+        if (!ExtractLayerSetupValue(Text, TEXT("BoneName"), BoneNameText))
+        {
+            BoneNameText = TEXT("spine_01");
+        }
+        FString BlendDepthText;
+        int32 BlendDepth = 10;
+        if (ExtractLayerSetupValue(Text, TEXT("BlendDepth"), BlendDepthText))
+        {
+            BlendDepth = FCString::Atoi(*BlendDepthText);
+        }
+        FBranchFilter Filter;
+        Filter.BoneName = FName(*BoneNameText);
+        Filter.BlendDepth = BlendDepth;
+        FInputBlendPose Pose;
+        Pose.BranchFilters.Add(Filter);
+        OutLayerSetup.Add(Pose);
+        return true;
+    }
+    if (Value->Type != EJson::Array)
+    {
+        OutErr = TEXT("layer_setup must be an array of {BranchFilters:[...]} entries or an ImportText string");
+        return false;
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>& Layers = Value->AsArray();
+    for (int32 LayerIndex = 0; LayerIndex < Layers.Num(); ++LayerIndex)
+    {
+        if (!Layers[LayerIndex].IsValid() || Layers[LayerIndex]->Type != EJson::Object)
+        {
+            OutErr = FString::Printf(TEXT("layer_setup[%d] must be an object"), LayerIndex);
+            return false;
+        }
+        const TSharedPtr<FJsonObject> LayerObj = Layers[LayerIndex]->AsObject();
+        const TArray<TSharedPtr<FJsonValue>>* Filters = nullptr;
+        if (!LayerObj->TryGetArrayField(TEXT("BranchFilters"), Filters))
+        {
+            LayerObj->TryGetArrayField(TEXT("branch_filters"), Filters);
+        }
+        if (!Filters)
+        {
+            OutErr = FString::Printf(TEXT("layer_setup[%d] missing BranchFilters"), LayerIndex);
+            return false;
+        }
+        FInputBlendPose Pose;
+        for (int32 FilterIndex = 0; FilterIndex < Filters->Num(); ++FilterIndex)
+        {
+            if (!(*Filters)[FilterIndex].IsValid() || (*Filters)[FilterIndex]->Type != EJson::Object)
+            {
+                OutErr = FString::Printf(TEXT("layer_setup[%d].BranchFilters[%d] must be an object"),
+                                         LayerIndex, FilterIndex);
+                return false;
+            }
+            FBranchFilter Filter;
+            if (!ParseBranchFilterObject((*Filters)[FilterIndex]->AsObject(), Filter, OutErr))
+            {
+                return false;
+            }
+            Pose.BranchFilters.Add(Filter);
+        }
+        OutLayerSetup.Add(Pose);
+    }
+    return true;
+}
+
+TArray<TSharedPtr<FJsonValue>> BlendMasksToJson(const TArray<TObjectPtr<UBlendProfile>>& Masks)
+{
+    TArray<TSharedPtr<FJsonValue>> Arr;
+    for (const TObjectPtr<UBlendProfile>& Mask : Masks)
+    {
+        Arr.Add(MakeShared<FJsonValueString>(
+            Mask ? FSoftObjectPath(Mask.Get()).ToString() : FString()));
+    }
+    return Arr;
+}
+
+TArray<TSharedPtr<FJsonValue>> BlendWeightsToJson(const TArray<float>& Weights)
+{
+    TArray<TSharedPtr<FJsonValue>> Arr;
+    for (float Weight : Weights)
+    {
+        Arr.Add(MakeShared<FJsonValueNumber>(Weight));
+    }
+    return Arr;
+}
+
+TArray<TSharedPtr<FJsonValue>> LayerSetupToJson(const TArray<FInputBlendPose>& LayerSetup)
+{
+    TArray<TSharedPtr<FJsonValue>> Layers;
+    for (const FInputBlendPose& Pose : LayerSetup)
+    {
+        auto LayerObj = MakeShared<FJsonObject>();
+        TArray<TSharedPtr<FJsonValue>> Filters;
+        for (const FBranchFilter& Filter : Pose.BranchFilters)
+        {
+            auto FilterObj = MakeShared<FJsonObject>();
+            FilterObj->SetStringField(TEXT("BoneName"), Filter.BoneName.ToString());
+            FilterObj->SetNumberField(TEXT("BlendDepth"), Filter.BlendDepth);
+            Filters.Add(MakeShared<FJsonValueObject>(FilterObj));
+        }
+        LayerObj->SetArrayField(TEXT("BranchFilters"), Filters);
+        Layers.Add(MakeShared<FJsonValueObject>(LayerObj));
+    }
+    return Layers;
+}
+
+TSharedPtr<FJsonObject> LayeredBoneBlendReadbackJson(const FAnimNode_LayeredBoneBlend& Node)
+{
+    auto Obj = MakeShared<FJsonObject>();
+    Obj->SetStringField(TEXT("BlendMode"), LayeredBoneBlendModeToString(Node.BlendMode));
+    Obj->SetArrayField(TEXT("BlendMasks"), BlendMasksToJson(Node.BlendMasks));
+    Obj->SetArrayField(TEXT("BlendWeights"), BlendWeightsToJson(Node.BlendWeights));
+    Obj->SetArrayField(TEXT("LayerSetup"), LayerSetupToJson(Node.LayerSetup));
+    Obj->SetBoolField(TEXT("bMeshSpaceRotationBlend"), Node.bMeshSpaceRotationBlend);
+    Obj->SetBoolField(TEXT("bRootSpaceRotationBlend"), Node.bRootSpaceRotationBlend);
+    Obj->SetBoolField(TEXT("bMeshSpaceScaleBlend"), Node.bMeshSpaceScaleBlend);
+    Obj->SetStringField(TEXT("CurveBlendOption"),
+        CurveBlendOptionToString(Node.CurveBlendOption.GetValue()));
+    Obj->SetNumberField(TEXT("blend_pose_count"), Node.BlendPoses.Num());
+    return Obj;
+}
+
+FSageToolDispatch::FOutcome SetLayeredBoneBlendConfigImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, GraphName, NodeId;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("node_id"), NodeId) || NodeId.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'node_id'"));
+    }
+    Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+    UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!AnimBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path));
+    }
+    UEdGraph* TargetGraph = ResolveAnimGraphTarget(AnimBP, GraphName);
+    if (!TargetGraph)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("graph '%s' not found"), *GraphName));
+    }
+    UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(
+        FindGraphNodeByGuid(TargetGraph, NodeId));
+    if (!AnimNode)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("node_id %s isn't a UAnimGraphNode_Base"), *NodeId));
+    }
+
+    FStructProperty* NodeStructProp = nullptr;
+    void* NodeStructPtr = nullptr;
+    if (!GetAnimNodeStructTarget(AnimNode, NodeStructProp, NodeStructPtr)
+        || !NodeStructProp || !NodeStructPtr
+        || NodeStructProp->Struct != FAnimNode_LayeredBoneBlend::StaticStruct())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("node_id %s is %s, not FAnimNode_LayeredBoneBlend"),
+                            *NodeId,
+                            NodeStructProp && NodeStructProp->Struct
+                                ? *NodeStructProp->Struct->GetPathName()
+                                : TEXT("<unknown>")));
+    }
+
+    FAnimNode_LayeredBoneBlend* LBB =
+        reinterpret_cast<FAnimNode_LayeredBoneBlend*>(NodeStructPtr);
+    const FAnimNode_LayeredBoneBlend OldNode = *LBB;
+    const int32 PoseCount = LBB->BlendPoses.Num();
+
+    FString Err;
+    ELayeredBoneBlendMode TargetMode = LBB->BlendMode;
+    FString ModeText;
+    if (Args->TryGetStringField(TEXT("blend_mode"), ModeText) && !ModeText.IsEmpty())
+    {
+        if (!ParseLayeredBoneBlendMode(ModeText, TargetMode, Err))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+        }
+    }
+    else if (Args->HasField(TEXT("blend_masks")))
+    {
+        TargetMode = ELayeredBoneBlendMode::BlendMask;
+    }
+    else if (Args->HasField(TEXT("layer_setup")))
+    {
+        TargetMode = ELayeredBoneBlendMode::BranchFilter;
+    }
+
+    TArray<TObjectPtr<UBlendProfile>> NewBlendMasks = LBB->BlendMasks;
+    TArray<TSharedPtr<FJsonValue>> ResolvedMasks;
+    if (Args->HasField(TEXT("blend_masks")))
+    {
+        if (!ParseBlendMaskArray(Args->TryGetField(TEXT("blend_masks")),
+                                 NewBlendMasks, ResolvedMasks, Err))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+        }
+    }
+    if (TargetMode == ELayeredBoneBlendMode::BlendMask)
+    {
+        if (!Args->HasField(TEXT("blend_masks")))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("blend_masks is required when blend_mode=BlendMask"));
+        }
+        if (NewBlendMasks.Num() != PoseCount)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("blend_masks length %d does not match blend pose count %d"),
+                                NewBlendMasks.Num(), PoseCount));
+        }
+    }
+
+    TArray<FInputBlendPose> NewLayerSetup = LBB->LayerSetup;
+    if (Args->HasField(TEXT("layer_setup")))
+    {
+        if (!ParseLayerSetupArray(Args->TryGetField(TEXT("layer_setup")),
+                                  NewLayerSetup, Err))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+        }
+    }
+    if (TargetMode == ELayeredBoneBlendMode::BranchFilter)
+    {
+        if (NewLayerSetup.Num() != PoseCount)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("layer_setup length %d does not match blend pose count %d"),
+                                NewLayerSetup.Num(), PoseCount));
+        }
+    }
+
+    TArray<float> NewBlendWeights = LBB->BlendWeights;
+    if (Args->HasField(TEXT("blend_weights")))
+    {
+        if (!ParseFloatArrayValue(Args->TryGetField(TEXT("blend_weights")),
+                                  NewBlendWeights, Err))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+        }
+    }
+    else if (NewBlendWeights.Num() != PoseCount)
+    {
+        NewBlendWeights.Init(1.0f, PoseCount);
+    }
+    if (NewBlendWeights.Num() != PoseCount)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("blend_weights length %d does not match blend pose count %d"),
+                            NewBlendWeights.Num(), PoseCount));
+    }
+
+    ECurveBlendOption::Type NewCurveBlendOption = LBB->CurveBlendOption.GetValue();
+    FString CurveOptionText;
+    if (Args->TryGetStringField(TEXT("curve_blend_option"), CurveOptionText)
+        && !CurveOptionText.IsEmpty())
+    {
+        if (!ParseCurveBlendOption(CurveOptionText, NewCurveBlendOption, Err))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+        }
+    }
+
+    bool bMeshSpaceRotationBlend = LBB->bMeshSpaceRotationBlend;
+    bool bRootSpaceRotationBlend = LBB->bRootSpaceRotationBlend;
+    bool bMeshSpaceScaleBlend = LBB->bMeshSpaceScaleBlend;
+    Args->TryGetBoolField(TEXT("mesh_space_rotation_blend"), bMeshSpaceRotationBlend);
+    Args->TryGetBoolField(TEXT("root_space_rotation_blend"), bRootSpaceRotationBlend);
+    Args->TryGetBoolField(TEXT("mesh_space_scale_blend"), bMeshSpaceScaleBlend);
+
+    bool bCompile = false;
+    bool bSave = false;
+    bool bDryRun = false;
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("node_id"), NodeId);
+    R->SetStringField(TEXT("graph"), TargetGraph->GetFName().ToString());
+    R->SetStringField(TEXT("node_class"), AnimNode->GetClass()->GetPathName());
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    R->SetObjectField(TEXT("before"), LayeredBoneBlendReadbackJson(*LBB));
+    R->SetArrayField(TEXT("resolved_blend_masks"), ResolvedMasks);
+    if (bDryRun)
+    {
+        R->SetBoolField(TEXT("modified"), false);
+        R->SetBoolField(TEXT("validated"), true);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SetLayeredBoneBlendConfig", "Sage: Set Layered Bone Blend Config"));
+    AnimBP->Modify();
+    AnimNode->Modify();
+
+    LBB->BlendMode = TargetMode;
+    if (TargetMode == ELayeredBoneBlendMode::BlendMask)
+    {
+        LBB->BlendMasks = NewBlendMasks;
+        LBB->LayerSetup.Reset();
+    }
+    else
+    {
+        LBB->LayerSetup = NewLayerSetup;
+        LBB->BlendMasks.Reset();
+    }
+    LBB->BlendWeights = NewBlendWeights;
+    LBB->bMeshSpaceRotationBlend = bMeshSpaceRotationBlend;
+    LBB->bRootSpaceRotationBlend = bRootSpaceRotationBlend;
+    LBB->bMeshSpaceScaleBlend = bMeshSpaceScaleBlend;
+    LBB->CurveBlendOption = NewCurveBlendOption;
+    LBB->InvalidatePerBoneBlendWeights();
+
+    FProperty* NodeProperty = AnimNode->GetClass()->FindPropertyByName(TEXT("Node"));
+    if (NodeProperty)
+    {
+        FPropertyChangedEvent ChangeEvent(NodeProperty, EPropertyChangeType::ValueSet);
+        AnimNode->PostEditChangeProperty(ChangeEvent);
+    }
+    else
+    {
+        AnimNode->PostEditChange();
+    }
+    AnimNode->ReconstructNode();
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+    AnimBP->MarkPackageDirty();
+    if (bCompile)
+    {
+        FKismetEditorUtilities::CompileBlueprint(AnimBP);
+    }
+
+    bool bSaved = false;
+    if (bSave)
+    {
+        UEditorAssetSubsystem* AssetSubsystem = GEditor
+            ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>()
+            : nullptr;
+        if (!AssetSubsystem)
+        {
+            *LBB = OldNode;
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32603,
+                TEXT("EditorAssetSubsystem unavailable for saving AnimBlueprint"));
+        }
+        const FString Package = PackagePathForObjectPath(FSoftObjectPath(AnimBP).ToString());
+        bSaved = AssetSubsystem->SaveAsset(Package, /*bOnlyIfIsDirty=*/false);
+        if (!bSaved)
+        {
+            *LBB = OldNode;
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32603,
+                FString::Printf(TEXT("SaveAsset returned false for %s"), *Package));
+        }
+    }
+
+    R->SetBoolField(TEXT("modified"), true);
+    R->SetBoolField(TEXT("compiled"), bCompile);
+    R->SetBoolField(TEXT("saved"), bSaved);
+    R->SetObjectField(TEXT("after"), LayeredBoneBlendReadbackJson(*LBB));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 // ---------------------------------------------------------------------------
 // animation.bind_anim_node_property
 // ---------------------------------------------------------------------------
@@ -8996,6 +13167,493 @@ FSageToolDispatch::FOutcome ReadAnimNodePropertiesImpl(const TSharedPtr<FJsonObj
     R->SetArrayField(TEXT("properties"), Properties);
     R->SetArrayField(TEXT("bindings"), Bindings);
     R->SetArrayField(TEXT("animation_assets"), AssetRefs);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+bool ParseRetargetSourceMode(const FString& Raw, ERetargetSourceMode& Out)
+{
+    const FString Key = NormalizeToken(Raw);
+    if (Key.IsEmpty() || Key == TEXT("parent") || Key == TEXT("parentskeletalmeshcomponent"))
+    {
+        Out = ERetargetSourceMode::ParentSkeletalMeshComponent;
+        return true;
+    }
+    if (Key == TEXT("custom") || Key == TEXT("customskeletalmeshcomponent") || Key == TEXT("component"))
+    {
+        Out = ERetargetSourceMode::CustomSkeletalMeshComponent;
+        return true;
+    }
+    if (Key == TEXT("pose") || Key == TEXT("sourcepose") || Key == TEXT("sourceposepin") || Key == TEXT("pin"))
+    {
+        Out = ERetargetSourceMode::SourcePosePin;
+        return true;
+    }
+    return false;
+}
+
+FString RetargetSourceModeToString(ERetargetSourceMode Mode)
+{
+    switch (Mode)
+    {
+    case ERetargetSourceMode::ParentSkeletalMeshComponent: return TEXT("ParentSkeletalMeshComponent");
+    case ERetargetSourceMode::CustomSkeletalMeshComponent: return TEXT("CustomSkeletalMeshComponent");
+    case ERetargetSourceMode::SourcePosePin:               return TEXT("SourcePosePin");
+    default:                                               return TEXT("Unknown");
+    }
+}
+
+TSharedRef<FJsonObject> RetargetProfileToJson(const FRetargetProfile& Profile)
+{
+    auto Obj = MakeShared<FJsonObject>();
+    Obj->SetBoolField(TEXT("apply_target_pose"), Profile.bApplyTargetRetargetPose);
+    Obj->SetStringField(TEXT("target_pose"), Profile.TargetRetargetPoseName.ToString());
+    Obj->SetBoolField(TEXT("apply_source_pose"), Profile.bApplySourceRetargetPose);
+    Obj->SetStringField(TEXT("source_pose"), Profile.SourceRetargetPoseName.ToString());
+    Obj->SetBoolField(TEXT("force_ik_off"), Profile.bForceAllIKOff);
+    TArray<TSharedPtr<FJsonValue>> OpProfiles;
+    for (const FRetargetOpProfile& OpProfile : Profile.RetargetOpProfiles)
+    {
+        auto Row = MakeShared<FJsonObject>();
+        Row->SetStringField(TEXT("op_name"), OpProfile.OpToApplySettingsTo.ToString());
+        Row->SetStringField(TEXT("settings_type"), OpProfile.SettingsToApply.GetScriptStruct()
+            ? OpProfile.SettingsToApply.GetScriptStruct()->GetPathName()
+            : FString());
+        OpProfiles.Add(MakeShared<FJsonValueObject>(Row));
+    }
+    Obj->SetArrayField(TEXT("op_profiles"), OpProfiles);
+    Obj->SetNumberField(TEXT("op_profile_count"), OpProfiles.Num());
+    return Obj;
+}
+
+bool ResolveRetargetPoseFromMeshNode(
+    const TSharedPtr<FJsonObject>& Args,
+    UAnimBlueprint*& OutAnimBP,
+    UEdGraph*& OutGraph,
+    UAnimGraphNode_Base*& OutGraphNode,
+    FAnimNode_RetargetPoseFromMesh*& OutNode,
+    FString& OutError)
+{
+    FString Path, GraphName, NodeId;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        OutError = TEXT("missing 'path'");
+        return false;
+    }
+    if (!Args->TryGetStringField(TEXT("node_id"), NodeId) || NodeId.IsEmpty())
+    {
+        OutError = TEXT("missing 'node_id'");
+        return false;
+    }
+    Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+    OutAnimBP = Cast<UAnimBlueprint>(ResolveAsset(Path));
+    if (!OutAnimBP)
+    {
+        OutError = FString::Printf(TEXT("not a UAnimBlueprint: %s"), *Path);
+        return false;
+    }
+    OutGraph = ResolveAnimGraphTarget(OutAnimBP, GraphName);
+    if (!OutGraph)
+    {
+        OutError = FString::Printf(TEXT("graph '%s' not found"), *GraphName);
+        return false;
+    }
+    OutGraphNode = Cast<UAnimGraphNode_Base>(FindGraphNodeByGuid(OutGraph, NodeId));
+    if (!OutGraphNode)
+    {
+        OutError = FString::Printf(TEXT("node_id %s isn't a UAnimGraphNode_Base"), *NodeId);
+        return false;
+    }
+
+    FStructProperty* NodeStructProp = nullptr;
+    void* NodeStructPtr = nullptr;
+    if (!GetAnimNodeStructTarget(OutGraphNode, NodeStructProp, NodeStructPtr) ||
+        !NodeStructProp ||
+        !NodeStructProp->Struct ||
+        !NodeStructProp->Struct->IsChildOf(FAnimNode_RetargetPoseFromMesh::StaticStruct()))
+    {
+        OutError = FString::Printf(TEXT("node_id %s is not Retarget Pose From Mesh"), *NodeId);
+        return false;
+    }
+    OutNode = reinterpret_cast<FAnimNode_RetargetPoseFromMesh*>(NodeStructPtr);
+    return OutNode != nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// animation.read_retarget_pose_from_mesh_node
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome ReadRetargetPoseFromMeshNodeImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    UAnimBlueprint* AnimBP = nullptr;
+    UEdGraph* Graph = nullptr;
+    UAnimGraphNode_Base* GraphNode = nullptr;
+    FAnimNode_RetargetPoseFromMesh* Node = nullptr;
+    FString Error;
+    if (!ResolveRetargetPoseFromMeshNode(Args, AnimBP, Graph, GraphNode, Node, Error))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    FSageToolDispatch::FOutcome GenericRead = ReadAnimNodePropertiesImpl(Args);
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), AnimBP->GetPathName());
+    R->SetStringField(TEXT("graph"), Graph->GetFName().ToString());
+    R->SetStringField(TEXT("node_id"), GraphNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+    R->SetStringField(TEXT("node_class"), GraphNode->GetClass()->GetPathName());
+    R->SetStringField(TEXT("retarget_from"), RetargetSourceModeToString(Node->RetargetFrom));
+    R->SetStringField(TEXT("ik_retargeter"), Node->IKRetargeterAsset ? Node->IKRetargeterAsset->GetPathName() : FString());
+    R->SetNumberField(TEXT("lod_threshold"), Node->LODThreshold);
+    R->SetNumberField(TEXT("ik_lod_threshold"), Node->LODThresholdForIK);
+    R->SetBoolField(TEXT("suppress_warnings"), Node->bSuppressWarnings);
+    R->SetObjectField(TEXT("custom_retarget_profile"), RetargetProfileToJson(Node->CustomRetargetProfile));
+    if (GenericRead.bSuccess && GenericRead.Result.IsValid())
+    {
+        R->SetObjectField(TEXT("generic_readback"), GenericRead.Result.ToSharedRef());
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.set_retarget_pose_from_mesh_node
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome SetRetargetPoseFromMeshNodeImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UAnimBlueprint* AnimBP = nullptr;
+    UEdGraph* Graph = nullptr;
+    UAnimGraphNode_Base* GraphNode = nullptr;
+    FAnimNode_RetargetPoseFromMesh* Node = nullptr;
+    FString Error;
+    if (!ResolveRetargetPoseFromMeshNode(Args, AnimBP, Graph, GraphNode, Node, Error))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    bool bDryRun = false;
+    bool bCompile = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    FString RetargeterPath;
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("ik_retargeter"), TEXT("retargeter"), TEXT("ik_retargeter_asset") }, RetargeterPath);
+    FString SourceModeString;
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("source_mode"), TEXT("retarget_from") }, SourceModeString);
+    bool bSuppressWarnings = Node->bSuppressWarnings;
+    bool bHaveSuppressWarnings = TryGetAnyBoolField(Args, TArray<const TCHAR*>{ TEXT("suppress_warnings"), TEXT("bSuppressWarnings") }, bSuppressWarnings);
+    bool bExposeSourceMeshPin = false;
+    Args->TryGetBoolField(TEXT("expose_source_mesh_pin"), bExposeSourceMeshPin);
+
+    int32 LODThreshold = Node->LODThreshold;
+    int32 IKLODThreshold = Node->LODThresholdForIK;
+    TryGetAnyIntField(Args, TArray<const TCHAR*>{ TEXT("lod_threshold"), TEXT("LODThreshold") }, LODThreshold);
+    TryGetAnyIntField(Args, TArray<const TCHAR*>{ TEXT("ik_lod_threshold"), TEXT("LODThresholdForIK") }, IKLODThreshold);
+
+    FString TargetPose, SourcePose;
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("target_pose"), TEXT("target_retarget_pose") }, TargetPose);
+    TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("source_pose"), TEXT("source_retarget_pose") }, SourcePose);
+    bool bForceIKOff = Node->CustomRetargetProfile.bForceAllIKOff;
+    bool bHaveForceIKOff = TryGetAnyBoolField(Args, TArray<const TCHAR*>{ TEXT("force_ik_off"), TEXT("force_all_ik_off") }, bForceIKOff);
+
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), AnimBP->GetPathName());
+        R->SetStringField(TEXT("node_id"), GraphNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+        R->SetStringField(TEXT("ik_retargeter"), RetargeterPath);
+        R->SetStringField(TEXT("source_mode"), SourceModeString);
+        R->SetNumberField(TEXT("lod_threshold"), LODThreshold);
+        R->SetNumberField(TEXT("ik_lod_threshold"), IKLODThreshold);
+        R->SetBoolField(TEXT("suppress_warnings"), bSuppressWarnings);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageSetRetargetPoseFromMeshNode", "Sage: Set Retarget Pose From Mesh Node"));
+    AnimBP->Modify();
+    GraphNode->Modify();
+    bool bModified = false;
+
+    if (!RetargeterPath.IsEmpty())
+    {
+        UIKRetargeter* Retargeter = Cast<UIKRetargeter>(ResolveAsset(RetargeterPath));
+        if (!Retargeter)
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("not a UIKRetargeter: %s"), *RetargeterPath));
+        }
+        Node->IKRetargeterAsset = Retargeter;
+        bModified = true;
+    }
+    if (!SourceModeString.IsEmpty())
+    {
+        ERetargetSourceMode Mode = Node->RetargetFrom;
+        if (!ParseRetargetSourceMode(SourceModeString, Mode))
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("invalid source_mode: %s"), *SourceModeString));
+        }
+        Node->RetargetFrom = Mode;
+        bModified = true;
+    }
+    if (TryGetAnyIntField(Args, TArray<const TCHAR*>{ TEXT("lod_threshold"), TEXT("LODThreshold") }, LODThreshold))
+    {
+        Node->LODThreshold = LODThreshold;
+        bModified = true;
+    }
+    if (TryGetAnyIntField(Args, TArray<const TCHAR*>{ TEXT("ik_lod_threshold"), TEXT("LODThresholdForIK") }, IKLODThreshold))
+    {
+        Node->LODThresholdForIK = IKLODThreshold;
+        bModified = true;
+    }
+    if (bHaveSuppressWarnings)
+    {
+        Node->bSuppressWarnings = bSuppressWarnings;
+        bModified = true;
+    }
+    if (!TargetPose.IsEmpty())
+    {
+        Node->CustomRetargetProfile.bApplyTargetRetargetPose = true;
+        Node->CustomRetargetProfile.TargetRetargetPoseName = FName(*TargetPose);
+        bModified = true;
+    }
+    if (!SourcePose.IsEmpty())
+    {
+        Node->CustomRetargetProfile.bApplySourceRetargetPose = true;
+        Node->CustomRetargetProfile.SourceRetargetPoseName = FName(*SourcePose);
+        bModified = true;
+    }
+    if (bHaveForceIKOff)
+    {
+        Node->CustomRetargetProfile.bForceAllIKOff = bForceIKOff;
+        bModified = true;
+    }
+    if (bExposeSourceMeshPin)
+    {
+        FResolvedAnimNodePinBinding PinInfo;
+        if (ResolveAnimNodePinBinding(GraphNode, TEXT("SourceMeshComponent"), PinInfo))
+        {
+            bModified |= SetResolvedAnimNodePinVisible(GraphNode, PinInfo, /*bReconstruct=*/true);
+        }
+    }
+
+    if (bModified)
+    {
+        FPropertyChangedEvent Event(nullptr, EPropertyChangeType::ValueSet);
+        GraphNode->PostEditChangeProperty(Event);
+        GraphNode->ReconstructNode();
+        AnimBP->MarkPackageDirty();
+    }
+    if (bCompile)
+    {
+        FKismetEditorUtilities::CompileBlueprint(AnimBP);
+    }
+
+    FSageToolDispatch::FOutcome Readback = ReadRetargetPoseFromMeshNodeImpl(Args);
+    TSharedPtr<FJsonObject> R = Readback.bSuccess && Readback.Result.IsValid()
+        ? Readback.Result
+        : MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("modified"), bModified);
+    R->SetBoolField(TEXT("compiled"), bCompile);
+    TrySaveLoadedAssetIfRequested(AnimBP, bSave && bModified, R.ToSharedRef());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.add_retarget_pose_from_mesh_node
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome AddRetargetPoseFromMeshNodeImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    auto AddArgs = MakeShared<FJsonObject>();
+    FString Path, GraphName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    AddArgs->SetStringField(TEXT("path"), Path);
+    if (Args->TryGetStringField(TEXT("graph_name"), GraphName))
+    {
+        AddArgs->SetStringField(TEXT("graph_name"), GraphName);
+    }
+    double X = 0.0;
+    double Y = 0.0;
+    if (Args->TryGetNumberField(TEXT("x"), X)) AddArgs->SetNumberField(TEXT("x"), X);
+    if (Args->TryGetNumberField(TEXT("y"), Y)) AddArgs->SetNumberField(TEXT("y"), Y);
+    AddArgs->SetStringField(TEXT("node_class"), TEXT("/Script/IKRigDeveloper.AnimGraphNode_RetargetPoseFromMesh"));
+
+    FSageToolDispatch::FOutcome Added = AddAnimGraphNodeImpl(AddArgs);
+    if (!Added.bSuccess || !Added.Result.IsValid())
+    {
+        return Added;
+    }
+    FString NodeId;
+    Added.Result->TryGetStringField(TEXT("node_id"), NodeId);
+    if (NodeId.IsEmpty())
+    {
+        return Added;
+    }
+
+    auto SetArgs = MakeShared<FJsonObject>();
+    SetArgs->SetStringField(TEXT("path"), Path);
+    SetArgs->SetStringField(TEXT("node_id"), NodeId);
+    if (!GraphName.IsEmpty()) SetArgs->SetStringField(TEXT("graph_name"), GraphName);
+    const TCHAR* StringFields[] = {
+        TEXT("ik_retargeter"), TEXT("retargeter"), TEXT("ik_retargeter_asset"),
+        TEXT("source_mode"), TEXT("retarget_from"),
+        TEXT("target_pose"), TEXT("source_pose")
+    };
+    for (const TCHAR* Field : StringFields)
+    {
+        FString Value;
+        if (Args->TryGetStringField(Field, Value))
+        {
+            SetArgs->SetStringField(Field, Value);
+        }
+    }
+    const TCHAR* NumberFields[] = {
+        TEXT("lod_threshold"), TEXT("ik_lod_threshold")
+    };
+    for (const TCHAR* Field : NumberFields)
+    {
+        double Value = 0.0;
+        if (Args->TryGetNumberField(Field, Value))
+        {
+            SetArgs->SetNumberField(Field, Value);
+        }
+    }
+    const TCHAR* BoolFields[] = {
+        TEXT("suppress_warnings"), TEXT("expose_source_mesh_pin"),
+        TEXT("force_ik_off"), TEXT("compile"), TEXT("save")
+    };
+    for (const TCHAR* Field : BoolFields)
+    {
+        bool Value = false;
+        if (Args->TryGetBoolField(Field, Value))
+        {
+            SetArgs->SetBoolField(Field, Value);
+        }
+    }
+    FSageToolDispatch::FOutcome Configured = SetRetargetPoseFromMeshNodeImpl(SetArgs);
+    if (Configured.bSuccess && Configured.Result.IsValid())
+    {
+        Configured.Result->SetObjectField(TEXT("created_node"), Added.Result.ToSharedRef());
+    }
+    return Configured;
+}
+
+// ---------------------------------------------------------------------------
+// animation.read_retarget_profile
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome ReadRetargetProfileImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString RetargeterPath;
+    if (Args.IsValid() && TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("retargeter"), TEXT("ik_retargeter") }, RetargeterPath))
+    {
+        UIKRetargeter* Retargeter = Cast<UIKRetargeter>(ResolveAsset(RetargeterPath));
+        if (!Retargeter)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("not a UIKRetargeter: %s"), *RetargeterPath));
+        }
+        FRetargetProfile Profile;
+        Profile.FillProfileWithAssetSettings(Retargeter);
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("retargeter"), Retargeter->GetPathName());
+        R->SetObjectField(TEXT("profile"), RetargetProfileToJson(Profile));
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    UAnimBlueprint* AnimBP = nullptr;
+    UEdGraph* Graph = nullptr;
+    UAnimGraphNode_Base* GraphNode = nullptr;
+    FAnimNode_RetargetPoseFromMesh* Node = nullptr;
+    FString Error;
+    if (!ResolveRetargetPoseFromMeshNode(Args, AnimBP, Graph, GraphNode, Node, Error))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), AnimBP->GetPathName());
+    R->SetStringField(TEXT("node_id"), GraphNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+    R->SetObjectField(TEXT("profile"), RetargetProfileToJson(Node->CustomRetargetProfile));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.set_retarget_profile
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome SetRetargetProfileImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    auto MutableArgs = MakeShared<FJsonObject>();
+    if (Args.IsValid())
+    {
+        for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Args->Values)
+        {
+            MutableArgs->SetField(Pair.Key, Pair.Value);
+        }
+    }
+    return SetRetargetPoseFromMeshNodeImpl(MutableArgs);
+}
+
+// ---------------------------------------------------------------------------
+// animation.copy_retarget_profile_from_asset
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome CopyRetargetProfileFromAssetImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString RetargeterPath;
+    if (!Args.IsValid() || !TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("retargeter"), TEXT("ik_retargeter") }, RetargeterPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'retargeter'"));
+    }
+    UIKRetargeter* Retargeter = Cast<UIKRetargeter>(ResolveAsset(RetargeterPath));
+    if (!Retargeter)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UIKRetargeter: %s"), *RetargeterPath));
+    }
+    FRetargetProfile Profile;
+    Profile.FillProfileWithAssetSettings(Retargeter);
+
+    FString Path, NodeId;
+    if (Args->TryGetStringField(TEXT("path"), Path) && Args->TryGetStringField(TEXT("node_id"), NodeId))
+    {
+        UAnimBlueprint* AnimBP = nullptr;
+        UEdGraph* Graph = nullptr;
+        UAnimGraphNode_Base* GraphNode = nullptr;
+        FAnimNode_RetargetPoseFromMesh* Node = nullptr;
+        FString Error;
+        if (!ResolveRetargetPoseFromMeshNode(Args, AnimBP, Graph, GraphNode, Node, Error))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+        }
+        FScopedTransaction Tx(LOCTEXT("SageCopyRetargetProfileFromAsset", "Sage: Copy Retarget Profile From Asset"));
+        AnimBP->Modify();
+        GraphNode->Modify();
+        Node->CustomRetargetProfile = Profile;
+        GraphNode->ReconstructNode();
+        AnimBP->MarkPackageDirty();
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("retargeter"), Retargeter->GetPathName());
+    R->SetObjectField(TEXT("profile"), RetargetProfileToJson(Profile));
+    R->SetBoolField(TEXT("applied_to_node"), !Path.IsEmpty() && !NodeId.IsEmpty());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -15601,9 +20259,18 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.read_sequence"),              GT(&ReadSequenceImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_blendspace"),            GT(&ReadBlendSpaceImpl));
     Dispatch.RegisterHandler(TEXT("animation.get_skeleton_info"),          GT(&GetSkeletonInfoImpl));
+    Dispatch.RegisterHandler(TEXT("animation.inspect_skeleton"),           GT(&InspectSkeletonImpl));
+    Dispatch.RegisterHandler(TEXT("animation.inspect_ref_pose"),           GT(&InspectRefPoseImpl));
+    Dispatch.RegisterHandler(TEXT("animation.list_skeletons"),             GT(&ListSkeletonsImpl));
+    Dispatch.RegisterHandler(TEXT("animation.read_blend_profiles"),        GT(&ReadBlendProfilesImpl));
     Dispatch.RegisterHandler(TEXT("animation.list_sockets"),               GT(&ListSkeletonSocketsImpl));
     Dispatch.RegisterHandler(TEXT("animation.list_skeletal_meshes"),       GT(&ListSkeletalMeshesImpl));
     Dispatch.RegisterHandler(TEXT("animation.get_physics_asset"),          GT(&GetPhysicsAssetImpl));
+    Dispatch.RegisterHandler(TEXT("animation.find_animations"),            GT(&FindAnimationsImpl));
+    Dispatch.RegisterHandler(TEXT("animation.inspect_animation"),          GT(&InspectAnimationImpl));
+    Dispatch.RegisterHandler(TEXT("animation.sample_bone_tracks"),         GT(&SampleBoneTracksImpl));
+    Dispatch.RegisterHandler(TEXT("animation.compare_retarget_bones"),     GT(&CompareRetargetBonesImpl));
+    Dispatch.RegisterHandler(TEXT("animation.diagnose_retarget_animation"),GT(&DiagnoseRetargetAnimationImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_state_machine"),         GT(&ReadStateMachineImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_anim_graph"),            GT(&ReadAnimGraphImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_state_graph"),           GT(&ReadStateGraphImpl));
@@ -15621,6 +20288,7 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.create_sequence"),            GT(&CreateSequenceImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_bone_keyframes"),         GT(&SetBoneKeyframesImpl));
     Dispatch.RegisterHandler(TEXT("animation.get_bone_transforms"),        GT(&GetBoneTransformsImpl));
+    Dispatch.RegisterHandler(TEXT("animation.copy_bone_tracks"),           GT(&CopyBoneTracksImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_montage_sequence"),       GT(&SetMontageSequenceImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_montage_properties"),     GT(&SetMontagePropertiesImpl));
     Dispatch.RegisterHandler(TEXT("animation.create_state_machine"),       GT(&CreateStateMachineImpl));
@@ -15634,13 +20302,32 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.add_montage_section"),        GT(&AddMontageSectionImpl));
     Dispatch.RegisterHandler(TEXT("animation.create_ik_rig"),              GT(&CreateIKRigImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_ik_rig"),                GT(&ReadIKRigImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_ik_retarget_chain"),      GT(&AddIKRetargetChainImpl));
+    Dispatch.RegisterHandler(TEXT("animation.remove_ik_retarget_chain"),   GT(&RemoveIKRetargetChainImpl));
+    Dispatch.RegisterHandler(TEXT("animation.rename_ik_retarget_chain"),   GT(&RenameIKRetargetChainImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_ik_retarget_chain_bones"),GT(&SetIKRetargetChainBonesImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_ik_retarget_chain_goal"), GT(&SetIKRetargetChainGoalImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_ik_retarget_root"),       GT(&SetIKRetargetRootImpl));
+    Dispatch.RegisterHandler(TEXT("animation.auto_generate_ik_retarget_definition"), GT(&AutoGenerateIKRetargetDefinitionImpl));
+    Dispatch.RegisterHandler(TEXT("animation.auto_generate_ik_fbik"),      GT(&AutoGenerateIKFBIKImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_root_motion"),            GT(&SetRootMotionImpl));
+    Dispatch.RegisterHandler(TEXT("animation.save_animation_asset"),       GT(&SaveAnimationAssetImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_skeleton_bone"),          GT(&AddSkeletonBoneImpl));
+    Dispatch.RegisterHandler(TEXT("animation.create_blend_mask"),          GT(&CreateBlendMaskImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_virtual_bone"),           GT(&AddVirtualBoneImpl));
     Dispatch.RegisterHandler(TEXT("animation.remove_virtual_bone"),        GT(&RemoveVirtualBoneImpl));
     Dispatch.RegisterHandler(TEXT("animation.create_composite"),           GT(&CreateCompositeImpl));
     Dispatch.RegisterHandler(TEXT("animation.create_ik_retargeter"),       GT(&CreateIKRetargeterImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_ik_retargeter"),         GT(&ReadIKRetargeterImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_ik_retargeter_rigs"),     GT(&SetIKRetargeterRigsImpl));
+    Dispatch.RegisterHandler(TEXT("animation.setup_ik_retargeter_ops"),    GT(&SetupIKRetargeterOpsImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_ik_retargeter_op"),       GT(&AddIKRetargeterOpImpl));
+    Dispatch.RegisterHandler(TEXT("animation.remove_ik_retargeter_op"),    GT(&RemoveIKRetargeterOpImpl));
+    Dispatch.RegisterHandler(TEXT("animation.move_ik_retargeter_op"),      GT(&MoveIKRetargeterOpImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_ik_retargeter_op_enabled"), GT(&SetIKRetargeterOpEnabledImpl));
+    Dispatch.RegisterHandler(TEXT("animation.auto_map_ik_retargeter_chains"), GT(&AutoMapIKRetargeterChainsImpl));
+    Dispatch.RegisterHandler(TEXT("animation.reset_ik_retargeter_chain_settings"), GT(&ResetIKRetargeterChainSettingsImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_ik_retargeter_fk_chain_settings"), GT(&SetIKRetargeterFKChainSettingsImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_ik_retargeter_chain_mapping"), GT(&SetIKRetargeterChainMappingImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_ik_retargeter_pose"),     GT(&SetIKRetargeterPoseImpl));
     Dispatch.RegisterHandler(TEXT("animation.retarget_animations"),        GT(&RetargetAnimationsImpl));
@@ -15664,8 +20351,15 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.connect_pose_pin"),           GT(&ConnectPosePinImpl));
     Dispatch.RegisterHandler(TEXT("animation.disconnect_pose_pin"),        GT(&DisconnectPosePinImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_anim_node_property"),     GT(&SetAnimNodePropertyImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_layered_bone_blend_config"), GT(&SetLayeredBoneBlendConfigImpl));
     Dispatch.RegisterHandler(TEXT("animation.bind_anim_node_property"),    GT(&BindAnimNodePropertyImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_anim_node_properties"),  GT(&ReadAnimNodePropertiesImpl));
+    Dispatch.RegisterHandler(TEXT("animation.add_retarget_pose_from_mesh_node"), GT(&AddRetargetPoseFromMeshNodeImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_retarget_pose_from_mesh_node"), GT(&SetRetargetPoseFromMeshNodeImpl));
+    Dispatch.RegisterHandler(TEXT("animation.read_retarget_pose_from_mesh_node"), GT(&ReadRetargetPoseFromMeshNodeImpl));
+    Dispatch.RegisterHandler(TEXT("animation.read_retarget_profile"),      GT(&ReadRetargetProfileImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_retarget_profile"),       GT(&SetRetargetProfileImpl));
+    Dispatch.RegisterHandler(TEXT("animation.copy_retarget_profile_from_asset"), GT(&CopyRetargetProfileFromAssetImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_owner_locomotion_update"),GT(&SetOwnerLocomotionUpdateImpl));
     Dispatch.RegisterHandler(TEXT("animation.list_animgraph_nodes"),       GT(&ListAnimGraphNodesImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_animgraph_root_pose"),    GT(&SetAnimGraphRootPoseImpl));

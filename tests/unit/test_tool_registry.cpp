@@ -252,4 +252,113 @@ TEST_CASE("Phase4 animation graph gap tools expose compact schemas",
     const Tool* removeNode = findTool("animation.remove_animgraph_node");
     REQUIRE(removeNode != nullptr);
     REQUIRE(removeNode->inputSchema["properties"].contains("dry_run"));
+
+    const Tool* layeredBlend = findTool("animation.set_layered_bone_blend_config");
+    REQUIRE(layeredBlend != nullptr);
+    REQUIRE(layeredBlend->inputSchema["properties"].contains("blend_masks"));
+    REQUIRE(layeredBlend->inputSchema["properties"].contains("layer_setup"));
+    REQUIRE(layeredBlend->inputSchema["properties"].contains("compile"));
+    REQUIRE(layeredBlend->inputSchema["required"] == nlohmann::json::array({"path", "node_id"}));
+
+    const Tool* addWidgetEntry = findTool("gamefeature.add_widget_entry");
+    REQUIRE(addWidgetEntry != nullptr);
+    REQUIRE(addWidgetEntry->inputSchema["properties"].contains("slot_id"));
+    REQUIRE(addWidgetEntry->inputSchema["properties"].contains("widget_class"));
+    REQUIRE(addWidgetEntry->inputSchema["properties"].contains("layer_id"));
+    REQUIRE(addWidgetEntry->inputSchema["properties"].contains("layout_class"));
+    REQUIRE(addWidgetEntry->inputSchema["required"] == nlohmann::json::array({"path"}));
+
+    const Tool* cdoInstancedArray = findTool("bp.set_cdo_instanced_array_element");
+    REQUIRE(cdoInstancedArray != nullptr);
+    REQUIRE(cdoInstancedArray->inputSchema["properties"].contains("array_property"));
+    REQUIRE(cdoInstancedArray->inputSchema["properties"].contains("class_name"));
+    REQUIRE(cdoInstancedArray->inputSchema["properties"].contains("element_value"));
+    REQUIRE(cdoInstancedArray->inputSchema["properties"].contains("match_fields"));
+    REQUIRE(cdoInstancedArray->inputSchema["properties"].contains("dry_run"));
+    REQUIRE(cdoInstancedArray->inputSchema["required"] == nlohmann::json::array({"path"}));
+
+    const Tool* createIKRig = findTool("animation.create_ik_rig");
+    REQUIRE(createIKRig != nullptr);
+    REQUIRE(createIKRig->inputSchema["properties"].contains("skeletal_mesh"));
+    REQUIRE(createIKRig->inputSchema["properties"].contains("retarget_root"));
+    REQUIRE(createIKRig->inputSchema["properties"].contains("chains"));
+    REQUIRE(createIKRig->inputSchema["properties"].contains("dry_run"));
+    REQUIRE(createIKRig->inputSchema["required"] == nlohmann::json::array({"path"}));
+
+    const Tool* inspectSkeleton = findTool("animation.inspect_skeleton");
+    REQUIRE(inspectSkeleton != nullptr);
+    REQUIRE(inspectSkeleton->inputSchema["properties"].contains("skeletal_mesh"));
+    REQUIRE(inspectSkeleton->inputSchema["properties"].contains("include_ref_pose"));
+
+    const Tool* createBlendMask = findTool("animation.create_blend_mask");
+    REQUIRE(createBlendMask != nullptr);
+    REQUIRE(createBlendMask->inputSchema["properties"].contains("entries"));
+    REQUIRE(createBlendMask->inputSchema["properties"].contains("clear_existing"));
+    REQUIRE(createBlendMask->inputSchema["properties"].contains("save"));
+
+    const Tool* readBlendProfiles = findTool("animation.read_blend_profiles");
+    REQUIRE(readBlendProfiles != nullptr);
+    REQUIRE(readBlendProfiles->inputSchema["properties"].contains("blend_masks_only"));
+
+    const Tool* setupRetargeterOps = findTool("animation.setup_ik_retargeter_ops");
+    REQUIRE(setupRetargeterOps != nullptr);
+    REQUIRE(setupRetargeterOps->inputSchema["properties"].contains("assign_ik_rigs"));
+    REQUIRE(setupRetargeterOps->inputSchema["properties"].contains("clean_chain_maps"));
+    REQUIRE(setupRetargeterOps->inputSchema["properties"].contains("auto_map_type"));
+    REQUIRE(setupRetargeterOps->inputSchema["required"] == nlohmann::json::array({"path"}));
+
+    const Tool* createRetargeter = findTool("animation.create_ik_retargeter");
+    REQUIRE(createRetargeter != nullptr);
+    REQUIRE(createRetargeter->inputSchema["properties"].contains("assign_ops"));
+    REQUIRE(createRetargeter->inputSchema["properties"].contains("auto_map_type"));
+    REQUIRE(createRetargeter->inputSchema["properties"].contains("save"));
+
+    const Tool* setRetargeterRigs = findTool("animation.set_ik_retargeter_rigs");
+    REQUIRE(setRetargeterRigs != nullptr);
+    REQUIRE(setRetargeterRigs->inputSchema["properties"].contains("clean_chain_maps"));
+    REQUIRE(setRetargeterRigs->inputSchema["properties"].contains("dry_run"));
+
+    const Tool* addRetargeterOp = findTool("animation.add_ik_retargeter_op");
+    REQUIRE(addRetargeterOp != nullptr);
+    REQUIRE(addRetargeterOp->inputSchema["properties"].contains("op_type"));
+    REQUIRE(addRetargeterOp->inputSchema["properties"].contains("parent_op_name"));
+    REQUIRE(addRetargeterOp->inputSchema["properties"].contains("run_initial_setup"));
+
+    const Tool* fkChainSettings = findTool("animation.set_ik_retargeter_fk_chain_settings");
+    REQUIRE(fkChainSettings != nullptr);
+    REQUIRE(fkChainSettings->inputSchema["properties"].contains("rotation_mode"));
+    REQUIRE(fkChainSettings->inputSchema["properties"].contains("translation_alpha"));
+    REQUIRE(fkChainSettings->inputSchema["properties"].contains("dry_run"));
+
+    const Tool* retargetPose = findTool("animation.set_ik_retargeter_pose");
+    REQUIRE(retargetPose != nullptr);
+    REQUIRE(retargetPose->inputSchema["properties"].contains("duplicate"));
+    REQUIRE(retargetPose->inputSchema["properties"].contains("reset_bones"));
+    REQUIRE(retargetPose->inputSchema["properties"].contains("auto_align"));
+    REQUIRE(retargetPose->inputSchema["properties"].contains("snap_to_ground"));
+
+    const Tool* chainMapping = findTool("animation.set_ik_retargeter_chain_mapping");
+    REQUIRE(chainMapping != nullptr);
+    REQUIRE(chainMapping->inputSchema["properties"].contains("dry_run"));
+    REQUIRE(chainMapping->inputSchema["properties"].contains("save"));
+
+    const Tool* addRetargetPoseFromMesh = findTool("animation.add_retarget_pose_from_mesh_node");
+    REQUIRE(addRetargetPoseFromMesh != nullptr);
+    REQUIRE(addRetargetPoseFromMesh->inputSchema["properties"].contains("ik_retargeter"));
+    REQUIRE(addRetargetPoseFromMesh->inputSchema["properties"].contains("source_mode"));
+    REQUIRE(addRetargetPoseFromMesh->inputSchema["required"] == nlohmann::json::array({"path"}));
+
+    const Tool* setRetargetPoseFromMesh = findTool("animation.set_retarget_pose_from_mesh_node");
+    REQUIRE(setRetargetPoseFromMesh != nullptr);
+    REQUIRE(setRetargetPoseFromMesh->inputSchema["properties"].contains("expose_source_mesh_pin"));
+    REQUIRE(setRetargetPoseFromMesh->inputSchema["properties"].contains("target_pose"));
+    REQUIRE(setRetargetPoseFromMesh->inputSchema["required"] == nlohmann::json::array({"path", "node_id"}));
+
+    const Tool* readRetargetProfile = findTool("animation.read_retarget_profile");
+    REQUIRE(readRetargetProfile != nullptr);
+    REQUIRE(readRetargetProfile->inputSchema["properties"].contains("retargeter"));
+
+    const Tool* copyRetargetProfile = findTool("animation.copy_retarget_profile_from_asset");
+    REQUIRE(copyRetargetProfile != nullptr);
+    REQUIRE(copyRetargetProfile->inputSchema["properties"].contains("ik_retargeter"));
 }

@@ -352,3 +352,45 @@ Phase 1–3 sonrası 443 tool handler'a ulaşıldı. UE-MCP (448 action) ile %99
 Master runner: `scripts/smoke/run_phase4_domains.py` — 10/10 PASS (gerçek UE editor + sage-server üzerinde).
 
 Plugin-gated graceful skip pattern'ı: GAS, PCG, SmartObjects, PoseSearch plugin'leri SageTest'te yüklü değil, smoke test'ler bunu yakalayıp skip ediyor.
+## Active Gap Closure - 2026-05-21
+
+- [x] Implement typed `gamefeature.add_widget_entry` for Lyra `UGameFeatureAction_AddWidgets` HUD entries.
+- [x] Implement LayeredBoneBlend BlendMask authoring for `animation.set_layered_bone_blend_config`.
+- [x] Verify server schema/build and UE plugin build.
+- [x] Move closed gap details from `.claude/notes/gap-inbox.md` into the implemented summary with evidence.
+
+Review:
+- Debug `sage-server` built successfully after initializing the VS dev environment.
+- `sage-tests` rebuilt and `ctest --test-dir build\debug --output-on-failure` passed 37/37.
+- `scripts\audit-tools.ps1` reports no plugin handler without schema and no schema/plugin stubs; only expected local `jobs.*` schema-only tools remain.
+- `scripts\build-plugin.ps1` packaged the Win64 plugin successfully under `build\plugin`.
+
+## Active Gap Closure - 2026-05-21 Reticle Provider CDO Array
+
+- [x] Implement `bp.set_cdo_instanced_array_element` for Blueprint/WidgetBlueprint CDO `TArray<TObjectPtr<Instanced UObject>>` authoring.
+- [x] Add recursive CDO readback support to `bp.get_cdo_properties` for Blueprint asset paths and instanced provider arrays.
+- [x] Register schema/handler and add registry coverage.
+- [x] Verify server build, unit tests, tool audit, and UE BuildPlugin.
+- [x] Move the detailed gap from `.claude/notes/gap-inbox.md` to the implemented summary.
+
+Review:
+- Debug `sage-server` build completed through `scripts\build-server.ps1`.
+- `sage-tests` rebuilt and `ctest --test-dir build\debug --output-on-failure` passed 37/37.
+- `scripts\audit-tools.ps1` reports 603 server tools, 585 plugin handlers, no plugin-without-schema, no stubs, and only expected local `jobs.*` schema-only tools.
+- `scripts\build-plugin.ps1` packaged the Win64 plugin successfully under `build\plugin`.
+
+## Active Gap Closure - 2026-05-30 Retargeting Parity
+
+- [x] Implement IK Rig parity slice: fix `animation.create_ik_rig`, replace `animation.read_ik_rig` placeholder, add chain/root/auto-generate tools.
+- [x] Implement IK Retargeter parity slice: op setup, op stack edits, standalone auto-map, chain reset, FK/IK settings readback, FK settings write, expanded pose operations.
+- [x] Implement import/discovery/diagnostic slice: FBX import, animation find/save, inspect/sample/compare/diagnose tools.
+- [x] Implement runtime retarget slice: `Retarget Pose From Mesh` node authoring/readback and retarget profile tools.
+- [x] Add skeleton-owned BlendMask creation/readback for UpperBody/LowerBody mask workflows.
+- [x] Verify schema registry, server tests, audit script, and UE BuildPlugin before closing the source/package gap.
+
+Review:
+- Debug `sage-tests` rebuilt through `scripts\build-server.ps1 debug -Target sage-tests`; `ctest --test-dir build\debug --output-on-failure` passed 37/37.
+- Debug `sage-server` rebuilt through `scripts\build-server.ps1 debug -Target sage-server`.
+- `scripts\audit-tools.ps1` reports 640 server tools, 622 plugin handlers, no plugin-without-schema, no stubs, and only expected local `jobs.*` schema-only tools.
+- `scripts\build-plugin.ps1` packaged the Win64 plugin successfully under `build\plugin`.
+- Runtime editor dogfood/deploy is still pending; no production project mutation was attempted in this gap-closure pass.

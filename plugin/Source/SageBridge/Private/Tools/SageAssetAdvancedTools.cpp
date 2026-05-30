@@ -23,8 +23,11 @@
 #include "Engine/Blueprint.h"
 #include "Materials/MaterialInterface.h"
 #include "Engine/DataTable.h"
+#include "Blueprint/UserWidget.h"
 #include "GameFeatureAction_AddComponents.h"
 #include "GameFeatureData.h"
+#include "GameplayTagContainer.h"
+#include "GameplayTagsManager.h"
 #include "AssetImportTask.h"
 #include "AssetExportTask.h"
 #include "Exporters/Exporter.h"
@@ -1006,6 +1009,107 @@ FSageToolDispatch::FOutcome ImportAnimationImpl(const TSharedPtr<FJsonObject>& A
     };
 
     return import_helpers::RunImport(Args, AnimSeq, ConfigureUI);
+}
+
+FSageToolDispatch::FOutcome BatchImportFbxAnimationsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Directory, Destination, SkeletonPath;
+    if (!Args.IsValid() ||
+        (!Args->TryGetStringField(TEXT("directory"), Directory) && !Args->TryGetStringField(TEXT("folder"), Directory)) ||
+        Directory.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'directory'"));
+    }
+    if (!Args->TryGetStringField(TEXT("destination"), Destination) || Destination.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'destination'"));
+    }
+    if (!Args->TryGetStringField(TEXT("skeleton"), SkeletonPath) || SkeletonPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeleton'"));
+    }
+    if (!IFileManager::Get().DirectoryExists(*Directory))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("directory not found: %s"), *Directory));
+    }
+
+    FString Pattern = TEXT("*.fbx");
+    bool bRecursive = false;
+    bool bReplace = false;
+    bool bDryRun = false;
+    Args->TryGetStringField(TEXT("pattern"), Pattern);
+    Args->TryGetBoolField(TEXT("recursive"), bRecursive);
+    Args->TryGetBoolField(TEXT("replace_existing"), bReplace);
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+
+    TArray<FString> Files;
+    IFileManager::Get().FindFilesRecursive(
+        Files,
+        *Directory,
+        *Pattern,
+        /*Files=*/true,
+        /*Directories=*/false,
+        bRecursive);
+    Files.Sort();
+
+    TArray<TSharedPtr<FJsonValue>> Results;
+    int32 ImportedCount = 0;
+    int32 FailedCount = 0;
+    for (const FString& File : Files)
+    {
+        const FString BaseName = FPaths::GetBaseFilename(File);
+        const FString DestPath = Destination / BaseName;
+        auto Row = MakeShared<FJsonObject>();
+        Row->SetStringField(TEXT("file"), File);
+        Row->SetStringField(TEXT("destination"), DestPath);
+        if (bDryRun)
+        {
+            Row->SetStringField(TEXT("status"), TEXT("dry_run"));
+            Results.Add(MakeShared<FJsonValueObject>(Row));
+            continue;
+        }
+
+        auto Single = MakeShared<FJsonObject>();
+        Single->SetStringField(TEXT("file"), File);
+        Single->SetStringField(TEXT("destination"), DestPath);
+        Single->SetStringField(TEXT("skeleton"), SkeletonPath);
+        Single->SetBoolField(TEXT("replace_existing"), bReplace);
+        FSageToolDispatch::FOutcome Imported = ImportAnimationImpl(Single);
+        if (Imported.bSuccess && Imported.Result.IsValid())
+        {
+            Row->SetStringField(TEXT("status"), TEXT("imported"));
+            Row->SetObjectField(TEXT("result"), Imported.Result.ToSharedRef());
+            ++ImportedCount;
+        }
+        else
+        {
+            Row->SetStringField(TEXT("status"), TEXT("failed"));
+            if (Imported.Error.IsValid())
+            {
+                Row->SetObjectField(TEXT("error"), Imported.Error.ToSharedRef());
+            }
+            ++FailedCount;
+        }
+        Results.Add(MakeShared<FJsonValueObject>(Row));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("directory"), Directory);
+    R->SetStringField(TEXT("destination"), Destination);
+    R->SetStringField(TEXT("skeleton"), SkeletonPath);
+    R->SetStringField(TEXT("pattern"), Pattern);
+    R->SetBoolField(TEXT("recursive"), bRecursive);
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    R->SetArrayField(TEXT("results"), Results);
+    R->SetNumberField(TEXT("count"), Files.Num());
+    R->SetNumberField(TEXT("imported"), ImportedCount);
+    R->SetNumberField(TEXT("failed"), FailedCount);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 FSageToolDispatch::FOutcome ReimportImpl(const TSharedPtr<FJsonObject>& Args)
@@ -2439,20 +2543,46 @@ FSageToolDispatch::FOutcome ReindexFtsImpl(const TSharedPtr<FJsonObject>& Args)
 //                                 properties.
 // Returns: {asset_path, array_property, index, length}.
 
-// ---- gamefeature.* AddComponents authoring (KaleGame P8 / Gap #30) ---------
+// ---- gamefeature.* authoring (KaleGame P8 / Lyra HUD gaps) -----------------
+
+FString CleanObjectReferenceLiteral(FString Raw)
+{
+    Raw = Raw.TrimStartAndEnd();
+    while (Raw.Len() >= 2 && Raw.StartsWith(TEXT("(")) && Raw.EndsWith(TEXT(")")))
+    {
+        Raw = Raw.Mid(1, Raw.Len() - 2).TrimStartAndEnd();
+    }
+    if (Raw.Len() >= 2
+        && ((Raw.StartsWith(TEXT("\"")) && Raw.EndsWith(TEXT("\"")))
+            || (Raw.StartsWith(TEXT("'")) && Raw.EndsWith(TEXT("'")))))
+    {
+        Raw = Raw.Mid(1, Raw.Len() - 2).TrimStartAndEnd();
+    }
+
+    int32 FirstQuote = INDEX_NONE;
+    int32 LastQuote = INDEX_NONE;
+    if (Raw.FindChar(TEXT('\''), FirstQuote)
+        && Raw.FindLastChar(TEXT('\''), LastQuote)
+        && LastQuote > FirstQuote)
+    {
+        Raw = Raw.Mid(FirstQuote + 1, LastQuote - FirstQuote - 1).TrimStartAndEnd();
+    }
+    return Raw;
+}
 
 UObject* ResolveAssetWithOptionalObjectName(const FString& Path)
 {
-    if (UObject* Obj = ResolveAsset(Path)) return Obj;
-    if (Path.Contains(TEXT(".")) || !Path.StartsWith(TEXT("/"))) return nullptr;
+    const FString CleanPath = CleanObjectReferenceLiteral(Path);
+    if (UObject* Obj = ResolveAsset(CleanPath)) return Obj;
+    if (CleanPath.Contains(TEXT(".")) || !CleanPath.StartsWith(TEXT("/"))) return nullptr;
 
     FString PackagePath, AssetName;
-    if (!Path.Split(TEXT("/"), &PackagePath, &AssetName,
+    if (!CleanPath.Split(TEXT("/"), &PackagePath, &AssetName,
                     ESearchCase::IgnoreCase, ESearchDir::FromEnd))
     {
         return nullptr;
     }
-    return ResolveAsset(Path + TEXT(".") + AssetName);
+    return ResolveAsset(CleanPath + TEXT(".") + AssetName);
 }
 
 UGameFeatureData* ResolveGameFeatureData(const FString& Path, FString& OutErr)
@@ -2472,7 +2602,8 @@ UGameFeatureData* ResolveGameFeatureData(const FString& Path, FString& OutErr)
 
 UClass* ResolveClassForGameFeature(const FString& Path, UClass* RequiredBase, FString& OutErr)
 {
-    UObject* Obj = ResolveAssetWithOptionalObjectName(Path);
+    const FString CleanPath = CleanObjectReferenceLiteral(Path);
+    UObject* Obj = ResolveAssetWithOptionalObjectName(CleanPath);
     UClass* Cls = Cast<UClass>(Obj);
     if (!Cls)
     {
@@ -2483,7 +2614,7 @@ UClass* ResolveClassForGameFeature(const FString& Path, UClass* RequiredBase, FS
     }
     if (!Cls)
     {
-        OutErr = FString::Printf(TEXT("class not found: %s"), *Path);
+        OutErr = FString::Printf(TEXT("class not found: %s"), *CleanPath);
         return nullptr;
     }
     if (RequiredBase && !Cls->IsChildOf(RequiredBase))
@@ -2821,6 +2952,638 @@ FSageToolDispatch::FOutcome GameFeatureRemoveComponentEntryImpl(const TSharedPtr
     R->SetBoolField(TEXT("removed"), true);
     R->SetNumberField(TEXT("removed_index"), FoundIndex);
     R->SetNumberField(TEXT("component_count"), Action->ComponentList.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+constexpr const TCHAR* kLyraAddWidgetsActionClassPath =
+    TEXT("/Script/LyraGame.GameFeatureAction_AddWidgets");
+
+UClass* ResolveAddWidgetsActionClass(FString& OutErr)
+{
+    UClass* Cls = FindObject<UClass>(nullptr, kLyraAddWidgetsActionClassPath);
+    if (!Cls)
+    {
+        Cls = LoadObject<UClass>(nullptr, kLyraAddWidgetsActionClassPath);
+    }
+    if (!Cls)
+    {
+        OutErr = FString::Printf(TEXT("class not found: %s"), kLyraAddWidgetsActionClassPath);
+        return nullptr;
+    }
+    if (!Cls->IsChildOf(UGameFeatureAction::StaticClass()))
+    {
+        OutErr = FString::Printf(TEXT("class %s is not a UGameFeatureAction"),
+                                 *Cls->GetPathName());
+        return nullptr;
+    }
+    return Cls;
+}
+
+UGameFeatureAction* FindAddWidgetsAction(UGameFeatureData* GFD, UClass* AddWidgetsClass)
+{
+    if (!GFD || !AddWidgetsClass) return nullptr;
+    for (UGameFeatureAction* Action : GFD->GetActions())
+    {
+        if (Action && Action->IsA(AddWidgetsClass))
+        {
+            return Action;
+        }
+    }
+    return nullptr;
+}
+
+UGameFeatureAction* EnsureAddWidgetsAction(UGameFeatureData* GFD,
+                                           UClass* AddWidgetsClass,
+                                           bool& bCreated)
+{
+    bCreated = false;
+    if (!GFD || !AddWidgetsClass) return nullptr;
+    if (UGameFeatureAction* Existing = FindAddWidgetsAction(GFD, AddWidgetsClass))
+    {
+        return Existing;
+    }
+
+    UGameFeatureAction* Action = NewObject<UGameFeatureAction>(
+        GFD, AddWidgetsClass, NAME_None, RF_Public | RF_Transactional);
+    if (!Action) return nullptr;
+
+#if WITH_EDITOR
+    GFD->Modify();
+    GFD->GetMutableActionsInEditor().Add(Action);
+    if (FProperty* ActionsProp = GFD->GetClass()->FindPropertyByName(TEXT("Actions")))
+    {
+        FPropertyChangedEvent E(ActionsProp, EPropertyChangeType::ArrayAdd);
+        GFD->PostEditChangeProperty(E);
+    }
+#endif
+    GFD->MarkPackageDirty();
+    bCreated = true;
+    return Action;
+}
+
+bool ResolveGameplayTagStrict(const FString& TagText,
+                              const TCHAR* FieldName,
+                              FGameplayTag& OutTag,
+                              FString& OutErr)
+{
+    const FString CleanTag = TagText.TrimStartAndEnd();
+    if (CleanTag.IsEmpty())
+    {
+        OutErr = FString::Printf(TEXT("missing '%s'"), FieldName);
+        return false;
+    }
+    OutTag = FGameplayTag::RequestGameplayTag(FName(*CleanTag), false);
+    if (!OutTag.IsValid())
+    {
+        OutErr = FString::Printf(TEXT("gameplay tag not found: %s"), *CleanTag);
+        return false;
+    }
+    return true;
+}
+
+bool GetActionArrayProperty(UObject* Action,
+                            const TCHAR* PropertyName,
+                            FArrayProperty*& OutArray,
+                            FStructProperty*& OutInnerStruct,
+                            FString& OutErr)
+{
+    OutArray = nullptr;
+    OutInnerStruct = nullptr;
+    if (!Action)
+    {
+        OutErr = TEXT("AddWidgets action is null");
+        return false;
+    }
+
+    OutArray = CastField<FArrayProperty>(
+        Action->GetClass()->FindPropertyByName(PropertyName));
+    if (!OutArray)
+    {
+        OutErr = FString::Printf(TEXT("%s array not found on %s"),
+                                 PropertyName, *Action->GetClass()->GetPathName());
+        return false;
+    }
+    OutInnerStruct = CastField<FStructProperty>(OutArray->Inner);
+    if (!OutInnerStruct || !OutInnerStruct->Struct)
+    {
+        OutErr = FString::Printf(TEXT("%s is not a TArray<USTRUCT> on %s"),
+                                 PropertyName, *Action->GetClass()->GetPathName());
+        return false;
+    }
+    return true;
+}
+
+FProperty* RequireStructField(FStructProperty* StructProperty,
+                              const TCHAR* FieldName,
+                              FString& OutErr)
+{
+    if (!StructProperty || !StructProperty->Struct)
+    {
+        OutErr = TEXT("entry struct is null");
+        return nullptr;
+    }
+    FProperty* Field = StructProperty->Struct->FindPropertyByName(FieldName);
+    if (!Field)
+    {
+        OutErr = FString::Printf(TEXT("field %s not found on %s"),
+                                 FieldName, *StructProperty->Struct->GetName());
+    }
+    return Field;
+}
+
+bool SetGameplayTagField(FProperty* Field,
+                         void* StructValuePtr,
+                         const FGameplayTag& Tag,
+                         FString& OutErr)
+{
+    FStructProperty* StructField = CastField<FStructProperty>(Field);
+    if (!StructField || !StructField->Struct
+        || StructField->Struct->GetFName() != FName(TEXT("GameplayTag")))
+    {
+        OutErr = FString::Printf(TEXT("field %s is not FGameplayTag"),
+                                 Field ? *Field->GetName() : TEXT("<null>"));
+        return false;
+    }
+    void* FieldPtr = Field->ContainerPtrToValuePtr<void>(StructValuePtr);
+    *reinterpret_cast<FGameplayTag*>(FieldPtr) = Tag;
+    return true;
+}
+
+FString ReadGameplayTagField(FProperty* Field, const void* StructValuePtr)
+{
+    if (const FStructProperty* StructField = CastField<FStructProperty>(Field))
+    {
+        if (StructField->Struct && StructField->Struct->GetFName() == FName(TEXT("GameplayTag")))
+        {
+            const void* FieldPtr = Field->ContainerPtrToValuePtr<void>(StructValuePtr);
+            return reinterpret_cast<const FGameplayTag*>(FieldPtr)->ToString();
+        }
+    }
+    if (TSharedPtr<FJsonValue> Value = detail::GetPropertyValueAtPtr(
+            Field, Field->ContainerPtrToValuePtr<void>(StructValuePtr)))
+    {
+        return Value->AsString();
+    }
+    return FString();
+}
+
+bool SetClassReferenceField(FProperty* Field,
+                            void* StructValuePtr,
+                            UClass* Class,
+                            FString& OutErr)
+{
+    if (!Field || !Class)
+    {
+        OutErr = TEXT("class reference field or class is null");
+        return false;
+    }
+    const TSharedPtr<FJsonValue> ClassValue =
+        MakeShared<FJsonValueString>(Class->GetPathName());
+    if (!detail::SetPropertyValueAtPtr(
+            Field, Field->ContainerPtrToValuePtr<void>(StructValuePtr), ClassValue))
+    {
+        OutErr = FString::Printf(TEXT("failed to set class field %s to %s"),
+                                 *Field->GetName(), *Class->GetPathName());
+        return false;
+    }
+    return true;
+}
+
+FString ReadClassReferenceField(FProperty* Field, const void* StructValuePtr)
+{
+    if (!Field) return FString();
+    if (TSharedPtr<FJsonValue> Value = detail::GetPropertyValueAtPtr(
+            Field, Field->ContainerPtrToValuePtr<void>(StructValuePtr)))
+    {
+        return Value->AsString();
+    }
+    return FString();
+}
+
+bool StoredClassMatches(const FString& StoredPath, UClass* DesiredClass, UClass* RequiredBase)
+{
+    if (!DesiredClass) return false;
+    const FString CleanStored = CleanObjectReferenceLiteral(StoredPath);
+    if (CleanStored.Equals(DesiredClass->GetPathName(), ESearchCase::CaseSensitive))
+    {
+        return true;
+    }
+
+    FString Err;
+    UClass* StoredClass = ResolveClassForGameFeature(CleanStored, RequiredBase, Err);
+    return StoredClass == DesiredClass;
+}
+
+TSharedPtr<FJsonObject> HudEntryToJson(UObject* Action,
+                                       FArrayProperty* ArrayProperty,
+                                       FStructProperty* StructProperty,
+                                       int32 Index,
+                                       const TCHAR* TagFieldName,
+                                       const TCHAR* ClassFieldName,
+                                       const TCHAR* TagJsonName,
+                                       const TCHAR* ClassJsonName)
+{
+    auto Row = MakeShared<FJsonObject>();
+    Row->SetNumberField(TEXT("index"), Index);
+    if (!Action || !ArrayProperty || !StructProperty)
+    {
+        Row->SetBoolField(TEXT("valid"), false);
+        return Row;
+    }
+
+    FScriptArrayHelper Helper(ArrayProperty,
+        ArrayProperty->ContainerPtrToValuePtr<void>(Action));
+    if (!Helper.IsValidIndex(Index))
+    {
+        Row->SetBoolField(TEXT("valid"), false);
+        return Row;
+    }
+
+    const void* EntryPtr = Helper.GetRawPtr(Index);
+    FProperty* TagField = StructProperty->Struct->FindPropertyByName(TagFieldName);
+    FProperty* ClassField = StructProperty->Struct->FindPropertyByName(ClassFieldName);
+    Row->SetBoolField(TEXT("valid"), TagField != nullptr && ClassField != nullptr);
+    if (TagField)
+    {
+        Row->SetStringField(TagJsonName, ReadGameplayTagField(TagField, EntryPtr));
+    }
+    if (ClassField)
+    {
+        Row->SetStringField(ClassJsonName, ReadClassReferenceField(ClassField, EntryPtr));
+    }
+    return Row;
+}
+
+void AddHudEntriesToJson(UObject* Action,
+                         FArrayProperty* ArrayProperty,
+                         FStructProperty* StructProperty,
+                         const TCHAR* TagFieldName,
+                         const TCHAR* ClassFieldName,
+                         const TCHAR* TagJsonName,
+                         const TCHAR* ClassJsonName,
+                         TArray<TSharedPtr<FJsonValue>>& OutEntries)
+{
+    if (!Action || !ArrayProperty || !StructProperty) return;
+    FScriptArrayHelper Helper(ArrayProperty,
+        ArrayProperty->ContainerPtrToValuePtr<void>(Action));
+    for (int32 i = 0; i < Helper.Num(); ++i)
+    {
+        OutEntries.Add(MakeShared<FJsonValueObject>(
+            HudEntryToJson(Action, ArrayProperty, StructProperty, i,
+                           TagFieldName, ClassFieldName,
+                           TagJsonName, ClassJsonName)));
+    }
+}
+
+int32 FindHudEntry(UObject* Action,
+                   FArrayProperty* ArrayProperty,
+                   FStructProperty* StructProperty,
+                   const TCHAR* TagFieldName,
+                   const TCHAR* ClassFieldName,
+                   const FGameplayTag& DesiredTag,
+                   UClass* DesiredClass,
+                   UClass* RequiredBase)
+{
+    if (!Action || !ArrayProperty || !StructProperty) return INDEX_NONE;
+    FProperty* TagField = StructProperty->Struct->FindPropertyByName(TagFieldName);
+    FProperty* ClassField = StructProperty->Struct->FindPropertyByName(ClassFieldName);
+    if (!TagField || !ClassField) return INDEX_NONE;
+
+    FScriptArrayHelper Helper(ArrayProperty,
+        ArrayProperty->ContainerPtrToValuePtr<void>(Action));
+    for (int32 i = 0; i < Helper.Num(); ++i)
+    {
+        const void* EntryPtr = Helper.GetRawPtr(i);
+        const FString ExistingTag = ReadGameplayTagField(TagField, EntryPtr);
+        const FString ExistingClass = ReadClassReferenceField(ClassField, EntryPtr);
+        if (ExistingTag == DesiredTag.ToString()
+            && StoredClassMatches(ExistingClass, DesiredClass, RequiredBase))
+        {
+            return i;
+        }
+    }
+    return INDEX_NONE;
+}
+
+int32 AddHudEntry(UObject* Action,
+                  FArrayProperty* ArrayProperty,
+                  FStructProperty* StructProperty,
+                  const TCHAR* TagFieldName,
+                  const TCHAR* ClassFieldName,
+                  const FGameplayTag& Tag,
+                  UClass* Class,
+                  FString& OutErr)
+{
+    FProperty* TagField = RequireStructField(StructProperty, TagFieldName, OutErr);
+    if (!TagField) return INDEX_NONE;
+    FProperty* ClassField = RequireStructField(StructProperty, ClassFieldName, OutErr);
+    if (!ClassField) return INDEX_NONE;
+
+    FScriptArrayHelper Helper(ArrayProperty,
+        ArrayProperty->ContainerPtrToValuePtr<void>(Action));
+    const int32 NewIndex = Helper.AddValue();
+    void* EntryPtr = Helper.GetRawPtr(NewIndex);
+    if (!SetClassReferenceField(ClassField, EntryPtr, Class, OutErr)
+        || !SetGameplayTagField(TagField, EntryPtr, Tag, OutErr))
+    {
+        Helper.Resize(NewIndex);
+        return INDEX_NONE;
+    }
+    return NewIndex;
+}
+
+bool SaveGameFeatureDataAsset(UGameFeatureData* GFD, bool bSave, bool& bSaved, FString& OutErr)
+{
+    bSaved = false;
+    if (!bSave) return true;
+    UEditorAssetSubsystem* AssetSubsystem = GEditor
+        ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>()
+        : nullptr;
+    if (!AssetSubsystem)
+    {
+        OutErr = TEXT("EditorAssetSubsystem unavailable for saving GameFeatureData");
+        return false;
+    }
+    const FString PackageName = GFD && GFD->GetOutermost()
+        ? GFD->GetOutermost()->GetName()
+        : FString();
+    if (PackageName.IsEmpty())
+    {
+        OutErr = TEXT("GameFeatureData package name is empty");
+        return false;
+    }
+    bSaved = AssetSubsystem->SaveAsset(PackageName, /*bOnlyIfIsDirty=*/false);
+    if (!bSaved)
+    {
+        OutErr = FString::Printf(TEXT("SaveAsset returned false for %s"), *PackageName);
+        return false;
+    }
+    return true;
+}
+
+FSageToolDispatch::FOutcome GameFeatureAddWidgetEntryImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+
+    FString SlotText, WidgetClassPath, LayerText, LayoutClassPath;
+    Args->TryGetStringField(TEXT("slot_id"), SlotText);
+    Args->TryGetStringField(TEXT("widget_class"), WidgetClassPath);
+    Args->TryGetStringField(TEXT("layer_id"), LayerText);
+    Args->TryGetStringField(TEXT("layout_class"), LayoutClassPath);
+    const bool bWantWidget = !SlotText.IsEmpty() || !WidgetClassPath.IsEmpty();
+    const bool bWantLayout = !LayerText.IsEmpty() || !LayoutClassPath.IsEmpty();
+    if (!bWantWidget && !bWantLayout)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("pass either slot_id+widget_class or layer_id+layout_class"));
+    }
+    if (bWantWidget && (SlotText.IsEmpty() || WidgetClassPath.IsEmpty()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("slot_id and widget_class must be supplied together"));
+    }
+    if (bWantLayout && (LayerText.IsEmpty() || LayoutClassPath.IsEmpty()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("layer_id and layout_class must be supplied together"));
+    }
+
+    bool bCreateActionIfMissing = true;
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("create_action_if_missing"), bCreateActionIfMissing);
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    FString Err;
+    UGameFeatureData* GFD = ResolveGameFeatureData(Path, Err);
+    if (!GFD) return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+
+    UClass* AddWidgetsClass = ResolveAddWidgetsActionClass(Err);
+    if (!AddWidgetsClass) return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+
+    FGameplayTag SlotTag;
+    UClass* WidgetClass = nullptr;
+    if (bWantWidget)
+    {
+        if (!ResolveGameplayTagStrict(SlotText, TEXT("slot_id"), SlotTag, Err))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+        }
+        WidgetClass = ResolveClassForGameFeature(
+            WidgetClassPath, UUserWidget::StaticClass(), Err);
+        if (!WidgetClass) return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+    }
+
+    FGameplayTag LayerTag;
+    UClass* LayoutClass = nullptr;
+    UClass* LayoutRequiredBase = FindObject<UClass>(
+        nullptr, TEXT("/Script/CommonUI.CommonActivatableWidget"));
+    if (!LayoutRequiredBase)
+    {
+        LayoutRequiredBase = UUserWidget::StaticClass();
+    }
+    if (bWantLayout)
+    {
+        if (!ResolveGameplayTagStrict(LayerText, TEXT("layer_id"), LayerTag, Err))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+        }
+        LayoutClass = ResolveClassForGameFeature(LayoutClassPath, LayoutRequiredBase, Err);
+        if (!LayoutClass) return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+    }
+
+    UGameFeatureAction* Action = FindAddWidgetsAction(GFD, AddWidgetsClass);
+    const bool bWouldCreateAction = Action == nullptr;
+    if (!Action && !bCreateActionIfMissing)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("GameFeatureData has no AddWidgets action and create_action_if_missing=false"));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), GFD->GetPathName());
+    R->SetStringField(TEXT("action_class"), AddWidgetsClass->GetPathName());
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    R->SetBoolField(TEXT("would_create_action"), bWouldCreateAction);
+
+    if (bDryRun && !Action)
+    {
+        R->SetBoolField(TEXT("validated"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        R->SetBoolField(TEXT("already"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    bool bActionCreated = false;
+    if (!Action)
+    {
+        Action = EnsureAddWidgetsAction(GFD, AddWidgetsClass, bActionCreated);
+        if (!Action)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32603,
+                TEXT("failed to create UGameFeatureAction_AddWidgets"));
+        }
+    }
+
+    FArrayProperty* WidgetsArray = nullptr;
+    FStructProperty* WidgetStruct = nullptr;
+    FArrayProperty* LayoutArray = nullptr;
+    FStructProperty* LayoutStruct = nullptr;
+    if (bWantWidget && !GetActionArrayProperty(
+            Action, TEXT("Widgets"), WidgetsArray, WidgetStruct, Err))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+    }
+    if (bWantLayout && !GetActionArrayProperty(
+            Action, TEXT("Layout"), LayoutArray, LayoutStruct, Err))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+    }
+
+    int32 WidgetIndex = INDEX_NONE;
+    int32 LayoutIndex = INDEX_NONE;
+    bool bWidgetAlready = false;
+    bool bLayoutAlready = false;
+    if (bWantWidget)
+    {
+        WidgetIndex = FindHudEntry(Action, WidgetsArray, WidgetStruct,
+            TEXT("SlotID"), TEXT("WidgetClass"), SlotTag, WidgetClass,
+            UUserWidget::StaticClass());
+        bWidgetAlready = WidgetIndex != INDEX_NONE;
+    }
+    if (bWantLayout)
+    {
+        LayoutIndex = FindHudEntry(Action, LayoutArray, LayoutStruct,
+            TEXT("LayerID"), TEXT("LayoutClass"), LayerTag, LayoutClass,
+            LayoutRequiredBase);
+        bLayoutAlready = LayoutIndex != INDEX_NONE;
+    }
+
+    const bool bNeedsWidgetAdd = bWantWidget && !bWidgetAlready;
+    const bool bNeedsLayoutAdd = bWantLayout && !bLayoutAlready;
+    bool bModified = bActionCreated || bNeedsWidgetAdd || bNeedsLayoutAdd;
+
+    if (!bDryRun && (bNeedsWidgetAdd || bNeedsLayoutAdd))
+    {
+        FScopedTransaction Tx(LOCTEXT("GameFeatureAddWidgetEntry", "Sage: Add GameFeature Widget Entry"));
+        GFD->Modify();
+        Action->Modify();
+
+        if (bNeedsWidgetAdd)
+        {
+            Action->PreEditChange(WidgetsArray);
+            WidgetIndex = AddHudEntry(Action, WidgetsArray, WidgetStruct,
+                TEXT("SlotID"), TEXT("WidgetClass"), SlotTag, WidgetClass, Err);
+            if (WidgetIndex == INDEX_NONE)
+            {
+                Tx.Cancel();
+                return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+            }
+            FPropertyChangedEvent E(WidgetsArray, EPropertyChangeType::ArrayAdd);
+            Action->PostEditChangeProperty(E);
+        }
+
+        if (bNeedsLayoutAdd)
+        {
+            Action->PreEditChange(LayoutArray);
+            LayoutIndex = AddHudEntry(Action, LayoutArray, LayoutStruct,
+                TEXT("LayerID"), TEXT("LayoutClass"), LayerTag, LayoutClass, Err);
+            if (LayoutIndex == INDEX_NONE)
+            {
+                Tx.Cancel();
+                return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+            }
+            FPropertyChangedEvent E(LayoutArray, EPropertyChangeType::ArrayAdd);
+            Action->PostEditChangeProperty(E);
+        }
+
+        GFD->MarkPackageDirty();
+    }
+
+    bool bSaved = false;
+    if (!bDryRun && bModified && !SaveGameFeatureDataAsset(GFD, bSave, bSaved, Err))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, Err);
+    }
+
+    R->SetStringField(TEXT("action"), Action->GetPathName());
+    R->SetBoolField(TEXT("created_action"), bActionCreated);
+    R->SetBoolField(TEXT("modified"), !bDryRun && bModified);
+    R->SetBoolField(TEXT("already"), (!bWantWidget || bWidgetAlready) && (!bWantLayout || bLayoutAlready));
+    R->SetBoolField(TEXT("widget_already"), bWidgetAlready);
+    R->SetBoolField(TEXT("layout_already"), bLayoutAlready);
+    R->SetBoolField(TEXT("would_add_widget"), bDryRun && bNeedsWidgetAdd);
+    R->SetBoolField(TEXT("would_add_layout"), bDryRun && bNeedsLayoutAdd);
+    R->SetBoolField(TEXT("saved"), bSaved);
+    if (bWantWidget)
+    {
+        R->SetNumberField(TEXT("widget_index"), WidgetIndex);
+        if (WidgetIndex >= 0)
+        {
+            R->SetObjectField(TEXT("widget_entry"),
+                HudEntryToJson(Action, WidgetsArray, WidgetStruct, WidgetIndex,
+                               TEXT("SlotID"), TEXT("WidgetClass"),
+                               TEXT("slot_id"), TEXT("widget_class")));
+        }
+        else
+        {
+            auto Requested = MakeShared<FJsonObject>();
+            Requested->SetStringField(TEXT("slot_id"), SlotTag.ToString());
+            Requested->SetStringField(TEXT("widget_class"), WidgetClass ? WidgetClass->GetPathName() : FString());
+            Requested->SetBoolField(TEXT("would_add"), true);
+            R->SetObjectField(TEXT("widget_entry"), Requested);
+        }
+    }
+    if (bWantLayout)
+    {
+        R->SetNumberField(TEXT("layout_index"), LayoutIndex);
+        if (LayoutIndex >= 0)
+        {
+            R->SetObjectField(TEXT("layout_entry"),
+                HudEntryToJson(Action, LayoutArray, LayoutStruct, LayoutIndex,
+                               TEXT("LayerID"), TEXT("LayoutClass"),
+                               TEXT("layer_id"), TEXT("layout_class")));
+        }
+        else
+        {
+            auto Requested = MakeShared<FJsonObject>();
+            Requested->SetStringField(TEXT("layer_id"), LayerTag.ToString());
+            Requested->SetStringField(TEXT("layout_class"), LayoutClass ? LayoutClass->GetPathName() : FString());
+            Requested->SetBoolField(TEXT("would_add"), true);
+            R->SetObjectField(TEXT("layout_entry"), Requested);
+        }
+    }
+
+    TArray<TSharedPtr<FJsonValue>> WidgetEntries;
+    if (!GetActionArrayProperty(Action, TEXT("Widgets"), WidgetsArray, WidgetStruct, Err))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+    }
+    AddHudEntriesToJson(Action, WidgetsArray, WidgetStruct,
+        TEXT("SlotID"), TEXT("WidgetClass"),
+        TEXT("slot_id"), TEXT("widget_class"), WidgetEntries);
+    R->SetArrayField(TEXT("widgets"), WidgetEntries);
+    R->SetNumberField(TEXT("widget_count"), WidgetEntries.Num());
+
+    TArray<TSharedPtr<FJsonValue>> LayoutEntries;
+    if (!GetActionArrayProperty(Action, TEXT("Layout"), LayoutArray, LayoutStruct, Err))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Err);
+    }
+    AddHudEntriesToJson(Action, LayoutArray, LayoutStruct,
+        TEXT("LayerID"), TEXT("LayoutClass"),
+        TEXT("layer_id"), TEXT("layout_class"), LayoutEntries);
+    R->SetArrayField(TEXT("layout"), LayoutEntries);
+    R->SetNumberField(TEXT("layout_count"), LayoutEntries.Num());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -6130,6 +6893,8 @@ void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
         GT(&GameFeatureRemoveComponentEntryImpl));
     Dispatch.RegisterHandler(TEXT("gamefeature.ensure_add_components_action"),
         GT(&GameFeatureEnsureAddComponentsActionImpl));
+    Dispatch.RegisterHandler(TEXT("gamefeature.add_widget_entry"),
+        GT(&GameFeatureAddWidgetEntryImpl));
 
     // Phase 4.5-r2 batch 2: socket management
     Dispatch.RegisterHandler(TEXT("asset.list_sockets"),       GT(&ListSocketsImpl));
@@ -6168,6 +6933,8 @@ void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("asset.import_static_mesh"),    GT(&ImportStaticMeshImpl));
     Dispatch.RegisterHandler(TEXT("asset.import_skeletal_mesh"),  GT(&ImportSkeletalMeshImpl));
     Dispatch.RegisterHandler(TEXT("asset.import_animation"),      GT(&ImportAnimationImpl));
+    Dispatch.RegisterHandler(TEXT("animation.import_fbx_animation"), GT(&ImportAnimationImpl));
+    Dispatch.RegisterHandler(TEXT("animation.batch_import_fbx_animations"), GT(&BatchImportFbxAnimationsImpl));
 
     // Write
     Dispatch.RegisterHandler(TEXT("asset.bulk_rename"),        GT(&BulkRenameImpl));
