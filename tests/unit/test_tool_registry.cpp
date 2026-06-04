@@ -285,6 +285,15 @@ TEST_CASE("Phase4 animation graph gap tools expose compact schemas",
     REQUIRE(createIKRig->inputSchema["properties"].contains("dry_run"));
     REQUIRE(createIKRig->inputSchema["required"] == nlohmann::json::array({"path"}));
 
+    const Tool* setIKRigMesh = findTool("animation.set_ik_rig_skeletal_mesh");
+    REQUIRE(setIKRigMesh != nullptr);
+    REQUIRE(setIKRigMesh->inputSchema["properties"].contains("skeletal_mesh"));
+    REQUIRE(setIKRigMesh->inputSchema["properties"].contains("skeletal_mesh_path"));
+    REQUIRE(setIKRigMesh->inputSchema["properties"].contains("dry_run"));
+    REQUIRE(setIKRigMesh->inputSchema["properties"].contains("validate_only"));
+    REQUIRE(setIKRigMesh->inputSchema["properties"].contains("save"));
+    REQUIRE(setIKRigMesh->inputSchema["required"] == nlohmann::json::array({"path"}));
+
     const Tool* inspectSkeleton = findTool("animation.inspect_skeleton");
     REQUIRE(inspectSkeleton != nullptr);
     REQUIRE(inspectSkeleton->inputSchema["properties"].contains("skeletal_mesh"));
@@ -299,6 +308,42 @@ TEST_CASE("Phase4 animation graph gap tools expose compact schemas",
     const Tool* readBlendProfiles = findTool("animation.read_blend_profiles");
     REQUIRE(readBlendProfiles != nullptr);
     REQUIRE(readBlendProfiles->inputSchema["properties"].contains("blend_masks_only"));
+
+    const Tool* animationListSockets = findTool("animation.list_sockets");
+    REQUIRE(animationListSockets != nullptr);
+    REQUIRE(animationListSockets->inputSchema["properties"].contains("owner"));
+
+    const Tool* controlRigRead = findTool("controlrig.read");
+    REQUIRE(controlRigRead != nullptr);
+    REQUIRE(controlRigRead->inputSchema["properties"].contains("include_controls"));
+    REQUIRE(controlRigRead->inputSchema["properties"].contains("include_transforms"));
+    REQUIRE(controlRigRead->inputSchema["required"] == nlohmann::json::array({"path"}));
+
+    const Tool* controlRigListControls = findTool("controlrig.list_controls");
+    REQUIRE(controlRigListControls != nullptr);
+    REQUIRE(controlRigListControls->inputSchema["properties"].contains("name_contains"));
+
+    const Tool* controlRigSetPreviewMesh = findTool("controlrig.set_preview_mesh");
+    REQUIRE(controlRigSetPreviewMesh != nullptr);
+    REQUIRE(controlRigSetPreviewMesh->inputSchema["properties"].contains("preview_mesh"));
+    REQUIRE(controlRigSetPreviewMesh->inputSchema["properties"].contains("skeletal_mesh"));
+    REQUIRE(controlRigSetPreviewMesh->inputSchema["properties"].contains("save"));
+
+    const Tool* controlRigSetControlTransform = findTool("controlrig.set_control_transform");
+    REQUIRE(controlRigSetControlTransform != nullptr);
+    REQUIRE(controlRigSetControlTransform->inputSchema["properties"].contains("space"));
+    REQUIRE(controlRigSetControlTransform->inputSchema["properties"].contains("initial"));
+    REQUIRE(controlRigSetControlTransform->inputSchema["properties"].contains("compile"));
+
+    const Tool* controlRigAddControl = findTool("controlrig.add_control");
+    REQUIRE(controlRigAddControl != nullptr);
+    REQUIRE(controlRigAddControl->inputSchema["properties"].contains("control_type"));
+    REQUIRE(controlRigAddControl->inputSchema["properties"].contains("offset_transform"));
+    REQUIRE(controlRigAddControl->inputSchema["required"] == nlohmann::json::array({"path", "name"}));
+
+    const Tool* controlRigRemoveControl = findTool("controlrig.remove_control");
+    REQUIRE(controlRigRemoveControl != nullptr);
+    REQUIRE(controlRigRemoveControl->inputSchema["properties"].contains("confirmed"));
 
     const Tool* setupRetargeterOps = findTool("animation.setup_ik_retargeter_ops");
     REQUIRE(setupRetargeterOps != nullptr);
@@ -329,6 +374,16 @@ TEST_CASE("Phase4 animation graph gap tools expose compact schemas",
     REQUIRE(fkChainSettings->inputSchema["properties"].contains("rotation_mode"));
     REQUIRE(fkChainSettings->inputSchema["properties"].contains("translation_alpha"));
     REQUIRE(fkChainSettings->inputSchema["properties"].contains("dry_run"));
+
+    const Tool* ikChainSettings = findTool("animation.set_ik_retargeter_ik_chain_settings");
+    REQUIRE(ikChainSettings != nullptr);
+    REQUIRE(ikChainSettings->inputSchema["properties"].contains("static_offset"));
+    REQUIRE(ikChainSettings->inputSchema["properties"].contains("static_rotation_offset"));
+    REQUIRE(ikChainSettings->inputSchema["properties"].contains("blend_to_source_translation"));
+    REQUIRE(ikChainSettings->inputSchema["properties"].contains("scale_vertical"));
+    REQUIRE(ikChainSettings->inputSchema["properties"].contains("extension"));
+    REQUIRE(ikChainSettings->inputSchema["properties"].contains("dry_run"));
+    REQUIRE(ikChainSettings->inputSchema["required"] == nlohmann::json::array({"path", "target_chain"}));
 
     const Tool* retargetPose = findTool("animation.set_ik_retargeter_pose");
     REQUIRE(retargetPose != nullptr);
@@ -361,4 +416,25 @@ TEST_CASE("Phase4 animation graph gap tools expose compact schemas",
     const Tool* copyRetargetProfile = findTool("animation.copy_retarget_profile_from_asset");
     REQUIRE(copyRetargetProfile != nullptr);
     REQUIRE(copyRetargetProfile->inputSchema["properties"].contains("ik_retargeter"));
+
+    const Tool* niagaraPreviewSpawn = findTool("niagara.preview_spawn");
+    REQUIRE(niagaraPreviewSpawn != nullptr);
+    REQUIRE(niagaraPreviewSpawn->inputSchema["properties"].contains("advance_ticks"));
+    REQUIRE(niagaraPreviewSpawn->inputSchema["properties"].contains("parameters"));
+    REQUIRE(niagaraPreviewSpawn->inputSchema["required"] == nlohmann::json::array({"path"}));
+
+    const Tool* niagaraAddModule = findTool("niagara.add_module");
+    REQUIRE(niagaraAddModule != nullptr);
+    REQUIRE(niagaraAddModule->inputSchema["properties"].contains("module_script"));
+    REQUIRE(niagaraAddModule->inputSchema["properties"].contains("dry_run"));
+    REQUIRE(niagaraAddModule->inputSchema["required"] == nlohmann::json::array({"path", "module_script"}));
+
+    const Tool* niagaraCollectionSetDefault = findTool("niagara.collection.set_default");
+    REQUIRE(niagaraCollectionSetDefault != nullptr);
+    REQUIRE(niagaraCollectionSetDefault->inputSchema["properties"].contains("value"));
+    REQUIRE(niagaraCollectionSetDefault->inputSchema["required"] == nlohmann::json::array({"path", "name", "value"}));
+
+    const Tool* niagaraValidateSystem = findTool("niagara.validate_system");
+    REQUIRE(niagaraValidateSystem != nullptr);
+    REQUIRE(niagaraValidateSystem->inputSchema["required"] == nlohmann::json::array({"path"}));
 }

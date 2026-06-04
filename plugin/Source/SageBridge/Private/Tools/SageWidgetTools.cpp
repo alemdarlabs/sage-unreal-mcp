@@ -8,6 +8,7 @@
 #include "AssetRegistry/IAssetRegistry.h"
 #include "AssetToolsModule.h"
 #include "Blueprint/UserWidget.h"
+#include "Blueprint/WidgetNavigation.h"
 #include "IAssetTools.h"
 #include "Blueprint/WidgetTree.h"
 #include "Components/Widget.h"
@@ -17,6 +18,7 @@
 #include "Editor.h"
 #include "Modules/ModuleManager.h"
 #include "ScopedTransaction.h"
+#include "Subsystems/EditorAssetSubsystem.h"
 #include "UObject/Package.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "WidgetBlueprint.h"
@@ -462,7 +464,10 @@ FSageToolDispatch::FOutcome SetWidgetPropertyImpl(const TSharedPtr<FJsonObject>&
 FSageToolDispatch::FOutcome ReadWidgetImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString Path;
-    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    if (!Args.IsValid()
+        || (!Args->TryGetStringField(TEXT("path"), Path)
+            && !Args->TryGetStringField(TEXT("blueprint"), Path)
+            && !Args->TryGetStringField(TEXT("asset"), Path)))
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
     }
@@ -1267,6 +1272,513 @@ FSageToolDispatch::FOutcome AnimAddKeyframeImpl(const TSharedPtr<FJsonObject>& A
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+static constexpr int32 kWidgetUnsupportedCode = -32005;
+
+FSageToolDispatch::FOutcome WidgetUnsupported(const FString& Tool, const FString& Reason)
+{
+    return FSageToolDispatch::FOutcome::MakeError(kWidgetUnsupportedCode,
+        FString::Printf(TEXT("%s is not exposed as a safe WidgetBlueprint mutation yet: %s"),
+                        *Tool, *Reason));
+}
+
+FString FirstWidgetStringArg(const TSharedPtr<FJsonObject>& Args,
+                             std::initializer_list<const TCHAR*> Fields)
+{
+    if (!Args.IsValid()) return FString();
+    FString Value;
+    for (const TCHAR* Field : Fields)
+    {
+        if (Args->TryGetStringField(Field, Value) && !Value.IsEmpty()) return Value;
+    }
+    return FString();
+}
+
+bool FirstWidgetBoolArg(const TSharedPtr<FJsonObject>& Args,
+                        std::initializer_list<const TCHAR*> Fields,
+                        bool DefaultValue = false)
+{
+    if (!Args.IsValid()) return DefaultValue;
+    bool Value = DefaultValue;
+    for (const TCHAR* Field : Fields)
+    {
+        if (Args->TryGetBoolField(Field, Value)) return Value;
+    }
+    return DefaultValue;
+}
+
+UWidgetBlueprint* ResolveWidgetBlueprintFromArgs(const TSharedPtr<FJsonObject>& Args)
+{
+    const FString Path = FirstWidgetStringArg(Args, {TEXT("blueprint"), TEXT("path"), TEXT("asset")});
+    return Path.IsEmpty() ? nullptr : ResolveWidgetBlueprint(Path);
+}
+
+UWidget* ResolveWidgetFromArgs(const TSharedPtr<FJsonObject>& Args, UWidgetBlueprint*& OutBlueprint)
+{
+    OutBlueprint = ResolveWidgetBlueprintFromArgs(Args);
+    if (!OutBlueprint || !OutBlueprint->WidgetTree) return nullptr;
+    const FString Name = FirstWidgetStringArg(Args, {TEXT("widget"), TEXT("name"), TEXT("widget_name")});
+    return Name.IsEmpty()
+        ? OutBlueprint->WidgetTree->RootWidget.Get()
+        : OutBlueprint->WidgetTree->FindWidget(FName(*Name));
+}
+
+void SaveWidgetIfRequested(UWidgetBlueprint* WB, const TSharedPtr<FJsonObject>& Args, const TSharedRef<FJsonObject>& R)
+{
+    if (!WB || !FirstWidgetBoolArg(Args, {TEXT("save")}, false) || !GEditor) return;
+    if (UEditorAssetSubsystem* Sub = GEditor->GetEditorSubsystem<UEditorAssetSubsystem>())
+    {
+        R->SetBoolField(TEXT("saved"), Sub->SaveLoadedAsset(WB));
+    }
+}
+
+FSageToolDispatch::FOutcome DumpUiSpecSchemaImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    TSharedRef<FJsonObject> Widget = MakeShared<FJsonObject>();
+    Widget->SetStringField(TEXT("name"), TEXT("TitleText"));
+    Widget->SetStringField(TEXT("class"), TEXT("/Script/UMG.TextBlock"));
+    Widget->SetStringField(TEXT("parent"), TEXT("RootCanvas"));
+    Widget->SetObjectField(TEXT("properties"), MakeShared<FJsonObject>());
+    TArray<TSharedPtr<FJsonValue>> Widgets{MakeShared<FJsonValueObject>(Widget)};
+
+    TSharedRef<FJsonObject> Schema = MakeShared<FJsonObject>();
+    Schema->SetStringField(TEXT("path"), TEXT("/Game/UI/WBP_Name"));
+    Schema->SetStringField(TEXT("parent_class"), TEXT("/Script/UMG.UserWidget"));
+    Schema->SetArrayField(TEXT("widgets"), Widgets);
+
+    TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("format"), TEXT("SageWidgetSpec.v1"));
+    R->SetObjectField(TEXT("schema"), Schema);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome DumpUiSpecImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return ReadWidgetImpl(Args);
+}
+
+FSageToolDispatch::FOutcome BuildUiFromSpecImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    const TSharedPtr<FJsonObject>* SpecPtr = nullptr;
+    TSharedPtr<FJsonObject> Spec = Args;
+    if (Args.IsValid() && Args->TryGetObjectField(TEXT("spec"), SpecPtr) && SpecPtr && SpecPtr->IsValid())
+    {
+        Spec = *SpecPtr;
+    }
+    FString Path;
+    if (!Spec.IsValid() || !Spec->TryGetStringField(TEXT("path"), Path) || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("spec.path is required"));
+    }
+
+    TSharedPtr<FJsonObject> CreateArgs = MakeShared<FJsonObject>();
+    CreateArgs->SetStringField(TEXT("path"), Path);
+    FString ParentClass;
+    if (Spec->TryGetStringField(TEXT("parent_class"), ParentClass) && !ParentClass.IsEmpty())
+    {
+        CreateArgs->SetStringField(TEXT("parent_class"), ParentClass);
+    }
+    FSageToolDispatch::FOutcome Created = CreateWidgetImpl(CreateArgs);
+    if (!Created.bSuccess) return Created;
+
+    TArray<TSharedPtr<FJsonValue>> Added;
+    const TArray<TSharedPtr<FJsonValue>>* Widgets = nullptr;
+    if (Spec->TryGetArrayField(TEXT("widgets"), Widgets) && Widgets)
+    {
+        for (const TSharedPtr<FJsonValue>& Value : *Widgets)
+        {
+            const TSharedPtr<FJsonObject>* WidgetSpec = nullptr;
+            if (!Value.IsValid() || !Value->TryGetObject(WidgetSpec) || !WidgetSpec || !WidgetSpec->IsValid()) continue;
+            FString ClassPath;
+            if (!(*WidgetSpec)->TryGetStringField(TEXT("class"), ClassPath))
+            {
+                (*WidgetSpec)->TryGetStringField(TEXT("widget_class"), ClassPath);
+            }
+            if (ClassPath.IsEmpty()) continue;
+            FString Name, Parent;
+            TSharedPtr<FJsonObject> AddArgs = MakeShared<FJsonObject>();
+            AddArgs->SetStringField(TEXT("blueprint"), Path);
+            AddArgs->SetStringField(TEXT("widget_class"), ClassPath);
+            if ((*WidgetSpec)->TryGetStringField(TEXT("name"), Name)) AddArgs->SetStringField(TEXT("name"), Name);
+            if ((*WidgetSpec)->TryGetStringField(TEXT("parent"), Parent)) AddArgs->SetStringField(TEXT("parent"), Parent);
+            FSageToolDispatch::FOutcome AddedOne = AddWidgetImpl(AddArgs);
+            if (!AddedOne.bSuccess) return AddedOne;
+            Added.Add(MakeShared<FJsonValueObject>(AddedOne.Result.ToSharedRef()));
+
+            const TSharedPtr<FJsonObject>* Props = nullptr;
+            if (!Name.IsEmpty() && (*WidgetSpec)->TryGetObjectField(TEXT("properties"), Props) && Props && Props->IsValid())
+            {
+                for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*Props)->Values)
+                {
+                    TSharedPtr<FJsonObject> SetArgs = MakeShared<FJsonObject>();
+                    SetArgs->SetStringField(TEXT("blueprint"), Path);
+                    SetArgs->SetStringField(TEXT("name"), Name);
+                    SetArgs->SetStringField(TEXT("property"), Pair.Key);
+                    SetArgs->SetField(TEXT("value"), Pair.Value);
+                    FSageToolDispatch::FOutcome Set = SetWidgetPropertyImpl(SetArgs);
+                    if (!Set.bSuccess) return Set;
+                }
+            }
+        }
+    }
+    TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Path);
+    R->SetObjectField(TEXT("created"), Created.Result.ToSharedRef());
+    R->SetArrayField(TEXT("added"), Added);
+    R->SetNumberField(TEXT("added_count"), Added.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome RenameWidgetParityImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    if (FSageToolDispatch::FOutcome Reject; detail::RejectIfPie(Reject)) return Reject;
+    UWidgetBlueprint* WB = nullptr;
+    UWidget* Widget = ResolveWidgetFromArgs(Args, WB);
+    if (!WB || !Widget) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("widget not found"));
+    const FString NewName = FirstWidgetStringArg(Args, {TEXT("new_name"), TEXT("to")});
+    if (NewName.IsEmpty()) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'new_name'"));
+    if (WB->WidgetTree->FindWidget(FName(*NewName)))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("target widget name already exists"));
+    }
+    const FString OldName = Widget->GetName();
+    FScopedTransaction Tx(LOCTEXT("SageRenameWidget", "Sage: Rename Widget"));
+    Widget->Modify();
+    Widget->Rename(*NewName, WB->WidgetTree, REN_DontCreateRedirectors | REN_ForceNoResetLoaders);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WB);
+    TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("old_name"), OldName);
+    R->SetStringField(TEXT("new_name"), Widget->GetName());
+    SaveWidgetIfRequested(WB, Args, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetWidgetIsVariableImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    if (FSageToolDispatch::FOutcome Reject; detail::RejectIfPie(Reject)) return Reject;
+    UWidgetBlueprint* WB = nullptr;
+    UWidget* Widget = ResolveWidgetFromArgs(Args, WB);
+    if (!WB || !Widget) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("widget not found"));
+    const bool bValue = FirstWidgetBoolArg(Args, {TEXT("is_variable"), TEXT("value")}, true);
+    FScopedTransaction Tx(LOCTEXT("SageSetWidgetIsVariable", "Sage: Set Widget Is Variable"));
+    Widget->Modify();
+    Widget->bIsVariable = bValue;
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WB);
+    TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("widget"), Widget->GetName());
+    R->SetBoolField(TEXT("is_variable"), bValue);
+    SaveWidgetIfRequested(WB, Args, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AuditFocusChainImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    UWidgetBlueprint* WB = ResolveWidgetBlueprintFromArgs(Args);
+    if (!WB || !WB->WidgetTree) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("WidgetBlueprint not found"));
+    TArray<UWidget*> All;
+    WB->WidgetTree->GetAllWidgets(All);
+    TArray<TSharedPtr<FJsonValue>> Rows;
+    TArray<TSharedPtr<FJsonValue>> Issues;
+    for (UWidget* Widget : All)
+    {
+        if (!Widget) continue;
+        TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
+        Row->SetStringField(TEXT("name"), Widget->GetName());
+        Row->SetStringField(TEXT("class"), Widget->GetClass()->GetName());
+        Row->SetBoolField(TEXT("is_enabled"), Widget->GetIsEnabled());
+        Row->SetBoolField(TEXT("is_variable"), Widget->bIsVariable != 0);
+        Row->SetBoolField(TEXT("has_navigation"), Widget->Navigation != nullptr);
+#if WITH_EDITORONLY_DATA
+        Row->SetBoolField(TEXT("override_accessibility"), Widget->bOverrideAccessibleDefaults != 0);
+        Row->SetStringField(TEXT("accessible_text"), Widget->GetAccessibleText().ToString());
+#endif
+        if (Widget->bIsVariable && !Widget->Navigation)
+        {
+            TSharedRef<FJsonObject> Issue = MakeShared<FJsonObject>();
+            Issue->SetStringField(TEXT("widget"), Widget->GetName());
+            Issue->SetStringField(TEXT("code"), TEXT("variable_without_navigation"));
+            Issues.Add(MakeShared<FJsonValueObject>(Issue));
+        }
+        Rows.Add(MakeShared<FJsonValueObject>(Row));
+    }
+    TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+    R->SetArrayField(TEXT("widgets"), Rows);
+    R->SetArrayField(TEXT("issues"), Issues);
+    R->SetBoolField(TEXT("ok"), Issues.Num() == 0);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ApplyTokenBindingImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    UWidgetBlueprint* WB = nullptr;
+    UWidget* Widget = ResolveWidgetFromArgs(Args, WB);
+    if (!WB || !Widget) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("widget not found"));
+    const FString Property = FirstWidgetStringArg(Args, {TEXT("property")});
+    const FString Token = FirstWidgetStringArg(Args, {TEXT("token")});
+    const TSharedPtr<FJsonObject>* Tokens = nullptr;
+    if (Property.IsEmpty() || Token.IsEmpty() ||
+        !Args.IsValid() || !Args->TryGetObjectField(TEXT("tokens"), Tokens) || !Tokens || !Tokens->IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing property/token/tokens"));
+    }
+    TSharedPtr<FJsonValue> Value = (*Tokens)->TryGetField(Token);
+    if (!Value.IsValid()) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("token not found"));
+    TSharedPtr<FJsonObject> SetArgs = MakeShared<FJsonObject>();
+    SetArgs->SetStringField(TEXT("blueprint"), WB->GetPathName());
+    SetArgs->SetStringField(TEXT("name"), Widget->GetName());
+    SetArgs->SetStringField(TEXT("property"), Property);
+    SetArgs->SetField(TEXT("value"), Value);
+    return SetWidgetPropertyImpl(SetArgs);
+}
+
+FSageToolDispatch::FOutcome ListWidgetPropertyEnumsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    const FString ClassPath = FirstWidgetStringArg(Args, {TEXT("widget_class"), TEXT("class")});
+    UClass* Cls = ClassPath.IsEmpty() ? UWidget::StaticClass() : FindObject<UClass>(nullptr, *ClassPath);
+    if (!Cls && !ClassPath.IsEmpty()) Cls = LoadObject<UClass>(nullptr, *ClassPath);
+    if (!Cls || !Cls->IsChildOf(UWidget::StaticClass()))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("class is not a UWidget subclass"));
+    }
+    TArray<TSharedPtr<FJsonValue>> Items;
+    for (TFieldIterator<FProperty> It(Cls); It; ++It)
+    {
+        FProperty* Prop = *It;
+        UEnum* Enum = nullptr;
+        if (FEnumProperty* EnumProp = CastField<FEnumProperty>(Prop)) Enum = EnumProp->GetEnum();
+        else if (FByteProperty* ByteProp = CastField<FByteProperty>(Prop)) Enum = ByteProp->Enum;
+        if (!Enum) continue;
+        TSharedRef<FJsonObject> J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("property"), Prop->GetName());
+        J->SetStringField(TEXT("enum"), Enum->GetPathName());
+        TArray<TSharedPtr<FJsonValue>> Values;
+        for (int32 I = 0; I < Enum->NumEnums() - 1; ++I)
+        {
+            Values.Add(MakeShared<FJsonValueString>(Enum->GetNameStringByIndex(I)));
+        }
+        J->SetArrayField(TEXT("values"), Values);
+        Items.Add(MakeShared<FJsonValueObject>(J));
+    }
+    TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("class"), Cls->GetPathName());
+    R->SetArrayField(TEXT("properties"), Items);
+    R->SetNumberField(TEXT("count"), Items.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+bool ParseUiNavigation(const FString& Text, EUINavigation& Out)
+{
+    if (Text.Equals(TEXT("left"), ESearchCase::IgnoreCase)) { Out = EUINavigation::Left; return true; }
+    if (Text.Equals(TEXT("right"), ESearchCase::IgnoreCase)) { Out = EUINavigation::Right; return true; }
+    if (Text.Equals(TEXT("up"), ESearchCase::IgnoreCase)) { Out = EUINavigation::Up; return true; }
+    if (Text.Equals(TEXT("down"), ESearchCase::IgnoreCase)) { Out = EUINavigation::Down; return true; }
+    if (Text.Equals(TEXT("next"), ESearchCase::IgnoreCase)) { Out = EUINavigation::Next; return true; }
+    if (Text.Equals(TEXT("previous"), ESearchCase::IgnoreCase)) { Out = EUINavigation::Previous; return true; }
+    return false;
+}
+
+bool ParseUiNavigationRule(const FString& Text, EUINavigationRule& Out)
+{
+    if (Text.Equals(TEXT("escape"), ESearchCase::IgnoreCase)) { Out = EUINavigationRule::Escape; return true; }
+    if (Text.Equals(TEXT("explicit"), ESearchCase::IgnoreCase)) { Out = EUINavigationRule::Explicit; return true; }
+    if (Text.Equals(TEXT("wrap"), ESearchCase::IgnoreCase)) { Out = EUINavigationRule::Wrap; return true; }
+    if (Text.Equals(TEXT("stop"), ESearchCase::IgnoreCase)) { Out = EUINavigationRule::Stop; return true; }
+    if (Text.Equals(TEXT("custom"), ESearchCase::IgnoreCase)) { Out = EUINavigationRule::Custom; return true; }
+    if (Text.Equals(TEXT("custom_boundary"), ESearchCase::IgnoreCase)) { Out = EUINavigationRule::CustomBoundary; return true; }
+    return false;
+}
+
+FSageToolDispatch::FOutcome DumpWidgetNavigationImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    UWidgetBlueprint* WB = ResolveWidgetBlueprintFromArgs(Args);
+    if (!WB || !WB->WidgetTree) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("WidgetBlueprint not found"));
+    TArray<UWidget*> All;
+    WB->WidgetTree->GetAllWidgets(All);
+    TArray<TSharedPtr<FJsonValue>> Rows;
+    for (UWidget* Widget : All)
+    {
+        if (!Widget) continue;
+        TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
+        Row->SetStringField(TEXT("name"), Widget->GetName());
+        Row->SetBoolField(TEXT("has_navigation"), Widget->Navigation != nullptr);
+        if (Widget->Navigation)
+        {
+            TSharedRef<FJsonObject> Nav = MakeShared<FJsonObject>();
+            for (TFieldIterator<FProperty> It(Widget->Navigation->GetClass()); It; ++It)
+            {
+                FProperty* P = *It;
+                if (TSharedPtr<FJsonValue> V = detail::GetUPropertyAsJson(Widget->Navigation, P))
+                {
+                    Nav->SetField(P->GetName(), V);
+                }
+            }
+            Row->SetObjectField(TEXT("navigation"), Nav);
+        }
+        Rows.Add(MakeShared<FJsonValueObject>(Row));
+    }
+    TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+    R->SetArrayField(TEXT("widgets"), Rows);
+    R->SetNumberField(TEXT("count"), Rows.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetWidgetNavigationBulkImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    if (FSageToolDispatch::FOutcome Reject; detail::RejectIfPie(Reject)) return Reject;
+    UWidgetBlueprint* WB = ResolveWidgetBlueprintFromArgs(Args);
+    if (!WB || !WB->WidgetTree) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("WidgetBlueprint not found"));
+    const TArray<TSharedPtr<FJsonValue>>* Rules = nullptr;
+    if (!Args.IsValid() || !Args->TryGetArrayField(TEXT("rules"), Rules) || !Rules)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'rules' array"));
+    }
+    FScopedTransaction Tx(LOCTEXT("SageSetWidgetNavigationBulk", "Sage: Set Widget Navigation Bulk"));
+    TArray<TSharedPtr<FJsonValue>> Results;
+    for (const TSharedPtr<FJsonValue>& V : *Rules)
+    {
+        const TSharedPtr<FJsonObject>* Obj = nullptr;
+        if (!V.IsValid() || !V->TryGetObject(Obj) || !Obj || !Obj->IsValid()) continue;
+        FString WidgetName, DirectionText, RuleText, TargetName;
+        (*Obj)->TryGetStringField(TEXT("widget"), WidgetName);
+        (*Obj)->TryGetStringField(TEXT("direction"), DirectionText);
+        (*Obj)->TryGetStringField(TEXT("rule"), RuleText);
+        (*Obj)->TryGetStringField(TEXT("target"), TargetName);
+        UWidget* Widget = WB->WidgetTree->FindWidget(FName(*WidgetName));
+        EUINavigation Direction;
+        EUINavigationRule Rule;
+        if (!Widget || !ParseUiNavigation(DirectionText, Direction) || !ParseUiNavigationRule(RuleText, Rule))
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("invalid navigation rule entry"));
+        }
+        Widget->Modify();
+        if (Rule == EUINavigationRule::Explicit)
+        {
+            UWidget* Target = WB->WidgetTree->FindWidget(FName(*TargetName));
+            if (!Target)
+            {
+                Tx.Cancel();
+                return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("explicit navigation target not found"));
+            }
+            Widget->SetNavigationRuleExplicit(Direction, Target);
+        }
+        else if (Rule == EUINavigationRule::Custom || Rule == EUINavigationRule::CustomBoundary)
+        {
+            Tx.Cancel();
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("custom navigation rules require delegate binding and are not safe through set_widget_navigation_bulk"));
+        }
+        else
+        {
+            Widget->SetNavigationRuleBase(Direction, Rule);
+        }
+        TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
+        Row->SetStringField(TEXT("widget"), WidgetName);
+        Row->SetStringField(TEXT("direction"), DirectionText);
+        Row->SetStringField(TEXT("rule"), RuleText);
+        Results.Add(MakeShared<FJsonValueObject>(Row));
+    }
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WB);
+    TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+    R->SetArrayField(TEXT("results"), Results);
+    R->SetNumberField(TEXT("changed"), Results.Num());
+    SaveWidgetIfRequested(WB, Args, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome SetActionBarButtonClassImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    if (FSageToolDispatch::FOutcome Reject; detail::RejectIfPie(Reject)) return Reject;
+    UWidgetBlueprint* WB = nullptr;
+    UWidget* Widget = ResolveWidgetFromArgs(Args, WB);
+    if (!WB || !Widget) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("widget not found"));
+    const FString ClassPath = FirstWidgetStringArg(Args, {TEXT("button_class"), TEXT("class"), TEXT("value")});
+    if (ClassPath.IsEmpty()) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'button_class'"));
+    FProperty* Prop = Widget->GetClass()->FindPropertyByName(TEXT("ActionButtonClass"));
+    if (!Prop) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("ActionButtonClass property not found on widget"));
+    FScopedTransaction Tx(LOCTEXT("SageSetActionBarButtonClass", "Sage: Set Action Bar Button Class"));
+    Widget->Modify();
+    if (!detail::SetUPropertyFromJson(Widget, Prop, MakeShared<FJsonValueString>(ClassPath)))
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("failed to set ActionButtonClass"));
+    }
+    FBlueprintEditorUtils::MarkBlueprintAsModified(WB);
+    TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("widget"), Widget->GetName());
+    R->SetStringField(TEXT("button_class"), ClassPath);
+    SaveWidgetIfRequested(WB, Args, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ReparentWidgetRootImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    if (FSageToolDispatch::FOutcome Reject; detail::RejectIfPie(Reject)) return Reject;
+    UWidgetBlueprint* WB = ResolveWidgetBlueprintFromArgs(Args);
+    if (!WB || !WB->WidgetTree) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("WidgetBlueprint not found"));
+    const FString RootName = FirstWidgetStringArg(Args, {TEXT("root"), TEXT("widget"), TEXT("name")});
+    if (RootName.IsEmpty()) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'root'"));
+    UWidget* NewRoot = WB->WidgetTree->FindWidget(FName(*RootName));
+    if (!NewRoot) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("root widget not found"));
+    FScopedTransaction Tx(LOCTEXT("SageReparentWidgetRoot", "Sage: Reparent Widget Root"));
+    WB->WidgetTree->Modify();
+    WB->WidgetTree->RootWidget = NewRoot;
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WB);
+    TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("root"), NewRoot->GetName());
+    SaveWidgetIfRequested(WB, Args, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome DumpBlueprintCompileLogImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    UWidgetBlueprint* WB = ResolveWidgetBlueprintFromArgs(Args);
+    if (!WB) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("WidgetBlueprint not found"));
+    TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), WB->GetPathName());
+    R->SetNumberField(TEXT("status"), static_cast<int32>(WB->Status));
+    R->SetBoolField(TEXT("has_generated_class"), WB->GeneratedClass != nullptr);
+    R->SetStringField(TEXT("generated_class"), WB->GeneratedClass ? WB->GeneratedClass->GetPathName() : FString());
+    R->SetBoolField(TEXT("compile_log_available"), false);
+    R->SetStringField(TEXT("compile_log_source"), TEXT("editor message log is not captured without triggering a compile"));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome WidgetEditImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    const FString Action = FirstWidgetStringArg(Args, {TEXT("action"), TEXT("op")});
+    if (Action == TEXT("set_property")) return SetWidgetPropertyImpl(Args);
+    if (Action == TEXT("add_widget")) return AddWidgetImpl(Args);
+    if (Action == TEXT("remove_widget")) return RemoveWidgetImpl(Args);
+    if (Action == TEXT("rename_widget")) return RenameWidgetParityImpl(Args);
+    if (Action == TEXT("set_navigation")) return SetWidgetNavigationBulkImpl(Args);
+    return WidgetUnsupported(TEXT("widget_edit"), TEXT("unknown action; supported: set_property/add_widget/remove_widget/rename_widget/set_navigation"));
+}
+
+FSageToolDispatch::FOutcome DispatchWidgetParityTool(const FString& Tool, const TSharedPtr<FJsonObject>& Args)
+{
+    if (Tool == TEXT("build_ui_from_spec")) return BuildUiFromSpecImpl(Args);
+    if (Tool == TEXT("dump_ui_spec_schema")) return DumpUiSpecSchemaImpl(Args);
+    if (Tool == TEXT("dump_ui_spec")) return DumpUiSpecImpl(Args);
+    if (Tool == TEXT("rename_widget")) return RenameWidgetParityImpl(Args);
+    if (Tool == TEXT("add_widget_variable")) return SetWidgetIsVariableImpl(Args);
+    if (Tool == TEXT("audit_focus_chain")) return AuditFocusChainImpl(Args);
+    if (Tool == TEXT("apply_token_binding")) return ApplyTokenBindingImpl(Args);
+    if (Tool == TEXT("list_widget_property_enums")) return ListWidgetPropertyEnumsImpl(Args);
+    if (Tool == TEXT("set_action_bar_button_class")) return SetActionBarButtonClassImpl(Args);
+    if (Tool == TEXT("dump_blueprint_compile_log")) return DumpBlueprintCompileLogImpl(Args);
+    if (Tool == TEXT("reparent_widget_root")) return ReparentWidgetRootImpl(Args);
+    if (Tool == TEXT("set_widget_is_variable")) return SetWidgetIsVariableImpl(Args);
+    if (Tool == TEXT("set_widget_navigation_bulk")) return SetWidgetNavigationBulkImpl(Args);
+    if (Tool == TEXT("dump_widget_navigation")) return DumpWidgetNavigationImpl(Args);
+    if (Tool == TEXT("widget_inspect")) return ReadWidgetImpl(Args);
+    if (Tool == TEXT("widget_edit")) return WidgetEditImpl(Args);
+    if (Tool == TEXT("convert_textblock_to_common") || Tool == TEXT("convert_border_to_common"))
+    {
+        return WidgetUnsupported(Tool, TEXT("class conversion must clone slots, bindings, animations, and named references; safe subtree conversion is not mapped yet"));
+    }
+    return WidgetUnsupported(Tool, TEXT("no dispatch mapping"));
+}
+
 }  // namespace (anonymous)
 
 void RegisterWidgetTools(FSageToolDispatch& Dispatch)
@@ -1307,6 +1819,38 @@ void RegisterWidgetTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("widget.anim.bind"),         GT(&AnimBindImpl));
     Dispatch.RegisterHandler(TEXT("widget.anim.add_track"),    GT(&AnimAddTrackImpl));
     Dispatch.RegisterHandler(TEXT("widget.anim.add_keyframe"), GT(&AnimAddKeyframeImpl));
+
+    static const TCHAR* WidgetParityTools[] = {
+        TEXT("build_ui_from_spec"),
+        TEXT("dump_ui_spec_schema"),
+        TEXT("dump_ui_spec"),
+        TEXT("rename_widget"),
+        TEXT("add_widget_variable"),
+        TEXT("audit_focus_chain"),
+        TEXT("apply_token_binding"),
+        TEXT("list_widget_property_enums"),
+        TEXT("convert_textblock_to_common"),
+        TEXT("convert_border_to_common"),
+        TEXT("set_action_bar_button_class"),
+        TEXT("dump_blueprint_compile_log"),
+        TEXT("reparent_widget_root"),
+        TEXT("set_widget_is_variable"),
+        TEXT("set_widget_navigation_bulk"),
+        TEXT("dump_widget_navigation"),
+        TEXT("widget_inspect"),
+        TEXT("widget_edit"),
+    };
+    for (const TCHAR* ToolName : WidgetParityTools)
+    {
+        Dispatch.RegisterHandler(ToolName,
+            [Tool = FString(ToolName)](const TSharedPtr<FJsonObject>& Args) -> FSageToolDispatch::FOutcome
+            {
+                return detail::RunOnGameThread([&]() -> FSageToolDispatch::FOutcome
+                {
+                    return DispatchWidgetParityTool(Tool, Args);
+                });
+            });
+    }
 }
 
 #undef LOCTEXT_NAMESPACE

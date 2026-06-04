@@ -39,6 +39,14 @@
         {
             "Name": "IKRig",
             "Enabled": true
+        },
+        {
+            "Name": "ControlRig",
+            "Enabled": true
+        },
+        {
+            "Name": "Niagara",
+            "Enabled": true
         }
     ]
 }

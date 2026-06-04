@@ -6,6 +6,17 @@
 
 ---
 
+## Niagara gap sweep source implementation (2026-06-04)
+
+- [x] Replaced Niagara placeholder-success handlers with real source behavior or explicit unsupported MCP errors.
+- [x] Expanded Niagara schema/handler surface from 26 to 68 aligned tools.
+- [x] Added Niagara module dependencies in `SageBridge.Build.cs` and `.uplugin`.
+- [x] Added registry canary coverage for new Niagara schema entries.
+- [x] Added external reference matrix at `.claude/notes/niagara-mcp-reference-matrix.md`.
+- [ ] Build/package/deploy/live Kale runtime dogfood intentionally pending; Mahmut will choose the compile window.
+
+---
+
 ## İlk Dogfooding Turu — 11 gap fix tek oturumda (2026-04-29)
 
 Mahmut Mac'te ikinci bir Claude Code session'ı (Kale projesi) ile gerçek MCP-client testi başlattı. Test eden Claude kullanıcı/tester rolünde, bu (sage repo) Claude geliştirici rolünde, Mahmut köprü. 11 gerçek gap raporu çıktı, hepsi aynı oturumda fix edildi.
@@ -394,3 +405,136 @@ Review:
 - `scripts\audit-tools.ps1` reports 640 server tools, 622 plugin handlers, no plugin-without-schema, no stubs, and only expected local `jobs.*` schema-only tools.
 - `scripts\build-plugin.ps1` packaged the Win64 plugin successfully under `build\plugin`.
 - Runtime editor dogfood/deploy is still pending; no production project mutation was attempted in this gap-closure pass.
+
+## Active Gap Closure - 2026-06-02 IK Retargeter + BP Reparent CDO
+
+- [x] Add `animation.set_ik_retargeter_ik_chain_settings` for IK Chains op per-target-chain settings.
+- [x] Make `bp.reparent` refresh/compile generated class layout so inherited native CDO properties are immediately visible.
+- [x] Harden `bp.set_cdo_property` with stale-layout refresh diagnostics, dry-run validation, before/after readback, and property owner readback.
+- [x] Register schemas and add registry coverage.
+- [x] Update `.claude/notes/gap-inbox.md` closure state.
+- [x] Run compile-free verification only; build is intentionally deferred by user instruction.
+
+Review:
+- `git diff --check` passed.
+- `scripts\audit-tools.ps1` passed: 650 server tools, 632 plugin handlers, 0 plugin-without-schema, 0 schema/plugin stubs, only expected local `jobs.*` schema-only tools.
+- `rg` confirms `FindBoneTrackByName` is gone from repo `plugin/Source`, but remains in Kale's stale deployed plugin source until the next build/deploy sync.
+- No server build, test binary rebuild, UE BuildPlugin, Kale deploy, or live editor dogfood was run per user instruction.
+
+## Active Gap Closure - 2026-06-02 IKRig Skeletal Mesh Setter
+
+- [x] Add `animation.set_ik_rig_skeletal_mesh` for existing/duplicated IKRig assets.
+- [x] Use UE IKRig compatibility validation before mutation and reject incompatible meshes without dirtying.
+- [x] Return before/after IKRig readback plus preservation diagnostics for root, chains, goals, solvers, and goal-solver connections.
+- [x] Extend `animation.read_ik_rig` with goal-solver connection readback.
+- [x] Register schema and add registry coverage.
+- [x] Move the detailed gap from `.claude/notes/gap-inbox.md` into implemented summary.
+- [x] Run compile-free verification only; build is intentionally deferred by user instruction.
+
+Review:
+- `git diff --check` passed.
+- `scripts\audit-tools.ps1` passed: 651 server tools, 633 plugin handlers, 0 plugin-without-schema, 0 schema/plugin stubs, only expected local `jobs.*` schema-only tools.
+- Targeted `rg` confirms the new handler/schema/test/docs entries exist and no open 2026-06-02 IKRig gap block remains.
+- Kale's deployed plugin source still contains the stale `FindBoneTrackByName` call; it should be corrected by the next full build/deploy sync, not by partial manual copy.
+- No server build, test binary rebuild, UE BuildPlugin, Kale deploy, or live editor dogfood was run per user instruction.
+
+## Reference Audit - 2026-06-04 Niagara Benchmarks
+
+- [x] Clone/source-audit Monolith, UE-MCP, ChiR24, Flopperam, runreal, and unreal-api-mcp into a temporary folder.
+- [x] Check remiphilippe mcp-unreal and UECortex as listing/product references.
+- [x] Update `.claude/notes/niagara-mcp-reference-matrix.md` with source-backed Niagara benchmark coverage and licensing notes.
+- [x] Add a new open post-reference Niagara parity gap for the remaining benchmark deltas.
+- [x] Run compile-free verification only; build is intentionally deferred by user instruction.
+
+Review:
+- Temporary audit folder: `C:\Users\mahmu\AppData\Local\Temp\sage-ref-audit-20260604-004937`.
+- Monolith remains the strongest Niagara-specific benchmark; UE-MCP and ChiR24 provide useful ergonomics/preset-action references.
+- New open deltas: CustomHlsl/HLSL module authoring, Niagara search/discovery, ordered stack usage selectors, dynamic input lifecycle, event/sim-stage creation, DI add/configure helpers, renderer binding/material convenience, and preview image/GIF capture.
+- `git diff --check` passed.
+- `scripts\audit-tools.ps1` passed: 693 server tools, 675 plugin handlers, 0 plugin-without-schema, 0 schema/plugin stubs, and only expected local `jobs.*` schema-only tools.
+- No server build, test binary rebuild, UE BuildPlugin, Kale deploy, or live editor dogfood was run per user instruction.
+
+## Active 1251 Tool Expansion - Batch 1 AI Gameplay Surface
+
+- [x] Add Batch 1 AI/BT/Blackboard/EQS/StateTree/SmartObject/Mass/ZoneGraph schemas from the 1251 master list.
+- [x] Implement plugin handlers without successful placeholder notes; unsupported editor-private graph mutations must return precise hard errors.
+- [x] Keep implementation compile-free: no server build, UE BuildPlugin, package, deploy, or live editor dogfood until explicitly requested.
+- [x] Run static registry/audit/diff checks only.
+
+## Active 1251 Tool Expansion - Batch 2 Mesh Gameplay Surface
+
+- [x] Add Batch 2 Mesh/GeometryScript/ProceduralMesh/RealtimeMesh schemas from the 1251 master list.
+- [x] Implement plugin handlers for static/skeletal mesh inspection, collision and LOD configuration, and procedural mesh component routing.
+- [x] Return precise hard errors for GeometryScript/RealtimeMesh/Chaos operations that require plugin-private mapping instead of fake success.
+- [x] Run static registry/audit/diff checks only; build/package/deploy remains deferred by user instruction.
+
+## Active 1251 Tool Expansion - Batch 3 Audio Gameplay Surface
+
+- [x] Add Batch 3 Audio/SoundCue/MetaSound schemas from the 1251 master list.
+- [x] Implement plugin handlers for sound asset create/write/search/health/batch operations and SoundCue/MetaSound read/preview paths.
+- [x] Return precise hard errors for SoundCue/MetaSound graph mutations and audio/perception binding where no safe public mapping exists.
+- [x] Run static registry/audit/diff checks only; build/package/deploy remains deferred by user instruction.
+
+## Active 1251 Tool Expansion - Batch 4 UI Gameplay Surface
+
+- [x] Add Batch 4 UMG/CommonUI/template/accessibility schemas from the 1251 master list.
+- [x] Implement plugin handlers for WidgetBlueprint spec import/export, rename/is-variable/root/navigation edits, focus/accessibility audit, token application, CommonUI action-bar class write, and inspect/edit aliases.
+- [x] Return precise hard errors for unsafe CommonUI widget class conversion and custom navigation delegate binding instead of fake success.
+- [x] Run static registry/audit/diff checks only; build/package/deploy remains deferred by user instruction.
+
+## Active 1251 Tool Expansion - Batch 5 Material Gameplay Surface
+
+- [x] Add Batch 5 material instance/function/HLSL/inspection schemas from the 1251 master list.
+- [x] Implement plugin handlers for Custom HLSL nodes, expression move/rename/duplicate/replace, material function creation/readback, material instance parameter writes, batch material operations, thumbnail/texture/PBR/orphan inspection.
+- [x] Return precise hard errors for viewport/render-target capture paths that need dedicated preview infrastructure instead of fake success.
+- [x] Run static registry/audit/diff checks only; build/package/deploy remains deferred by user instruction.
+
+## Active 1251 Tool Expansion - Batch 6 Source Intelligence Surface
+
+- [x] Add Batch 6 C++ API/docs/source-callgraph/decision/risk/cppreflect/network/pipeline tools from the 1251 master list.
+- [x] Implement the batch as server-side local tools, not editor-bridge tools, because the surface reads source/docs/git/ADRs rather than mutating Unreal editor state.
+- [x] Update audit coverage for `regLocal(registry, "...")` server-only registrations and explicit source-intelligence prefixes.
+- [x] Run static registry/audit/diff checks only; build/package/deploy remains deferred by user instruction.
+
+## Active 1251 Tool Expansion - Batch 7 Runtime Verification Surface
+
+- [x] Add Batch 7 runtime verification, automation test, capture, build/cook/live-compile, and performance schemas from the 1251 master list.
+- [x] Implement QA aliases/logs in `SageQaTools`, Live Coding/build boundary in `SageCompileTools`, and capture/performance/runtime-console wrappers in `SageEditorAutomationTools`.
+- [x] Return precise hard errors for full UBT build and asset-specific preview-scene capture backends that cannot be safely driven through the current editor bridge.
+- [x] Run static registry/audit/diff checks only; build/package/deploy remains deferred by user instruction.
+
+## Active 1251 Tool Expansion - Batch 8 Asset Content Surface
+
+- [x] Add Batch 8 asset folder/save/import-source/health/report/tag/Fab/ISM-HISM schemas from the 1251 master list.
+- [x] Implement asset folder create/delete, save/save-all-dirty, batch texture import, import-source readback, asset health/report/validate, metadata tag writes, and ISM/HISM actor component instance operations.
+- [x] Return precise hard errors for Interchange pipeline asset authoring, thumbnail generation, and Fab marketplace operations that require dedicated authenticated/rendering infrastructure instead of fake success.
+- [x] Run static registry/audit/diff checks only; build/package/deploy remains deferred by user instruction.
+
+## Active 1251 Tool Expansion - Batch 9 Niagara Reference Surface
+
+- [x] Add Batch 9 Niagara CustomHlsl/search/discovery schemas from the 1251 master list.
+- [x] Implement existing CustomHlsl node read/write via reflection, parameter/data-interface/material searches, generic Niagara query, similar-system scoring, referencer alias, and system data-interface listing.
+- [x] Preserve hard-error boundaries for creating new CustomHlsl/dynamic-input/editor-stack structures that still require dedicated Niagara editor graph construction.
+- [x] Run static registry/audit/diff checks only; build/package/deploy remains deferred by user instruction.
+
+## Active 1251 Tool Expansion - Batch 10 Sequencer Cinematics Surface
+
+- [x] Add Batch 10 `level_sequence_query` and `sequencer_edit` schemas from the 1251 master list.
+- [x] Implement Level Sequence listing/query/readback with tracks, sections, bindings, possessables, spawnables, display/tick rate, and playback range summary.
+- [x] Implement `sequencer_edit` as a real operation router for existing sequence create/track/key/binding/spawnable writes plus playback-range edits; unsupported richer edits return hard MCP errors.
+- [x] Run static registry/audit/diff checks only; build/package/deploy remains deferred by user instruction.
+
+## Active 1251 Tool Expansion - Batch 11 Specialized And Status Surface
+
+- [x] Add Batch 11 specialized marketplace/plugin-domain and lower-priority path/status tools from the 1251 master list.
+- [x] Implement `logicdriver_query` and `combograph_query` as safe plugin-gated AssetRegistry/reflection query wrappers, with vendor graph mutation ops returning hard MCP errors.
+- [x] Implement server-local Unreal engine/project path getter-setter tools and unified `status` health payload.
+- [x] Run static registry/audit/diff checks only; build/package/deploy remains deferred by user instruction.
+
+## Active 1251 Tool Expansion - Batch 12 Reference Parity Closure
+
+- [x] Register the remaining 172 exact reference-derived tool names from the 1251 master list.
+- [x] Implement safe generic operations for trace/raycast/overlap, line-of-sight, actor tags, actor attach/detach/mobility, snap-to-floor, relative transform, actor motion readback, current-level/streaming readback, and batch translation.
+- [x] Return hard MCP errors for StateTree, procedural generation, vendor/plugin graph, GAS/tag registry, PCG/Landscape/Foliage mutation, and animation/physics/cloth/ControlRig authoring paths that need dedicated domain contracts.
+- [x] Verify full planned-list parity: 558/558 planned names registered; `scripts\audit-tools.ps1` reports 1251 server tools and only expected `jobs.*` server-only entries.
+- [x] Run static registry/audit/diff checks only; build/package/deploy remains deferred by user instruction.

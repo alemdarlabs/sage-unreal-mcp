@@ -62,6 +62,8 @@ public class SageBridge : ModuleRules
             "MovieSceneTracks",
             // Navigation rebuild (gameplay tools) — ALandscape nav not needed
             "NavigationSystem",
+            // AI parity surface (Blackboard / BehaviorTree / EQS public APIs).
+            "AIModule",
             // Blutility — EditorUtilityWidget / GlobalEditorUtilityBase class lookups
             "Blutility",
             // Editor asset validation (editor.validate_assets).
@@ -84,8 +86,15 @@ public class SageBridge : ModuleRules
             "AnimationModifiers",
             "IKRig",
             "IKRigEditor",
+            "ControlRig",
+            "ControlRigDeveloper",
+            "ControlRigEditor",
+            // Niagara authoring/readback (2026-06 Niagara gap sweep).
+            "Niagara",
+            "NiagaraCore",
+            "NiagaraEditor",
         });
-        // Note: Niagara, PCG, Landscape, Foliage, GAS, MetaSound are loaded via
+        // Note: PCG, Landscape, Foliage, GAS, MetaSound are loaded via
         // FindObject<UClass> at runtime — no hard Build.cs dep needed.
         // Add them to your project plugin list to enable full functionality.
 

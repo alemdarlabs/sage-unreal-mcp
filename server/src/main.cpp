@@ -17,6 +17,7 @@
 #include "tools/builtin.h"
 #include "tools/phase4_schemas.h"
 #include "tools/restart_orchestrator.h"
+#include "tools/source_intelligence_tools.h"
 #include "transport/http_sse_server.h"
 #include "transport/stdio_mcp.h"
 #include "util/crash_handler.h"
@@ -511,6 +512,7 @@ int main(int argc, char* argv[]) {
     auto registry = std::make_shared<sage::mcp::ToolRegistry>();
     sage::tools::registerBuiltins(*registry);
     sage::tools::registerPhase4Schemas(*registry);
+    sage::tools::registerSourceIntelligenceTools(*registry);
     spdlog::info("Registered {} built-in tool(s)", registry->size());
 
     sage::mcp::MCPServer mcpServer(
@@ -2089,6 +2091,8 @@ int main(int argc, char* argv[]) {
             {"properties", {
                 {"class",      {{"type", "string"}}},
                 {"properties", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"recurse_instanced", {{"type", "boolean"}}},
+                {"max_depth", {{"type", "integer"}, {"minimum", 1}, {"maximum", 16}}},
             }},
             {"required", nlohmann::json::array({"class"})},
             {"additionalProperties", false},
@@ -2690,13 +2694,19 @@ int main(int argc, char* argv[]) {
         .description = "Write a property on the BP's class default object. Goes "
                        "through Phase 4.0 reflection (TArray/TMap/TObjectPtr/"
                        "FStruct/UEnum all supported). Marks BP structurally "
-                       "modified. PIE rejected.",
+                       "modified. Supports dry_run/validate_only reflection "
+                       "validation and reports before/after plus owner class. "
+                       "Refreshes stale generated-class layout after reparent "
+                       "when an inherited parent property is not yet visible. "
+                       "PIE rejected.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
                 {"path",     {{"type", "string"}}},
                 {"property", {{"type", "string"}}},
                 {"value",    {{"description", "JSON value matching property type"}}},
+                {"dry_run",  {{"type", "boolean"}}},
+                {"validate_only", {{"type", "boolean"}}},
             }},
             {"required", nlohmann::json::array({"path", "property", "value"})},
             {"additionalProperties", false},
@@ -2706,7 +2716,8 @@ int main(int argc, char* argv[]) {
     registerRemote(sage::mcp::Tool{
         .name = "bp.reparent",
         .description = "Change BP's parent class. Refreshes all nodes for the new "
-                       "parent's interface. PIE rejected.",
+                       "parent's interface and compiles so inherited native CDO "
+                       "properties are immediately visible. PIE rejected.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
             {"properties", {
@@ -3364,12 +3375,17 @@ int main(int argc, char* argv[]) {
         .description = "List sockets on a UStaticMesh or USkeletalMesh. "
                        "Returns {kind: 'static_mesh'|'skeletal_mesh', "
                        "sockets: [{name, location, rotation, scale, "
-                       "tag?, bone?, force_always_animated?}], count}. "
-                       "Skeletal mesh returns mesh-only sockets (not "
-                       "skeleton-derived).",
+                       "tag?, bone?, owner, effective, force_always_animated?}], "
+                       "count}. Skeletal mesh defaults to mesh-only sockets for "
+                       "backward compatibility; pass owner='any' or 'skeleton' "
+                       "to include inherited skeleton sockets plus override "
+                       "collision diagnostics.",
         .inputSchema = nlohmann::json{
             {"type", "object"},
-            {"properties", {{"path", {{"type", "string"}}}}},
+            {"properties", {
+                {"path", {{"type", "string"}}},
+                {"owner", {{"type", "string"}, {"enum", nlohmann::json::array({"mesh", "skeleton", "any"})}}},
+            }},
             {"required", nlohmann::json::array({"path"})},
             {"additionalProperties", false},
         },
@@ -3392,6 +3408,80 @@ int main(int argc, char* argv[]) {
                 {"location", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3}}},
                 {"rotation", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3}}},
                 {"scale",    {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3}}},
+            }},
+            {"required", nlohmann::json::array({"path", "name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.get_socket",
+        .description = "Read one socket by name on a UStaticMesh or USkeletalMesh. "
+                       "For skeletal meshes returns mesh_socket, skeleton_socket, "
+                       "effective_socket, owner collision flags, and the asset "
+                       "that owns each socket.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path", {{"type", "string"}}},
+                {"name", {{"type", "string"}}},
+                {"owner", {{"type", "string"}, {"enum", nlohmann::json::array({"mesh", "skeleton", "any"})}}},
+            }},
+            {"required", nlohmann::json::array({"path", "name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.upsert_socket",
+        .description = "Create or update a mesh-owned or skeleton-owned socket. "
+                       "For skeletal meshes, owner='mesh' can intentionally create "
+                       "a mesh-only override of an inherited skeleton socket when "
+                       "allow_mesh_override_of_skeleton_socket=true, without "
+                       "mutating the shared skeleton. owner='skeleton' requires "
+                       "confirmed:true for real writes. Supports dry_run/save and "
+                       "before/after readback.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"name",     {{"type", "string"}}},
+                {"owner",    {{"type", "string"}, {"enum", nlohmann::json::array({"mesh", "skeleton"})}}},
+                {"bone",     {{"type", "string"}}},
+                {"parent_bone", {{"type", "string"}}},
+                {"location", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3}}},
+                {"rotation", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3}}},
+                {"scale",    {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3}}},
+                {"create_if_missing", {{"type", "boolean"}}},
+                {"allow_mesh_override_of_skeleton_socket", {{"type", "boolean"}}},
+                {"dry_run", {{"type", "boolean"}}},
+                {"save", {{"type", "boolean"}}},
+                {"confirmed", {{"type", "boolean"}}},
+            }},
+            {"required", nlohmann::json::array({"path", "name"})},
+            {"additionalProperties", false},
+        },
+        .handler = nullptr, .remote = true,
+    });
+    registerRemote(sage::mcp::Tool{
+        .name = "asset.update_socket",
+        .description = "Alias of asset.upsert_socket.",
+        .inputSchema = nlohmann::json{
+            {"type", "object"},
+            {"properties", {
+                {"path",     {{"type", "string"}}},
+                {"name",     {{"type", "string"}}},
+                {"owner",    {{"type", "string"}, {"enum", nlohmann::json::array({"mesh", "skeleton"})}}},
+                {"bone",     {{"type", "string"}}},
+                {"parent_bone", {{"type", "string"}}},
+                {"location", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3}}},
+                {"rotation", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3}}},
+                {"scale",    {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3}}},
+                {"create_if_missing", {{"type", "boolean"}}},
+                {"allow_mesh_override_of_skeleton_socket", {{"type", "boolean"}}},
+                {"dry_run", {{"type", "boolean"}}},
+                {"save", {{"type", "boolean"}}},
+                {"confirmed", {{"type", "boolean"}}},
             }},
             {"required", nlohmann::json::array({"path", "name"})},
             {"additionalProperties", false},

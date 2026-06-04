@@ -50,6 +50,7 @@
 #include "Kismet2/CompilerResultsLog.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Kismet2/KismetReinstanceUtilities.h"
+#include "Misc/PackageName.h"
 #include "ScopedTransaction.h"
 #include "Misc/ScopeExit.h"
 #include "GameFramework/Actor.h"
@@ -1859,6 +1860,9 @@ FSageToolDispatch::FOutcome BpSetCdoPropertyImpl(const TSharedPtr<FJsonObject>& 
     }
     auto It = Args->Values.Find(TEXT("value"));
     if (!It) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'value'"));
+    bool bDryRun = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
 
     FSageToolDispatch::FOutcome PieErr;
     if (detail::RejectIfPie(PieErr)) return PieErr;
@@ -1869,7 +1873,80 @@ FSageToolDispatch::FOutcome BpSetCdoPropertyImpl(const TSharedPtr<FJsonObject>& 
     UObject* CDO = BP->GeneratedClass->GetDefaultObject(/*bCreateIfNeeded*/ true);
     if (!CDO) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("CDO unavailable"));
     FProperty* P = CDO->GetClass()->FindPropertyByName(FName(*PropName));
-    if (!P) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("property not found"));
+    bool bRefreshedGeneratedClass = false;
+    if (!P && BP->ParentClass && BP->ParentClass->FindPropertyByName(FName(*PropName)))
+    {
+        if (bDryRun)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("property exists on parent class but generated class layout is stale; run bp.reparent/bp.refresh_nodes/compile before validate_only, or call bp.set_cdo_property without dry_run to refresh and write"));
+        }
+        FBlueprintEditorUtils::RefreshAllNodes(BP);
+        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+        FKismetEditorUtilities::CompileBlueprint(BP);
+        bRefreshedGeneratedClass = true;
+        if (!BP->GeneratedClass)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32603,
+                TEXT("generated class unavailable after stale-layout refresh"));
+        }
+        CDO = BP->GeneratedClass->GetDefaultObject(/*bCreateIfNeeded*/ true);
+        if (!CDO) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("CDO unavailable after stale-layout refresh"));
+        P = CDO->GetClass()->FindPropertyByName(FName(*PropName));
+    }
+    if (!P)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("property not found on generated class %s or parent class %s: %s"),
+                BP->GeneratedClass ? *BP->GeneratedClass->GetPathName() : TEXT("<none>"),
+                BP->ParentClass ? *BP->ParentClass->GetPathName() : TEXT("<none>"),
+                *PropName));
+    }
+
+    TSharedPtr<FJsonValue> Before = detail::GetUPropertyAsJson(CDO, P);
+    if (!Before.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("property readback failed before write"));
+    }
+
+    const UClass* OwnerClass = P->GetOwnerClass();
+    const FString OwnerClassPath = OwnerClass ? OwnerClass->GetPathName() : FString();
+    const FString GeneratedClassPath = BP->GeneratedClass ? BP->GeneratedClass->GetPathName() : FString();
+    const FString ParentClassPath = BP->ParentClass ? BP->ParentClass->GetPathName() : FString();
+
+    if (bDryRun)
+    {
+        void* TempValue = FMemory::Malloc(P->GetSize(), P->GetMinAlignment());
+        P->InitializeValue(TempValue);
+        P->CopyCompleteValue(TempValue, P->ContainerPtrToValuePtr<void>(CDO));
+        const bool bAccepted = detail::SetPropertyValueAtPtr(P, TempValue, *It);
+        TSharedPtr<FJsonValue> ProposedReadback = bAccepted
+            ? detail::GetPropertyValueAtPtr(P, TempValue)
+            : nullptr;
+        P->DestroyValue(TempValue);
+        FMemory::Free(TempValue);
+        if (!bAccepted || !ProposedReadback.IsValid())
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("value rejected by reflection set"));
+        }
+
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("blueprint"), BP->GetName());
+        R->SetStringField(TEXT("property"), PropName);
+        R->SetStringField(TEXT("owner_class"), OwnerClassPath);
+        R->SetStringField(TEXT("generated_class"), GeneratedClassPath);
+        R->SetStringField(TEXT("parent_class"), ParentClassPath);
+        R->SetField(TEXT("value"), *It);
+        R->SetField(TEXT("before"), Before);
+        R->SetField(TEXT("readback"), ProposedReadback);
+        R->SetField(TEXT("after"), ProposedReadback);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        R->SetBoolField(TEXT("refreshed_generated_class"), bRefreshedGeneratedClass);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
 
     FScopedTransaction Tx(LOCTEXT("BpCdo", "Sage: Set CDO Property"));
     CDO->Modify();
@@ -1914,8 +1991,16 @@ FSageToolDispatch::FOutcome BpSetCdoPropertyImpl(const TSharedPtr<FJsonObject>& 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("blueprint"), BP->GetName());
     R->SetStringField(TEXT("property"),  PropName);
+    R->SetStringField(TEXT("owner_class"), OwnerClassPath);
+    R->SetStringField(TEXT("generated_class"), GeneratedClassPath);
+    R->SetStringField(TEXT("parent_class"), ParentClassPath);
     R->SetField(TEXT("value"), *It);
+    R->SetField(TEXT("before"), Before);
     R->SetField(TEXT("readback"), Readback);
+    R->SetField(TEXT("after"), Readback);
+    R->SetBoolField(TEXT("dry_run"), false);
+    R->SetBoolField(TEXT("modified"), true);
+    R->SetBoolField(TEXT("refreshed_generated_class"), bRefreshedGeneratedClass);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -2110,6 +2195,13 @@ FSageToolDispatch::FOutcome BpGetCdoPropertiesImpl(const TSharedPtr<FJsonObject>
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'class'"));
     }
     UClass* Cls = ResolveParentClassByName(ClassName);
+    if (!Cls)
+    {
+        if (UBlueprint* BP = ResolveBlueprint(ClassName))
+        {
+            Cls = BP->GeneratedClass;
+        }
+    }
     if (!Cls) return FSageToolDispatch::FOutcome::MakeError(-32602,
         FString::Printf(TEXT("class not found: %s"), *ClassName));
 
@@ -2118,6 +2210,22 @@ FSageToolDispatch::FOutcome BpGetCdoPropertiesImpl(const TSharedPtr<FJsonObject>
     // GetDefaultObject() with default arg returns nullptr first call.
     UObject* CDO = Cls->GetDefaultObject(/*bCreateIfNeeded=*/true);
     if (!CDO) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no CDO"));
+
+    bool bRecurseInstanced = false;
+    int32 MaxDepth = 4;
+    if (Args.IsValid())
+    {
+        Args->TryGetBoolField(TEXT("recurse_instanced"), bRecurseInstanced);
+        double Depth = 0;
+        if (Args->TryGetNumberField(TEXT("max_depth"), Depth))
+        {
+            MaxDepth = FMath::Clamp(static_cast<int32>(Depth), 1, 16);
+        }
+    }
+    detail::FInstancedRecurseCtx Ctx;
+    Ctx.MaxDepth = MaxDepth;
+    Ctx.Visited.Add(CDO);
+    detail::FInstancedRecurseCtx* CtxPtr = bRecurseInstanced ? &Ctx : nullptr;
 
     // Optional name filter
     TSet<FString> Filter;
@@ -2139,7 +2247,7 @@ FSageToolDispatch::FOutcome BpGetCdoPropertiesImpl(const TSharedPtr<FJsonObject>
         if (P->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient)) continue;
         const FString N = P->GetName();
         if (Filter.Num() > 0 && !Filter.Contains(N)) continue;
-        TSharedPtr<FJsonValue> V = detail::GetUPropertyAsJson(CDO, P);
+        TSharedPtr<FJsonValue> V = detail::GetUPropertyAsJson(CDO, P, CtxPtr);
         if (V.IsValid()) { Props->SetField(N, V); ++Count; }
     }
 
@@ -2186,6 +2294,11 @@ FSageToolDispatch::FOutcome BpGetCdoPropertiesImpl(const TSharedPtr<FJsonObject>
     R->SetNumberField(TEXT("count"),      Count);
     R->SetArrayField (TEXT("components"), CompsJson);
     R->SetNumberField(TEXT("component_count"), CompsJson.Num());
+    if (bRecurseInstanced)
+    {
+        R->SetBoolField(TEXT("recurse_instanced"), true);
+        R->SetNumberField(TEXT("max_depth"), MaxDepth);
+    }
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -2592,6 +2705,682 @@ static bool SaveBlueprintAsset(UBlueprint* BP, FString& OutError)
         return false;
     }
     return true;
+}
+
+static void AddStringArrayField(const TSharedPtr<FJsonObject>& Obj,
+                                const TCHAR* FieldName,
+                                const TArray<FString>& Values)
+{
+    if (!Obj.IsValid()) return;
+    TArray<TSharedPtr<FJsonValue>> Arr;
+    Arr.Reserve(Values.Num());
+    for (const FString& Value : Values)
+    {
+        Arr.Add(MakeShared<FJsonValueString>(Value));
+    }
+    Obj->SetArrayField(FieldName, Arr);
+}
+
+static bool IsMetadataElementField(const FString& Name)
+{
+    return Name == TEXT("_class")
+        || Name == TEXT("class")
+        || Name == TEXT("class_name")
+        || Name == TEXT("Class")
+        || Name == TEXT("_path")
+        || Name == TEXT("path")
+        || Name == TEXT("ObjectPath")
+        || Name == TEXT("object_path");
+}
+
+static TSharedPtr<FJsonObject> ExtractInstancedElementFields(
+    const TSharedPtr<FJsonValue>& ElementValue,
+    FString& InOutClassName,
+    FString& OutError)
+{
+    if (!ElementValue.IsValid() || ElementValue->Type != EJson::Object)
+    {
+        OutError = TEXT("'element_value' must be a JSON object for instanced UObject arrays");
+        return nullptr;
+    }
+
+    const TSharedPtr<FJsonObject> Obj = ElementValue->AsObject();
+    if (!Obj.IsValid())
+    {
+        OutError = TEXT("'element_value' object is invalid");
+        return nullptr;
+    }
+
+    FString EmbeddedClass;
+    if (Obj->TryGetStringField(TEXT("_class"), EmbeddedClass)
+        || Obj->TryGetStringField(TEXT("class_name"), EmbeddedClass)
+        || Obj->TryGetStringField(TEXT("class"), EmbeddedClass)
+        || Obj->TryGetStringField(TEXT("Class"), EmbeddedClass))
+    {
+        if (InOutClassName.IsEmpty())
+        {
+            InOutClassName = EmbeddedClass;
+        }
+    }
+
+    const TSharedPtr<FJsonObject>* PropsObj = nullptr;
+    if (Obj->TryGetObjectField(TEXT("_props"), PropsObj) && PropsObj && PropsObj->IsValid())
+    {
+        return *PropsObj;
+    }
+
+    auto Fields = MakeShared<FJsonObject>();
+    for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Obj->Values)
+    {
+        if (IsMetadataElementField(Pair.Key)) continue;
+        Fields->SetField(Pair.Key, Pair.Value);
+    }
+    return Fields;
+}
+
+static void AddClassPathCandidatesForBp(FString Path, TArray<FString>& Out)
+{
+    Path = Path.TrimStartAndEnd();
+    if (Path.Len() >= 2
+        && ((Path.StartsWith(TEXT("\"")) && Path.EndsWith(TEXT("\"")))
+            || (Path.StartsWith(TEXT("'")) && Path.EndsWith(TEXT("'")))))
+    {
+        Path = Path.Mid(1, Path.Len() - 2).TrimStartAndEnd();
+    }
+    if (Path.IsEmpty()) return;
+
+    Out.AddUnique(Path);
+    FString PackageName;
+    FString ObjectName;
+    if (Path.Split(TEXT("."), &PackageName, &ObjectName, ESearchCase::CaseSensitive, ESearchDir::FromEnd))
+    {
+        if (!ObjectName.EndsWith(TEXT("_C")))
+        {
+            Out.AddUnique(Path + TEXT("_C"));
+        }
+    }
+    else
+    {
+        const FString Leaf = FPackageName::GetShortName(Path);
+        if (!Leaf.IsEmpty())
+        {
+            Out.AddUnique(Path + TEXT(".") + Leaf);
+            if (!Leaf.EndsWith(TEXT("_C")))
+            {
+                Out.AddUnique(Path + TEXT(".") + Leaf + TEXT("_C"));
+            }
+        }
+    }
+}
+
+static UClass* ResolveInstancedElementClass(const FString& ClassName,
+                                            FObjectProperty* InnerObj,
+                                            FString& OutError)
+{
+    UClass* Cls = nullptr;
+    if (!ClassName.IsEmpty())
+    {
+        TArray<FString> Candidates;
+        AddClassPathCandidatesForBp(ClassName, Candidates);
+        for (const FString& Candidate : Candidates)
+        {
+            Cls = LoadClass<UObject>(nullptr, *Candidate);
+            if (!Cls)
+            {
+                Cls = StaticLoadClass(UObject::StaticClass(), nullptr, *Candidate);
+            }
+            if (!Cls)
+            {
+                FSoftObjectPath Soft(Candidate);
+                UObject* Obj = Soft.ResolveObject();
+                if (!Obj) Obj = Soft.TryLoad();
+                if (UBlueprint* BP = Cast<UBlueprint>(Obj))
+                {
+                    Cls = BP->GeneratedClass;
+                }
+                else
+                {
+                    Cls = Cast<UClass>(Obj);
+                }
+            }
+            if (Cls) break;
+        }
+        if (!Cls)
+        {
+            OutError = FString::Printf(TEXT("class not found: %s"), *ClassName);
+            return nullptr;
+        }
+    }
+    else if (InnerObj && InnerObj->PropertyClass
+        && !InnerObj->PropertyClass->HasAnyClassFlags(CLASS_Abstract))
+    {
+        Cls = InnerObj->PropertyClass;
+    }
+    else
+    {
+        OutError = TEXT("missing 'class_name' for instanced object array with abstract or unknown inner class");
+        return nullptr;
+    }
+
+    if (InnerObj && InnerObj->PropertyClass && !Cls->IsChildOf(InnerObj->PropertyClass))
+    {
+        OutError = FString::Printf(TEXT("class %s is not a subclass of %s"),
+                                   *Cls->GetPathName(),
+                                   *InnerObj->PropertyClass->GetPathName());
+        return nullptr;
+    }
+    if (Cls->HasAnyClassFlags(CLASS_Abstract))
+    {
+        OutError = FString::Printf(TEXT("class %s is abstract and cannot be instanced"),
+                                   *Cls->GetPathName());
+        return nullptr;
+    }
+    return Cls;
+}
+
+static FObjectProperty* ValidateInstancedObjectArray(FArrayProperty* Array,
+                                                     FString& OutError)
+{
+    if (!Array)
+    {
+        OutError = TEXT("array property unavailable");
+        return nullptr;
+    }
+    if (!Array->Inner)
+    {
+        OutError = TEXT("array inner property is null");
+        return nullptr;
+    }
+    FObjectProperty* InnerObj = CastField<FObjectProperty>(Array->Inner);
+    if (!InnerObj)
+    {
+        OutError = FString::Printf(TEXT("unsupported inner type %s; expected UObject object property"),
+                                   *Array->Inner->GetClass()->GetName());
+        return nullptr;
+    }
+
+    const bool bClassInstanced = InnerObj->PropertyClass
+        && InnerObj->PropertyClass->HasAnyClassFlags(CLASS_DefaultToInstanced | CLASS_EditInlineNew);
+    const bool bInstanced = Array->HasAnyPropertyFlags(
+            CPF_ContainsInstancedReference | CPF_InstancedReference | CPF_PersistentInstance)
+        || InnerObj->HasAnyPropertyFlags(CPF_InstancedReference | CPF_PersistentInstance)
+        || bClassInstanced;
+    if (!bInstanced)
+    {
+        OutError = FString::Printf(TEXT("'%s' is a UObject array but is not marked Instanced/EditInlineNew"),
+                                   *Array->GetName());
+        return nullptr;
+    }
+    return InnerObj;
+}
+
+static bool ApplyInstancedObjectFields(UObject* Obj,
+                                       const TSharedPtr<FJsonObject>& Fields,
+                                       bool bAllowEmpty,
+                                       int32& OutSetCount,
+                                       TArray<FString>& OutAppliedFields,
+                                       TArray<FString>& OutFailedFields,
+                                       TArray<FString>& OutUnknownFields)
+{
+    OutSetCount = 0;
+    if (!Obj || !Fields.IsValid()) return false;
+    for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Fields->Values)
+    {
+        if (IsMetadataElementField(Pair.Key)) continue;
+        FProperty* SubP = Obj->GetClass()->FindPropertyByName(FName(*Pair.Key));
+        if (!SubP)
+        {
+            OutUnknownFields.Add(Pair.Key);
+            continue;
+        }
+        if (!detail::SetUPropertyFromJson(Obj, SubP, Pair.Value))
+        {
+            OutFailedFields.Add(Pair.Key);
+            continue;
+        }
+        ++OutSetCount;
+        OutAppliedFields.Add(Pair.Key);
+    }
+    if (OutUnknownFields.Num() > 0 || OutFailedFields.Num() > 0)
+    {
+        return false;
+    }
+    return bAllowEmpty || OutSetCount > 0;
+}
+
+static TArray<FString> ParseMatchFields(const TSharedPtr<FJsonObject>& Args,
+                                        const TArray<FString>& DefaultFields)
+{
+    TArray<FString> MatchFields;
+    const TArray<TSharedPtr<FJsonValue>>* MatchArr = nullptr;
+    if (Args.IsValid() && Args->TryGetArrayField(TEXT("match_fields"), MatchArr) && MatchArr)
+    {
+        for (const TSharedPtr<FJsonValue>& Value : *MatchArr)
+        {
+            FString Field;
+            if (Value.IsValid() && Value->TryGetString(Field) && !Field.IsEmpty())
+            {
+                MatchFields.AddUnique(Field);
+            }
+        }
+    }
+    if (MatchFields.Num() == 0)
+    {
+        for (const FString& Field : DefaultFields)
+        {
+            MatchFields.AddUnique(Field);
+        }
+    }
+    return MatchFields;
+}
+
+static bool InstancedObjectMatchesFields(UObject* Existing,
+                                         UClass* RequestedClass,
+                                         const TSharedPtr<FJsonObject>& Fields,
+                                         const TArray<FString>& MatchFields,
+                                         FString& OutError)
+{
+    if (!Existing || !RequestedClass || !Fields.IsValid()) return false;
+    if (!Existing->IsA(RequestedClass)) return false;
+    if (MatchFields.Num() == 0) return false;
+
+    UObject* Temp = NewObject<UObject>(GetTransientPackage(), Existing->GetClass());
+    if (!Temp)
+    {
+        OutError = TEXT("failed to allocate transient comparison object");
+        return false;
+    }
+
+    for (const FString& FieldName : MatchFields)
+    {
+        const TSharedPtr<FJsonValue>* FieldValue = Fields->Values.Find(FieldName);
+        if (!FieldValue || !FieldValue->IsValid())
+        {
+            Temp->MarkAsGarbage();
+            OutError = FString::Printf(TEXT("match field '%s' is not present in element_value"),
+                                       *FieldName);
+            return false;
+        }
+        FProperty* Prop = Existing->GetClass()->FindPropertyByName(FName(*FieldName));
+        if (!Prop)
+        {
+            Temp->MarkAsGarbage();
+            OutError = FString::Printf(TEXT("match field '%s' is not a property on %s"),
+                                       *FieldName, *Existing->GetClass()->GetName());
+            return false;
+        }
+        if (!detail::SetUPropertyFromJson(Temp, Prop, *FieldValue))
+        {
+            Temp->MarkAsGarbage();
+            OutError = FString::Printf(TEXT("match field '%s' value rejected by reflection writer"),
+                                       *FieldName);
+            return false;
+        }
+        const void* ExistingPtr = Prop->ContainerPtrToValuePtr<void>(Existing);
+        const void* TempPtr = Prop->ContainerPtrToValuePtr<void>(Temp);
+        if (!Prop->Identical(ExistingPtr, TempPtr, PPF_None))
+        {
+            Temp->MarkAsGarbage();
+            return false;
+        }
+    }
+
+    Temp->MarkAsGarbage();
+    return true;
+}
+
+static TSharedPtr<FJsonValue> ReadInstancedArrayProperty(UObject* CDO, FArrayProperty* Array)
+{
+    detail::FInstancedRecurseCtx Ctx;
+    Ctx.MaxDepth = 4;
+    Ctx.Visited.Add(CDO);
+    return detail::GetUPropertyAsJson(CDO, Array, &Ctx);
+}
+
+FSageToolDispatch::FOutcome BpSetCdoInstancedArrayElementImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    FString ArrayPropName;
+    if (!Args.IsValid()
+        || !Args->TryGetStringField(TEXT("path"), Path)
+        || Path.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("array_property"), ArrayPropName) || ArrayPropName.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("property"), ArrayPropName);
+    }
+    if (ArrayPropName.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'array_property' or 'property'"));
+    }
+
+    TSharedPtr<FJsonValue> ElementValue = Args->Values.FindRef(TEXT("element_value"));
+    if (!ElementValue.IsValid())
+    {
+        ElementValue = Args->Values.FindRef(TEXT("value"));
+    }
+    if (!ElementValue.IsValid())
+    {
+        ElementValue = Args->Values.FindRef(TEXT("properties"));
+    }
+    if (!ElementValue.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("missing 'element_value'"));
+    }
+
+    bool bDryRun = false;
+    bool bAllowEmpty = false;
+    bool bUpdateExisting = true;
+    bool bCompile = false;
+    bool bSave = false;
+    FString ClassName;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("allow_empty"), bAllowEmpty);
+    Args->TryGetBoolField(TEXT("update_existing"), bUpdateExisting);
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    Args->TryGetStringField(TEXT("class_name"), ClassName);
+
+    FString Error;
+    TSharedPtr<FJsonObject> Fields = ExtractInstancedElementFields(ElementValue, ClassName, Error);
+    if (!Fields.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    FSageToolDispatch::FOutcome PieErr;
+    if (detail::RejectIfPie(PieErr)) return PieErr;
+
+    UBlueprint* BP = ResolveBlueprint(Path);
+    if (!BP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("blueprint not found"));
+    if (!BP->GeneratedClass) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("no generated class"));
+
+    UObject* CDO = BP->GeneratedClass->GetDefaultObject(/*bCreateIfNeeded*/ true);
+    if (!CDO) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("CDO unavailable"));
+
+    FArrayProperty* Array = CastField<FArrayProperty>(
+        CDO->GetClass()->FindPropertyByName(FName(*ArrayPropName)));
+    if (!Array)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("'%s' is not a TArray on CDO class %s"),
+                            *ArrayPropName, *CDO->GetClass()->GetName()));
+    }
+
+    FObjectProperty* InnerObj = ValidateInstancedObjectArray(Array, Error);
+    if (!InnerObj)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    UClass* ElementClass = ResolveInstancedElementClass(ClassName, InnerObj, Error);
+    if (!ElementClass)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    UObject* TempInst = NewObject<UObject>(GetTransientPackage(), ElementClass);
+    int32 SetCount = 0;
+    TArray<FString> AppliedFields;
+    TArray<FString> FailedFields;
+    TArray<FString> UnknownFields;
+    if (!ApplyInstancedObjectFields(TempInst, Fields, bAllowEmpty,
+                                    SetCount, AppliedFields, FailedFields, UnknownFields))
+    {
+        TempInst->MarkAsGarbage();
+        auto Err = MakeShared<FJsonObject>();
+        Err->SetNumberField(TEXT("code"), -32602);
+        if (SetCount == 0 && FailedFields.Num() == 0 && UnknownFields.Num() == 0 && !bAllowEmpty)
+        {
+            Err->SetStringField(TEXT("message"),
+                FString::Printf(TEXT("instanced subobject '%s' would have zero fields applied; pass allow_empty:true to accept"),
+                                *ElementClass->GetName()));
+        }
+        else
+        {
+            Err->SetStringField(TEXT("message"),
+                FString::Printf(TEXT("element_value rejected for %s"), *ElementClass->GetName()));
+        }
+        AddStringArrayField(Err, TEXT("applied_fields"), AppliedFields);
+        AddStringArrayField(Err, TEXT("failed_fields"), FailedFields);
+        AddStringArrayField(Err, TEXT("unknown_fields"), UnknownFields);
+        return FSageToolDispatch::FOutcome{false, nullptr, Err};
+    }
+    TempInst->MarkAsGarbage();
+
+    TArray<FString> DefaultMatchFields;
+    if (Fields->HasField(TEXT("Presentation")))
+    {
+        DefaultMatchFields.Add(TEXT("Presentation"));
+    }
+    if (Fields->HasField(TEXT("WidgetClass")))
+    {
+        DefaultMatchFields.Add(TEXT("WidgetClass"));
+    }
+    if (DefaultMatchFields.Num() == 0)
+    {
+        DefaultMatchFields = AppliedFields;
+    }
+    TArray<FString> MatchFields = ParseMatchFields(Args, DefaultMatchFields);
+    if (MatchFields.Num() == 0 && !bAllowEmpty)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("no match fields available; pass match_fields or allow_empty:true"));
+    }
+
+    FScriptArrayHelper Helper(Array, Array->ContainerPtrToValuePtr<void>(CDO));
+    const int32 OldCount = Helper.Num();
+    int32 MatchedIndex = INDEX_NONE;
+    for (int32 Index = 0; Index < Helper.Num(); ++Index)
+    {
+        UObject* Existing = InnerObj->GetObjectPropertyValue(Helper.GetRawPtr(Index));
+        FString MatchError;
+        if (InstancedObjectMatchesFields(Existing, ElementClass, Fields, MatchFields, MatchError))
+        {
+            MatchedIndex = Index;
+            break;
+        }
+        if (!MatchError.IsEmpty())
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, MatchError);
+        }
+    }
+
+    const bool bWouldCreate = MatchedIndex == INDEX_NONE;
+    const bool bWouldUpdate = MatchedIndex != INDEX_NONE && bUpdateExisting;
+    const bool bWouldModify = bWouldCreate || bWouldUpdate;
+
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("blueprint"), BP->GetName());
+        R->SetStringField(TEXT("path"), BP->GetPathName());
+        R->SetStringField(TEXT("class"), BP->GeneratedClass->GetPathName());
+        R->SetStringField(TEXT("array_property"), ArrayPropName);
+        R->SetStringField(TEXT("element_class"), ElementClass->GetPathName());
+        R->SetNumberField(TEXT("old_count"), OldCount);
+        R->SetNumberField(TEXT("matched_index"), MatchedIndex);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("validated"), true);
+        R->SetBoolField(TEXT("would_create"), bWouldCreate);
+        R->SetBoolField(TEXT("would_update"), bWouldUpdate);
+        R->SetBoolField(TEXT("would_modify"), bWouldModify);
+        AddStringArrayField(R, TEXT("applied_fields"), AppliedFields);
+        AddStringArrayField(R, TEXT("match_fields"), MatchFields);
+        if (TSharedPtr<FJsonValue> Readback = ReadInstancedArrayProperty(CDO, Array))
+        {
+            R->SetField(TEXT("readback"), Readback);
+        }
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    if (MatchedIndex != INDEX_NONE && !bUpdateExisting)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("blueprint"), BP->GetName());
+        R->SetStringField(TEXT("path"), BP->GetPathName());
+        R->SetStringField(TEXT("class"), BP->GeneratedClass->GetPathName());
+        R->SetStringField(TEXT("array_property"), ArrayPropName);
+        R->SetStringField(TEXT("element_class"), ElementClass->GetPathName());
+        R->SetNumberField(TEXT("old_count"), OldCount);
+        R->SetNumberField(TEXT("new_count"), OldCount);
+        R->SetNumberField(TEXT("index"), MatchedIndex);
+        R->SetNumberField(TEXT("matched_index"), MatchedIndex);
+        R->SetBoolField(TEXT("created"), false);
+        R->SetBoolField(TEXT("updated"), false);
+        R->SetBoolField(TEXT("already_exists"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        R->SetBoolField(TEXT("compiled"), false);
+        R->SetBoolField(TEXT("saved"), false);
+        AddStringArrayField(R, TEXT("applied_fields"), AppliedFields);
+        AddStringArrayField(R, TEXT("match_fields"), MatchFields);
+        if (TSharedPtr<FJsonValue> Readback = ReadInstancedArrayProperty(CDO, Array))
+        {
+            R->SetField(TEXT("readback"), Readback);
+        }
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    bool bModified = false;
+    int32 TargetIndex = MatchedIndex;
+    {
+        FScopedTransaction Tx(LOCTEXT("BpSetCdoInstancedArrayElement",
+            "Sage: Set CDO Instanced Array Element"));
+        CDO->Modify();
+        CDO->PreEditChange(Array);
+
+        UObject* TargetObject = nullptr;
+        if (MatchedIndex != INDEX_NONE)
+        {
+            TargetObject = InnerObj->GetObjectPropertyValue(Helper.GetRawPtr(MatchedIndex));
+            if (bUpdateExisting && TargetObject)
+            {
+                TargetObject->Modify();
+                int32 RealSetCount = 0;
+                TArray<FString> RealApplied;
+                TArray<FString> RealFailed;
+                TArray<FString> RealUnknown;
+                if (!ApplyInstancedObjectFields(TargetObject, Fields, bAllowEmpty,
+                                                RealSetCount, RealApplied, RealFailed, RealUnknown))
+                {
+                    Tx.Cancel();
+                    return FSageToolDispatch::FOutcome::MakeError(-32603,
+                        TEXT("validated instanced element failed during update"));
+                }
+                bModified = true;
+                AppliedFields = RealApplied;
+            }
+        }
+        else
+        {
+            TargetIndex = Helper.AddValue();
+            void* ElemPtr = Helper.GetRawPtr(TargetIndex);
+            TargetObject = NewObject<UObject>(CDO, ElementClass, NAME_None,
+                RF_Public | RF_Transactional);
+            if (!TargetObject)
+            {
+                Helper.Resize(OldCount);
+                Tx.Cancel();
+                return FSageToolDispatch::FOutcome::MakeError(-32603,
+                    TEXT("failed to create instanced subobject"));
+            }
+            InnerObj->SetObjectPropertyValue(ElemPtr, TargetObject);
+            int32 RealSetCount = 0;
+            TArray<FString> RealApplied;
+            TArray<FString> RealFailed;
+            TArray<FString> RealUnknown;
+            if (!ApplyInstancedObjectFields(TargetObject, Fields, bAllowEmpty,
+                                            RealSetCount, RealApplied, RealFailed, RealUnknown))
+            {
+                InnerObj->SetObjectPropertyValue(ElemPtr, nullptr);
+                TargetObject->MarkAsGarbage();
+                Helper.Resize(OldCount);
+                Tx.Cancel();
+                return FSageToolDispatch::FOutcome::MakeError(-32603,
+                    TEXT("validated instanced element failed during add"));
+            }
+            bModified = true;
+            AppliedFields = RealApplied;
+        }
+
+        if (bModified)
+        {
+            FPropertyChangedEvent ChangeEvent(Array,
+                bWouldCreate ? EPropertyChangeType::ArrayAdd : EPropertyChangeType::ValueSet);
+            CDO->PostEditChangeProperty(ChangeEvent);
+            FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+            BP->MarkPackageDirty();
+        }
+        else
+        {
+            FPropertyChangedEvent ChangeEvent(Array);
+            CDO->PostEditChangeProperty(ChangeEvent);
+        }
+    }
+
+    bool bCompiled = false;
+    if (bCompile && bModified)
+    {
+        FKismetEditorUtilities::CompileBlueprint(BP);
+        bCompiled = true;
+        if (BP->GeneratedClass)
+        {
+            CDO = BP->GeneratedClass->GetDefaultObject(/*bCreateIfNeeded*/ true);
+            Array = CDO
+                ? CastField<FArrayProperty>(CDO->GetClass()->FindPropertyByName(FName(*ArrayPropName)))
+                : nullptr;
+        }
+    }
+
+    bool bSaved = false;
+    if (bSave && bModified)
+    {
+        FString SaveError;
+        if (!SaveBlueprintAsset(BP, SaveError))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32603, SaveError);
+        }
+        bSaved = true;
+    }
+
+    int32 NewCount = OldCount;
+    if (CDO && Array)
+    {
+        FScriptArrayHelper AfterHelper(Array, Array->ContainerPtrToValuePtr<void>(CDO));
+        NewCount = AfterHelper.Num();
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("blueprint"), BP->GetName());
+    R->SetStringField(TEXT("path"), BP->GetPathName());
+    R->SetStringField(TEXT("class"), BP->GeneratedClass ? BP->GeneratedClass->GetPathName() : FString());
+    R->SetStringField(TEXT("array_property"), ArrayPropName);
+    R->SetStringField(TEXT("element_class"), ElementClass->GetPathName());
+    R->SetNumberField(TEXT("old_count"), OldCount);
+    R->SetNumberField(TEXT("new_count"), NewCount);
+    R->SetNumberField(TEXT("index"), TargetIndex);
+    R->SetNumberField(TEXT("matched_index"), MatchedIndex);
+    R->SetBoolField(TEXT("created"), bWouldCreate);
+    R->SetBoolField(TEXT("updated"), bWouldUpdate);
+    R->SetBoolField(TEXT("already_exists"), MatchedIndex != INDEX_NONE && !bUpdateExisting);
+    R->SetBoolField(TEXT("modified"), bModified);
+    R->SetBoolField(TEXT("compiled"), bCompiled);
+    R->SetBoolField(TEXT("saved"), bSaved);
+    AddStringArrayField(R, TEXT("applied_fields"), AppliedFields);
+    AddStringArrayField(R, TEXT("match_fields"), MatchFields);
+    if (CDO && Array)
+    {
+        if (TSharedPtr<FJsonValue> Readback = ReadInstancedArrayProperty(CDO, Array))
+        {
+            R->SetField(TEXT("readback"), Readback);
+        }
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 FSageToolDispatch::FOutcome BpReadComponentPropertiesImpl(const TSharedPtr<FJsonObject>& Args)
@@ -5338,13 +6127,20 @@ FSageToolDispatch::FOutcome BpReparentImpl(const TSharedPtr<FJsonObject>& Args)
 
     FScopedTransaction Tx(LOCTEXT("BpReparent", "Sage: Reparent BP"));
     BP->Modify();
+    const UClass* OldClass = BP->ParentClass;
     BP->ParentClass = NewClass;
     FBlueprintEditorUtils::RefreshAllNodes(BP);
     FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+    FKismetEditorUtilities::CompileBlueprint(BP);
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("blueprint"), BP->GetName());
-    R->SetStringField(TEXT("new_parent"), NewClass->GetName());
+    R->SetStringField(TEXT("old_parent"), OldClass ? OldClass->GetPathName() : FString());
+    R->SetStringField(TEXT("new_parent"), NewClass->GetPathName());
+    R->SetStringField(TEXT("generated_class"), BP->GeneratedClass ? BP->GeneratedClass->GetPathName() : FString());
+    R->SetBoolField(TEXT("compiled"), true);
+    R->SetBoolField(TEXT("generated_class_parent_matches"),
+        BP->GeneratedClass && BP->GeneratedClass->IsChildOf(NewClass));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -6421,6 +7217,8 @@ void RegisterBlueprintTools(FSageToolDispatch& Dispatch)
 
     // Write — class shape
     Dispatch.RegisterHandler(TEXT("bp.set_cdo_property"),    GT(&BpSetCdoPropertyImpl));
+    Dispatch.RegisterHandler(TEXT("bp.set_cdo_instanced_array_element"),
+                             GT(&BpSetCdoInstancedArrayElementImpl));
     Dispatch.RegisterHandler(TEXT("bp.reparent"),            GT(&BpReparentImpl));
     Dispatch.RegisterHandler(TEXT("bp.refresh_nodes"),       GT(&BpRefreshNodesImpl));
 

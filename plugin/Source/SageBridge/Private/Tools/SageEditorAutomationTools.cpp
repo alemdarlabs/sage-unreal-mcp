@@ -44,6 +44,7 @@
 #include "GenericPlatform/GenericPlatformOutputDevices.h"
 #include "HAL/PlatformFile.h"
 #include "HAL/PlatformFileManager.h"
+#include "HAL/PlatformMemory.h"
 #include "HAL/PlatformOutputDevices.h"
 #include "Subsystems/AssetEditorSubsystem.h"
 #include "Subsystems/EditorAssetSubsystem.h"
@@ -4981,6 +4982,328 @@ FSageToolDispatch::FOutcome OpenAssetImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- Batch 7 runtime verification / capture / performance ------------------
+
+TSharedPtr<FJsonObject> CaptureArgsFromAliases(const TSharedPtr<FJsonObject>& Args)
+{
+    auto CaptureArgs = MakeShared<FJsonObject>();
+    FString Path;
+    if (Args.IsValid()
+        && (Args->TryGetStringField(TEXT("path"), Path)
+            || Args->TryGetStringField(TEXT("output_path"), Path)))
+    {
+        CaptureArgs->SetStringField(TEXT("path"), Path);
+    }
+    return CaptureArgs;
+}
+
+FSageToolDispatch::FOutcome CaptureViewportLikeImpl(const TSharedPtr<FJsonObject>& Args, const TCHAR* ToolName)
+{
+    FSageToolDispatch::FOutcome Out = TakeScreenshotImpl(CaptureArgsFromAliases(Args));
+    if (Out.bSuccess && Out.Result.IsValid())
+    {
+        Out.Result->SetStringField(TEXT("tool"), ToolName);
+        Out.Result->SetStringField(TEXT("capture_source"), TEXT("active_editor_viewport"));
+        Out.Result->SetBoolField(TEXT("async_file_write"), true);
+    }
+    return Out;
+}
+
+FSageToolDispatch::FOutcome WindowCaptureImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return CaptureViewportLikeImpl(Args, TEXT("window_capture"));
+}
+
+FSageToolDispatch::FOutcome CaptureViewportImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return CaptureViewportLikeImpl(Args, TEXT("capture_viewport"));
+}
+
+FSageToolDispatch::FOutcome CaptureScenePreviewImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString AssetPath;
+    FString PreviewType;
+    if (Args.IsValid())
+    {
+        Args->TryGetStringField(TEXT("asset"), AssetPath);
+        Args->TryGetStringField(TEXT("path"), AssetPath);
+        Args->TryGetStringField(TEXT("preview_type"), PreviewType);
+        Args->TryGetStringField(TEXT("type"), PreviewType);
+    }
+    if (!AssetPath.IsEmpty() || !PreviewType.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603,
+            TEXT("asset-specific static-mesh/skeletal-mesh/widget/material/Niagara preview capture requires dedicated editor preview-scene/render-target plumbing; use capture_viewport for the active viewport until that preview backend is available"));
+    }
+    return CaptureViewportLikeImpl(Args, TEXT("capture_scene_preview"));
+}
+
+TSharedRef<FJsonObject> CurrentPieWorldSummary(UWorld* World)
+{
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("pie_active"), World != nullptr);
+    if (!World) return R;
+
+    int32 ActorCount = 0;
+    TArray<TSharedPtr<FJsonValue>> Actors;
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        AActor* Actor = *It;
+        if (!Actor) continue;
+        ++ActorCount;
+        if (Actors.Num() < 100)
+        {
+            auto A = MakeShared<FJsonObject>();
+            A->SetStringField(TEXT("name"), Actor->GetName());
+            A->SetStringField(TEXT("path"), Actor->GetPathName());
+            A->SetStringField(TEXT("class"), Actor->GetClass() ? Actor->GetClass()->GetName() : TEXT(""));
+            Actors.Add(MakeShared<FJsonValueObject>(A));
+        }
+    }
+    R->SetStringField(TEXT("world"), World->GetPathName());
+    R->SetNumberField(TEXT("actor_count"), ActorCount);
+    R->SetArrayField(TEXT("sample_actors"), Actors);
+    return R;
+}
+
+bool PieActorExists(UWorld* World, const FString& Query)
+{
+    if (!World || Query.IsEmpty()) return false;
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        AActor* Actor = *It;
+        if (!Actor) continue;
+        if (Actor->GetName().Contains(Query) || Actor->GetPathName().Contains(Query))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void EvaluatePieAssertions(UWorld* World, const TSharedPtr<FJsonObject>& Args, const TSharedRef<FJsonObject>& R)
+{
+    TArray<TSharedPtr<FJsonValue>> Results;
+    int32 Failed = 0;
+    const TArray<TSharedPtr<FJsonValue>>* Assertions = nullptr;
+    if (Args.IsValid() && Args->TryGetArrayField(TEXT("assertions"), Assertions) && Assertions)
+    {
+        for (const TSharedPtr<FJsonValue>& V : *Assertions)
+        {
+            const TSharedPtr<FJsonObject>* Obj = nullptr;
+            if (!V.IsValid() || !V->TryGetObject(Obj) || Obj == nullptr || !Obj->IsValid()) continue;
+            FString ActorQuery;
+            bool bExpectedExists = true;
+            (*Obj)->TryGetStringField(TEXT("actor"), ActorQuery);
+            (*Obj)->TryGetStringField(TEXT("actor_name"), ActorQuery);
+            (*Obj)->TryGetBoolField(TEXT("exists"), bExpectedExists);
+            const bool bActualExists = PieActorExists(World, ActorQuery);
+            const bool bPassed = bActualExists == bExpectedExists;
+            if (!bPassed) ++Failed;
+
+            auto Row = MakeShared<FJsonObject>();
+            Row->SetStringField(TEXT("kind"), TEXT("actor_exists"));
+            Row->SetStringField(TEXT("actor"), ActorQuery);
+            Row->SetBoolField(TEXT("expected_exists"), bExpectedExists);
+            Row->SetBoolField(TEXT("actual_exists"), bActualExists);
+            Row->SetBoolField(TEXT("passed"), bPassed);
+            Results.Add(MakeShared<FJsonValueObject>(Row));
+        }
+    }
+    R->SetArrayField(TEXT("assertions"), Results);
+    R->SetNumberField(TEXT("assertion_count"), Results.Num());
+    R->SetNumberField(TEXT("failed_assertions"), Failed);
+    R->SetBoolField(TEXT("passed"), Failed == 0);
+}
+
+FSageToolDispatch::FOutcome PieTestImpl(const TSharedPtr<FJsonObject>& Args, const TCHAR* ToolName)
+{
+    UWorld* World = GEditor ? GEditor->PlayWorld : nullptr;
+    if (!World)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("%s requires an active PIE world; start PIE first with run_pie"), ToolName));
+    }
+    auto R = CurrentPieWorldSummary(World);
+    R->SetStringField(TEXT("tool"), ToolName);
+    EvaluatePieAssertions(World, Args, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome PieTestBpImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return PieTestImpl(Args, TEXT("pie_test_bp"));
+}
+
+FSageToolDispatch::FOutcome PieTestSceneImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return PieTestImpl(Args, TEXT("pie_test_scene"));
+}
+
+bool ExecEditorCommand(const FString& Cmd)
+{
+    if (!GEditor || !GEngine) return false;
+    UWorld* World = GEditor->PlayWorld.Get() ? GEditor->PlayWorld.Get() : GEditor->GetEditorWorldContext().World();
+    return GEngine->Exec(World, *Cmd);
+}
+
+FSageToolDispatch::FOutcome ExecCommandTool(const TCHAR* ToolName, const TArray<FString>& Commands)
+{
+    TArray<TSharedPtr<FJsonValue>> Ran;
+    bool bAllSucceeded = true;
+    for (const FString& Cmd : Commands)
+    {
+        const bool bOk = ExecEditorCommand(Cmd);
+        bAllSucceeded = bAllSucceeded && bOk;
+        auto Row = MakeShared<FJsonObject>();
+        Row->SetStringField(TEXT("command"), Cmd);
+        Row->SetBoolField(TEXT("exec_return"), bOk);
+        Ran.Add(MakeShared<FJsonValueObject>(Row));
+    }
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("tool"), ToolName);
+    R->SetArrayField(TEXT("commands"), Ran);
+    R->SetBoolField(TEXT("all_exec_returned_true"), bAllSucceeded);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome CookProjectImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Out = CookContentImpl(Args);
+    if (Out.bSuccess && Out.Result.IsValid())
+    {
+        Out.Result->SetStringField(TEXT("tool"), TEXT("cook_project"));
+        Out.Result->SetStringField(TEXT("alias_of"), TEXT("editor.cook_content"));
+    }
+    return Out;
+}
+
+FSageToolDispatch::FOutcome PerformanceAuditImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Perf = GetPerfStatsImpl(Args);
+    if (!Perf.bSuccess || !Perf.Result.IsValid()) return Perf;
+
+    const FPlatformMemoryStats Stats = FPlatformMemory::GetStats();
+    auto Memory = MakeShared<FJsonObject>();
+    Memory->SetNumberField(TEXT("used_physical"), static_cast<double>(Stats.UsedPhysical));
+    Memory->SetNumberField(TEXT("peak_used_physical"), static_cast<double>(Stats.PeakUsedPhysical));
+    Memory->SetNumberField(TEXT("used_virtual"), static_cast<double>(Stats.UsedVirtual));
+    Memory->SetNumberField(TEXT("peak_used_virtual"), static_cast<double>(Stats.PeakUsedVirtual));
+    Memory->SetNumberField(TEXT("total_physical"), static_cast<double>(Stats.TotalPhysical));
+    Memory->SetNumberField(TEXT("available_physical"), static_cast<double>(Stats.AvailablePhysical));
+    Perf.Result->SetObjectField(TEXT("memory"), Memory);
+    Perf.Result->SetStringField(TEXT("tool"), TEXT("performance_audit"));
+    return Perf;
+}
+
+FSageToolDispatch::FOutcome GenerateMemoryReportImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    bool bFull = true;
+    if (Args.IsValid()) Args->TryGetBoolField(TEXT("full"), bFull);
+    return ExecCommandTool(TEXT("generate_memory_report"),
+        {bFull ? FString(TEXT("MemReport -full")) : FString(TEXT("MemReport"))});
+}
+
+FSageToolDispatch::FOutcome ConfigureTextureStreamingImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    bool bEnabled = true;
+    double PoolSize = -1.0;
+    if (Args.IsValid())
+    {
+        Args->TryGetBoolField(TEXT("enabled"), bEnabled);
+        Args->TryGetNumberField(TEXT("pool_size_mb"), PoolSize);
+    }
+    TArray<FString> Commands;
+    Commands.Add(FString::Printf(TEXT("r.TextureStreaming %d"), bEnabled ? 1 : 0));
+    if (PoolSize >= 0.0)
+    {
+        Commands.Add(FString::Printf(TEXT("r.Streaming.PoolSize %d"), FMath::Max(0, static_cast<int32>(PoolSize))));
+    }
+    return ExecCommandTool(TEXT("configure_texture_streaming"), Commands);
+}
+
+FSageToolDispatch::FOutcome StartProfilingImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    return ExecCommandTool(TEXT("start_profiling"), {TEXT("stat startfile")});
+}
+
+FSageToolDispatch::FOutcome StopProfilingImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    return ExecCommandTool(TEXT("stop_profiling"), {TEXT("stat stopfile")});
+}
+
+FSageToolDispatch::FOutcome ShowFpsImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    return ExecCommandTool(TEXT("show_fps"), {TEXT("stat fps")});
+}
+
+FSageToolDispatch::FOutcome ShowStatsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Stat = TEXT("unit");
+    if (Args.IsValid())
+    {
+        Args->TryGetStringField(TEXT("stat"), Stat);
+        Args->TryGetStringField(TEXT("group"), Stat);
+    }
+    return ExecCommandTool(TEXT("show_stats"), {FString::Printf(TEXT("stat %s"), *Stat)});
+}
+
+FSageToolDispatch::FOutcome SetResolutionScaleImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    double Scale = 100.0;
+    if (Args.IsValid())
+    {
+        Args->TryGetNumberField(TEXT("scale"), Scale);
+        Args->TryGetNumberField(TEXT("screen_percentage"), Scale);
+    }
+    Scale = FMath::Clamp(Scale, 10.0, 200.0);
+    return ExecCommandTool(TEXT("set_resolution_scale"),
+        {FString::Printf(TEXT("r.ScreenPercentage %.3f"), Scale),
+         FString::Printf(TEXT("sg.ResolutionQuality %.3f"), Scale)});
+}
+
+FSageToolDispatch::FOutcome SetVsyncImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    bool bEnabled = true;
+    if (Args.IsValid()) Args->TryGetBoolField(TEXT("enabled"), bEnabled);
+    return ExecCommandTool(TEXT("set_vsync"),
+        {FString::Printf(TEXT("r.VSync %d"), bEnabled ? 1 : 0)});
+}
+
+FSageToolDispatch::FOutcome SetFrameRateLimitImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    double Limit = 0.0;
+    if (Args.IsValid())
+    {
+        Args->TryGetNumberField(TEXT("limit"), Limit);
+        Args->TryGetNumberField(TEXT("fps"), Limit);
+    }
+    Limit = FMath::Clamp(Limit, 0.0, 1000.0);
+    return ExecCommandTool(TEXT("set_frame_rate_limit"),
+        {FString::Printf(TEXT("t.MaxFPS %.3f"), Limit)});
+}
+
+FSageToolDispatch::FOutcome ConfigureNaniteImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    bool bEnabled = true;
+    if (Args.IsValid()) Args->TryGetBoolField(TEXT("enabled"), bEnabled);
+    return ExecCommandTool(TEXT("configure_nanite"),
+        {FString::Printf(TEXT("r.Nanite %d"), bEnabled ? 1 : 0)});
+}
+
+FSageToolDispatch::FOutcome ConfigureLodImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    double LOD = -1.0;
+    if (Args.IsValid())
+    {
+        Args->TryGetNumberField(TEXT("lod"), LOD);
+        Args->TryGetNumberField(TEXT("force_lod"), LOD);
+    }
+    const int32 ForcedLod = FMath::Clamp(static_cast<int32>(LOD), -1, 8);
+    return ExecCommandTool(TEXT("configure_lod"),
+        {FString::Printf(TEXT("r.ForceLOD %d"), ForcedLod)});
+}
+
 }  // namespace (anonymous)
 
 void RegisterEditorAutomationTools(FSageToolDispatch& Dispatch)
@@ -5048,6 +5371,26 @@ void RegisterEditorAutomationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("editor.cook_content"),       GT(&CookContentImpl));
     Dispatch.RegisterHandler(TEXT("editor.get_message_log"),    GT(&GetMessageLogImpl));
     Dispatch.RegisterHandler(TEXT("editor.open_asset"),         GT(&OpenAssetImpl));
+
+    // Batch 7: runtime verification, capture, and performance parity.
+    Dispatch.RegisterHandler(TEXT("window_capture"),            GT(&WindowCaptureImpl));
+    Dispatch.RegisterHandler(TEXT("capture_viewport"),          GT(&CaptureViewportImpl));
+    Dispatch.RegisterHandler(TEXT("capture_scene_preview"),     GT(&CaptureScenePreviewImpl));
+    Dispatch.RegisterHandler(TEXT("pie_test_bp"),               GT(&PieTestBpImpl));
+    Dispatch.RegisterHandler(TEXT("pie_test_scene"),            GT(&PieTestSceneImpl));
+    Dispatch.RegisterHandler(TEXT("cook_project"),              GT(&CookProjectImpl));
+    Dispatch.RegisterHandler(TEXT("performance_audit"),         GT(&PerformanceAuditImpl));
+    Dispatch.RegisterHandler(TEXT("generate_memory_report"),    GT(&GenerateMemoryReportImpl));
+    Dispatch.RegisterHandler(TEXT("configure_texture_streaming"), GT(&ConfigureTextureStreamingImpl));
+    Dispatch.RegisterHandler(TEXT("start_profiling"),           GT(&StartProfilingImpl));
+    Dispatch.RegisterHandler(TEXT("stop_profiling"),            GT(&StopProfilingImpl));
+    Dispatch.RegisterHandler(TEXT("show_fps"),                  GT(&ShowFpsImpl));
+    Dispatch.RegisterHandler(TEXT("show_stats"),                GT(&ShowStatsImpl));
+    Dispatch.RegisterHandler(TEXT("set_resolution_scale"),      GT(&SetResolutionScaleImpl));
+    Dispatch.RegisterHandler(TEXT("set_vsync"),                 GT(&SetVsyncImpl));
+    Dispatch.RegisterHandler(TEXT("set_frame_rate_limit"),      GT(&SetFrameRateLimitImpl));
+    Dispatch.RegisterHandler(TEXT("configure_nanite"),          GT(&ConfigureNaniteImpl));
+    Dispatch.RegisterHandler(TEXT("configure_lod"),             GT(&ConfigureLodImpl));
 }
 
 #undef LOCTEXT_NAMESPACE

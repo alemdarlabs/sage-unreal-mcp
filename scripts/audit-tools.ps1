@@ -18,16 +18,37 @@ function Read-AllText {
     Get-Content -Raw -Encoding UTF8 -LiteralPath $Path
 }
 
+function Get-ArrayRegisteredToolNames {
+    param(
+        [string]$Text,
+        [string]$ArrayPattern,
+        [string]$NamePattern
+    )
+    [regex]::Matches($Text, $ArrayPattern) | ForEach-Object {
+        $body = $_.Groups[1].Value
+        Get-RegexGroupValues $body $NamePattern
+    }
+}
+
 $serverRoot = Join-Path $RepoRoot 'server/src'
 $pluginRoot = Join-Path $RepoRoot 'plugin/Source/SageBridge/Private'
 
 $serverNames = Get-ChildItem $serverRoot -Recurse -Filter '*.cpp' |
-    ForEach-Object { Get-RegexGroupValues (Read-AllText $_.FullName) '\.name\s*=\s*"([^"]+)"' } |
+    ForEach-Object {
+        $text = Read-AllText $_.FullName
+        Get-RegexGroupValues $text '\.name\s*=\s*"([^"]+)"'
+        Get-RegexGroupValues $text 'regLocal\(\s*registry\s*,\s*"([^"]+)"'
+        Get-ArrayRegisteredToolNames $text 'const\s+char\*\s+\w*Tools\[\]\s*=\s*\{([\s\S]*?)\};' '"([^"]+)"'
+    } |
     Where-Object { $_ -ne 'sage-unreal-mcp' } |
     Sort-Object -Unique
 
 $pluginNames = Get-ChildItem $pluginRoot -Recurse -Filter '*.cpp' |
-    ForEach-Object { Get-RegexGroupValues (Read-AllText $_.FullName) 'RegisterHandler\(TEXT\("([^"]+)"\)' } |
+    ForEach-Object {
+        $text = Read-AllText $_.FullName
+        Get-RegexGroupValues $text 'RegisterHandler\(TEXT\("([^"]+)"\)'
+        Get-ArrayRegisteredToolNames $text 'static\s+const\s+TCHAR\*\s+\w*Tools\[\]\s*=\s*\{([\s\S]*?)\};' 'TEXT\("([^"]+)"\)'
+    } |
     Sort-Object -Unique
 
 $serverOnlyExact = @(
@@ -46,10 +67,50 @@ $serverOnlyExact = @(
     'index_status'
 )
 
+$serverOnlyPrefixes = @(
+    'source.',
+    'decision.',
+    'risk.',
+    'cppreflect.',
+    'network.',
+    'pipeline.'
+)
+
+$sourceIntelligenceServerOnlyExact = @(
+    'search_unreal_api',
+    'get_by_fqn',
+    'get_class_members',
+    'get_class_reference',
+    'get_function_signature',
+    'get_include_path',
+    'search_deprecated',
+    'get_deprecation_warnings',
+    'lookup_docs',
+    'lookup_class',
+    'find_callers',
+    'find_callees',
+    'reflect.rebuild_reflection_index',
+    'set_unreal_engine_path',
+    'get_unreal_engine_path',
+    'set_unreal_project_path',
+    'get_unreal_project_path',
+    'status'
+)
+
+function Test-ServerOnlyTool {
+    param([string]$Name)
+    if ($serverOnlyExact -contains $Name) { return $true }
+    if ($sourceIntelligenceServerOnlyExact -contains $Name) { return $true }
+    foreach ($prefix in $serverOnlyPrefixes) {
+        if ($Name.StartsWith($prefix)) { return $true }
+    }
+    return $false
+}
+
 $schemaWithoutPlugin = Compare-Object $serverNames $pluginNames |
     Where-Object {
         $_.SideIndicator -eq '<=' -and
-        $serverOnlyExact -notcontains $_.InputObject -and
+        -not (Test-ServerOnlyTool $_.InputObject) -and
         $_.InputObject -notmatch '^index_'
     } |
     ForEach-Object { $_.InputObject }

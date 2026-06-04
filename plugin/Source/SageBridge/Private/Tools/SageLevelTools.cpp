@@ -6,8 +6,11 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
 #include "Components/ExponentialHeightFogComponent.h"
+#include "Components/HierarchicalInstancedStaticMeshComponent.h"
+#include "Components/InstancedStaticMeshComponent.h"
 #include "Components/LightComponent.h"
 #include "Components/MeshComponent.h"
+#include "Components/SceneComponent.h"
 #include "Components/SplineComponent.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -15,6 +18,7 @@
 #include "Engine/ExponentialHeightFog.h"
 #include "Engine/Level.h"
 #include "Engine/LevelStreaming.h"
+#include "Engine/StaticMesh.h"
 #include "Engine/TriggerVolume.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -30,6 +34,7 @@
 #include "Subsystems/AssetEditorSubsystem.h"
 #include "UObject/Package.h"
 #include "UObject/SavePackage.h"
+#include "UObject/SoftObjectPath.h"
 
 #define LOCTEXT_NAMESPACE "SageLevel"
 
@@ -1729,6 +1734,458 @@ FSageToolDispatch::FOutcome WorldExportImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---- level.add_hismc_instances / ism_ops --------------------------------
+
+FString FirstLevelStringArg(const TSharedPtr<FJsonObject>& Args,
+                            std::initializer_list<const TCHAR*> Names,
+                            const FString& Fallback = FString())
+{
+    if (!Args.IsValid()) return Fallback;
+    FString Value;
+    for (const TCHAR* Name : Names)
+    {
+        if (Args->TryGetStringField(Name, Value) && !Value.IsEmpty())
+        {
+            return Value;
+        }
+    }
+    return Fallback;
+}
+
+bool JsonValueToVector3(const TSharedPtr<FJsonValue>& Value, FVector& Out)
+{
+    if (!Value.IsValid()) return false;
+    if (Value->Type == EJson::Array)
+    {
+        const TArray<TSharedPtr<FJsonValue>>& Arr = Value->AsArray();
+        if (Arr.Num() != 3) return false;
+        Out.X = Arr[0].IsValid() ? Arr[0]->AsNumber() : 0.0;
+        Out.Y = Arr[1].IsValid() ? Arr[1]->AsNumber() : 0.0;
+        Out.Z = Arr[2].IsValid() ? Arr[2]->AsNumber() : 0.0;
+        return true;
+    }
+    if (Value->Type == EJson::Object)
+    {
+        const TSharedPtr<FJsonObject> Obj = Value->AsObject();
+        if (!Obj.IsValid()) return false;
+        double X = 0.0, Y = 0.0, Z = 0.0;
+        const bool bLower = Obj->TryGetNumberField(TEXT("x"), X)
+            && Obj->TryGetNumberField(TEXT("y"), Y)
+            && Obj->TryGetNumberField(TEXT("z"), Z);
+        const bool bUpper = Obj->TryGetNumberField(TEXT("X"), X)
+            && Obj->TryGetNumberField(TEXT("Y"), Y)
+            && Obj->TryGetNumberField(TEXT("Z"), Z);
+        if (!bLower && !bUpper) return false;
+        Out = FVector(X, Y, Z);
+        return true;
+    }
+    return false;
+}
+
+bool ReadVectorField(const TSharedPtr<FJsonObject>& Obj,
+                     const TCHAR* Field,
+                     FVector& Out)
+{
+    if (!Obj.IsValid()) return false;
+    const TSharedPtr<FJsonValue>* Value = Obj->Values.Find(Field);
+    return Value != nullptr && JsonValueToVector3(*Value, Out);
+}
+
+bool JsonObjectToInstanceTransform(const TSharedPtr<FJsonObject>& Raw,
+                                   FTransform& Out,
+                                   FString& OutError)
+{
+    if (!Raw.IsValid())
+    {
+        OutError = TEXT("transform entry is not an object");
+        return false;
+    }
+
+    TSharedPtr<FJsonObject> Obj = Raw;
+    const TSharedPtr<FJsonObject>* Nested = nullptr;
+    if (Raw->TryGetObjectField(TEXT("transform"), Nested) && Nested != nullptr && Nested->IsValid())
+    {
+        Obj = *Nested;
+    }
+
+    FVector Location = FVector::ZeroVector;
+    FVector Scale = FVector::OneVector;
+    FVector RotationVec = FVector::ZeroVector;
+    ReadVectorField(Obj, TEXT("location"), Location);
+    ReadVectorField(Obj, TEXT("translation"), Location);
+    ReadVectorField(Obj, TEXT("scale"), Scale);
+    ReadVectorField(Obj, TEXT("scale3d"), Scale);
+    ReadVectorField(Obj, TEXT("rotation"), RotationVec);
+    ReadVectorField(Obj, TEXT("rotator"), RotationVec);
+
+    Out = FTransform(FRotator(RotationVec.X, RotationVec.Y, RotationVec.Z), Location, Scale);
+    return true;
+}
+
+bool CollectInstanceTransforms(const TSharedPtr<FJsonObject>& Args,
+                               TArray<FTransform>& Out,
+                               FString& OutError)
+{
+    Out.Reset();
+    OutError.Reset();
+    if (!Args.IsValid())
+    {
+        OutError = TEXT("missing args");
+        return false;
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* Transforms = nullptr;
+    if (Args->TryGetArrayField(TEXT("transforms"), Transforms) && Transforms != nullptr)
+    {
+        for (int32 I = 0; I < Transforms->Num(); ++I)
+        {
+            const TSharedPtr<FJsonValue>& Entry = (*Transforms)[I];
+            FTransform Tf = FTransform::Identity;
+            if (Entry.IsValid() && Entry->Type == EJson::Object)
+            {
+                if (!JsonObjectToInstanceTransform(Entry->AsObject(), Tf, OutError))
+                {
+                    OutError = FString::Printf(TEXT("transforms[%d]: %s"), I, *OutError);
+                    return false;
+                }
+            }
+            else
+            {
+                FVector Location = FVector::ZeroVector;
+                if (!JsonValueToVector3(Entry, Location))
+                {
+                    OutError = FString::Printf(TEXT("transforms[%d] must be an object transform or [x,y,z]"), I);
+                    return false;
+                }
+                Tf = FTransform(FRotator::ZeroRotator, Location, FVector::OneVector);
+            }
+            Out.Add(Tf);
+        }
+        return Out.Num() > 0;
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* Locations = nullptr;
+    if (Args->TryGetArrayField(TEXT("locations"), Locations) && Locations != nullptr)
+    {
+        for (int32 I = 0; I < Locations->Num(); ++I)
+        {
+            FVector Location = FVector::ZeroVector;
+            if (!JsonValueToVector3((*Locations)[I], Location))
+            {
+                OutError = FString::Printf(TEXT("locations[%d] must be [x,y,z] or {x,y,z}"), I);
+                return false;
+            }
+            Out.Add(FTransform(FRotator::ZeroRotator, Location, FVector::OneVector));
+        }
+        return Out.Num() > 0;
+    }
+
+    OutError = TEXT("missing non-empty 'transforms' or 'locations'");
+    return false;
+}
+
+UStaticMesh* ResolveStaticMeshArg(const TSharedPtr<FJsonObject>& Args,
+                                  FString& OutPath,
+                                  FString& OutError)
+{
+    OutPath = FirstLevelStringArg(Args, {TEXT("static_mesh"), TEXT("mesh"), TEXT("mesh_path")});
+    if (OutPath.IsEmpty())
+    {
+        OutError = TEXT("missing 'static_mesh'/'mesh'");
+        return nullptr;
+    }
+
+    FSoftObjectPath SoftPath(OutPath);
+    UObject* Obj = SoftPath.ResolveObject();
+    if (!Obj) Obj = SoftPath.TryLoad();
+    UStaticMesh* Mesh = Cast<UStaticMesh>(Obj);
+    if (!Mesh)
+    {
+        OutError = FString::Printf(TEXT("static mesh not found or not a UStaticMesh: %s"), *OutPath);
+    }
+    return Mesh;
+}
+
+TSharedRef<FJsonObject> InstancedComponentToJson(const UInstancedStaticMeshComponent* Comp)
+{
+    auto Row = MakeShared<FJsonObject>();
+    Row->SetStringField(TEXT("name"), Comp ? Comp->GetName() : FString());
+    Row->SetStringField(TEXT("path"), Comp ? Comp->GetPathName() : FString());
+    Row->SetBoolField(TEXT("hism"), Comp && Comp->IsA<UHierarchicalInstancedStaticMeshComponent>());
+    Row->SetNumberField(TEXT("instance_count"), Comp ? Comp->GetInstanceCount() : 0);
+    if (Comp && Comp->GetStaticMesh())
+    {
+        Row->SetStringField(TEXT("static_mesh"), Comp->GetStaticMesh()->GetPathName());
+    }
+    return Row;
+}
+
+UInstancedStaticMeshComponent* FindInstancedComponent(AActor* Actor,
+                                                     const FString& ComponentName,
+                                                     bool bRequireHism)
+{
+    if (!Actor) return nullptr;
+    TArray<UInstancedStaticMeshComponent*> Components;
+    Actor->GetComponents<UInstancedStaticMeshComponent>(Components);
+    for (UInstancedStaticMeshComponent* Comp : Components)
+    {
+        if (!Comp) continue;
+        if (bRequireHism && !Comp->IsA<UHierarchicalInstancedStaticMeshComponent>()) continue;
+        if (ComponentName.IsEmpty() || Comp->GetName() == ComponentName)
+        {
+            return Comp;
+        }
+    }
+    return nullptr;
+}
+
+UInstancedStaticMeshComponent* FindOrCreateInstancedComponent(AActor* Actor,
+                                                             bool bHism,
+                                                             UStaticMesh* Mesh,
+                                                             const FString& ComponentName,
+                                                             FString& OutState,
+                                                             FString& OutError)
+{
+    if (!Actor)
+    {
+        OutError = TEXT("actor not found");
+        return nullptr;
+    }
+    if (!Mesh)
+    {
+        OutError = TEXT("static mesh is required");
+        return nullptr;
+    }
+
+    UInstancedStaticMeshComponent* Comp = FindInstancedComponent(Actor, ComponentName, bHism);
+    if (!Comp && ComponentName.IsEmpty())
+    {
+        TArray<UInstancedStaticMeshComponent*> Components;
+        Actor->GetComponents<UInstancedStaticMeshComponent>(Components);
+        for (UInstancedStaticMeshComponent* Candidate : Components)
+        {
+            if (!Candidate) continue;
+            if (bHism && !Candidate->IsA<UHierarchicalInstancedStaticMeshComponent>()) continue;
+            if (Candidate->GetStaticMesh() == Mesh)
+            {
+                Comp = Candidate;
+                break;
+            }
+        }
+    }
+
+    if (Comp)
+    {
+        if (Comp->GetStaticMesh() && Comp->GetStaticMesh() != Mesh)
+        {
+            OutError = FString::Printf(TEXT("component '%s' already uses static mesh '%s'"),
+                *Comp->GetName(), *Comp->GetStaticMesh()->GetPathName());
+            return nullptr;
+        }
+        if (!Comp->GetStaticMesh())
+        {
+            Comp->Modify();
+            Comp->SetStaticMesh(Mesh);
+        }
+        OutState = TEXT("reused");
+        return Comp;
+    }
+
+    FName NewName = ComponentName.IsEmpty()
+        ? MakeUniqueObjectName(Actor, bHism
+            ? UHierarchicalInstancedStaticMeshComponent::StaticClass()
+            : UInstancedStaticMeshComponent::StaticClass(),
+            bHism ? TEXT("SageHISM") : TEXT("SageISM"))
+        : FName(*ComponentName);
+
+    Comp = bHism
+        ? Cast<UInstancedStaticMeshComponent>(NewObject<UHierarchicalInstancedStaticMeshComponent>(
+            Actor, NewName, RF_Transactional))
+        : NewObject<UInstancedStaticMeshComponent>(Actor, NewName, RF_Transactional);
+    if (!Comp)
+    {
+        OutError = TEXT("failed to create instanced static mesh component");
+        return nullptr;
+    }
+
+    Comp->SetStaticMesh(Mesh);
+    if (USceneComponent* Root = Actor->GetRootComponent())
+    {
+        Comp->SetupAttachment(Root);
+    }
+    else
+    {
+        Actor->SetRootComponent(Comp);
+    }
+    Actor->AddInstanceComponent(Comp);
+    Comp->OnComponentCreated();
+    Comp->RegisterComponent();
+    OutState = TEXT("created");
+    return Comp;
+}
+
+FSageToolDispatch::FOutcome AddInstancedMeshInstancesImpl(const TSharedPtr<FJsonObject>& Args,
+                                                          bool bHism,
+                                                          const TCHAR* ToolName)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString ActorId;
+    if (!TryGetActorIdentifier(Args, ActorId))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor'/'actor_id'"));
+    }
+    AActor* Actor = detail::ResolveActor(ActorId);
+    if (!Actor)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("actor not found: %s"), *ActorId));
+    }
+
+    FString MeshPath;
+    FString Error;
+    UStaticMesh* Mesh = ResolveStaticMeshArg(Args, MeshPath, Error);
+    if (!Mesh)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    TArray<FTransform> Transforms;
+    if (!CollectInstanceTransforms(Args, Transforms, Error))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    bool bWorldSpace = false;
+    if (Args.IsValid()) Args->TryGetBoolField(TEXT("world_space"), bWorldSpace);
+    const FString ComponentName = FirstLevelStringArg(Args, {TEXT("component"), TEXT("component_name")});
+
+    FScopedTransaction Tx(FText::Format(
+        LOCTEXT("AddInstancedMeshInstances", "Sage: {0}"),
+        FText::FromString(FString(ToolName))));
+    Actor->Modify();
+
+    FString ComponentState;
+    UInstancedStaticMeshComponent* Comp =
+        FindOrCreateInstancedComponent(Actor, bHism, Mesh, ComponentName, ComponentState, Error);
+    if (!Comp)
+    {
+        Tx.Cancel();
+        return FSageToolDispatch::FOutcome::MakeError(-32602, Error);
+    }
+
+    Comp->Modify();
+    const int32 Before = Comp->GetInstanceCount();
+    for (const FTransform& Tf : Transforms)
+    {
+        Comp->AddInstance(Tf, bWorldSpace);
+    }
+    Comp->MarkRenderStateDirty();
+    Actor->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("actor"), Actor->GetPathName());
+    R->SetStringField(TEXT("component"), Comp->GetPathName());
+    R->SetStringField(TEXT("component_state"), ComponentState);
+    R->SetStringField(TEXT("static_mesh"), Mesh->GetPathName());
+    R->SetBoolField(TEXT("hism"), Comp->IsA<UHierarchicalInstancedStaticMeshComponent>());
+    R->SetBoolField(TEXT("world_space"), bWorldSpace);
+    R->SetNumberField(TEXT("added_count"), Transforms.Num());
+    R->SetNumberField(TEXT("instance_count_before"), Before);
+    R->SetNumberField(TEXT("instance_count"), Comp->GetInstanceCount());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome LevelAddHismcInstancesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return AddInstancedMeshInstancesImpl(Args, /*bHism=*/true, TEXT("level.add_hismc_instances"));
+}
+
+FSageToolDispatch::FOutcome IsmOpsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString ActorId;
+    if (!TryGetActorIdentifier(Args, ActorId))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'actor'/'actor_id'"));
+    }
+    AActor* Actor = detail::ResolveActor(ActorId);
+    if (!Actor)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("actor not found: %s"), *ActorId));
+    }
+
+    FString Op = FirstLevelStringArg(Args, {TEXT("op"), TEXT("operation")}, TEXT("list")).ToLower();
+    if (Op == TEXT("list") || Op == TEXT("inspect"))
+    {
+        TArray<UInstancedStaticMeshComponent*> Components;
+        Actor->GetComponents<UInstancedStaticMeshComponent>(Components);
+        TArray<TSharedPtr<FJsonValue>> Rows;
+        for (const UInstancedStaticMeshComponent* Comp : Components)
+        {
+            if (Comp)
+            {
+                Rows.Add(MakeShared<FJsonValueObject>(InstancedComponentToJson(Comp)));
+            }
+        }
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("actor"), Actor->GetPathName());
+        R->SetArrayField(TEXT("components"), Rows);
+        R->SetNumberField(TEXT("count"), Rows.Num());
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    if (Op == TEXT("add") || Op == TEXT("add_instances") || Op == TEXT("add_hism") || Op == TEXT("add_hism_instances"))
+    {
+        bool bHism = Op.Contains(TEXT("hism"));
+        if (Args.IsValid()) Args->TryGetBoolField(TEXT("hism"), bHism);
+        return AddInstancedMeshInstancesImpl(Args, bHism, TEXT("ism_ops.add_instances"));
+    }
+
+    if (Op == TEXT("clear") || Op == TEXT("clear_instances"))
+    {
+        FSageToolDispatch::FOutcome Reject;
+        if (detail::RejectIfPie(Reject)) return Reject;
+        bool bConfirmed = false;
+        if (Args.IsValid()) Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+        if (!bConfirmed)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("ism_ops clear is destructive and requires confirmed:true"));
+        }
+
+        const FString ComponentName = FirstLevelStringArg(Args, {TEXT("component"), TEXT("component_name")});
+        TArray<UInstancedStaticMeshComponent*> Components;
+        Actor->GetComponents<UInstancedStaticMeshComponent>(Components);
+        int32 ClearedComponents = 0;
+        int32 RemovedInstances = 0;
+        FScopedTransaction Tx(LOCTEXT("ClearInstancedMeshInstances", "Sage: Clear ISM/HISM Instances"));
+        Actor->Modify();
+        for (UInstancedStaticMeshComponent* Comp : Components)
+        {
+            if (!Comp) continue;
+            if (!ComponentName.IsEmpty() && Comp->GetName() != ComponentName) continue;
+            Comp->Modify();
+            RemovedInstances += Comp->GetInstanceCount();
+            Comp->ClearInstances();
+            Comp->MarkRenderStateDirty();
+            ++ClearedComponents;
+        }
+        Actor->MarkPackageDirty();
+
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("actor"), Actor->GetPathName());
+        if (!ComponentName.IsEmpty()) R->SetStringField(TEXT("component_name"), ComponentName);
+        R->SetNumberField(TEXT("cleared_components"), ClearedComponents);
+        R->SetNumberField(TEXT("removed_instances"), RemovedInstances);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    return FSageToolDispatch::FOutcome::MakeError(-32602,
+        FString::Printf(TEXT("unsupported ism_ops op: %s"), *Op));
+}
+
 }  // namespace (anonymous)
 
 void RegisterLevelTools(FSageToolDispatch& Dispatch)
@@ -1756,6 +2213,7 @@ void RegisterLevelTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("level.resolve_actor"),        GT(&LevelResolveActorImpl));
     Dispatch.RegisterHandler(TEXT("level.get_runtime_virtual_texture_summary"),
                                                                  GT(&LevelGetRvtSummaryImpl));
+    Dispatch.RegisterHandler(TEXT("ism_ops"),                    GT(&IsmOpsImpl));
     // Write
     Dispatch.RegisterHandler(TEXT("level.load"),                 GT(&LevelLoadImpl));
     Dispatch.RegisterHandler(TEXT("level.create"),               GT(&LevelCreateImpl));
@@ -1771,6 +2229,7 @@ void RegisterLevelTools(FSageToolDispatch& Dispatch)
                                                                  GT(&LyraSetDefaultGameplayExperienceImpl));
     Dispatch.RegisterHandler(TEXT("level.set_water_body_property"), GT(&LevelSetWaterBodyPropertyImpl));
     Dispatch.RegisterHandler(TEXT("level.build_lighting"),       GT(&LevelBuildLightingImpl));
+    Dispatch.RegisterHandler(TEXT("level.add_hismc_instances"),  GT(&LevelAddHismcInstancesImpl));
 
     // World/Map structural exporter (Phase 4.6-r4 — CommonAIExport parity)
     Dispatch.RegisterHandler(TEXT("world.export"),               GT(&WorldExportImpl));

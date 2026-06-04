@@ -129,6 +129,39 @@ FSageToolDispatch::FOutcome CompileAndReloadOnGameThread(const TSharedPtr<FJsonO
 #endif
 }
 
+FSageToolDispatch::FOutcome LiveCompileOnGameThread(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Out = CompileAndReloadOnGameThread(Args);
+    if (Out.bSuccess && Out.Result.IsValid())
+    {
+        Out.Result->SetStringField(TEXT("alias_of"), TEXT("compile_and_reload"));
+        Out.Result->SetStringField(TEXT("tool"), TEXT("live_compile"));
+    }
+    return Out;
+}
+
+FSageToolDispatch::FOutcome BuildProjectOnGameThread(const TSharedPtr<FJsonObject>& Args)
+{
+    bool bAllowLiveCompileFallback = false;
+    if (Args.IsValid())
+    {
+        Args->TryGetBoolField(TEXT("live_compile_fallback"), bAllowLiveCompileFallback);
+    }
+    if (bAllowLiveCompileFallback)
+    {
+        FSageToolDispatch::FOutcome Out = CompileAndReloadOnGameThread(Args);
+        if (Out.bSuccess && Out.Result.IsValid())
+        {
+            Out.Result->SetStringField(TEXT("tool"), TEXT("build_project"));
+            Out.Result->SetStringField(TEXT("strategy"), TEXT("live_compile_fallback"));
+        }
+        return Out;
+    }
+
+    return FSageToolDispatch::FOutcome::MakeError(-32007,
+        TEXT("build_project requires full UBT/UAT process orchestration outside the editor process; use restart_editor with rebuild_project_modules=true or run the server-side build script at the chosen build time. Pass live_compile_fallback=true to request Live Coding instead."));
+}
+
 // ---- handlers --------------------------------------------------------------
 
 FSageToolDispatch::FOutcome GetLiveCodingStatusHandler(const TSharedPtr<FJsonObject>& Args)
@@ -139,6 +172,14 @@ FSageToolDispatch::FOutcome CompileAndReloadHandler(const TSharedPtr<FJsonObject
 {
     return detail::RunOnGameThread([Args]() { return CompileAndReloadOnGameThread(Args); });
 }
+FSageToolDispatch::FOutcome LiveCompileHandler(const TSharedPtr<FJsonObject>& Args)
+{
+    return detail::RunOnGameThread([Args]() { return LiveCompileOnGameThread(Args); });
+}
+FSageToolDispatch::FOutcome BuildProjectHandler(const TSharedPtr<FJsonObject>& Args)
+{
+    return detail::RunOnGameThread([Args]() { return BuildProjectOnGameThread(Args); });
+}
 
 }  // namespace
 
@@ -146,6 +187,8 @@ void RegisterCompileTools(FSageToolDispatch& Dispatch)
 {
     Dispatch.RegisterHandler(TEXT("get_live_coding_status"), &GetLiveCodingStatusHandler);
     Dispatch.RegisterHandler(TEXT("compile_and_reload"),     &CompileAndReloadHandler);
+    Dispatch.RegisterHandler(TEXT("live_compile"),           &LiveCompileHandler);
+    Dispatch.RegisterHandler(TEXT("build_project"),          &BuildProjectHandler);
 }
 
 }  // namespace sage::tools

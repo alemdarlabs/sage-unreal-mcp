@@ -95,7 +95,9 @@
 #include "RigEditor/IKRigAutoCharacterizer.h"
 #include "RigEditor/IKRigAutoFBIK.h"
 #include "RigEditor/IKRigController.h"
+#include "IKRigLogger.h"
 #include "Rig/IKRigDefinition.h"
+#include "Rig/IKRigProcessor.h"
 #include "Rig/IKRigSkeleton.h"
 
 // IAnimationDataController for AnimSequence curve add (UE 5.5+ canonical path)
@@ -106,8 +108,12 @@
 #include "Animation/AnimCurveTypes.h"
 #include "AnimationModifier.h"
 #include "AnimationModifiersAssetUserData.h"
+#include "ControlRigBlueprintEditorLibrary.h"
+#include "ControlRigBlueprintLegacy.h"
 #include "EditorAnimUtils.h"
 #include "Engine/Blueprint.h"
+#include "Rigs/RigHierarchy.h"
+#include "Rigs/RigHierarchyController.h"
 
 // IBlueprintGeneratedClass + Anim* class hierarchy
 #include "Animation/AnimBlueprintGeneratedClass.h"
@@ -724,6 +730,7 @@ TSharedRef<FJsonObject> IKRigToJson(UIKRigDefinition* Rig, UIKRigController* Con
     R->SetNumberField(TEXT("chain_count"), Chains.Num());
 
     TArray<TSharedPtr<FJsonValue>> Goals;
+    int32 GoalConnectionCount = 0;
     const TArray<UIKRigEffectorGoal*>& AllGoals = Controller ? Controller->GetAllGoals() : Rig->GetGoalArray();
     for (const UIKRigEffectorGoal* Goal : AllGoals)
     {
@@ -738,6 +745,23 @@ TSharedRef<FJsonObject> IKRigToJson(UIKRigDefinition* Rig, UIKRigController* Con
         GoalObj->SetNumberField(TEXT("rotation_alpha"), Goal->RotationAlpha);
         GoalObj->SetObjectField(TEXT("current_transform"), TransformToJsonObject(Goal->CurrentTransform));
         GoalObj->SetObjectField(TEXT("initial_transform"), TransformToJsonObject(Goal->InitialTransform));
+        if (Controller)
+        {
+            TArray<TSharedPtr<FJsonValue>> ConnectedSolverIndices;
+            TArray<TSharedPtr<FJsonValue>> ConnectedSolverNames;
+            for (int32 SolverIndex = 0; SolverIndex < Controller->GetNumSolvers(); ++SolverIndex)
+            {
+                if (Controller->IsGoalConnectedToSolver(Goal->GoalName, SolverIndex))
+                {
+                    ConnectedSolverIndices.Add(MakeShared<FJsonValueNumber>(SolverIndex));
+                    ConnectedSolverNames.Add(MakeShared<FJsonValueString>(Controller->GetSolverUniqueName(SolverIndex)));
+                    ++GoalConnectionCount;
+                }
+            }
+            GoalObj->SetArrayField(TEXT("connected_solver_indices"), ConnectedSolverIndices);
+            GoalObj->SetArrayField(TEXT("connected_solver_names"), ConnectedSolverNames);
+            GoalObj->SetBoolField(TEXT("connected_to_any_solver"), ConnectedSolverIndices.Num() > 0);
+        }
 #if WITH_EDITORONLY_DATA
         GoalObj->SetBoolField(TEXT("expose_position"), Goal->bExposePosition);
         GoalObj->SetBoolField(TEXT("expose_rotation"), Goal->bExposeRotation);
@@ -746,6 +770,7 @@ TSharedRef<FJsonObject> IKRigToJson(UIKRigDefinition* Rig, UIKRigController* Con
     }
     R->SetArrayField(TEXT("goals"), Goals);
     R->SetNumberField(TEXT("goal_count"), Goals.Num());
+    R->SetNumberField(TEXT("goal_connection_count"), GoalConnectionCount);
 
     TArray<TSharedPtr<FJsonValue>> Solvers;
     const int32 NumSolvers = Controller ? Controller->GetNumSolvers() : Rig->GetSolverStructs().Num();
@@ -784,6 +809,54 @@ TSharedRef<FJsonObject> IKRigToJson(UIKRigDefinition* Rig, UIKRigController* Con
         Warnings.Add(MakeShared<FJsonValueString>(TEXT("IK Rig has no preview skeletal mesh")));
     }
     R->SetArrayField(TEXT("warnings"), Warnings);
+    return R;
+}
+
+TArray<TSharedPtr<FJsonValue>> TextArrayToJsonArray(const TArray<FText>& Texts)
+{
+    TArray<TSharedPtr<FJsonValue>> Out;
+    for (const FText& Text : Texts)
+    {
+        Out.Add(MakeShared<FJsonValueString>(Text.ToString()));
+    }
+    return Out;
+}
+
+TSharedRef<FJsonObject> IKRigMeshCompatibilityToJson(UIKRigDefinition* Rig, USkeletalMesh* Mesh)
+{
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("rig"), Rig ? Rig->GetPathName() : FString());
+    R->SetStringField(TEXT("skeletal_mesh"), AssetPathOrEmpty(Mesh));
+    R->SetBoolField(TEXT("compatible"), false);
+
+    if (!Rig)
+    {
+        TArray<TSharedPtr<FJsonValue>> Errors;
+        Errors.Add(MakeShared<FJsonValueString>(TEXT("IK Rig asset is null")));
+        R->SetArrayField(TEXT("errors"), Errors);
+        R->SetArrayField(TEXT("warnings"), TArray<TSharedPtr<FJsonValue>>());
+        R->SetArrayField(TEXT("messages"), TArray<TSharedPtr<FJsonValue>>());
+        return R;
+    }
+    if (!Mesh)
+    {
+        TArray<TSharedPtr<FJsonValue>> Errors;
+        Errors.Add(MakeShared<FJsonValueString>(TEXT("Skeletal mesh is null")));
+        R->SetArrayField(TEXT("errors"), Errors);
+        R->SetArrayField(TEXT("warnings"), TArray<TSharedPtr<FJsonValue>>());
+        R->SetArrayField(TEXT("messages"), TArray<TSharedPtr<FJsonValue>>());
+        return R;
+    }
+
+    FIKRigLogger Logger;
+    Logger.SetLogTarget(Rig);
+    const FIKRigInputSkeleton InputSkeleton(Mesh);
+    const bool bCompatible = FIKRigProcessor::IsIKRigCompatibleWithSkeleton(Rig, InputSkeleton, &Logger);
+    R->SetBoolField(TEXT("compatible"), bCompatible);
+    R->SetArrayField(TEXT("errors"), TextArrayToJsonArray(Logger.GetErrors()));
+    R->SetArrayField(TEXT("warnings"), TextArrayToJsonArray(Logger.GetWarnings()));
+    R->SetArrayField(TEXT("messages"), TextArrayToJsonArray(Logger.GetMessages()));
+    R->SetNumberField(TEXT("candidate_bone_count"), InputSkeleton.BoneNames.Num());
     return R;
 }
 
@@ -2862,6 +2935,14 @@ FSageToolDispatch::FOutcome ListSkeletonSocketsImpl(const TSharedPtr<FJsonObject
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
     }
+    FString OwnerFilter = TEXT("any");
+    Args->TryGetStringField(TEXT("owner"), OwnerFilter);
+    OwnerFilter = OwnerFilter.TrimStartAndEnd().ToLower();
+    if (OwnerFilter.IsEmpty()) OwnerFilter = TEXT("any");
+    if (OwnerFilter != TEXT("any") && OwnerFilter != TEXT("mesh") && OwnerFilter != TEXT("skeleton"))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("'owner' must be one of: mesh, skeleton, any"));
+    }
     UObject* Asset = ResolveAsset(Path);
     USkeleton* Skeleton = Cast<USkeleton>(Asset);
     USkeletalMesh* Mesh = Cast<USkeletalMesh>(Asset);
@@ -2872,41 +2953,93 @@ FSageToolDispatch::FOutcome ListSkeletonSocketsImpl(const TSharedPtr<FJsonObject
     }
 
     TArray<TSharedPtr<FJsonValue>> Sockets;
-    auto AddSocket = [&Sockets](const USkeletalMeshSocket* S, const FString& Owner)
+    TArray<TSharedPtr<FJsonValue>> Collisions;
+    auto AddSocket = [&Sockets](const USkeletalMeshSocket* S, const FString& Owner, const UObject* OwnerAsset, bool bEffective)
     {
         if (!S) return;
         auto J = MakeShared<FJsonObject>();
         J->SetStringField(TEXT("name"),        S->SocketName.ToString());
         J->SetStringField(TEXT("bone_name"),   S->BoneName.ToString());
         J->SetStringField(TEXT("parent_bone"), S->BoneName.ToString());
+        J->SetStringField(TEXT("owner"),       Owner);
+        J->SetBoolField  (TEXT("effective"),   bEffective);
+        if (OwnerAsset)
+        {
+            J->SetStringField(TEXT("owner_asset"), OwnerAsset->GetPathName());
+        }
         J->SetField(TEXT("location"), detail::Vec3ToJson(S->RelativeLocation));
         J->SetField(TEXT("rotation"), detail::Rot3ToJson(S->RelativeRotation));
         J->SetField(TEXT("scale"), detail::Vec3ToJson(S->RelativeScale));
         J->SetBoolField(TEXT("force_always_animated"), S->bForceAlwaysAnimated);
-        J->SetStringField(TEXT("owner"), Owner);
         Sockets.Add(MakeShared<FJsonValueObject>(J));
     };
     if (Skeleton)
     {
-        for (const USkeletalMeshSocket* S : Skeleton->Sockets)
+        if (OwnerFilter == TEXT("any") || OwnerFilter == TEXT("skeleton"))
         {
-            AddSocket(S, TEXT("skeleton"));
+            for (const USkeletalMeshSocket* S : Skeleton->Sockets)
+            {
+                AddSocket(S, TEXT("skeleton"), Skeleton, true);
+            }
         }
     }
     if (Mesh)
     {
-        for (const USkeletalMeshSocket* S : Mesh->GetActiveSocketList())
+        USkeleton* OwningSkeleton = Mesh->GetSkeleton();
+        TMap<FName, const USkeletalMeshSocket*> MeshSocketsByName;
+        if (OwnerFilter == TEXT("any") || OwnerFilter == TEXT("mesh"))
         {
-            const bool bMeshOwned = S && S->GetOuter() == Mesh;
-            AddSocket(S, bMeshOwned ? TEXT("mesh") : TEXT("skeleton"));
+            for (const TObjectPtr<USkeletalMeshSocket>& S : Mesh->GetMeshOnlySocketList())
+            {
+                if (!S) continue;
+                MeshSocketsByName.Add(S->SocketName, S.Get());
+                AddSocket(S.Get(), TEXT("mesh"), Mesh, true);
+            }
+        }
+        if (OwnerFilter == TEXT("any") || OwnerFilter == TEXT("skeleton"))
+        {
+            if (OwningSkeleton)
+            {
+                for (const USkeletalMeshSocket* S : OwningSkeleton->Sockets)
+                {
+                    if (!S) continue;
+                    const USkeletalMeshSocket* MeshOverride = MeshSocketsByName.FindRef(S->SocketName);
+                    if (!MeshOverride)
+                    {
+                        for (const TObjectPtr<USkeletalMeshSocket>& MeshSocket : Mesh->GetMeshOnlySocketList())
+                        {
+                            if (MeshSocket && MeshSocket->SocketName == S->SocketName)
+                            {
+                                MeshOverride = MeshSocket.Get();
+                                break;
+                            }
+                        }
+                    }
+                    const bool bShadowed = MeshOverride != nullptr;
+                    AddSocket(S, TEXT("skeleton"), OwningSkeleton, !bShadowed);
+                    if (bShadowed)
+                    {
+                        auto C = MakeShared<FJsonObject>();
+                        C->SetStringField(TEXT("name"), S->SocketName.ToString());
+                        C->SetStringField(TEXT("effective_owner"), TEXT("mesh"));
+                        C->SetStringField(TEXT("shadowed_owner"), TEXT("skeleton"));
+                        C->SetStringField(TEXT("mesh_asset"), Mesh->GetPathName());
+                        C->SetStringField(TEXT("skeleton_asset"), OwningSkeleton->GetPathName());
+                        Collisions.Add(MakeShared<FJsonValueObject>(C));
+                    }
+                }
+            }
         }
     }
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"),    Asset->GetPathName());
     R->SetStringField(TEXT("asset_type"), Skeleton ? TEXT("USkeleton") : TEXT("USkeletalMesh"));
+    R->SetStringField(TEXT("owner_filter"), OwnerFilter);
     R->SetArrayField (TEXT("sockets"), Sockets);
     R->SetNumberField(TEXT("count"),   Sockets.Num());
+    R->SetArrayField(TEXT("owner_collisions"), Collisions);
+    R->SetNumberField(TEXT("owner_collision_count"), Collisions.Num());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -4135,19 +4268,796 @@ FSageToolDispatch::FOutcome ReadAnimationCurvesImpl(const TSharedPtr<FJsonObject
 // animation.list_control_rig_variables
 // ---------------------------------------------------------------------------
 
-FSageToolDispatch::FOutcome ListControlRigVariablesImpl(const TSharedPtr<FJsonObject>& Args)
+UControlRigBlueprint* ResolveControlRigBlueprintAsset(const FString& Path)
+{
+    UObject* Asset = ResolveAsset(Path);
+    if (UControlRigBlueprint* RigBP = Cast<UControlRigBlueprint>(Asset))
+    {
+        return RigBP;
+    }
+    if (UBlueprint* BP = Cast<UBlueprint>(Asset))
+    {
+        return Cast<UControlRigBlueprint>(BP);
+    }
+    return nullptr;
+}
+
+FString RigElementTypeToString(ERigElementType Type)
+{
+    switch (Type)
+    {
+    case ERigElementType::Bone: return TEXT("bone");
+    case ERigElementType::Null: return TEXT("null");
+    case ERigElementType::Control: return TEXT("control");
+    case ERigElementType::Curve: return TEXT("curve");
+    case ERigElementType::Connector: return TEXT("connector");
+    case ERigElementType::Socket: return TEXT("socket");
+    case ERigElementType::Reference: return TEXT("reference");
+    default: return TEXT("unknown");
+    }
+}
+
+bool ParseRigElementType(const FString& InType, ERigElementType& OutType)
+{
+    const FString Type = InType.TrimStartAndEnd().ToLower();
+    if (Type.IsEmpty() || Type == TEXT("none"))
+    {
+        OutType = ERigElementType::None;
+        return true;
+    }
+    if (Type == TEXT("bone")) { OutType = ERigElementType::Bone; return true; }
+    if (Type == TEXT("null") || Type == TEXT("space")) { OutType = ERigElementType::Null; return true; }
+    if (Type == TEXT("control")) { OutType = ERigElementType::Control; return true; }
+    if (Type == TEXT("curve")) { OutType = ERigElementType::Curve; return true; }
+    if (Type == TEXT("connector")) { OutType = ERigElementType::Connector; return true; }
+    if (Type == TEXT("socket")) { OutType = ERigElementType::Socket; return true; }
+    if (Type == TEXT("reference")) { OutType = ERigElementType::Reference; return true; }
+    return false;
+}
+
+FString RigControlTypeToString(ERigControlType Type)
+{
+    switch (Type)
+    {
+    case ERigControlType::Bool: return TEXT("bool");
+    case ERigControlType::Float: return TEXT("float");
+    case ERigControlType::Integer: return TEXT("integer");
+    case ERigControlType::Vector2D: return TEXT("vector2d");
+    case ERigControlType::Position: return TEXT("position");
+    case ERigControlType::Scale: return TEXT("scale");
+    case ERigControlType::Rotator: return TEXT("rotator");
+    case ERigControlType::Transform: return TEXT("transform");
+    case ERigControlType::TransformNoScale: return TEXT("transform_no_scale");
+    case ERigControlType::EulerTransform: return TEXT("euler_transform");
+    case ERigControlType::ScaleFloat: return TEXT("scale_float");
+    default: return TEXT("unknown");
+    }
+}
+
+bool ParseRigControlType(const FString& InType, ERigControlType& OutType)
+{
+    const FString Type = InType.TrimStartAndEnd().ToLower();
+    if (Type.IsEmpty() || Type == TEXT("transform") || Type == TEXT("euler_transform"))
+    {
+        OutType = ERigControlType::EulerTransform;
+        return true;
+    }
+    if (Type == TEXT("bool")) { OutType = ERigControlType::Bool; return true; }
+    if (Type == TEXT("float")) { OutType = ERigControlType::Float; return true; }
+    if (Type == TEXT("integer") || Type == TEXT("int")) { OutType = ERigControlType::Integer; return true; }
+    if (Type == TEXT("vector2d")) { OutType = ERigControlType::Vector2D; return true; }
+    if (Type == TEXT("position") || Type == TEXT("vector")) { OutType = ERigControlType::Position; return true; }
+    if (Type == TEXT("scale")) { OutType = ERigControlType::Scale; return true; }
+    if (Type == TEXT("rotator") || Type == TEXT("rotation")) { OutType = ERigControlType::Rotator; return true; }
+    if (Type == TEXT("transform_no_scale")) { OutType = ERigControlType::TransformNoScale; return true; }
+    if (Type == TEXT("scale_float")) { OutType = ERigControlType::ScaleFloat; return true; }
+    return false;
+}
+
+FString RigControlAnimationTypeToString(ERigControlAnimationType Type)
+{
+    switch (Type)
+    {
+    case ERigControlAnimationType::AnimationControl: return TEXT("animation_control");
+    case ERigControlAnimationType::AnimationChannel: return TEXT("animation_channel");
+    case ERigControlAnimationType::ProxyControl: return TEXT("proxy_control");
+    case ERigControlAnimationType::VisualCue: return TEXT("visual_cue");
+    default: return TEXT("unknown");
+    }
+}
+
+bool ParseRigControlAnimationType(const FString& InType, ERigControlAnimationType& OutType)
+{
+    const FString Type = InType.TrimStartAndEnd().ToLower();
+    if (Type.IsEmpty() || Type == TEXT("animation_control") || Type == TEXT("control"))
+    {
+        OutType = ERigControlAnimationType::AnimationControl;
+        return true;
+    }
+    if (Type == TEXT("animation_channel") || Type == TEXT("channel"))
+    {
+        OutType = ERigControlAnimationType::AnimationChannel;
+        return true;
+    }
+    if (Type == TEXT("proxy_control") || Type == TEXT("proxy"))
+    {
+        OutType = ERigControlAnimationType::ProxyControl;
+        return true;
+    }
+    if (Type == TEXT("visual_cue") || Type == TEXT("visual"))
+    {
+        OutType = ERigControlAnimationType::VisualCue;
+        return true;
+    }
+    return false;
+}
+
+TSharedRef<FJsonObject> RigElementKeyToJson(const FRigElementKey& Key)
+{
+    auto Obj = MakeShared<FJsonObject>();
+    Obj->SetStringField(TEXT("name"), Key.Name.ToString());
+    Obj->SetStringField(TEXT("type"), RigElementTypeToString(Key.Type));
+    return Obj;
+}
+
+TArray<TSharedPtr<FJsonValue>> RigElementKeysToJson(const TArray<FRigElementKey>& Keys)
+{
+    TArray<TSharedPtr<FJsonValue>> Out;
+    for (const FRigElementKey& Key : Keys)
+    {
+        Out.Add(MakeShared<FJsonValueObject>(RigElementKeyToJson(Key)));
+    }
+    return Out;
+}
+
+TSharedRef<FJsonObject> RigControlValueToJson(
+    const FRigControlValue& Value,
+    ERigControlType ControlType,
+    ERigControlAxis PrimaryAxis)
+{
+    auto Obj = MakeShared<FJsonObject>();
+    Obj->SetBoolField(TEXT("valid"), Value.IsValid());
+    Obj->SetStringField(TEXT("control_type"), RigControlTypeToString(ControlType));
+    if (!Value.IsValid())
+    {
+        return Obj;
+    }
+
+    switch (ControlType)
+    {
+    case ERigControlType::Bool:
+        Obj->SetBoolField(TEXT("value"), Value.Get<bool>());
+        break;
+    case ERigControlType::Float:
+    case ERigControlType::ScaleFloat:
+        Obj->SetNumberField(TEXT("value"), Value.Get<float>());
+        break;
+    case ERigControlType::Integer:
+        Obj->SetNumberField(TEXT("value"), Value.Get<int32>());
+        break;
+    case ERigControlType::Vector2D:
+    {
+        const FVector3f V = Value.Get<FVector3f>();
+        Obj->SetField(TEXT("value"), detail::Vec3ToJson(FVector(V.X, V.Y, 0.0)));
+        break;
+    }
+    case ERigControlType::Position:
+    case ERigControlType::Scale:
+    case ERigControlType::Rotator:
+    {
+        const FVector3f V = Value.Get<FVector3f>();
+        Obj->SetField(TEXT("value"), detail::Vec3ToJson(FVector(V)));
+        break;
+    }
+    default:
+        Obj->SetObjectField(TEXT("transform"), TransformToJsonObject(Value.GetAsTransform(ControlType, PrimaryAxis)));
+        break;
+    }
+    Obj->SetObjectField(TEXT("as_transform"), TransformToJsonObject(Value.GetAsTransform(ControlType, PrimaryAxis)));
+    return Obj;
+}
+
+TSharedRef<FJsonObject> RigElementToJson(URigHierarchy* Hierarchy, const FRigElementKey& Key, bool bIncludeTransforms)
+{
+    auto Obj = MakeShared<FJsonObject>();
+    Obj->SetStringField(TEXT("name"), Key.Name.ToString());
+    Obj->SetStringField(TEXT("type"), RigElementTypeToString(Key.Type));
+    if (!Hierarchy)
+    {
+        return Obj;
+    }
+
+    Obj->SetArrayField(TEXT("parents"), RigElementKeysToJson(Hierarchy->GetParents(Key, false)));
+    Obj->SetArrayField(TEXT("children"), RigElementKeysToJson(Hierarchy->GetChildren(Key, false)));
+
+    if (Key.Type == ERigElementType::Curve)
+    {
+        Obj->SetNumberField(TEXT("value"), Hierarchy->GetCurveValue(Key));
+    }
+    if (bIncludeTransforms &&
+        (Key.Type == ERigElementType::Bone ||
+         Key.Type == ERigElementType::Null ||
+         Key.Type == ERigElementType::Control ||
+         Key.Type == ERigElementType::Socket))
+    {
+        Obj->SetObjectField(TEXT("current_local"), TransformToJsonObject(Hierarchy->GetLocalTransform(Key, false)));
+        Obj->SetObjectField(TEXT("current_global"), TransformToJsonObject(Hierarchy->GetGlobalTransform(Key, false)));
+        Obj->SetObjectField(TEXT("initial_local"), TransformToJsonObject(Hierarchy->GetLocalTransform(Key, true)));
+        Obj->SetObjectField(TEXT("initial_global"), TransformToJsonObject(Hierarchy->GetGlobalTransform(Key, true)));
+    }
+    return Obj;
+}
+
+TSharedRef<FJsonObject> RigControlToJson(URigHierarchy* Hierarchy, FRigControlElement* Control, bool bIncludeTransforms)
+{
+    const FRigElementKey Key = Control ? Control->GetKey() : FRigElementKey();
+    TSharedRef<FJsonObject> Obj = RigElementToJson(Hierarchy, Key, bIncludeTransforms);
+    if (!Hierarchy || !Control)
+    {
+        return Obj;
+    }
+
+    const FRigControlSettings& Settings = Control->Settings;
+    Obj->SetStringField(TEXT("control_type"), RigControlTypeToString(Settings.ControlType));
+    Obj->SetStringField(TEXT("animation_type"), RigControlAnimationTypeToString(Settings.AnimationType));
+    Obj->SetStringField(TEXT("display_name"), Settings.DisplayName.ToString());
+    Obj->SetStringField(TEXT("primary_axis"), StaticEnum<ERigControlAxis>()->GetNameStringByValue(static_cast<int64>(Settings.PrimaryAxis)));
+    Obj->SetBoolField(TEXT("shape_visible"), Settings.bShapeVisible);
+    Obj->SetStringField(TEXT("shape_name"), Settings.ShapeName.ToString());
+    Obj->SetBoolField(TEXT("selectable"), Settings.IsSelectable(/*bRespectVisibility=*/true));
+    Obj->SetBoolField(TEXT("animatable"), Settings.IsAnimatable());
+    Obj->SetObjectField(TEXT("shape_color"), [&Settings]()
+    {
+        auto C = MakeShared<FJsonObject>();
+        C->SetNumberField(TEXT("r"), Settings.ShapeColor.R);
+        C->SetNumberField(TEXT("g"), Settings.ShapeColor.G);
+        C->SetNumberField(TEXT("b"), Settings.ShapeColor.B);
+        C->SetNumberField(TEXT("a"), Settings.ShapeColor.A);
+        return C;
+    }());
+    Obj->SetObjectField(TEXT("current_value"), RigControlValueToJson(
+        Hierarchy->GetControlValue(Control, ERigControlValueType::Current),
+        Settings.ControlType,
+        Settings.PrimaryAxis));
+    Obj->SetObjectField(TEXT("initial_value"), RigControlValueToJson(
+        Hierarchy->GetControlValue(Control, ERigControlValueType::Initial),
+        Settings.ControlType,
+        Settings.PrimaryAxis));
+    Obj->SetObjectField(TEXT("minimum_value"), RigControlValueToJson(
+        Settings.MinimumValue,
+        Settings.ControlType,
+        Settings.PrimaryAxis));
+    Obj->SetObjectField(TEXT("maximum_value"), RigControlValueToJson(
+        Settings.MaximumValue,
+        Settings.ControlType,
+        Settings.PrimaryAxis));
+    if (bIncludeTransforms)
+    {
+        Obj->SetObjectField(TEXT("offset_current_local"), TransformToJsonObject(Control->GetOffsetTransform()[ERigTransformType::CurrentLocal].Get()));
+        Obj->SetObjectField(TEXT("offset_initial_local"), TransformToJsonObject(Control->GetOffsetTransform()[ERigTransformType::InitialLocal].Get()));
+        Obj->SetObjectField(TEXT("shape_current_local"), TransformToJsonObject(Control->GetShapeTransform()[ERigTransformType::CurrentLocal].Get()));
+        Obj->SetObjectField(TEXT("shape_initial_local"), TransformToJsonObject(Control->GetShapeTransform()[ERigTransformType::InitialLocal].Get()));
+    }
+    return Obj;
+}
+
+TSharedRef<FJsonObject> ControlRigSummaryToJson(UControlRigBlueprint* RigBP, bool bIncludeElements, bool bIncludeControls, bool bIncludeTransforms)
+{
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), RigBP ? RigBP->GetPathName() : FString());
+    if (!RigBP)
+    {
+        return R;
+    }
+
+    URigHierarchy* Hierarchy = UControlRigBlueprintEditorLibrary::GetHierarchy(RigBP);
+    USkeletalMesh* PreviewMesh = UControlRigBlueprintEditorLibrary::GetPreviewMesh(RigBP);
+    R->SetStringField(TEXT("class"), RigBP->GetClass()->GetName());
+    R->SetStringField(TEXT("generated_class"), RigBP->GeneratedClass ? RigBP->GeneratedClass->GetPathName() : FString());
+    R->SetStringField(TEXT("control_rig_class"), RigBP->GetControlRigClass() ? RigBP->GetControlRigClass()->GetPathName() : FString());
+    R->SetStringField(TEXT("preview_mesh"), PreviewMesh ? PreviewMesh->GetPathName() : FString());
+    R->SetBoolField(TEXT("has_hierarchy"), Hierarchy != nullptr);
+    if (!Hierarchy)
+    {
+        return R;
+    }
+
+    const TArray<FRigElementKey> BoneKeys = Hierarchy->GetBoneKeys(true);
+    const TArray<FRigElementKey> NullKeys = Hierarchy->GetNullKeys(true);
+    const TArray<FRigElementKey> ControlKeys = Hierarchy->GetControlKeys(true);
+    const TArray<FRigElementKey> CurveKeys = Hierarchy->GetCurveKeys();
+    const TArray<FRigElementKey> ConnectorKeys = Hierarchy->GetConnectorKeys(true);
+    const TArray<FRigElementKey> SocketKeys = Hierarchy->GetSocketKeys(true);
+    const TArray<FRigElementKey> RootKeys = Hierarchy->GetRootElementKeys();
+    R->SetNumberField(TEXT("bone_count"), BoneKeys.Num());
+    R->SetNumberField(TEXT("null_count"), NullKeys.Num());
+    R->SetNumberField(TEXT("control_count"), ControlKeys.Num());
+    R->SetNumberField(TEXT("curve_count"), CurveKeys.Num());
+    R->SetNumberField(TEXT("connector_count"), ConnectorKeys.Num());
+    R->SetNumberField(TEXT("socket_count"), SocketKeys.Num());
+    R->SetNumberField(TEXT("root_count"), RootKeys.Num());
+    R->SetArrayField(TEXT("root_elements"), RigElementKeysToJson(RootKeys));
+
+    if (bIncludeControls)
+    {
+        TArray<TSharedPtr<FJsonValue>> Controls;
+        for (FRigControlElement* Control : Hierarchy->GetControls(true))
+        {
+            if (!Control) continue;
+            Controls.Add(MakeShared<FJsonValueObject>(RigControlToJson(Hierarchy, Control, bIncludeTransforms)));
+        }
+        R->SetArrayField(TEXT("controls"), Controls);
+    }
+    if (bIncludeElements)
+    {
+        auto KeysToElements = [Hierarchy, bIncludeTransforms](const TArray<FRigElementKey>& Keys)
+        {
+            TArray<TSharedPtr<FJsonValue>> Arr;
+            for (const FRigElementKey& Key : Keys)
+            {
+                Arr.Add(MakeShared<FJsonValueObject>(RigElementToJson(Hierarchy, Key, bIncludeTransforms)));
+            }
+            return Arr;
+        };
+        R->SetArrayField(TEXT("bones"), KeysToElements(BoneKeys));
+        R->SetArrayField(TEXT("nulls"), KeysToElements(NullKeys));
+        R->SetArrayField(TEXT("curves"), KeysToElements(CurveKeys));
+        R->SetArrayField(TEXT("connectors"), KeysToElements(ConnectorKeys));
+        R->SetArrayField(TEXT("sockets"), KeysToElements(SocketKeys));
+    }
+    return R;
+}
+
+bool ParseControlRigTransformArgs(const TSharedPtr<FJsonObject>& Args, FTransform& Out)
+{
+    bool bParsed = false;
+    const TSharedPtr<FJsonObject>* TransformObj = nullptr;
+    if (Args.IsValid() && Args->TryGetObjectField(TEXT("transform"), TransformObj) && TransformObj && TransformObj->IsValid())
+    {
+        bParsed = ReadAnimationTransform(*TransformObj, Out) || bParsed;
+    }
+    if (Args.IsValid())
+    {
+        FVector Location = Out.GetLocation();
+        FVector Scale = Out.GetScale3D();
+        FRotator Rotation = Out.GetRotation().Rotator();
+        if (ReadVectorArray(Args, TEXT("location"), Location))
+        {
+            Out.SetLocation(Location);
+            bParsed = true;
+        }
+        if (ReadVectorArray(Args, TEXT("scale"), Scale))
+        {
+            Out.SetScale3D(Scale);
+            bParsed = true;
+        }
+        if (ReadRotatorArray(Args, TEXT("rotation"), Rotation))
+        {
+            Out.SetRotation(Rotation.Quaternion());
+            bParsed = true;
+        }
+    }
+    return bParsed;
+}
+
+bool CompileControlRigIfRequested(UControlRigBlueprint* RigBP, bool bCompile, TSharedRef<FJsonObject> Result)
+{
+    Result->SetBoolField(TEXT("compile_requested"), bCompile);
+    if (!bCompile)
+    {
+        return true;
+    }
+    if (!RigBP)
+    {
+        Result->SetStringField(TEXT("compile_error"), TEXT("ControlRigBlueprint is null"));
+        return false;
+    }
+    FKismetEditorUtilities::CompileBlueprint(RigBP);
+    Result->SetBoolField(TEXT("compiled"), true);
+    return true;
+}
+
+FSageToolDispatch::FOutcome ControlRigReadImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FString Path;
     if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
     }
+    UControlRigBlueprint* RigBP = ResolveControlRigBlueprintAsset(Path);
+    if (!RigBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UControlRigBlueprint: %s"), *Path));
+    }
+    bool bIncludeElements = true;
+    bool bIncludeControls = true;
+    bool bIncludeTransforms = true;
+    Args->TryGetBoolField(TEXT("include_elements"), bIncludeElements);
+    Args->TryGetBoolField(TEXT("include_controls"), bIncludeControls);
+    Args->TryGetBoolField(TEXT("include_transforms"), bIncludeTransforms);
+    return FSageToolDispatch::FOutcome::MakeSuccess(
+        ControlRigSummaryToJson(RigBP, bIncludeElements, bIncludeControls, bIncludeTransforms));
+}
+
+FSageToolDispatch::FOutcome ControlRigListControlsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    UControlRigBlueprint* RigBP = ResolveControlRigBlueprintAsset(Path);
+    if (!RigBP)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a UControlRigBlueprint: %s"), *Path));
+    }
+    URigHierarchy* Hierarchy = UControlRigBlueprintEditorLibrary::GetHierarchy(RigBP);
+    if (!Hierarchy)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("ControlRig hierarchy unavailable"));
+    }
+
+    bool bIncludeTransforms = true;
+    FString NameContains;
+    Args->TryGetBoolField(TEXT("include_transforms"), bIncludeTransforms);
+    Args->TryGetStringField(TEXT("name_contains"), NameContains);
+
+    TArray<TSharedPtr<FJsonValue>> Controls;
+    for (FRigControlElement* Control : Hierarchy->GetControls(true))
+    {
+        if (!Control) continue;
+        const FString Name = Control->GetKey().Name.ToString();
+        if (!NameContains.IsEmpty() && !Name.Contains(NameContains, ESearchCase::IgnoreCase))
+        {
+            continue;
+        }
+        Controls.Add(MakeShared<FJsonValueObject>(RigControlToJson(Hierarchy, Control, bIncludeTransforms)));
+    }
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), RigBP->GetPathName());
+    R->SetArrayField(TEXT("controls"), Controls);
+    R->SetNumberField(TEXT("count"), Controls.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ControlRigSetPreviewMeshImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path, MeshPath;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    const TArray<const TCHAR*> PreviewMeshFields{TEXT("preview_mesh"), TEXT("skeletal_mesh")};
+    if (!TryGetAnyStringField(Args, PreviewMeshFields, MeshPath))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'preview_mesh'"));
+    }
+    UControlRigBlueprint* RigBP = ResolveControlRigBlueprintAsset(Path);
+    if (!RigBP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UControlRigBlueprint"));
+    USkeletalMesh* Mesh = Cast<USkeletalMesh>(ResolveAsset(MeshPath));
+    if (!Mesh) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("preview_mesh is not a USkeletalMesh"));
+
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), RigBP->GetPathName());
+    R->SetStringField(TEXT("before_preview_mesh"), AssetPathOrEmpty(UControlRigBlueprintEditorLibrary::GetPreviewMesh(RigBP)));
+    R->SetStringField(TEXT("requested_preview_mesh"), Mesh->GetPathName());
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    if (bDryRun)
+    {
+        R->SetBoolField(TEXT("changed"), true);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SetControlRigPreviewMesh", "Sage: Set Control Rig Preview Mesh"));
+    RigBP->UBlueprint::Modify();
+    UControlRigBlueprintEditorLibrary::SetPreviewMesh(RigBP, Mesh, true);
+    UControlRigBlueprintEditorLibrary::RequestControlRigInit(RigBP);
+    RigBP->MarkPackageDirty();
+    R->SetBoolField(TEXT("changed"), true);
+    R->SetStringField(TEXT("after_preview_mesh"), AssetPathOrEmpty(UControlRigBlueprintEditorLibrary::GetPreviewMesh(RigBP)));
+    TrySaveLoadedAssetIfRequested(RigBP, bSave, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ControlRigSetControlTransformImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path, ControlName;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("control"), ControlName) && !Args->TryGetStringField(TEXT("name"), ControlName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'control'"));
+    }
+    UControlRigBlueprint* RigBP = ResolveControlRigBlueprintAsset(Path);
+    if (!RigBP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UControlRigBlueprint"));
+    URigHierarchy* Hierarchy = UControlRigBlueprintEditorLibrary::GetHierarchy(RigBP);
+    if (!Hierarchy) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("ControlRig hierarchy unavailable"));
+    const FRigElementKey Key(FName(*ControlName), ERigElementType::Control);
+    FRigControlElement* Control = Hierarchy->Find<FRigControlElement>(Key);
+    if (!Control)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("control '%s' not found"), *ControlName));
+    }
+
+    FTransform Transform = Hierarchy->GetLocalTransform(Key, false);
+    if (!ParseControlRigTransformArgs(Args, Transform))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing transform/location/rotation/scale"));
+    }
+    FString Space = TEXT("local");
+    Args->TryGetStringField(TEXT("space"), Space);
+    Space = Space.TrimStartAndEnd().ToLower();
+    if (Space.IsEmpty()) Space = TEXT("local");
+    if (Space != TEXT("local") && Space != TEXT("global"))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("'space' must be local or global"));
+    }
+    bool bInitial = false;
+    bool bAffectChildren = true;
+    bool bDryRun = false;
+    bool bSave = false;
+    bool bCompile = true;
+    Args->TryGetBoolField(TEXT("initial"), bInitial);
+    Args->TryGetBoolField(TEXT("affect_children"), bAffectChildren);
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
 
     auto R = MakeShared<FJsonObject>();
-    R->SetStringField(TEXT("path"), Path);
-    R->SetStringField(TEXT("note"),
-        TEXT("ControlRig variables are accessible via bp.list_variables with the ControlRig Blueprint path"));
+    R->SetStringField(TEXT("path"), RigBP->GetPathName());
+    R->SetStringField(TEXT("control"), ControlName);
+    R->SetStringField(TEXT("space"), Space);
+    R->SetBoolField(TEXT("initial"), bInitial);
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    R->SetObjectField(TEXT("before"), RigControlToJson(Hierarchy, Control, true));
+    R->SetObjectField(TEXT("requested_transform"), TransformToJsonObject(Transform));
+    if (bDryRun)
+    {
+        R->SetBoolField(TEXT("changed"), true);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SetControlRigControlTransform", "Sage: Set Control Rig Control Transform"));
+    RigBP->UBlueprint::Modify();
+    Hierarchy->Modify();
+    if (Space == TEXT("global"))
+    {
+        Hierarchy->SetGlobalTransform(Key, Transform, bInitial, bAffectChildren, /*bSetupUndo=*/true);
+    }
+    else
+    {
+        Hierarchy->SetLocalTransform(Key, Transform, bInitial, bAffectChildren, /*bSetupUndo=*/true);
+    }
+    RigBP->MarkPackageDirty();
+    CompileControlRigIfRequested(RigBP, bCompile, R);
+    R->SetBoolField(TEXT("changed"), true);
+    R->SetObjectField(TEXT("after"), RigControlToJson(Hierarchy, Control, true));
+    TrySaveLoadedAssetIfRequested(RigBP, bSave, R);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ControlRigAddControlImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path, Name;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+    }
+    UControlRigBlueprint* RigBP = ResolveControlRigBlueprintAsset(Path);
+    if (!RigBP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UControlRigBlueprint"));
+    URigHierarchy* Hierarchy = UControlRigBlueprintEditorLibrary::GetHierarchy(RigBP);
+    URigHierarchyController* Controller = UControlRigBlueprintEditorLibrary::GetHierarchyController(RigBP);
+    if (!Hierarchy || !Controller) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("ControlRig hierarchy/controller unavailable"));
+
+    const FRigElementKey NewKey(FName(*Name), ERigElementType::Control);
+    if (Hierarchy->Contains(NewKey))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("control '%s' already exists"), *Name));
+    }
+
+    FString ControlTypeStr;
+    Args->TryGetStringField(TEXT("control_type"), ControlTypeStr);
+    ERigControlType ControlType = ERigControlType::EulerTransform;
+    if (!ParseRigControlType(ControlTypeStr, ControlType))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("unsupported control_type"));
+    }
+    FString AnimationTypeStr;
+    Args->TryGetStringField(TEXT("animation_type"), AnimationTypeStr);
+    ERigControlAnimationType AnimationType = ERigControlAnimationType::AnimationControl;
+    if (!ParseRigControlAnimationType(AnimationTypeStr, AnimationType))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("unsupported animation_type"));
+    }
+
+    FString ParentName;
+    FString ParentTypeStr = TEXT("null");
+    Args->TryGetStringField(TEXT("parent"), ParentName);
+    Args->TryGetStringField(TEXT("parent_name"), ParentName);
+    Args->TryGetStringField(TEXT("parent_type"), ParentTypeStr);
+    ERigElementType ParentType = ERigElementType::None;
+    FRigElementKey ParentKey;
+    if (!ParentName.IsEmpty())
+    {
+        if (!ParseRigElementType(ParentTypeStr, ParentType) || ParentType == ERigElementType::None)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("unsupported parent_type"));
+        }
+        ParentKey = FRigElementKey(FName(*ParentName), ParentType);
+        if (!Hierarchy->Contains(ParentKey))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("parent '%s' of type '%s' not found"), *ParentName, *ParentTypeStr));
+        }
+    }
+
+    FTransform ValueTransform = FTransform::Identity;
+    ParseControlRigTransformArgs(Args, ValueTransform);
+    FTransform OffsetTransform = FTransform::Identity;
+    const TSharedPtr<FJsonObject>* OffsetObj = nullptr;
+    if (Args->TryGetObjectField(TEXT("offset_transform"), OffsetObj) && OffsetObj && OffsetObj->IsValid())
+    {
+        ReadAnimationTransform(*OffsetObj, OffsetTransform);
+    }
+    FTransform ShapeTransform = FTransform::Identity;
+    const TSharedPtr<FJsonObject>* ShapeObj = nullptr;
+    if (Args->TryGetObjectField(TEXT("shape_transform"), ShapeObj) && ShapeObj && ShapeObj->IsValid())
+    {
+        ReadAnimationTransform(*ShapeObj, ShapeTransform);
+    }
+
+    bool bDryRun = false;
+    bool bSave = false;
+    bool bCompile = true;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
+
+    FRigControlSettings Settings;
+    Settings.ControlType = ControlType;
+    Settings.AnimationType = AnimationType;
+    FString DisplayName;
+    if (Args->TryGetStringField(TEXT("display_name"), DisplayName))
+    {
+        Settings.DisplayName = FName(*DisplayName);
+    }
+    FString ShapeName;
+    if (Args->TryGetStringField(TEXT("shape_name"), ShapeName))
+    {
+        Settings.ShapeName = FName(*ShapeName);
+    }
+    bool bShapeVisible = Settings.bShapeVisible;
+    if (Args->TryGetBoolField(TEXT("shape_visible"), bShapeVisible))
+    {
+        Settings.bShapeVisible = bShapeVisible;
+    }
+    FRigControlValue Value;
+    Value.SetFromTransform(ValueTransform, Settings.ControlType, Settings.PrimaryAxis);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), RigBP->GetPathName());
+    R->SetStringField(TEXT("name"), Name);
+    R->SetStringField(TEXT("control_type"), RigControlTypeToString(ControlType));
+    R->SetStringField(TEXT("animation_type"), RigControlAnimationTypeToString(AnimationType));
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    if (bDryRun)
+    {
+        R->SetBoolField(TEXT("changed"), true);
+        R->SetStringField(TEXT("would_add"), Name);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("AddControlRigControl", "Sage: Add Control Rig Control"));
+    RigBP->UBlueprint::Modify();
+    Hierarchy->Modify();
+    const FRigElementKey AddedKey = Controller->AddControl(
+        FName(*Name),
+        ParentKey,
+        Settings,
+        Value,
+        OffsetTransform,
+        ShapeTransform,
+        /*bSetupUndo=*/true,
+        /*bPrintPythonCommand=*/false);
+    if (!AddedKey.IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("URigHierarchyController::AddControl failed"));
+    }
+    RigBP->MarkPackageDirty();
+    CompileControlRigIfRequested(RigBP, bCompile, R);
+    R->SetBoolField(TEXT("changed"), true);
+    R->SetObjectField(TEXT("control"), RigControlToJson(Hierarchy, Hierarchy->Find<FRigControlElement>(AddedKey), true));
+    TrySaveLoadedAssetIfRequested(RigBP, bSave, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ControlRigRemoveControlImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    FString Path, Name;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("control"), Name) && !Args->TryGetStringField(TEXT("name"), Name))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'control'"));
+    }
+    UControlRigBlueprint* RigBP = ResolveControlRigBlueprintAsset(Path);
+    if (!RigBP) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("not a UControlRigBlueprint"));
+    URigHierarchy* Hierarchy = UControlRigBlueprintEditorLibrary::GetHierarchy(RigBP);
+    URigHierarchyController* Controller = UControlRigBlueprintEditorLibrary::GetHierarchyController(RigBP);
+    if (!Hierarchy || !Controller) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("ControlRig hierarchy/controller unavailable"));
+
+    const FRigElementKey Key(FName(*Name), ERigElementType::Control);
+    FRigControlElement* Control = Hierarchy->Find<FRigControlElement>(Key);
+    if (!Control)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("control '%s' not found"), *Name));
+    }
+    bool bDryRun = false;
+    bool bSave = false;
+    bool bCompile = true;
+    bool bConfirmed = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    Args->TryGetBoolField(TEXT("compile"), bCompile);
+    Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), RigBP->GetPathName());
+    R->SetStringField(TEXT("control"), Name);
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    R->SetObjectField(TEXT("before"), RigControlToJson(Hierarchy, Control, true));
+    if (bDryRun)
+    {
+        R->SetBoolField(TEXT("changed"), true);
+        R->SetStringField(TEXT("would_remove"), Name);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+    if (!bConfirmed)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("controlrig.remove_control is destructive; pass confirmed:true to proceed"));
+    }
+
+    FScopedTransaction Tx(LOCTEXT("RemoveControlRigControl", "Sage: Remove Control Rig Control"));
+    RigBP->UBlueprint::Modify();
+    Hierarchy->Modify();
+    const bool bRemoved = Controller->RemoveElement(Key, /*bSetupUndo=*/true, /*bPrintPythonCommand=*/false);
+    RigBP->MarkPackageDirty();
+    CompileControlRigIfRequested(RigBP, bCompile, R);
+    R->SetBoolField(TEXT("removed"), bRemoved);
+    R->SetBoolField(TEXT("changed"), bRemoved);
+    R->SetObjectField(TEXT("after_summary"), ControlRigSummaryToJson(RigBP, false, false, false));
+    TrySaveLoadedAssetIfRequested(RigBP, bSave && bRemoved, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome ListControlRigVariablesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return ControlRigReadImpl(Args);
 }
 
 // ---------------------------------------------------------------------------
@@ -4588,12 +5498,12 @@ FSageToolDispatch::FOutcome CopyBoneTracksImpl(const TSharedPtr<FJsonObject>& Ar
     {
         auto Row = MakeShared<FJsonObject>();
         Row->SetStringField(TEXT("bone"), BoneName.ToString());
-        const FBoneAnimationTrack* SourceTrack = SourceModel->FindBoneTrackByName(BoneName);
+        const bool bSourceTrackFound = SourceModel->IsValidBoneTrackName(BoneName);
         const bool bTargetHasBone = TargetSeq->GetSkeleton() &&
             TargetSeq->GetSkeleton()->GetReferenceSkeleton().FindBoneIndex(BoneName) != INDEX_NONE;
-        Row->SetBoolField(TEXT("source_track_found"), SourceTrack != nullptr);
+        Row->SetBoolField(TEXT("source_track_found"), bSourceTrackFound);
         Row->SetBoolField(TEXT("target_bone_found"), bTargetHasBone);
-        if (!SourceTrack || !bTargetHasBone)
+        if (!bSourceTrackFound || !bTargetHasBone)
         {
             Row->SetStringField(TEXT("status"), TEXT("skipped"));
             ++Failed;
@@ -4608,17 +5518,30 @@ FSageToolDispatch::FOutcome CopyBoneTracksImpl(const TSharedPtr<FJsonObject>& Ar
             {
                 TargetController->AddBoneCurve(BoneName, false);
             }
-            const FRawAnimSequenceTrack& Raw = SourceTrack->InternalTrackData;
+            TArray<FTransform> SourceTransforms;
+            SourceModel->GetBoneTrackTransforms(BoneName, SourceTransforms);
+            TArray<FVector> Positions;
+            TArray<FQuat> Rotations;
+            TArray<FVector> Scales;
+            Positions.Reserve(SourceTransforms.Num());
+            Rotations.Reserve(SourceTransforms.Num());
+            Scales.Reserve(SourceTransforms.Num());
+            for (const FTransform& Transform : SourceTransforms)
+            {
+                Positions.Add(Transform.GetTranslation());
+                Rotations.Add(Transform.GetRotation());
+                Scales.Add(Transform.GetScale3D());
+            }
             const bool bOk = TargetController->SetBoneTrackKeys(
                 BoneName,
-                Raw.PosKeys,
-                Raw.RotKeys,
-                Raw.ScaleKeys,
+                Positions,
+                Rotations,
+                Scales,
                 false);
             Row->SetStringField(TEXT("status"), bOk ? TEXT("copied") : TEXT("failed"));
-            Row->SetNumberField(TEXT("pos_key_count"), Raw.PosKeys.Num());
-            Row->SetNumberField(TEXT("rot_key_count"), Raw.RotKeys.Num());
-            Row->SetNumberField(TEXT("scale_key_count"), Raw.ScaleKeys.Num());
+            Row->SetNumberField(TEXT("pos_key_count"), Positions.Num());
+            Row->SetNumberField(TEXT("rot_key_count"), Rotations.Num());
+            Row->SetNumberField(TEXT("scale_key_count"), Scales.Num());
             bOk ? ++Copied : ++Failed;
         }
         Results.Add(MakeShared<FJsonValueObject>(Row));
@@ -6658,6 +7581,124 @@ FSageToolDispatch::FOutcome ReadIKRigImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
+// ---------------------------------------------------------------------------
+// animation.set_ik_rig_skeletal_mesh
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome SetIKRigSkeletalMeshImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRigDefinition* Rig = nullptr;
+    UIKRigController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRigController(Args, Rig, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    FString MeshPath;
+    if (!TryGetAnyStringField(Args,
+        TArray<const TCHAR*>{ TEXT("skeletal_mesh"), TEXT("skeletal_mesh_path"), TEXT("mesh"), TEXT("mesh_path") },
+        MeshPath) || MeshPath.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'skeletal_mesh'"));
+    }
+
+    USkeletalMesh* Mesh = Cast<USkeletalMesh>(ResolveAsset(MeshPath));
+    if (!Mesh)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("not a USkeletalMesh: %s"), *MeshPath));
+    }
+
+    bool bDryRun = false;
+    bool bValidateOnly = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bValidateOnly);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    bDryRun = bDryRun || bValidateOnly;
+
+    TSharedRef<FJsonObject> Before = IKRigToJson(Rig, Controller);
+    USkeletalMesh* BeforeMesh = Controller->GetSkeletalMesh();
+    const bool bWouldModify = BeforeMesh != Mesh;
+    TSharedRef<FJsonObject> Compatibility = IKRigMeshCompatibilityToJson(Rig, Mesh);
+    const bool bCompatible = Compatibility->GetBoolField(TEXT("compatible"));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Rig->GetPathName());
+    R->SetStringField(TEXT("skeletal_mesh"), Mesh->GetPathName());
+    R->SetStringField(TEXT("before_skeletal_mesh"), AssetPathOrEmpty(BeforeMesh));
+    R->SetBoolField(TEXT("compatible"), bCompatible);
+    R->SetBoolField(TEXT("would_modify"), bWouldModify);
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    R->SetBoolField(TEXT("validate_only"), bValidateOnly);
+    R->SetBoolField(TEXT("modified"), false);
+    R->SetObjectField(TEXT("compatibility"), Compatibility);
+    R->SetObjectField(TEXT("before"), Before);
+
+    if (!bCompatible)
+    {
+        R->SetBoolField(TEXT("rejected"), true);
+        R->SetStringField(TEXT("reason"), TEXT("UIKRigController::IsSkeletalMeshCompatible returned false"));
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    if (bDryRun)
+    {
+        R->SetBoolField(TEXT("rejected"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    bool bSet = true;
+    if (bWouldModify)
+    {
+        FScopedTransaction Tx(LOCTEXT("SageSetIKRigSkeletalMesh", "Sage: Set IK Rig Skeletal Mesh"));
+        Rig->Modify();
+        bSet = Controller->SetSkeletalMesh(Mesh);
+        if (!bSet)
+        {
+            Tx.Cancel();
+            R->SetBoolField(TEXT("set_result"), false);
+            R->SetBoolField(TEXT("rejected"), true);
+            R->SetStringField(TEXT("reason"), TEXT("UIKRigController::SetSkeletalMesh returned false"));
+            R->SetObjectField(TEXT("after"), IKRigToJson(Rig, Controller));
+            return FSageToolDispatch::FOutcome::MakeSuccess(R);
+        }
+        Controller->BroadcastNeedsReinitialized();
+        Rig->MarkPackageDirty();
+    }
+
+    TSharedRef<FJsonObject> After = IKRigToJson(Rig, Controller);
+    R->SetBoolField(TEXT("set_result"), bSet);
+    R->SetBoolField(TEXT("rejected"), false);
+    R->SetBoolField(TEXT("modified"), bWouldModify);
+    R->SetObjectField(TEXT("after"), After);
+
+    FString BeforeRoot;
+    FString AfterRoot;
+    Before->TryGetStringField(TEXT("retarget_root"), BeforeRoot);
+    After->TryGetStringField(TEXT("retarget_root"), AfterRoot);
+    R->SetBoolField(TEXT("retarget_root_preserved"), BeforeRoot == AfterRoot);
+
+    double BeforeCount = 0.0;
+    double AfterCount = 0.0;
+    Before->TryGetNumberField(TEXT("chain_count"), BeforeCount);
+    After->TryGetNumberField(TEXT("chain_count"), AfterCount);
+    R->SetBoolField(TEXT("chain_count_preserved"), FMath::RoundToInt(BeforeCount) == FMath::RoundToInt(AfterCount));
+    Before->TryGetNumberField(TEXT("goal_count"), BeforeCount);
+    After->TryGetNumberField(TEXT("goal_count"), AfterCount);
+    R->SetBoolField(TEXT("goal_count_preserved"), FMath::RoundToInt(BeforeCount) == FMath::RoundToInt(AfterCount));
+    Before->TryGetNumberField(TEXT("solver_count"), BeforeCount);
+    After->TryGetNumberField(TEXT("solver_count"), AfterCount);
+    R->SetBoolField(TEXT("solver_count_preserved"), FMath::RoundToInt(BeforeCount) == FMath::RoundToInt(AfterCount));
+    Before->TryGetNumberField(TEXT("goal_connection_count"), BeforeCount);
+    After->TryGetNumberField(TEXT("goal_connection_count"), AfterCount);
+    R->SetBoolField(TEXT("goal_connection_count_preserved"), FMath::RoundToInt(BeforeCount) == FMath::RoundToInt(AfterCount));
+
+    TrySaveLoadedAssetIfRequested(Rig, bSave, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
 FSageToolDispatch::FOutcome AddIKRetargetChainImpl(const TSharedPtr<FJsonObject>& Args)
 {
     FSageToolDispatch::FOutcome Reject;
@@ -7685,19 +8726,28 @@ FSageToolDispatch::FOutcome ReadIKRetargeterImpl(const TSharedPtr<FJsonObject>& 
         }
         if (UIKRetargetIKChainsController* IKController = Cast<UIKRetargetIKChainsController>(Controller->GetOpController(I)))
         {
-            const FIKRetargetIKChainsOpSettings IKSettings = IKController->GetSettings();
+            const FIKRetargetOpBase* IKOp = Controller->GetRetargetOpByIndex(I);
+            const FIKRetargetIKChainsOpSettings* IKSettings = IKOp
+                ? reinterpret_cast<const FIKRetargetIKChainsOpSettings*>(IKOp->GetSettingsConst())
+                : nullptr;
             TArray<TSharedPtr<FJsonValue>> IKChains;
-            for (const FRetargetIKChainSettings& ChainSettings : IKSettings.ChainsToRetarget)
+            if (IKSettings)
             {
-                IKChains.Add(MakeShared<FJsonValueObject>(IKChainSettingsToJson(ChainSettings)));
+                for (const FRetargetIKChainSettings& ChainSettings : IKSettings->ChainsToRetarget)
+                {
+                    IKChains.Add(MakeShared<FJsonValueObject>(IKChainSettingsToJson(ChainSettings)));
+                }
             }
             auto IKObj = MakeShared<FJsonObject>();
             IKObj->SetArrayField(TEXT("chains"), IKChains);
             IKObj->SetNumberField(TEXT("chain_count"), IKChains.Num());
-            IKObj->SetBoolField(TEXT("draw_final_goals"), IKSettings.bDrawFinalGoals);
-            IKObj->SetBoolField(TEXT("draw_source_locations"), IKSettings.bDrawSourceLocations);
-            IKObj->SetNumberField(TEXT("goal_draw_size"), IKSettings.GoalDrawSize);
-            IKObj->SetNumberField(TEXT("goal_draw_thickness"), IKSettings.GoalDrawThickness);
+            if (IKSettings)
+            {
+                IKObj->SetBoolField(TEXT("draw_final_goals"), IKSettings->bDrawFinalGoals);
+                IKObj->SetBoolField(TEXT("draw_source_locations"), IKSettings->bDrawSourceLocations);
+                IKObj->SetNumberField(TEXT("goal_draw_size"), IKSettings->GoalDrawSize);
+                IKObj->SetNumberField(TEXT("goal_draw_thickness"), IKSettings->GoalDrawThickness);
+            }
             OpObj->SetObjectField(TEXT("ik_settings"), IKObj);
         }
         Ops.Add(MakeShared<FJsonValueObject>(OpObj));
@@ -8053,6 +9103,24 @@ int32 FindFirstFKRetargetOpIndex(UIKRetargeterController* Controller)
         FInstancedStruct* OpStruct = Controller->GetRetargetOpStructAtIndex(Index);
         const UScriptStruct* ScriptStruct = OpStruct ? OpStruct->GetScriptStruct() : nullptr;
         if (ScriptStruct && ScriptStruct->IsChildOf(FIKRetargetFKChainsOp::StaticStruct()))
+        {
+            return Index;
+        }
+    }
+    return INDEX_NONE;
+}
+
+int32 FindFirstIKRetargetOpIndex(UIKRetargeterController* Controller)
+{
+    if (!Controller)
+    {
+        return INDEX_NONE;
+    }
+    for (int32 Index = 0; Index < Controller->GetNumRetargetOps(); ++Index)
+    {
+        FInstancedStruct* OpStruct = Controller->GetRetargetOpStructAtIndex(Index);
+        const UScriptStruct* ScriptStruct = OpStruct ? OpStruct->GetScriptStruct() : nullptr;
+        if (ScriptStruct && ScriptStruct->IsChildOf(FIKRetargetIKChainsOp::StaticStruct()))
         {
             return Index;
         }
@@ -8824,6 +9892,194 @@ FSageToolDispatch::FOutcome ResetIKRetargeterChainSettingsImpl(const TSharedPtr<
         R->SetBoolField(TEXT("at_default"), Controller->AreChainSettingsAtDefault(FName(*TargetChain), FName(*OpName)));
     }
     TrySaveLoadedAssetIfRequested(Retargeter, bSave, R);
+    AddIKRetargeterReadback(Retargeter, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+// ---------------------------------------------------------------------------
+// animation.set_ik_retargeter_ik_chain_settings
+// ---------------------------------------------------------------------------
+
+FSageToolDispatch::FOutcome SetIKRetargeterIKChainSettingsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    UIKRetargeter* Retargeter = nullptr;
+    UIKRetargeterController* Controller = nullptr;
+    FSageToolDispatch::FOutcome Resolved = ResolveIKRetargeterController(Args, Retargeter, Controller);
+    if (!Resolved.bSuccess) return Resolved;
+
+    FString TargetChain;
+    if (!TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("target_chain"), TEXT("chain"), TEXT("chain_name") }, TargetChain))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'target_chain'"));
+    }
+
+    int32 OpIndex = INDEX_NONE;
+    FString OpError;
+    FString OpName;
+    if (TryGetAnyStringField(Args, TArray<const TCHAR*>{ TEXT("op_name"), TEXT("name") }, OpName) ||
+        TryGetAnyIntField(Args, TArray<const TCHAR*>{ TEXT("index"), TEXT("op_index") }, OpIndex))
+    {
+        if (!TryResolveIKRetargeterOpIndex(Args, Controller, OpIndex, OpError))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, OpError);
+        }
+    }
+    else
+    {
+        OpIndex = FindFirstIKRetargetOpIndex(Controller);
+        if (OpIndex == INDEX_NONE)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                TEXT("no IK Chains op found; add default ops or pass op_name/index"));
+        }
+    }
+
+    UIKRetargetIKChainsController* IKController = Cast<UIKRetargetIKChainsController>(Controller->GetOpController(OpIndex));
+    if (!IKController)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("retarget op is not an IK Chains op: %s"), *Controller->GetOpName(OpIndex).ToString()));
+    }
+
+    bool bDryRun = false;
+    bool bSave = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("validate_only"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+
+    FIKRetargetOpBase* RetargetOp = Controller->GetRetargetOpByIndex(OpIndex);
+    FIKRetargetIKChainsOpSettings* Settings = RetargetOp
+        ? reinterpret_cast<FIKRetargetIKChainsOpSettings*>(RetargetOp->GetSettings())
+        : nullptr;
+    if (!Settings)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("IK Chains op settings unavailable"));
+    }
+
+    const int32 ChainIndex = Settings->ChainsToRetarget.IndexOfByPredicate(
+        [&TargetChain](const FRetargetIKChainSettings& Item)
+        {
+            return Item.TargetChainName == FName(*TargetChain);
+        });
+    if (ChainIndex == INDEX_NONE)
+    {
+        TArray<FString> ExistingChains;
+        for (const FRetargetIKChainSettings& Existing : Settings->ChainsToRetarget)
+        {
+            ExistingChains.Add(Existing.TargetChainName.ToString());
+        }
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("target chain not found in IK Chains op settings: %s (op=%s, available=%s)"),
+                *TargetChain,
+                *Controller->GetOpName(OpIndex).ToString(),
+                *FString::Join(ExistingChains, TEXT(", "))));
+    }
+
+    const FRetargetIKChainSettings Before = Settings->ChainsToRetarget[ChainIndex];
+    FRetargetIKChainSettings Updated = Before;
+    bool bAnyField = false;
+
+    auto ApplyBool = [&](const TArray<const TCHAR*>& Names, bool& Field)
+    {
+        bool Value = Field;
+        if (TryGetAnyBoolField(Args, Names, Value))
+        {
+            Field = Value;
+            bAnyField = true;
+        }
+    };
+    auto ApplyNumber = [&](const TArray<const TCHAR*>& Names, double& Field)
+    {
+        double Value = Field;
+        if (TryGetAnyNumberField(Args, Names, Value))
+        {
+            Field = Value;
+            bAnyField = true;
+        }
+    };
+    auto ApplyVector = [&](const TArray<const TCHAR*>& Names, FVector& Field)
+    {
+        for (const TCHAR* Name : Names)
+        {
+            FVector Value = Field;
+            if (ReadVectorArray(Args, Name, Value))
+            {
+                Field = Value;
+                bAnyField = true;
+                return;
+            }
+        }
+    };
+    auto ApplyRotator = [&](const TArray<const TCHAR*>& Names, FRotator& Field)
+    {
+        for (const TCHAR* Name : Names)
+        {
+            FRotator Value = Field;
+            if (ReadRotatorArray(Args, Name, Value))
+            {
+                Field = Value;
+                bAnyField = true;
+                return;
+            }
+        }
+    };
+
+    ApplyBool(TArray<const TCHAR*>{ TEXT("enable_ik"), TEXT("enabled"), TEXT("enable") }, Updated.EnableIK);
+    ApplyNumber(TArray<const TCHAR*>{ TEXT("blend_to_source") }, Updated.BlendToSource);
+    ApplyNumber(TArray<const TCHAR*>{ TEXT("blend_to_source_translation"), TEXT("blend_translation") }, Updated.BlendToSourceTranslation);
+    ApplyNumber(TArray<const TCHAR*>{ TEXT("blend_to_source_rotation"), TEXT("blend_rotation") }, Updated.BlendToSourceRotation);
+    ApplyVector(TArray<const TCHAR*>{ TEXT("blend_to_source_weights"), TEXT("blend_weights") }, Updated.BlendToSourceWeights);
+    ApplyBool(TArray<const TCHAR*>{ TEXT("apply_pelvis_offset_to_source_goals"), TEXT("apply_pelvis_offset") }, Updated.ApplyPelvisOffsetToSourceGoals);
+    ApplyVector(TArray<const TCHAR*>{ TEXT("static_offset"), TEXT("offset") }, Updated.StaticOffset);
+    ApplyVector(TArray<const TCHAR*>{ TEXT("static_local_offset"), TEXT("local_offset") }, Updated.StaticLocalOffset);
+    ApplyRotator(TArray<const TCHAR*>{ TEXT("static_rotation_offset"), TEXT("rotation_offset") }, Updated.StaticRotationOffset);
+    ApplyNumber(TArray<const TCHAR*>{ TEXT("scale_vertical"), TEXT("vertical_scale") }, Updated.ScaleVertical);
+    ApplyNumber(TArray<const TCHAR*>{ TEXT("extension"), TEXT("scale_length") }, Updated.Extension);
+
+    if (!bAnyField)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("no IK chain setting field supplied"));
+    }
+
+    const bool bWouldModify = !(Before == Updated);
+    if (bDryRun)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+        R->SetNumberField(TEXT("op_index"), OpIndex);
+        R->SetStringField(TEXT("op_name"), Controller->GetOpName(OpIndex).ToString());
+        R->SetStringField(TEXT("target_chain"), TargetChain);
+        R->SetObjectField(TEXT("before_settings"), IKChainSettingsToJson(Before));
+        R->SetObjectField(TEXT("after_settings"), IKChainSettingsToJson(Updated));
+        R->SetBoolField(TEXT("would_modify"), bWouldModify);
+        R->SetBoolField(TEXT("dry_run"), true);
+        R->SetBoolField(TEXT("modified"), false);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("SageSetIKRetargeterIKChainSettings", "Sage: Set IK Retargeter IK Chain Settings"));
+    Retargeter->Modify();
+    Settings->ChainsToRetarget[ChainIndex] = Updated;
+    FPropertyChangedEvent Event(nullptr, EPropertyChangeType::ValueSet);
+    Controller->OnOpPropertyChanged(Controller->GetOpName(OpIndex), Event);
+    if (bWouldModify)
+    {
+        Retargeter->MarkPackageDirty();
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Retargeter->GetPathName());
+    R->SetNumberField(TEXT("op_index"), OpIndex);
+    R->SetStringField(TEXT("op_name"), Controller->GetOpName(OpIndex).ToString());
+    R->SetStringField(TEXT("target_chain"), TargetChain);
+    R->SetObjectField(TEXT("before_settings"), IKChainSettingsToJson(Before));
+    R->SetObjectField(TEXT("after_settings"), IKChainSettingsToJson(Updated));
+    R->SetBoolField(TEXT("modified"), bWouldModify);
+    TrySaveLoadedAssetIfRequested(Retargeter, bSave && bWouldModify, R);
     AddIKRetargeterReadback(Retargeter, R);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
@@ -20278,6 +21534,12 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.read_bone_track"),            GT(&ReadBoneTrackImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_animation_curves"),       GT(&ReadAnimationCurvesImpl));
     Dispatch.RegisterHandler(TEXT("animation.list_control_rig_variables"), GT(&ListControlRigVariablesImpl));
+    Dispatch.RegisterHandler(TEXT("controlrig.read"),                      GT(&ControlRigReadImpl));
+    Dispatch.RegisterHandler(TEXT("controlrig.list_controls"),             GT(&ControlRigListControlsImpl));
+    Dispatch.RegisterHandler(TEXT("controlrig.set_preview_mesh"),          GT(&ControlRigSetPreviewMeshImpl));
+    Dispatch.RegisterHandler(TEXT("controlrig.set_control_transform"),     GT(&ControlRigSetControlTransformImpl));
+    Dispatch.RegisterHandler(TEXT("controlrig.add_control"),               GT(&ControlRigAddControlImpl));
+    Dispatch.RegisterHandler(TEXT("controlrig.remove_control"),            GT(&ControlRigRemoveControlImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_pose_search_database"),  GT(&ReadPoseSearchDatabaseImpl));
 
     // Write tools
@@ -20302,6 +21564,7 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.add_montage_section"),        GT(&AddMontageSectionImpl));
     Dispatch.RegisterHandler(TEXT("animation.create_ik_rig"),              GT(&CreateIKRigImpl));
     Dispatch.RegisterHandler(TEXT("animation.read_ik_rig"),                GT(&ReadIKRigImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_ik_rig_skeletal_mesh"),   GT(&SetIKRigSkeletalMeshImpl));
     Dispatch.RegisterHandler(TEXT("animation.add_ik_retarget_chain"),      GT(&AddIKRetargetChainImpl));
     Dispatch.RegisterHandler(TEXT("animation.remove_ik_retarget_chain"),   GT(&RemoveIKRetargetChainImpl));
     Dispatch.RegisterHandler(TEXT("animation.rename_ik_retarget_chain"),   GT(&RenameIKRetargetChainImpl));
@@ -20327,6 +21590,7 @@ void RegisterAnimationTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("animation.set_ik_retargeter_op_enabled"), GT(&SetIKRetargeterOpEnabledImpl));
     Dispatch.RegisterHandler(TEXT("animation.auto_map_ik_retargeter_chains"), GT(&AutoMapIKRetargeterChainsImpl));
     Dispatch.RegisterHandler(TEXT("animation.reset_ik_retargeter_chain_settings"), GT(&ResetIKRetargeterChainSettingsImpl));
+    Dispatch.RegisterHandler(TEXT("animation.set_ik_retargeter_ik_chain_settings"), GT(&SetIKRetargeterIKChainSettingsImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_ik_retargeter_fk_chain_settings"), GT(&SetIKRetargeterFKChainSettingsImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_ik_retargeter_chain_mapping"), GT(&SetIKRetargeterChainMappingImpl));
     Dispatch.RegisterHandler(TEXT("animation.set_ik_retargeter_pose"),     GT(&SetIKRetargeterPoseImpl));

@@ -109,8 +109,8 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.list_sockets",
-        .description="List sockets on a skeletal mesh.",
-        .inputSchema=obj({{"path",str()}},{"path"}),
+        .description="List sockets on a USkeleton or USkeletalMesh with owner filtering. owner defaults to any; skeletal meshes report mesh-owned overrides, inherited skeleton sockets, effective ownership, and owner collision diagnostics.",
+        .inputSchema=obj({{"path",str()},{"owner",str()}},{"path"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.get_physics_asset",
@@ -371,6 +371,11 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .inputSchema=obj({{"path",str()}},{"path"}),
         .handler=nullptr,.remote=true});
 
+    reg(registry, Tool{.name="animation.set_ik_rig_skeletal_mesh",
+        .description="Set the preview skeletal mesh on an existing IKRig via UIKRigController while preserving compatible retarget root, chains, goals, solvers, and goal-solver links. Supports skeletal_mesh/skeletal_mesh_path/mesh aliases, dry_run/validate_only, save, compatibility diagnostics, and before/after readback.",
+        .inputSchema=obj({{"path",str()},{"skeletal_mesh",str()},{"skeletal_mesh_path",str()},{"mesh",str()},{"mesh_path",str()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
     reg(registry, Tool{.name="animation.add_ik_retarget_chain",
         .description="Add a retarget chain to an IKRig. Accepts name/chain_name, start_bone, end_bone, optional goal, dry_run, and save.",
         .inputSchema=obj({{"path",str()},{"name",str()},{"chain_name",str()},{"start_bone",str()},{"start",str()},{"end_bone",str()},{"end",str()},{"goal",str()},{"goal_name",str()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
@@ -461,6 +466,11 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .inputSchema=obj({{"path",str()},{"target_chain",str()},{"chain",str()},{"chain_name",str()},{"op_name",str()},{"name",str()},{"all_ops",bln()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
         .handler=nullptr,.remote=true});
 
+    reg(registry, Tool{.name="animation.set_ik_retargeter_ik_chain_settings",
+        .description="Edit IK Chains op settings for one existing target chain without touching other chains or ops. Supports enable_ik, blend_to_source*, blend_to_source_weights, static_offset, static_local_offset, static_rotation_offset, scale_vertical, extension, before/after readback, dry-run, and save. If op_name/index is omitted, the first IK Chains op is used.",
+        .inputSchema=obj({{"path",str()},{"target_chain",str()},{"chain",str()},{"chain_name",str()},{"op_name",str()},{"name",str()},{"index",num()},{"op_index",num()},{"enable_ik",bln()},{"enabled",bln()},{"enable",bln()},{"blend_to_source",num()},{"blend_to_source_translation",num()},{"blend_translation",num()},{"blend_to_source_rotation",num()},{"blend_rotation",num()},{"blend_to_source_weights",vec3()},{"blend_weights",vec3()},{"apply_pelvis_offset_to_source_goals",bln()},{"apply_pelvis_offset",bln()},{"static_offset",vec3()},{"offset",vec3()},{"static_local_offset",vec3()},{"local_offset",vec3()},{"static_rotation_offset",vec3()},{"rotation_offset",vec3()},{"scale_vertical",num()},{"vertical_scale",num()},{"extension",num()},{"scale_length",num()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path","target_chain"}),
+        .handler=nullptr,.remote=true});
+
     reg(registry, Tool{.name="animation.set_ik_retargeter_fk_chain_settings",
         .description="Edit FK Chains op settings for one target chain: enable_fk, rotation_mode, rotation_alpha, translation_mode, translation_alpha. If op_name/index is omitted, the first FK Chains op is used.",
         .inputSchema=obj({{"path",str()},{"target_chain",str()},{"chain",str()},{"chain_name",str()},{"op_name",str()},{"name",str()},{"index",num()},{"op_index",num()},{"enable_fk",bln()},{"enabled",bln()},{"rotation_mode",str()},{"fk_rotation_mode",str()},{"rotation_alpha",num()},{"fk_rotation_alpha",num()},{"translation_mode",str()},{"fk_translation_mode",str()},{"translation_alpha",num()},{"fk_translation_alpha",num()},{"dry_run",bln()},{"validate_only",bln()},{"save",bln()}},{"path"}),
@@ -492,8 +502,33 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.list_control_rig_variables",
-        .description="List exposed variables on a ControlRig asset.",
-        .inputSchema=obj({{"path",str()}},{"path"}),
+        .description="Compatibility alias for Control Rig inspection. Returns real UControlRigBlueprint hierarchy/control readback instead of the old placeholder.",
+        .inputSchema=obj({{"path",str()},{"include_elements",bln()},{"include_controls",bln()},{"include_transforms",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="controlrig.read",
+        .description="Read a UControlRigBlueprint: preview mesh, generated/control-rig class, hierarchy counts, roots, controls, bones, nulls, curves, connectors, sockets, and optional transforms.",
+        .inputSchema=obj({{"path",str()},{"include_elements",bln()},{"include_controls",bln()},{"include_transforms",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="controlrig.list_controls",
+        .description="List Control Rig controls with type, parent/child keys, shape metadata, current/initial values, local/global transforms, offset and shape transforms.",
+        .inputSchema=obj({{"path",str()},{"name_contains",str()},{"include_transforms",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="controlrig.set_preview_mesh",
+        .description="Set the preview skeletal mesh on a UControlRigBlueprint using UControlRigBlueprintEditorLibrary with dry_run/save/readback.",
+        .inputSchema=obj({{"path",str()},{"preview_mesh",str()},{"skeletal_mesh",str()},{"dry_run",bln()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="controlrig.set_control_transform",
+        .description="Set a Control Rig control local/global current or initial transform through URigHierarchy, with transaction, compile/save, dry_run, and before/after readback.",
+        .inputSchema=obj({{"path",str()},{"control",str()},{"name",str()},{"transform",obj({})},{"location",arr()},{"rotation",arr()},{"scale",arr()},{"space",str()},{"initial",bln()},{"affect_children",bln()},{"dry_run",bln()},{"compile",bln()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="controlrig.add_control",
+        .description="Add a Control Rig control through URigHierarchyController::AddControl. Supports control_type, animation_type, parent key, value/offset/shape transforms, dry_run, compile, save, and readback.",
+        .inputSchema=obj({{"path",str()},{"name",str()},{"control_type",str()},{"animation_type",str()},{"parent",str()},{"parent_name",str()},{"parent_type",str()},{"display_name",str()},{"shape_name",str()},{"shape_visible",bln()},{"transform",obj({})},{"location",arr()},{"rotation",arr()},{"scale",arr()},{"offset_transform",obj({})},{"shape_transform",obj({})},{"dry_run",bln()},{"compile",bln()},{"save",bln()}},{"path","name"}),
+        .handler=nullptr,.remote=true});
+    reg(registry, Tool{.name="controlrig.remove_control",
+        .description="Remove a Control Rig control through URigHierarchyController::RemoveElement. Destructive real writes require confirmed:true; supports dry_run, compile, save, and before/after summary.",
+        .inputSchema=obj({{"path",str()},{"control",str()},{"name",str()},{"dry_run",bln()},{"confirmed",bln()},{"compile",bln()},{"save",bln()}},{"path"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.add_virtual_bone",
@@ -1355,12 +1390,482 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     // ========================================================================
-    // niagara.* (26 tools)
+    // AI parity batch 1: Blackboard / BehaviorTree / EQS / SmartObject / Mass
+    // / ZoneGraph / runtime AI helpers (131 tools)
+    // ========================================================================
+
+    const nlohmann::json aiParitySchema = obj({
+        {"path",str()},
+        {"asset",str()},
+        {"source",str()},
+        {"destination",str()},
+        {"dest",str()},
+        {"new_path",str()},
+        {"folder",str()},
+        {"query",str()},
+        {"filter",str()},
+        {"blackboard",str()},
+        {"blackboard_path",str()},
+        {"behavior_tree",str()},
+        {"tree",str()},
+        {"eqs",str()},
+        {"definition",str()},
+        {"other",str()},
+        {"other_path",str()},
+        {"target",str()},
+        {"parent",str()},
+        {"parent_path",str()},
+        {"parent_class",str()},
+        {"key",str()},
+        {"name",str()},
+        {"new_name",str()},
+        {"old_key",str()},
+        {"new_key",str()},
+        {"type",str()},
+        {"key_type",str()},
+        {"class",str()},
+        {"node",str()},
+        {"node_name",str()},
+        {"node_class",str()},
+        {"task_class",str()},
+        {"generator_class",str()},
+        {"test_class",str()},
+        {"context_class",str()},
+        {"index",i32()},
+        {"node_index",i32()},
+        {"child_index",i32()},
+        {"option_index",i32()},
+        {"test_index",i32()},
+        {"from",i32()},
+        {"to",i32()},
+        {"new_index",i32()},
+        {"max",i32()},
+        {"max_results",i32()},
+        {"properties",anyObj()},
+        {"spec",anyObj()},
+        {"keys",arr()},
+        {"tags",arr()},
+        {"value",nlohmann::json::object()},
+        {"actor",str()},
+        {"actor_id",str()},
+        {"controller",str()},
+        {"pawn",str()},
+        {"location",vec3()},
+        {"radius",num()},
+        {"loudness",num()},
+        {"description",str()},
+        {"category",str()},
+        {"instance_synced",bln()},
+        {"synced",bln()},
+        {"confirmed",bln()},
+        {"dry_run",bln()},
+    });
+
+    const char* aiParityTools[] = {
+        "get_blackboard",
+        "delete_blackboard",
+        "duplicate_blackboard",
+        "add_bb_key",
+        "remove_bb_key",
+        "rename_bb_key",
+        "get_bb_key_details",
+        "batch_add_bb_keys",
+        "set_bb_parent",
+        "compare_blackboards",
+        "gameplay.add_blackboard_key",
+        "gameplay.remove_blackboard_key",
+        "gameplay.set_blackboard_parent",
+        "gameplay.read_blackboard",
+        "delete_behavior_tree",
+        "duplicate_behavior_tree",
+        "set_bt_blackboard",
+        "add_bt_node",
+        "remove_bt_node",
+        "move_bt_node",
+        "add_bt_decorator",
+        "remove_bt_decorator",
+        "add_bt_service",
+        "remove_bt_service",
+        "set_bt_node_property",
+        "get_bt_node_properties",
+        "reorder_bt_children",
+        "add_bt_run_eqs_task",
+        "add_bt_smart_object_task",
+        "add_bt_use_ability_task",
+        "build_behavior_tree_from_spec",
+        "export_bt_spec",
+        "import_bt_spec",
+        "clone_bt_subtree",
+        "auto_arrange_bt",
+        "compare_behavior_trees",
+        "create_bt_task_blueprint",
+        "create_bt_decorator_blueprint",
+        "create_bt_service_blueprint",
+        "generate_bt_diagram",
+        "get_bt_graph",
+        "get_eqs_query",
+        "delete_eqs_query",
+        "duplicate_eqs_query",
+        "add_eqs_generator",
+        "remove_eqs_generator",
+        "configure_eqs_generator",
+        "add_eqs_test",
+        "remove_eqs_test",
+        "configure_eqs_test",
+        "configure_eqs_scoring",
+        "configure_eqs_filter",
+        "list_eqs_generator_types",
+        "list_eqs_test_types",
+        "list_eqs_contexts",
+        "validate_eqs_query",
+        "reorder_eqs_tests",
+        "build_eqs_query_from_spec",
+        "create_eqs_from_template",
+        "get_smart_object_definition",
+        "list_smart_object_definitions",
+        "delete_smart_object_definition",
+        "add_so_slot",
+        "remove_so_slot",
+        "configure_so_slot",
+        "add_so_behavior_definition",
+        "remove_so_behavior_definition",
+        "set_so_tags",
+        "place_smart_object_actor",
+        "find_smart_objects_in_level",
+        "validate_smart_object_definition",
+        "create_so_from_template",
+        "duplicate_smart_object_definition",
+        "gameplay.add_smart_object_slot",
+        "gameplay.set_smart_object_slot",
+        "gameplay.remove_smart_object_slot",
+        "gameplay.list_smart_object_slots",
+        "gameplay.add_smart_object_slot_behavior",
+        "runtime_get_bb_value",
+        "runtime_set_bb_value",
+        "runtime_clear_bb_value",
+        "runtime_get_bt_state",
+        "runtime_start_bt",
+        "runtime_stop_bt",
+        "runtime_get_bt_execution_path",
+        "runtime_get_perceived_actors",
+        "runtime_check_perception",
+        "runtime_report_noise",
+        "runtime_get_st_active_states",
+        "runtime_send_st_event",
+        "runtime_find_smart_objects",
+        "runtime_run_eqs_query",
+        "scaffold_complete_ai_character",
+        "scaffold_perception_to_blackboard",
+        "scaffold_team_system",
+        "scaffold_patrol_investigate_ai",
+        "scaffold_enemy_ai",
+        "scaffold_eqs_move_sequence",
+        "scaffold_ai_controller_blueprint",
+        "scaffold_companion_ai",
+        "scaffold_boss_ai",
+        "scaffold_ambient_npc",
+        "scaffold_horror_stalker",
+        "scaffold_stealth_game_ai",
+        "scaffold_group_coordinator",
+        "scaffold_flying_ai",
+        "batch_validate_ai_assets",
+        "validate_ai_controller",
+        "get_ai_overview",
+        "list_ai_node_types",
+        "search_ai_assets",
+        "validate_ai_data_flow",
+        "find_eqs_references",
+        "find_so_references",
+        "lint_behavior_tree",
+        "lint_state_tree",
+        "detect_ai_circular_references",
+        "export_ai_manifest",
+        "get_ai_behavior_summary",
+        "list_mass_entity_configs",
+        "get_mass_entity_config",
+        "create_mass_entity_config",
+        "add_mass_trait",
+        "remove_mass_trait",
+        "list_mass_traits",
+        "list_mass_processors",
+        "validate_mass_entity_config",
+        "get_mass_entity_stats",
+        "list_zone_graphs",
+        "query_zone_lanes",
+        "get_zone_lane_info",
+    };
+    for (const char* Name : aiParityTools) {
+        reg(registry, Tool{.name=Name,
+            .description="AI parity tool from the 1251 catalog batch: Blackboard, BehaviorTree, EQS, SmartObject, Mass, ZoneGraph, scaffold, lint, or runtime AI operation. Unsupported editor-private mutations return hard MCP errors with exact reason.",
+            .inputSchema=aiParitySchema,
+            .handler=nullptr,.remote=true});
+    }
+
+    // ========================================================================
+    // mesh / GeometryScript / ProceduralMesh / RealtimeMesh parity batch
+    // ========================================================================
+
+    const nlohmann::json meshParitySchema = obj({
+        {"path",str()},
+        {"asset",str()},
+        {"mesh",str()},
+        {"a",str()},
+        {"b",str()},
+        {"source",str()},
+        {"target",str()},
+        {"component",str()},
+        {"component_path",str()},
+        {"actor",str()},
+        {"actor_path",str()},
+        {"actor_label",str()},
+        {"component_name",str()},
+        {"action",str()},
+        {"op",str()},
+        {"material",str()},
+        {"material_path",str()},
+        {"index",i32()},
+        {"slot",i32()},
+        {"material_index",i32()},
+        {"section_index",i32()},
+        {"lod",i32()},
+        {"lod_index",i32()},
+        {"lod_count",i32()},
+        {"num_lods",i32()},
+        {"target_lod_count",i32()},
+        {"sample_count",i32()},
+        {"samples",i32()},
+        {"high_vertex_threshold",i32()},
+        {"percent_triangles",num()},
+        {"reduction_percent_triangles",num()},
+        {"screen_sizes",arr()},
+        {"auto_screen_size",bln()},
+        {"auto_compute_screen_size",bln()},
+        {"complexity",str()},
+        {"collision_complexity",str()},
+        {"mode",str()},
+        {"preset",str()},
+        {"collision_profile",str()},
+        {"profile",str()},
+        {"double_sided",bln()},
+        {"create_collision",bln()},
+        {"srgb_conversion",bln()},
+        {"vertices",arr()},
+        {"triangles",arr()},
+        {"normals",arr()},
+        {"uv0",arr()},
+        {"uv1",arr()},
+        {"uv2",arr()},
+        {"uv3",arr()},
+        {"vertex_colors",arr()},
+        {"tangents",arr()},
+        {"properties",anyObj()},
+        {"settings",anyObj()},
+        {"spec",anyObj()},
+        {"save",bln()},
+        {"dry_run",bln()},
+        {"confirmed",bln()},
+    });
+
+    const char* meshParityTools[] = {
+        "get_mesh_lods",
+        "get_mesh_uvs",
+        "analyze_skeletal_mesh",
+        "analyze_mesh_quality",
+        "compare_meshes",
+        "get_vertex_colors",
+        "mesh_boolean",
+        "mesh_simplify",
+        "mesh_remesh",
+        "mesh_mirror",
+        "mesh_fill_holes",
+        "compute_uvs",
+        "fix_mesh_quality",
+        "generate_collision",
+        "generate_lods",
+        "set_lod_screen_sizes",
+        "set_collision_preset",
+        "set_mesh_collision",
+        "auto_generate_lods",
+        "generate_proxy_mesh",
+        "setup_hlod",
+        "boolean_union",
+        "boolean_subtract",
+        "boolean_intersection",
+        "boolean_trim",
+        "remesh_uniform",
+        "remesh_voxel",
+        "remove_degenerates",
+        "auto_uv",
+        "unwrap_uv",
+        "pack_uv_islands",
+        "project_uv",
+        "transform_uvs",
+        "generate_complex_collision",
+        "simplify_collision",
+        "set_lod_settings",
+        "procedural_mesh",
+        "create_section",
+        "update_section",
+        "clear",
+        "set_material",
+        "UProceduralMeshComponent",
+        "realtime_mesh",
+        "create_lod",
+        "create_section_group",
+        "update_mesh_data",
+        "set_material_slot",
+        "setup_collision",
+        "chaos_edit",
+    };
+
+    for (const char* Name : meshParityTools) {
+        reg(registry, Tool{.name=Name,
+            .description="Mesh parity tool from the 1251 catalog batch: Static/Skeletal mesh inspection, collision/LOD configuration, ProceduralMesh runtime component operations, or GeometryScript/RealtimeMesh capability gate. Unsupported plugin-private mutations return hard MCP errors with exact reason.",
+            .inputSchema=meshParitySchema,
+            .handler=nullptr,.remote=true});
+    }
+
+    // ========================================================================
+    // audio / SoundCue / MetaSound parity batch
+    // ========================================================================
+
+    const nlohmann::json audioParitySchema = obj({
+        {"path",str()},
+        {"asset",str()},
+        {"assets",arr()},
+        {"paths",arr()},
+        {"query",str()},
+        {"name",str()},
+        {"type",str()},
+        {"class",str()},
+        {"max",i32()},
+        {"max_results",i32()},
+        {"properties",anyObj()},
+        {"settings",anyObj()},
+        {"spec",anyObj()},
+        {"sound_class",str()},
+        {"class_path",str()},
+        {"attenuation",str()},
+        {"attenuation_path",str()},
+        {"submix",str()},
+        {"submix_path",str()},
+        {"concurrency",str()},
+        {"concurrency_path",str()},
+        {"value",{{"description","JSON scalar, object, or array value"}}},
+        {"looping",bln()},
+        {"compression_quality",i32()},
+        {"quality",i32()},
+        {"compression_type",str()},
+        {"sound_asset_compression_type",str()},
+        {"virtualization",str()},
+        {"virtualization_mode",str()},
+        {"cue",str()},
+        {"sound",str()},
+        {"metasound",str()},
+        {"node",str()},
+        {"node_id",str()},
+        {"node_class",str()},
+        {"from",str()},
+        {"to",str()},
+        {"input",str()},
+        {"output",str()},
+        {"interface",str()},
+        {"location",vec3()},
+        {"volume",num()},
+        {"save",bln()},
+        {"dry_run",bln()},
+        {"confirmed",bln()},
+    });
+
+    const char* audioParityTools[] = {
+        "create_sound_attenuation",
+        "set_attenuation_settings",
+        "create_sound_class",
+        "set_sound_class_properties",
+        "create_sound_mix",
+        "set_sound_mix_settings",
+        "create_sound_concurrency",
+        "set_concurrency_settings",
+        "create_sound_submix",
+        "set_submix_properties",
+        "search_audio_assets",
+        "find_audio_references",
+        "find_unused_audio",
+        "find_sounds_without_class",
+        "find_unattenuated_sounds",
+        "get_audio_stats",
+        "batch_assign_sound_class",
+        "batch_assign_attenuation",
+        "batch_set_compression",
+        "batch_set_submix",
+        "batch_set_concurrency",
+        "batch_set_looping",
+        "batch_set_virtualization",
+        "batch_rename_audio",
+        "batch_set_sound_wave_properties",
+        "apply_audio_template",
+        "get_sound_cue_graph",
+        "add_sound_cue_node",
+        "remove_sound_cue_node",
+        "connect_sound_cue_nodes",
+        "set_sound_cue_first_node",
+        "set_sound_cue_node_property",
+        "list_sound_cue_node_types",
+        "validate_sound_cue",
+        "build_sound_cue_from_spec",
+        "create_random_sound_cue",
+        "create_layered_sound_cue",
+        "create_looping_ambient_cue",
+        "create_distance_crossfade_cue",
+        "create_switch_sound_cue",
+        "preview_sound",
+        "stop_preview",
+        "get_sound_cue_duration",
+        "create_metasound_source",
+        "create_metasound_patch",
+        "add_metasound_node",
+        "remove_metasound_node",
+        "connect_metasound_nodes",
+        "disconnect_metasound_nodes",
+        "add_metasound_input",
+        "add_metasound_output",
+        "set_metasound_input_default",
+        "add_metasound_interface",
+        "build_metasound_from_spec",
+        "get_metasound_graph",
+        "list_metasound_connections",
+        "list_available_metasound_nodes",
+        "get_metasound_node_info",
+        "find_metasound_node_inputs",
+        "find_metasound_node_outputs",
+        "get_metasound_input_names",
+        "create_metasound_preset",
+        "create_oneshot_sfx",
+        "create_looping_ambient_metasound",
+        "create_synthesized_tone",
+        "create_interactive_metasound",
+        "add_metasound_variable",
+        "set_metasound_node_location",
+        "bind_sound_to_perception",
+        "unbind_sound_from_perception",
+        "get_sound_perception_binding",
+        "list_perception_bound_sounds",
+    };
+
+    for (const char* Name : audioParityTools) {
+        reg(registry, Tool{.name=Name,
+            .description="Audio parity tool from the 1251 catalog batch: sound asset writers, audio search/health, batch assignment, SoundCue inspection, MetaSound create/read, preview, or explicit graph capability gate. Unsupported graph/private mutations return hard MCP errors with exact reason.",
+            .inputSchema=audioParitySchema,
+            .handler=nullptr,.remote=true});
+    }
+
+    // ========================================================================
+    // niagara.* (68 tools)
     // ========================================================================
 
     reg(registry, Tool{.name="niagara.list",
-        .description="List UNiagaraSystem assets in the project.",
-        .inputSchema=obj({{"path",str()},{"max_results",i32()}}),
+        .description="List Niagara systems, emitters, or parameter collections in the project.",
+        .inputSchema=obj({{"path",str()},{"class",str()},{"max_results",i32()}}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="niagara.get_info",
@@ -1369,13 +1874,13 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="niagara.spawn",
-        .description="Spawn a Niagara system at a world location in PIE.",
-        .inputSchema=obj({{"path",str()},{"location",vec3()},{"auto_destroy",bln()}},{"path","location"}),
+        .description="Spawn a preview Niagara actor/component in the editor world and optionally advance simulation.",
+        .inputSchema=obj({{"path",str()},{"location",vec3()},{"rotation",vec3()},{"scale",vec3()},{"auto_destroy",bln()},{"activate",bln()},{"advance_ticks",i32()},{"advance_delta_time",num()},{"parameters",arr()}},{"path"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="niagara.set_parameter",
-        .description="Set a user-exposed parameter (float/int/bool/color/vector) on a spawned Niagara component.",
-        .inputSchema=obj({{"component",str()},{"name",str()},{"value",{{"description","scalar or array"}}}},{"component","name","value"}),
+        .description="Set a user-exposed parameter on a spawned Niagara component or owning actor.",
+        .inputSchema=obj({{"component",str()},{"component_id",str()},{"actor",str()},{"actor_id",str()},{"name",str()},{"type",str()},{"value",{{"description","scalar, array, or object value"}}}},{"name","value"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="niagara.create",
@@ -1404,7 +1909,7 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="niagara.list_modules",
-        .description="List script modules of a Niagara emitter.",
+        .description="List actual UNiagaraNodeFunctionCall modules from a Niagara emitter graph.",
         .inputSchema=obj({{"path",str()},{"emitter",str()}},{"path"}),
         .handler=nullptr,.remote=true});
 
@@ -1444,7 +1949,7 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="niagara.get_compiled_hlsl",
-        .description="Retrieve compiled HLSL for a Niagara script. Note: requires NiagaraEditor private API.",
+        .description="Retrieve cached HLSL translation text when Unreal exposes it; returns a hard error otherwise.",
         .inputSchema=obj({{"path",str()}},{"path"}),
         .handler=nullptr,.remote=true});
 
@@ -1455,31 +1960,31 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
 
     reg(registry, Tool{.name="niagara.list_module_inputs",
         .description="List variable inputs for a module script in a Niagara emitter.",
-        .inputSchema=obj({{"path",str()},{"emitter",str()}},{"path","emitter"}),
+        .inputSchema=obj({{"path",str()},{"emitter",str()},{"module",str()},{"module_id",str()},{"module_index",i32()}},{"path","module"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="niagara.set_module_input",
         .description="Override a variable input on a Niagara script module.",
-        .inputSchema=obj({{"path",str()},{"emitter",str()},{"variable",str()},{"value",{{"description","JSON value"}}}},{"path","emitter","variable","value"}),
+        .inputSchema=obj({{"path",str()},{"emitter",str()},{"module",str()},{"module_id",str()},{"module_index",i32()},{"variable",str()},{"pin",str()},{"value",{{"description","JSON value"}}},{"dry_run",bln()},{"save",bln()},{"compile",bln()}},{"path","module","value"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="niagara.list_static_switches",
         .description="List static switch variables on a Niagara script.",
-        .inputSchema=obj({{"path",str()}},{"path"}),
+        .inputSchema=obj({{"path",str()},{"emitter",str()}},{"path"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="niagara.set_static_switch",
         .description="Override a static switch value on a Niagara script.",
-        .inputSchema=obj({{"path",str()},{"switch",str()},{"value",{{"description","bool or int"}}}},{"path","switch","value"}),
+        .inputSchema=obj({{"path",str()},{"emitter",str()},{"module",str()},{"module_id",str()},{"module_index",i32()},{"switch",str()},{"name",str()},{"value",{{"description","bool or int"}}},{"dry_run",bln()},{"save",bln()},{"compile",bln()}},{"path","module","value"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="niagara.create_module_from_hlsl",
-        .description="Create a Niagara script module from HLSL source. Note: requires compiler private API.",
+        .description="Unsupported boundary: creating Niagara module scripts from raw HLSL is not exposed by public/editor-stable API.",
         .inputSchema=obj({{"path",str()},{"hlsl",str()}},{"path","hlsl"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="niagara.create_scratch_module",
-        .description="Create a scratch-pad script module for a Niagara emitter.",
+        .description="Unsupported boundary: scratch-pad authoring is not exposed by public/editor-stable API.",
         .inputSchema=obj({{"path",str()},{"emitter",str()}},{"path","emitter"}),
         .handler=nullptr,.remote=true});
 
@@ -1487,6 +1992,264 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .description="Execute multiple niagara tool calls sequentially in one request.",
         .inputSchema=obj({{"calls",arr()}},{"calls"}),
         .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.preview_spawn",
+        .description="Spawn a preview Niagara actor/component in the editor world and optionally advance simulation.",
+        .inputSchema=obj({{"path",str()},{"location",vec3()},{"rotation",vec3()},{"scale",vec3()},{"activate",bln()},{"auto_destroy",bln()},{"advance_ticks",i32()},{"advance_delta_time",num()},{"parameters",arr()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.cleanup_preview",
+        .description="Destroy a preview Niagara actor returned by niagara.preview_spawn.",
+        .inputSchema=obj({{"actor",str()},{"actor_id",str()},{"component",str()},{"component_id",str()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.capture_preview",
+        .description="Unsupported boundary: deterministic viewport/render-target capture is not implemented in the bridge yet.",
+        .inputSchema=obj({{"component",str()},{"actor",str()},{"output_path",str()},{"advance_ticks",i32()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.set_component_parameters",
+        .description="Set multiple user-exposed parameters on a Niagara component or owning actor.",
+        .inputSchema=obj({{"component",str()},{"component_id",str()},{"actor",str()},{"actor_id",str()},{"parameters",arr()}},{"parameters"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.read_component",
+        .description="Read a live Niagara component asset, activation state, bounds, and override parameters.",
+        .inputSchema=obj({{"component",str()},{"component_id",str()},{"actor",str()},{"actor_id",str()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.make_emitters_local",
+        .description="Duplicate system emitter references into local emitter instances so renderer/module writes do not mutate shared assets.",
+        .inputSchema=obj({{"path",str()},{"emitters",arr()},{"all",bln()},{"dry_run",bln()},{"save",bln()},{"compile",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.upsert_user_parameter",
+        .description="Add or update a user-exposed parameter in a Niagara system parameter store.",
+        .inputSchema=obj({{"path",str()},{"name",str()},{"type",str()},{"value",{{"description","JSON value"}}},{"save",bln()},{"compile",bln()}},{"path","name","type"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.add_module",
+        .description="Add a Niagara module script to an emitter graph through UNiagaraScriptSource.",
+        .inputSchema=obj({{"path",str()},{"emitter",str()},{"module_script",str()},{"name",str()},{"dry_run",bln()},{"save",bln()},{"compile",bln()}},{"path","module_script"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.remove_module",
+        .description="Remove a module node from a Niagara emitter graph.",
+        .inputSchema=obj({{"path",str()},{"emitter",str()},{"module",str()},{"module_id",str()},{"module_index",i32()},{"dry_run",bln()},{"save",bln()},{"compile",bln()}},{"path","module"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.move_module",
+        .description="Unsupported boundary: stable Niagara stack ordering requires editor stack APIs that are not exported.",
+        .inputSchema=obj({{"path",str()},{"emitter",str()},{"module",str()},{"before",str()},{"after",str()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.duplicate_module",
+        .description="Unsupported boundary: duplicating stack modules safely requires editor stack APIs that are not exported.",
+        .inputSchema=obj({{"path",str()},{"emitter",str()},{"module",str()},{"new_name",str()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.replace_module",
+        .description="Replace a Niagara module node's script reference.",
+        .inputSchema=obj({{"path",str()},{"emitter",str()},{"module",str()},{"module_id",str()},{"module_index",i32()},{"new_module_script",str()},{"dry_run",bln()},{"save",bln()},{"compile",bln()}},{"path","module","new_module_script"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.export_graph",
+        .description="Export a Niagara emitter graph as compact node/pin JSON.",
+        .inputSchema=obj({{"path",str()},{"emitter",str()},{"include_pins",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.list_dynamic_inputs",
+        .description="List linked dynamic-input pins visible on Niagara module graph nodes.",
+        .inputSchema=obj({{"path",str()},{"emitter",str()},{"module",str()},{"module_id",str()},{"module_index",i32()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.set_dynamic_input",
+        .description="Unsupported boundary: safe dynamic-input stack authoring requires non-exported Niagara editor stack APIs.",
+        .inputSchema=obj({{"path",str()},{"emitter",str()},{"module",str()},{"pin",str()},{"script",str()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.set_custom_expression",
+        .description="Unsupported boundary: custom-expression node authoring is not exposed by public/editor-stable API.",
+        .inputSchema=obj({{"path",str()},{"emitter",str()},{"module",str()},{"pin",str()},{"expression",str()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.collection.list",
+        .description="List Niagara parameter collection assets.",
+        .inputSchema=obj({{"path",str()},{"max_results",i32()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.collection.read",
+        .description="Read a Niagara parameter collection and its default instance parameters.",
+        .inputSchema=obj({{"path",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.collection.create",
+        .description="Create a Niagara parameter collection asset.",
+        .inputSchema=obj({{"path",str()},{"parameters",arr()},{"save",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.collection.upsert_parameter",
+        .description="Add or update a Niagara parameter collection parameter.",
+        .inputSchema=obj({{"path",str()},{"name",str()},{"type",str()},{"save",bln()}},{"path","name","type"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.collection.set_default",
+        .description="Set a Niagara parameter collection default value.",
+        .inputSchema=obj({{"path",str()},{"name",str()},{"value",{{"description","JSON value"}}},{"save",bln()}},{"path","name","value"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.collection.set_runtime_value",
+        .description="Unsupported boundary: runtime collection overrides require world-instance runtime state, not asset mutation.",
+        .inputSchema=obj({{"path",str()},{"name",str()},{"value",{{"description","JSON value"}}}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.read_scalability",
+        .description="Read Niagara system scalability override state and effect type.",
+        .inputSchema=obj({{"path",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.set_scalability",
+        .description="Set Niagara system scalability override state.",
+        .inputSchema=obj({{"path",str()},{"override",bln()},{"save",bln()},{"compile",bln()}},{"path","override"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.set_fixed_bounds",
+        .description="Set fixed bounds on a Niagara system or live component.",
+        .inputSchema=obj({{"path",str()},{"component",str()},{"actor",str()},{"min",vec3()},{"max",vec3()},{"save",bln()},{"compile",bln()}},{"min","max"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.clear_fixed_bounds",
+        .description="Disable fixed bounds on a Niagara system or live component.",
+        .inputSchema=obj({{"path",str()},{"component",str()},{"actor",str()},{"save",bln()},{"compile",bln()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.set_warmup",
+        .description="Set Niagara system warmup tick count and delta.",
+        .inputSchema=obj({{"path",str()},{"warmup_time",num()},{"tick_count",i32()},{"tick_delta",num()},{"save",bln()},{"compile",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.set_effect_type",
+        .description="Assign or clear a Niagara effect type asset on a system.",
+        .inputSchema=obj({{"path",str()},{"effect_type",str()},{"clear",bln()},{"save",bln()},{"compile",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.validate_system",
+        .description="Validate a Niagara system/emitter for missing assets, shared emitter mutation risk, bounds, modules, renderers, and scripts.",
+        .inputSchema=obj({{"path",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.capture_sim_cache",
+        .description="Capture a Niagara sim cache from a live component.",
+        .inputSchema=obj({{"component",str()},{"actor",str()},{"path",str()},{"frames",i32()},{"capture_rate",num()},{"save",bln()},{"advance_simulation",bln()},{"advance_ticks",i32()},{"advance_delta_time",num()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.read_sim_cache",
+        .description="Read frame and variable metadata from a Niagara sim cache asset.",
+        .inputSchema=obj({{"path",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.compare_sim_cache",
+        .description="Compare two Niagara sim cache assets at metadata level.",
+        .inputSchema=obj({{"baseline",str()},{"candidate",str()},{"a",str()},{"b",str()}},{"baseline","candidate"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.list_event_handlers",
+        .description="List event handlers from a Niagara emitter.",
+        .inputSchema=obj({{"path",str()},{"emitter",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.add_event_handler",
+        .description="Unsupported boundary: event-handler script graph creation requires non-exported editor stack APIs.",
+        .inputSchema=obj({{"path",str()},{"emitter",str()},{"source_event",str()},{"name",str()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.remove_event_handler",
+        .description="Remove a Niagara emitter event handler by usage id or index.",
+        .inputSchema=obj({{"path",str()},{"emitter",str()},{"usage_id",str()},{"index",i32()},{"save",bln()},{"compile",bln()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.list_simulation_stages",
+        .description="List simulation stages from a Niagara emitter.",
+        .inputSchema=obj({{"path",str()},{"emitter",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.add_simulation_stage",
+        .description="Unsupported boundary: creating simulation-stage graphs requires non-exported editor stack APIs.",
+        .inputSchema=obj({{"path",str()},{"emitter",str()},{"name",str()},{"script",str()}}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.remove_simulation_stage",
+        .description="Remove a Niagara simulation stage by index.",
+        .inputSchema=obj({{"path",str()},{"emitter",str()},{"index",i32()},{"save",bln()},{"compile",bln()}},{"path","index"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.get_dependencies",
+        .description="List hard/soft package dependencies for a Niagara asset.",
+        .inputSchema=obj({{"path",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.find_referencers",
+        .description="List hard/soft package referencers of a Niagara asset.",
+        .inputSchema=obj({{"path",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.validate_dependencies",
+        .description="Validate missing dependency packages for a Niagara asset.",
+        .inputSchema=obj({{"path",str()}},{"path"}),
+        .handler=nullptr,.remote=true});
+
+    reg(registry, Tool{.name="niagara.audit_cross_asset_refs",
+        .description="Audit Niagara systems for shared emitter/package references under a path.",
+        .inputSchema=obj({{"path",str()},{"max_results",i32()}}),
+        .handler=nullptr,.remote=true});
+
+    const nlohmann::json niagaraReferenceParitySchema = obj({
+        {"path",str()},
+        {"system",str()},
+        {"emitter",str()},
+        {"asset",str()},
+        {"folder",str()},
+        {"directory",str()},
+        {"search_path",str()},
+        {"query",str()},
+        {"q",str()},
+        {"name",str()},
+        {"parameter",str()},
+        {"data_interface",str()},
+        {"type",str()},
+        {"class",str()},
+        {"material",str()},
+        {"node_id",str()},
+        {"id",str()},
+        {"index",i32()},
+        {"custom_hlsl_index",i32()},
+        {"hlsl",str()},
+        {"text",str()},
+        {"code",str()},
+        {"dry_run",bln()},
+        {"save",bln()},
+        {"compile",bln()},
+        {"max_results",i32()},
+        {"limit",i32()},
+    });
+    const char* niagaraReferenceParityTools[] = {
+        "get_custom_hlsl_text",
+        "set_custom_hlsl_text",
+        "search_by_parameter",
+        "search_by_data_interface",
+        "search_by_material",
+        "query_niagara",
+        "find_similar_systems",
+        "find_niagara_references",
+        "list_system_data_interfaces"
+    };
+    for (const char* Name : niagaraReferenceParityTools) {
+        reg(registry, Tool{
+            .name=Name,
+            .description="Niagara benchmark-parity discovery or existing CustomHlsl read/write action from the 1251 catalog batch.",
+            .inputSchema=niagaraReferenceParitySchema,
+            .handler=nullptr,.remote=true});
+    }
 
     // ========================================================================
     // pcg.* (16 tools)
@@ -2043,6 +2806,86 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .inputSchema=obj({{"path",str()}}),
         .handler=nullptr,.remote=true});
 
+    const nlohmann::json materialParitySchema = obj({
+        {"path",str()},
+        {"material",str()},
+        {"asset",str()},
+        {"assets",arr()},
+        {"paths",arr()},
+        {"instance",str()},
+        {"function",str()},
+        {"destination",str()},
+        {"parent",str()},
+        {"parent_path",str()},
+        {"expression_id",str()},
+        {"node_id",str()},
+        {"old_expression_id",str()},
+        {"expression_class",str()},
+        {"new_class",str()},
+        {"class",str()},
+        {"code",str()},
+        {"description",str()},
+        {"caption",str()},
+        {"output_type",str()},
+        {"inputs",arr()},
+        {"include_paths",arr()},
+        {"nodes",arr()},
+        {"clear_existing",bln()},
+        {"parameter",str()},
+        {"name",str()},
+        {"new_name",str()},
+        {"to",str()},
+        {"kind",str()},
+        {"property",str()},
+        {"value",{{"description","JSON scalar, object, or array value"}}},
+        {"parameters",{{"description","Object map or array of {name, kind, value} parameter edits"}}},
+        {"x",i32()},
+        {"y",i32()},
+        {"offset_x",num()},
+        {"offset_y",num()},
+        {"query",str()},
+        {"max_results",i32()},
+        {"include_data",bln()},
+        {"base64",bln()},
+        {"expose_to_library",bln()},
+        {"save",bln()},
+        {"dry_run",bln()},
+        {"confirmed",bln()},
+    });
+
+    const char* materialParityTools[] = {
+        "create_custom_hlsl_node",
+        "update_custom_hlsl_node",
+        "move_expression",
+        "rename_expression",
+        "duplicate_expression",
+        "replace_expression",
+        "create_material_function",
+        "build_function_graph",
+        "get_function_info",
+        "get_instance_parameters",
+        "set_instance_parameter",
+        "set_instance_parameters",
+        "set_instance_parent",
+        "clear_instance_parameter",
+        "list_material_instances",
+        "batch_set_material_property",
+        "batch_recompile",
+        "get_thumbnail",
+        "capture_material_grid",
+        "capture_with_overlay",
+        "inspect_material_pbr",
+        "inspect_texture_channels",
+        "audit_orphan_materials",
+    };
+
+    for (const char* Name : materialParityTools) {
+        reg(registry, Tool{.name=Name,
+            .description="Material parity tool from the 1251 catalog batch: custom HLSL, graph refactors, material function lifecycle, material instance parameter lifecycle, thumbnail metadata, PBR/texture inspection, orphan audit, or explicit capture capability gate.",
+            .inputSchema=materialParitySchema,
+            .handler=nullptr,.remote=true});
+    }
+
     // ========================================================================
     // editor.* extensions (missing tools)
     // ========================================================================
@@ -2091,6 +2934,133 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .description="Open an asset in its editor using UAssetEditorSubsystem.",
         .inputSchema=obj({{"path",str()}},{"path"}),
         .handler=nullptr,.remote=true});
+
+    const nlohmann::json runtimeVerificationSchema = obj({
+        {"filter",str()},
+        {"test",str()},
+        {"tests",arr()},
+        {"max_lines",i32()},
+        {"max_results",i32()},
+        {"path",str()},
+        {"output_path",str()},
+        {"asset",str()},
+        {"preview_type",str()},
+        {"type",str()},
+        {"width",i32()},
+        {"height",i32()},
+        {"duration",num()},
+        {"assertions",arr()},
+        {"platform",str()},
+        {"maps",arr()},
+        {"configuration",str()},
+        {"target",str()},
+        {"confirmed",bln()},
+        {"live_compile_fallback",bln()},
+        {"enabled",bln()},
+        {"full",bln()},
+        {"pool_size_mb",num()},
+        {"stat",str()},
+        {"group",str()},
+        {"scale",num()},
+        {"screen_percentage",num()},
+        {"limit",num()},
+        {"fps",num()},
+        {"lod",i32()},
+        {"force_lod",i32()}
+    });
+    const char* runtimeVerificationTools[] = {
+        "run_visual_tests",
+        "get_test_log",
+        "window_capture",
+        "capture_viewport",
+        "capture_scene_preview",
+        "pie_test_bp",
+        "pie_test_scene",
+        "list_automation_tests",
+        "run_automation_tests",
+        "build_project",
+        "cook_project",
+        "live_compile",
+        "performance_audit",
+        "generate_memory_report",
+        "configure_texture_streaming",
+        "start_profiling",
+        "stop_profiling",
+        "show_fps",
+        "show_stats",
+        "set_resolution_scale",
+        "set_vsync",
+        "set_frame_rate_limit",
+        "configure_nanite",
+        "configure_lod"
+    };
+    for (const char* Name : runtimeVerificationTools) {
+        reg(registry, Tool{
+            .name=Name,
+            .description="Runtime verification, automation-test, viewport capture, build/cook/live-compile boundary, or performance console wrapper from the 1251 catalog batch.",
+            .inputSchema=runtimeVerificationSchema,
+            .handler=nullptr,.remote=true});
+    }
+
+    const nlohmann::json assetContentParitySchema = obj({
+        {"path",str()},
+        {"folder",str()},
+        {"directory",str()},
+        {"asset",str()},
+        {"asset_path",str()},
+        {"src",str()},
+        {"dst",str()},
+        {"files",arr()},
+        {"source_files",arr()},
+        {"sources",arr()},
+        {"destination",str()},
+        {"dest",str()},
+        {"replace_existing",bln()},
+        {"tags",anyObj()},
+        {"confirmed",bln()},
+        {"recursive",bln()},
+        {"only_if_dirty",bln()},
+        {"max_results",i32()},
+        {"op",str()},
+        {"operation",str()},
+        {"actor",str()},
+        {"actor_id",str()},
+        {"component",str()},
+        {"component_name",str()},
+        {"static_mesh",str()},
+        {"mesh",str()},
+        {"mesh_path",str()},
+        {"transforms",arr()},
+        {"locations",arr()},
+        {"world_space",bln()},
+        {"hism",bln()},
+        {"width",i32()},
+        {"height",i32()},
+    });
+    const char* assetContentParityTools[] = {
+        "asset.create_folder",
+        "asset.delete_folder",
+        "asset.save",
+        "asset.save_all_dirty",
+        "asset.create_interchange_pipeline",
+        "asset.import_texture_batch",
+        "asset.read_import_sources",
+        "asset.health_check",
+        "asset.generate_report",
+        "asset.create_thumbnail",
+        "asset.validate",
+        "asset.set_tags",
+        "fab_ops",
+        "ism_ops",
+        "level.add_hismc_instances"
+    };
+    for (const char* Name : assetContentParityTools) {
+        reg(registry, Tool{
+            .name=Name,
+            .description="Asset/folder/import/report/tag/Fab or ISM-HISM level operation from the 1251 catalog batch.",
+            .inputSchema=assetContentParitySchema,
+            .handler=nullptr,.remote=true});
+    }
 
     // ========================================================================
     // project.* extensions (missing tools)
@@ -2225,6 +3195,63 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .description="List FMulticastDelegateProperty names on a runtime UUserWidget.",
         .inputSchema=obj({{"name",str()}},{"name"}),
         .handler=nullptr,.remote=true});
+
+    const nlohmann::json uiParitySchema = obj({
+        {"path",str()},
+        {"blueprint",str()},
+        {"asset",str()},
+        {"spec",anyObj()},
+        {"widgets",arr()},
+        {"rules",arr()},
+        {"widget",str()},
+        {"widget_name",str()},
+        {"name",str()},
+        {"new_name",str()},
+        {"to",str()},
+        {"root",str()},
+        {"parent",str()},
+        {"widget_class",str()},
+        {"class",str()},
+        {"property",str()},
+        {"value",{{"description","JSON scalar, object, or array value"}}},
+        {"token",str()},
+        {"tokens",anyObj()},
+        {"button_class",str()},
+        {"action",str()},
+        {"op",str()},
+        {"is_variable",bln()},
+        {"save",bln()},
+        {"dry_run",bln()},
+        {"confirmed",bln()},
+    });
+
+    const char* uiParityTools[] = {
+        "build_ui_from_spec",
+        "dump_ui_spec_schema",
+        "dump_ui_spec",
+        "rename_widget",
+        "add_widget_variable",
+        "audit_focus_chain",
+        "apply_token_binding",
+        "list_widget_property_enums",
+        "convert_textblock_to_common",
+        "convert_border_to_common",
+        "set_action_bar_button_class",
+        "dump_blueprint_compile_log",
+        "reparent_widget_root",
+        "set_widget_is_variable",
+        "set_widget_navigation_bulk",
+        "dump_widget_navigation",
+        "widget_inspect",
+        "widget_edit",
+    };
+
+    for (const char* Name : uiParityTools) {
+        reg(registry, Tool{.name=Name,
+            .description="UI parity tool from the 1251 catalog batch: WidgetBlueprint spec import/export, widget tree edits, focus/navigation audit, token application, CommonUI-oriented property helpers, or explicit unsupported safe-conversion gate.",
+            .inputSchema=uiParitySchema,
+            .handler=nullptr,.remote=true});
+    }
 
     // ========================================================================
     // widget.anim.* — UMG Widget Animation authoring (Phase 4.11-r3)
@@ -2777,6 +3804,290 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .description="Add a spawnable binding (template object) to a Level Sequence. Returns {guid} for subsequent binding targeting.",
         .inputSchema=obj({{"path",str()},{"class_path",str()}},{"path","class_path"}),
         .handler=nullptr,.remote=true});
+
+    const nlohmann::json sequencerReferenceParitySchema = obj({
+        {"path",str()},
+        {"sequence",str()},
+        {"folder",str()},
+        {"directory",str()},
+        {"search_path",str()},
+        {"query",str()},
+        {"q",str()},
+        {"name",str()},
+        {"op",str()},
+        {"action",str()},
+        {"operation",str()},
+        {"include_details",bln()},
+        {"max_results",i32()},
+        {"limit",i32()},
+        {"track_class",str()},
+        {"track_name",str()},
+        {"time",num()},
+        {"value",{{"description","JSON value"}}},
+        {"channel_index",i32()},
+        {"actor_id",str()},
+        {"class_path",str()},
+        {"start",num()},
+        {"end",num()},
+        {"start_frame",i32()},
+        {"end_frame",i32()},
+    });
+    const char* sequencerReferenceParityTools[] = {
+        "level_sequence_query",
+        "sequencer_edit"
+    };
+    for (const char* Name : sequencerReferenceParityTools) {
+        reg(registry, Tool{
+            .name=Name,
+            .description="Reference benchmark Sequencer/Cinematics query or edit operation from the 1251 catalog batch.",
+            .inputSchema=sequencerReferenceParitySchema,
+            .handler=nullptr,.remote=true});
+    }
+
+    const nlohmann::json pluginDomainParitySchema = obj({
+        {"op",str()},
+        {"action",str()},
+        {"operation",str()},
+        {"path",str()},
+        {"asset",str()},
+        {"graph",str()},
+        {"folder",str()},
+        {"directory",str()},
+        {"query",str()},
+        {"q",str()},
+        {"name",str()},
+        {"max_results",i32()},
+        {"limit",i32()},
+    });
+    const char* pluginDomainParityTools[] = {
+        "logicdriver_query",
+        "combograph_query"
+    };
+    for (const char* Name : pluginDomainParityTools) {
+        reg(registry, Tool{
+            .name=Name,
+            .description="Marketplace/plugin-domain query wrapper from the 1251 catalog batch. Provides safe status/list/search/read via AssetRegistry/reflection; vendor graph mutations return hard MCP errors without the plugin SDK.",
+            .inputSchema=pluginDomainParitySchema,
+            .handler=nullptr,.remote=true});
+    }
+
+    const nlohmann::json referenceParitySchema = obj({
+        {"op",str()},
+        {"action",str()},
+        {"operation",str()},
+        {"path",str()},
+        {"asset",str()},
+        {"query",str()},
+        {"q",str()},
+        {"name",str()},
+        {"tool",str()},
+        {"start",vec3()},
+        {"end",vec3()},
+        {"location",vec3()},
+        {"delta",vec3()},
+        {"radius",num()},
+        {"channel",str()},
+        {"trace_channel",str()},
+        {"actor",str()},
+        {"actor_id",str()},
+        {"from_actor",str()},
+        {"to_actor",str()},
+        {"target",str()},
+        {"parent",str()},
+        {"parent_actor",str()},
+        {"ignore_actor",str()},
+        {"tag",str()},
+        {"tags",arr()},
+        {"actors",arr()},
+        {"mobility",str()},
+        {"confirmed",bln()},
+        {"dry_run",bln()},
+        {"max_results",i32()},
+        {"limit",i32()},
+        {"spec",anyObj()},
+        {"value",{{"description","JSON value"}}},
+    });
+    const char* referenceParityTools[] = {
+        "monolith.guide",
+        "describe.schema",
+        "describe.list_targets",
+        "describe.action_schema",
+        "bulk_fill.apply",
+        "bulk_fill.list_namespaces",
+        "did_you_mean",
+        "blueprint.auto_layout",
+        "auto_layout",
+        "blueprint.add_timeline_track",
+        "blueprint.set_component_override_materials",
+        "blueprint.set_capsule_size",
+        "blueprint.cleanup_graph",
+        "blueprint.connect_pins_batch",
+        "blueprint.set_node_position",
+        "add_macro",
+        "remove_function",
+        "set_function_params",
+        "promote_pin_to_variable",
+        "scaffold_interface_implementation",
+        "seed_data_asset",
+        "audit_cdo_drift",
+        "asset.set_datatable_row",
+        "asset.add_datatable_row",
+        "asset.update_datatable_row",
+        "asset.remove_datatable_row",
+        "reflection.create_enum",
+        "reflection.set_enum_entries",
+        "statetree.read",
+        "statetree.list_states",
+        "statetree.add_state",
+        "statetree.remove_state",
+        "statetree.set_state_property",
+        "statetree.clear_state_nodes",
+        "statetree.add_task",
+        "statetree.remove_task",
+        "statetree.set_task_property",
+        "statetree.set_task_instance_property",
+        "statetree.add_enter_condition",
+        "statetree.remove_enter_condition",
+        "statetree.add_transition",
+        "statetree.remove_transition",
+        "statetree.add_transition_condition",
+        "statetree.add_binding",
+        "statetree.remove_binding",
+        "statetree.list_bindings",
+        "statetree.add_evaluator",
+        "statetree.remove_evaluator",
+        "statetree.set_evaluator_property",
+        "statetree.set_evaluator_instance_property",
+        "statetree.add_global_task",
+        "statetree.remove_global_task",
+        "statetree.set_global_task_property",
+        "statetree.set_global_task_instance_property",
+        "statetree.list_colors",
+        "statetree.add_color",
+        "statetree.list_state_parameters",
+        "statetree.add_state_parameter",
+        "statetree.remove_state_parameter",
+        "statetree.set_state_parameter",
+        "statetree.set_root_parameters",
+        "statetree.compile",
+        "statetree.validate",
+        "build_state_tree_from_spec",
+        "export_st_spec",
+        "generate_st_diagram",
+        "auto_arrange_st",
+        "set_st_schema",
+        "list_st_task_types",
+        "list_st_condition_types",
+        "get_st_bindable_properties",
+        "add_st_consideration",
+        "configure_st_consideration",
+        "list_st_extension_types",
+        "add_st_extension",
+        "line_trace",
+        "raycast",
+        "overlap_test",
+        "radial_sweep",
+        "line_of_sight",
+        "navigation_raycast",
+        "find_path",
+        "test_path",
+        "get_random_navigable_point",
+        "level.snap_actor_to_floor",
+        "level.get_relative_transform",
+        "level.read_actor_motion",
+        "level.add_actor_tag",
+        "level.remove_actor_tag",
+        "level.set_actor_tags",
+        "level.list_actor_tags",
+        "level.attach_actor",
+        "level.detach_actor",
+        "level.set_actor_mobility",
+        "level.get_current_edit_level",
+        "level.set_current_edit_level",
+        "level.list_streaming_sublevels",
+        "level.add_streaming_sublevel",
+        "level.remove_streaming_sublevel",
+        "level.set_streaming_sublevel_properties",
+        "level.spawn_grid",
+        "level.batch_translate",
+        "level.place_actors_batch",
+        "scatter_props",
+        "replace_blockout_with_assets",
+        "export_layout",
+        "import_layout",
+        "create_town",
+        "construct_house",
+        "construct_mansion",
+        "create_tower",
+        "create_arch",
+        "create_staircase",
+        "create_castle_fortress",
+        "create_suspension_bridge",
+        "create_aqueduct",
+        "create_maze",
+        "create_pyramid",
+        "create_wall",
+        "create_parametric_mesh",
+        "create_horror_prop",
+        "create_structure",
+        "create_building",
+        "create_pipe_network",
+        "create_fragments",
+        "create_terrain_patch",
+        "generate_floor_plan",
+        "create_building_from_grid",
+        "generate_facade",
+        "generate_roof",
+        "register_building",
+        "create_city_block",
+        "landscape.create",
+        "landscape_edit",
+        "paint_foliage",
+        "add_foliage_instances",
+        "get_foliage_instances",
+        "remove_foliage",
+        "foliage_inspect",
+        "foliage_edit",
+        "pcg.export_graph",
+        "pcg.import_graph",
+        "pcg_graph_edit",
+        "tag_registry_edit",
+        "gas_ops",
+        "create_aim_offset",
+        "add_aim_offset_sample",
+        "create_pose_library",
+        "add_compatible_skeleton",
+        "remove_compatible_skeleton",
+        "get_compatible_skeletons",
+        "preview_animation",
+        "create_physics_asset",
+        "add_physics_body",
+        "configure_physics_body",
+        "add_physics_constraint",
+        "configure_constraint_limits",
+        "list_physics_bodies",
+        "assign_cloth_asset_to_mesh",
+        "bind_cloth_to_skeletal_mesh",
+        "auto_skin_weights",
+        "copy_weights",
+        "mirror_weights",
+        "normalize_weights",
+        "prune_weights",
+        "set_vertex_weights",
+        "create_morph_target",
+        "import_morph_targets",
+        "set_morph_target_deltas",
+        "add_rig_unit",
+        "connect_rig_elements",
+        "animation.auto_layout"
+    };
+    for (const char* Name : referenceParityTools) {
+        reg(registry, Tool{
+            .name=Name,
+            .description="Reference-derived compatibility tool from the 1251 catalog batch. Safe read/trace/actor-tag/transform operations are implemented directly; graph-heavy, vendor, procedural, or asset-specific authoring returns hard MCP errors rather than placeholder success.",
+            .inputSchema=referenceParitySchema,
+            .handler=nullptr,.remote=true});
+    }
 
     // ========================================================================
     // reflection.* extensions (missing tools)

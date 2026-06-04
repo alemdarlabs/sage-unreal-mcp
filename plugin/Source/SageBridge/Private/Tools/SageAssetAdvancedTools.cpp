@@ -29,6 +29,7 @@
 #include "GameplayTagContainer.h"
 #include "GameplayTagsManager.h"
 #include "AssetImportTask.h"
+#include "EditorFramework/AssetImportData.h"
 #include "AssetExportTask.h"
 #include "Exporters/Exporter.h"
 #include "EditorReimportHandler.h"
@@ -49,9 +50,11 @@
 #include "Serialization/JsonWriter.h"
 #include "Subsystems/EditorAssetSubsystem.h"
 #include "ObjectTools.h"
+#include "UObject/MetaData.h"
 #include "UObject/ObjectRedirector.h"
 #include "UObject/Package.h"
 #include "UObject/SoftObjectPath.h"
+#include "UObject/UnrealType.h"
 #include "Factories/FbxImportUI.h"
 #include "Factories/FbxAnimSequenceImportData.h"
 #include "Animation/AnimationAsset.h"
@@ -75,6 +78,7 @@ UObject* ResolveAsset(const FString& Path)
 TSharedPtr<FJsonObject> AssetDeleteDiagnosticJson(
     const FString& PackagePath,
     UEditorAssetSubsystem* AssetSubsystem);
+FSageToolDispatch::FOutcome ImportTextureImpl(const TSharedPtr<FJsonObject>& Args);
 FString SummarizeDeleteDiagnostic(const TSharedPtr<FJsonObject>& Diag);
 
 // ---- asset.get_mesh_bounds ------------------------------------------------
@@ -377,6 +381,331 @@ FSageToolDispatch::FOutcome MoveFolderImpl(const TSharedPtr<FJsonObject>& Args)
     R->SetNumberField(TEXT("failed"),     Failed);
     R->SetArrayField (TEXT("results"),    Results);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FString FirstAssetStringArg(const TSharedPtr<FJsonObject>& Args,
+                            std::initializer_list<const TCHAR*> Names,
+                            const FString& Fallback = FString())
+{
+    if (!Args.IsValid()) return Fallback;
+    FString Value;
+    for (const TCHAR* Name : Names)
+    {
+        if (Args->TryGetStringField(Name, Value) && !Value.IsEmpty()) return Value;
+    }
+    return Fallback;
+}
+
+TArray<FString> AssetStringArrayArg(const TSharedPtr<FJsonObject>& Args,
+                                    std::initializer_list<const TCHAR*> Names)
+{
+    TArray<FString> Out;
+    if (!Args.IsValid()) return Out;
+    for (const TCHAR* Name : Names)
+    {
+        const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+        if (!Args->TryGetArrayField(Name, Arr) || Arr == nullptr) continue;
+        for (const TSharedPtr<FJsonValue>& V : *Arr)
+        {
+            if (V.IsValid() && V->Type == EJson::String)
+            {
+                Out.Add(V->AsString());
+            }
+        }
+        if (Out.Num() > 0) return Out;
+    }
+    return Out;
+}
+
+UEditorAssetSubsystem* EditorAssetSubsystemOrNull()
+{
+    return GEditor ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>() : nullptr;
+}
+
+FSageToolDispatch::FOutcome AssetCreateFolderImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    const FString Folder = FirstAssetStringArg(Args, {TEXT("path"), TEXT("folder")});
+    if (Folder.IsEmpty()) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'/'folder'"));
+    UEditorAssetSubsystem* Sub = EditorAssetSubsystemOrNull();
+    if (!Sub) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("EditorAssetSubsystem unavailable"));
+
+    const bool bAlready = Sub->DoesDirectoryExist(Folder);
+    const bool bOk = bAlready ? true : Sub->MakeDirectory(Folder);
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("folder"), Folder);
+    R->SetBoolField(TEXT("already"), bAlready);
+    R->SetBoolField(TEXT("created"), bOk && !bAlready);
+    R->SetBoolField(TEXT("exists"), Sub->DoesDirectoryExist(Folder));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AssetDeleteFolderImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    const FString Folder = FirstAssetStringArg(Args, {TEXT("path"), TEXT("folder")});
+    if (Folder.IsEmpty()) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'/'folder'"));
+    bool bConfirmed = false;
+    if (Args.IsValid()) Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+    if (!bConfirmed)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("asset.delete_folder is destructive and requires confirmed:true"));
+    }
+    UEditorAssetSubsystem* Sub = EditorAssetSubsystemOrNull();
+    if (!Sub) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("EditorAssetSubsystem unavailable"));
+
+    const bool bExisted = Sub->DoesDirectoryExist(Folder);
+    const bool bDeleted = bExisted ? Sub->DeleteDirectory(Folder) : true;
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("folder"), Folder);
+    R->SetBoolField(TEXT("existed"), bExisted);
+    R->SetBoolField(TEXT("deleted"), bDeleted && bExisted);
+    R->SetBoolField(TEXT("exists_after"), Sub->DoesDirectoryExist(Folder));
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AssetSaveImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    const FString Path = FirstAssetStringArg(Args, {TEXT("path"), TEXT("asset"), TEXT("asset_path")});
+    if (Path.IsEmpty()) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    bool bOnlyIfDirty = true;
+    if (Args.IsValid()) Args->TryGetBoolField(TEXT("only_if_dirty"), bOnlyIfDirty);
+    UEditorAssetSubsystem* Sub = EditorAssetSubsystemOrNull();
+    if (!Sub) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("EditorAssetSubsystem unavailable"));
+
+    const bool bSaved = Sub->SaveAsset(Path, bOnlyIfDirty);
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Path);
+    R->SetBoolField(TEXT("saved"), bSaved);
+    R->SetBoolField(TEXT("only_if_dirty"), bOnlyIfDirty);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AssetSaveAllDirtyImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    const FString Directory = FirstAssetStringArg(Args, {TEXT("path"), TEXT("folder"), TEXT("directory")}, TEXT("/Game"));
+    bool bRecursive = true;
+    if (Args.IsValid()) Args->TryGetBoolField(TEXT("recursive"), bRecursive);
+    UEditorAssetSubsystem* Sub = EditorAssetSubsystemOrNull();
+    if (!Sub) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("EditorAssetSubsystem unavailable"));
+
+    const bool bSaved = Sub->SaveDirectory(Directory, /*bOnlyIfIsDirty=*/true, bRecursive);
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("directory"), Directory);
+    R->SetBoolField(TEXT("recursive"), bRecursive);
+    R->SetBoolField(TEXT("saved"), bSaved);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AssetCreateInterchangePipelineImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32603,
+        TEXT("asset.create_interchange_pipeline requires Interchange editor pipeline asset authoring; current bridge has safe import tasks but no stable public pipeline-asset construction path"));
+}
+
+FSageToolDispatch::FOutcome AssetImportTextureBatchImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    const TArray<FString> Files = AssetStringArrayArg(Args, {TEXT("files"), TEXT("source_files"), TEXT("sources")});
+    const FString Destination = FirstAssetStringArg(Args, {TEXT("destination"), TEXT("dest"), TEXT("folder")});
+    if (Files.Num() == 0) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing files/source_files"));
+    if (Destination.IsEmpty()) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing destination"));
+
+    bool bReplace = false;
+    if (Args.IsValid()) Args->TryGetBoolField(TEXT("replace_existing"), bReplace);
+
+    TArray<TSharedPtr<FJsonValue>> Results;
+    int32 Imported = 0;
+    int32 Failed = 0;
+    for (const FString& File : Files)
+    {
+        const FString AssetName = FPaths::GetBaseFilename(File);
+        auto One = MakeShared<FJsonObject>();
+        One->SetStringField(TEXT("file"), File);
+        One->SetStringField(TEXT("destination"), Destination / AssetName);
+        One->SetBoolField(TEXT("replace_existing"), bReplace);
+        FSageToolDispatch::FOutcome Out = ImportTextureImpl(One);
+        auto Row = MakeShared<FJsonObject>();
+        Row->SetStringField(TEXT("file"), File);
+        Row->SetBoolField(TEXT("success"), Out.bSuccess);
+        if (Out.bSuccess && Out.Result.IsValid())
+        {
+            Row->SetObjectField(TEXT("result"), Out.Result);
+            ++Imported;
+        }
+        else
+        {
+            if (Out.Error.IsValid()) Row->SetObjectField(TEXT("error"), Out.Error);
+            ++Failed;
+        }
+        Results.Add(MakeShared<FJsonValueObject>(Row));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("destination"), Destination);
+    R->SetArrayField(TEXT("results"), Results);
+    R->SetNumberField(TEXT("imported"), Imported);
+    R->SetNumberField(TEXT("failed"), Failed);
+    R->SetBoolField(TEXT("all_succeeded"), Failed == 0);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AssetReadImportSourcesImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    const FString Path = FirstAssetStringArg(Args, {TEXT("path"), TEXT("asset"), TEXT("asset_path")});
+    if (Path.IsEmpty()) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    UObject* Asset = ResolveAsset(Path);
+    if (!Asset) return FSageToolDispatch::FOutcome::MakeError(-32602, FString::Printf(TEXT("asset not found: %s"), *Path));
+
+    UAssetImportData* ImportData = nullptr;
+    if (FObjectPropertyBase* ImportProp = FindFProperty<FObjectPropertyBase>(Asset->GetClass(), TEXT("AssetImportData")))
+    {
+        ImportData = Cast<UAssetImportData>(ImportProp->GetObjectPropertyValue_InContainer(Asset));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Files;
+    if (ImportData)
+    {
+        TArray<FString> Filenames;
+        ImportData->ExtractFilenames(Filenames);
+        for (const FString& File : Filenames)
+        {
+            Files.Add(MakeShared<FJsonValueString>(File));
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Asset->GetPathName());
+    R->SetStringField(TEXT("class"), Asset->GetClass()->GetName());
+    R->SetBoolField(TEXT("has_import_data"), ImportData != nullptr);
+    R->SetArrayField(TEXT("source_files"), Files);
+    R->SetNumberField(TEXT("count"), Files.Num());
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AssetHealthCheckImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Folder = FirstAssetStringArg(Args, {TEXT("path"), TEXT("folder"), TEXT("directory")}, TEXT("/Game"));
+    int32 MaxResults = 500;
+    if (Args.IsValid())
+    {
+        double N = 0.0;
+        if (Args->TryGetNumberField(TEXT("max_results"), N)) MaxResults = FMath::Clamp(static_cast<int32>(N), 1, 5000);
+    }
+
+    FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+    FARFilter Filter;
+    Filter.PackagePaths.Add(FName(*Folder));
+    Filter.bRecursivePaths = true;
+    TArray<FAssetData> Assets;
+    ARM.Get().GetAssets(Filter, Assets);
+
+    TArray<TSharedPtr<FJsonValue>> Rows;
+    int32 Redirectors = 0;
+    int32 MissingPackageFiles = 0;
+    for (const FAssetData& Data : Assets)
+    {
+        if (Rows.Num() >= MaxResults) break;
+        if (Data.AssetClassPath == UObjectRedirector::StaticClass()->GetClassPathName()) ++Redirectors;
+        FString Filename;
+        const bool bHasFilename = FPackageName::DoesPackageExist(Data.PackageName.ToString(), &Filename);
+        if (!bHasFilename) ++MissingPackageFiles;
+        auto Row = MakeShared<FJsonObject>();
+        Row->SetStringField(TEXT("object_path"), Data.GetSoftObjectPath().ToString());
+        Row->SetStringField(TEXT("package"), Data.PackageName.ToString());
+        Row->SetStringField(TEXT("class"), Data.AssetClassPath.ToString());
+        Row->SetBoolField(TEXT("package_file_exists"), bHasFilename);
+        if (bHasFilename) Row->SetStringField(TEXT("filename"), Filename);
+        Rows.Add(MakeShared<FJsonValueObject>(Row));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("folder"), Folder);
+    R->SetNumberField(TEXT("asset_count"), Assets.Num());
+    R->SetNumberField(TEXT("returned"), Rows.Num());
+    R->SetNumberField(TEXT("redirector_count"), Redirectors);
+    R->SetNumberField(TEXT("missing_package_file_count"), MissingPackageFiles);
+    R->SetArrayField(TEXT("assets"), Rows);
+    R->SetBoolField(TEXT("healthy"), Redirectors == 0 && MissingPackageFiles == 0);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome AssetGenerateReportImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Out = AssetHealthCheckImpl(Args);
+    if (Out.bSuccess && Out.Result.IsValid())
+    {
+        Out.Result->SetStringField(TEXT("report_type"), TEXT("asset_health"));
+        Out.Result->SetStringField(TEXT("generated_at"), FDateTime::UtcNow().ToIso8601());
+    }
+    return Out;
+}
+
+FSageToolDispatch::FOutcome AssetCreateThumbnailImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32603,
+        TEXT("asset.create_thumbnail requires ThumbnailTools/renderer integration and image writeback beyond the current safe AssetRegistry path; use capture_viewport or material get_thumbnail where available"));
+}
+
+FSageToolDispatch::FOutcome AssetValidateImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    return AssetHealthCheckImpl(Args);
+}
+
+FSageToolDispatch::FOutcome AssetSetTagsImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+    const FString Path = FirstAssetStringArg(Args, {TEXT("path"), TEXT("asset"), TEXT("asset_path")});
+    if (Path.IsEmpty()) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    UObject* Asset = ResolveAsset(Path);
+    if (!Asset) return FSageToolDispatch::FOutcome::MakeError(-32602, FString::Printf(TEXT("asset not found: %s"), *Path));
+
+    const TSharedPtr<FJsonObject>* TagsObj = nullptr;
+    if (!Args.IsValid() || !Args->TryGetObjectField(TEXT("tags"), TagsObj) || TagsObj == nullptr || !TagsObj->IsValid())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing object field 'tags'"));
+    }
+
+    UPackage* Package = Asset->GetOutermost();
+    if (!Package) return FSageToolDispatch::FOutcome::MakeError(-32603, TEXT("package unavailable"));
+    FMetaData& Meta = Package->GetMetaData();
+
+    TArray<TSharedPtr<FJsonValue>> Applied;
+    for (const auto& Pair : (*TagsObj)->Values)
+    {
+        FString Value;
+        if (Pair.Value.IsValid())
+        {
+            Value = Pair.Value->AsString();
+        }
+        Meta.SetValue(Asset, *Pair.Key, *Value);
+        auto Row = MakeShared<FJsonObject>();
+        Row->SetStringField(TEXT("key"), Pair.Key);
+        Row->SetStringField(TEXT("value"), Value);
+        Applied.Add(MakeShared<FJsonValueObject>(Row));
+    }
+    Asset->MarkPackageDirty();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Asset->GetPathName());
+    R->SetArrayField(TEXT("applied"), Applied);
+    R->SetNumberField(TEXT("count"), Applied.Num());
+    R->SetBoolField(TEXT("dirty"), true);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
+}
+
+FSageToolDispatch::FOutcome FabOpsImpl(const TSharedPtr<FJsonObject>& /*Args*/)
+{
+    return FSageToolDispatch::FOutcome::MakeError(-32603,
+        TEXT("fab_ops requires Epic/Fab marketplace authentication, cache policy, and license-aware download/import orchestration; no authenticated Fab connector is configured in SageBridge"));
 }
 
 // ---- asset.list_redirectors ----------------------------------------------
@@ -2138,10 +2467,56 @@ FSageToolDispatch::FOutcome SetTextureSettingsImpl(const TSharedPtr<FJsonObject>
 
 namespace socket_helpers
 {
-    TSharedPtr<FJsonObject> StaticSocketToJson(const UStaticMeshSocket* S)
+    enum class EOwner
+    {
+        Mesh,
+        Skeleton,
+        Any
+    };
+
+    FString OwnerToString(EOwner Owner)
+    {
+        switch (Owner)
+        {
+        case EOwner::Mesh: return TEXT("mesh");
+        case EOwner::Skeleton: return TEXT("skeleton");
+        default: return TEXT("any");
+        }
+    }
+
+    bool ParseOwner(const TSharedPtr<FJsonObject>& Args, EOwner DefaultOwner, EOwner& OutOwner, FString& OutError)
+    {
+        OutOwner = DefaultOwner;
+        FString OwnerStr;
+        if (!Args.IsValid() || !Args->TryGetStringField(TEXT("owner"), OwnerStr) || OwnerStr.IsEmpty())
+        {
+            return true;
+        }
+        OwnerStr = OwnerStr.TrimStartAndEnd().ToLower();
+        if (OwnerStr == TEXT("mesh"))
+        {
+            OutOwner = EOwner::Mesh;
+            return true;
+        }
+        if (OwnerStr == TEXT("skeleton"))
+        {
+            OutOwner = EOwner::Skeleton;
+            return true;
+        }
+        if (OwnerStr == TEXT("any") || OwnerStr == TEXT("effective"))
+        {
+            OutOwner = EOwner::Any;
+            return true;
+        }
+        OutError = TEXT("'owner' must be one of: mesh, skeleton, any");
+        return false;
+    }
+
+    TSharedPtr<FJsonObject> StaticSocketToJson(const UStaticMeshSocket* S, const FString& Owner = TEXT("mesh"))
     {
         auto J = MakeShared<FJsonObject>();
         J->SetStringField(TEXT("name"),     S->SocketName.ToString());
+        J->SetStringField(TEXT("owner"),    Owner);
         J->SetField(TEXT("location"),       detail::Vec3ToJson(S->RelativeLocation));
         J->SetField(TEXT("rotation"),       detail::Rot3ToJson(S->RelativeRotation));
         J->SetField(TEXT("scale"),          detail::Vec3ToJson(S->RelativeScale));
@@ -2149,16 +2524,195 @@ namespace socket_helpers
         return J;
     }
 
-    TSharedPtr<FJsonObject> SkelSocketToJson(const USkeletalMeshSocket* S)
+    TSharedPtr<FJsonObject> SkelSocketToJson(
+        const USkeletalMeshSocket* S,
+        const FString& Owner = TEXT("mesh"),
+        const UObject* OwnerAsset = nullptr,
+        bool bEffective = true)
     {
         auto J = MakeShared<FJsonObject>();
         J->SetStringField(TEXT("name"),         S->SocketName.ToString());
         J->SetStringField(TEXT("bone"),         S->BoneName.ToString());
+        J->SetStringField(TEXT("parent_bone"),  S->BoneName.ToString());
+        J->SetStringField(TEXT("owner"),        Owner);
+        J->SetBoolField  (TEXT("effective"),    bEffective);
+        if (OwnerAsset)
+        {
+            J->SetStringField(TEXT("owner_asset"), OwnerAsset->GetPathName());
+        }
         J->SetField(TEXT("location"),           detail::Vec3ToJson(S->RelativeLocation));
         J->SetField(TEXT("rotation"),           detail::Rot3ToJson(S->RelativeRotation));
         J->SetField(TEXT("scale"),              detail::Vec3ToJson(S->RelativeScale));
         J->SetBoolField(TEXT("force_always_animated"), S->bForceAlwaysAnimated);
         return J;
+    }
+
+    USkeletalMeshSocket* FindMeshOnlySocket(USkeletalMesh* Mesh, FName Name)
+    {
+        if (!Mesh) return nullptr;
+        for (const TObjectPtr<USkeletalMeshSocket>& Socket : Mesh->GetMeshOnlySocketList())
+        {
+            if (Socket && Socket->SocketName == Name)
+            {
+                return Socket.Get();
+            }
+        }
+        return nullptr;
+    }
+
+    USkeletalMeshSocket* FindSkeletonSocket(USkeleton* Skeleton, FName Name)
+    {
+        if (!Skeleton) return nullptr;
+        for (USkeletalMeshSocket* Socket : Skeleton->Sockets)
+        {
+            if (Socket && Socket->SocketName == Name)
+            {
+                return Socket;
+            }
+        }
+        return nullptr;
+    }
+
+    bool SkeletonHasBone(USkeleton* Skeleton, FName BoneName)
+    {
+        if (!Skeleton || BoneName.IsNone()) return true;
+        return Skeleton->GetReferenceSkeleton().FindBoneIndex(BoneName) != INDEX_NONE;
+    }
+
+    bool MeshHasBone(USkeletalMesh* Mesh, FName BoneName)
+    {
+        if (!Mesh || BoneName.IsNone()) return true;
+        return Mesh->GetRefSkeleton().FindBoneIndex(BoneName) != INDEX_NONE;
+    }
+
+    TSharedPtr<FJsonObject> DesiredSkelSocketJson(
+        const FString& Name,
+        const FString& Owner,
+        const UObject* OwnerAsset,
+        FName BoneName,
+        const FVector& Location,
+        const FRotator& Rotation,
+        const FVector& Scale)
+    {
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("name"), Name);
+        J->SetStringField(TEXT("bone"), BoneName.ToString());
+        J->SetStringField(TEXT("parent_bone"), BoneName.ToString());
+        J->SetStringField(TEXT("owner"), Owner);
+        J->SetBoolField(TEXT("effective"), true);
+        if (OwnerAsset)
+        {
+            J->SetStringField(TEXT("owner_asset"), OwnerAsset->GetPathName());
+        }
+        J->SetField(TEXT("location"), detail::Vec3ToJson(Location));
+        J->SetField(TEXT("rotation"), detail::Rot3ToJson(Rotation));
+        J->SetField(TEXT("scale"), detail::Vec3ToJson(Scale));
+        return J;
+    }
+
+    void AddCollisionIfNeeded(
+        const FName SocketName,
+        const USkeletalMeshSocket* MeshSocket,
+        const USkeletalMeshSocket* SkeletonSocket,
+        const USkeletalMesh* Mesh,
+        const USkeleton* Skeleton,
+        TArray<TSharedPtr<FJsonValue>>& Collisions)
+    {
+        if (!MeshSocket || !SkeletonSocket) return;
+        auto C = MakeShared<FJsonObject>();
+        C->SetStringField(TEXT("name"), SocketName.ToString());
+        C->SetStringField(TEXT("effective_owner"), TEXT("mesh"));
+        C->SetStringField(TEXT("shadowed_owner"), TEXT("skeleton"));
+        C->SetStringField(TEXT("mesh_asset"), Mesh ? Mesh->GetPathName() : FString());
+        C->SetStringField(TEXT("skeleton_asset"), Skeleton ? Skeleton->GetPathName() : FString());
+        C->SetObjectField(TEXT("mesh_socket"), SkelSocketToJson(MeshSocket, TEXT("mesh"), Mesh, true));
+        C->SetObjectField(TEXT("skeleton_socket"), SkelSocketToJson(SkeletonSocket, TEXT("skeleton"), Skeleton, false));
+        Collisions.Add(MakeShared<FJsonValueObject>(C));
+    }
+
+    bool SaveLoadedAssetIfRequested(UObject* Asset, bool bSave, TSharedRef<FJsonObject> Result)
+    {
+        Result->SetBoolField(TEXT("save_requested"), bSave);
+        if (!bSave) return true;
+        UEditorAssetSubsystem* AssetSubsystem = GEditor
+            ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>()
+            : nullptr;
+        if (!AssetSubsystem)
+        {
+            Result->SetStringField(TEXT("save_error"), TEXT("EditorAssetSubsystem unavailable"));
+            return false;
+        }
+        const bool bSaved = AssetSubsystem->SaveLoadedAsset(Asset, /*bOnlyIfIsDirty=*/false);
+        Result->SetBoolField(TEXT("saved"), bSaved);
+        if (!bSaved)
+        {
+            Result->SetStringField(TEXT("save_error"),
+                FString::Printf(TEXT("SaveLoadedAsset returned false for %s"), *Asset->GetPathName()));
+        }
+        return bSaved;
+    }
+
+    TSharedPtr<FJsonObject> BuildSocketReadback(UObject* Asset, FName SocketFName, EOwner Owner)
+    {
+        auto R = MakeShared<FJsonObject>();
+        R->SetStringField(TEXT("path"), Asset ? Asset->GetPathName() : FString());
+        R->SetStringField(TEXT("requested_name"), SocketFName.ToString());
+        R->SetStringField(TEXT("owner_filter"), OwnerToString(Owner));
+        R->SetBoolField(TEXT("found"), false);
+
+        if (UStaticMesh* SM = Cast<UStaticMesh>(Asset))
+        {
+            R->SetStringField(TEXT("kind"), TEXT("static_mesh"));
+            UStaticMeshSocket* Found = SM->FindSocket(SocketFName);
+            if (Found && Owner != EOwner::Skeleton)
+            {
+                R->SetBoolField(TEXT("found"), true);
+                R->SetStringField(TEXT("effective_owner"), TEXT("mesh"));
+                R->SetObjectField(TEXT("socket"), StaticSocketToJson(Found));
+                R->SetObjectField(TEXT("effective_socket"), StaticSocketToJson(Found));
+            }
+            return R;
+        }
+
+        if (USkeletalMesh* SK = Cast<USkeletalMesh>(Asset))
+        {
+            R->SetStringField(TEXT("kind"), TEXT("skeletal_mesh"));
+            USkeleton* Skeleton = SK->GetSkeleton();
+            USkeletalMeshSocket* MeshSocket = FindMeshOnlySocket(SK, SocketFName);
+            USkeletalMeshSocket* SkeletonSocket = FindSkeletonSocket(Skeleton, SocketFName);
+            if (MeshSocket)
+            {
+                R->SetObjectField(TEXT("mesh_socket"), SkelSocketToJson(MeshSocket, TEXT("mesh"), SK, true));
+            }
+            if (SkeletonSocket)
+            {
+                const bool bSkeletonEffective = MeshSocket == nullptr;
+                R->SetObjectField(TEXT("skeleton_socket"), SkelSocketToJson(SkeletonSocket, TEXT("skeleton"), Skeleton, bSkeletonEffective));
+            }
+            R->SetBoolField(TEXT("has_mesh_socket"), MeshSocket != nullptr);
+            R->SetBoolField(TEXT("has_skeleton_socket"), SkeletonSocket != nullptr);
+            R->SetBoolField(TEXT("has_owner_collision"), MeshSocket && SkeletonSocket);
+            if (MeshSocket || SkeletonSocket)
+            {
+                const bool bOwnerMatches =
+                    Owner == EOwner::Any ||
+                    (Owner == EOwner::Mesh && MeshSocket) ||
+                    (Owner == EOwner::Skeleton && SkeletonSocket);
+                R->SetBoolField(TEXT("found"), bOwnerMatches);
+                if (MeshSocket)
+                {
+                    R->SetStringField(TEXT("effective_owner"), TEXT("mesh"));
+                    R->SetObjectField(TEXT("effective_socket"), SkelSocketToJson(MeshSocket, TEXT("mesh"), SK, true));
+                }
+                else if (SkeletonSocket)
+                {
+                    R->SetStringField(TEXT("effective_owner"), TEXT("skeleton"));
+                    R->SetObjectField(TEXT("effective_socket"), SkelSocketToJson(SkeletonSocket, TEXT("skeleton"), Skeleton, true));
+                }
+            }
+            return R;
+        }
+        return R;
     }
 }
 
@@ -2169,16 +2723,33 @@ FSageToolDispatch::FOutcome ListSocketsImpl(const TSharedPtr<FJsonObject>& Args)
     {
         return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
     }
+    socket_helpers::EOwner OwnerFilter = socket_helpers::EOwner::Mesh;
+    FString OwnerErr;
+    if (!socket_helpers::ParseOwner(Args, socket_helpers::EOwner::Mesh, OwnerFilter, OwnerErr))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, OwnerErr);
+    }
     UObject* Asset = ResolveAsset(Path);
     if (!Asset) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("asset not found"));
 
     auto R = MakeShared<FJsonObject>();
     R->SetStringField(TEXT("path"),  Asset->GetPathName());
     R->SetStringField(TEXT("class"), Asset->GetClass()->GetName());
+    R->SetStringField(TEXT("owner_filter"), socket_helpers::OwnerToString(OwnerFilter));
 
     TArray<TSharedPtr<FJsonValue>> SocketArr;
+    TArray<TSharedPtr<FJsonValue>> Collisions;
     if (UStaticMesh* SM = Cast<UStaticMesh>(Asset))
     {
+        if (OwnerFilter == socket_helpers::EOwner::Skeleton)
+        {
+            R->SetStringField(TEXT("kind"), TEXT("static_mesh"));
+            R->SetArrayField(TEXT("sockets"), SocketArr);
+            R->SetNumberField(TEXT("count"), 0);
+            R->SetArrayField(TEXT("owner_collisions"), Collisions);
+            R->SetNumberField(TEXT("owner_collision_count"), 0);
+            return FSageToolDispatch::FOutcome::MakeSuccess(R);
+        }
         for (UStaticMeshSocket* S : SM->Sockets)
         {
             if (!S) continue;
@@ -2188,12 +2759,40 @@ FSageToolDispatch::FOutcome ListSocketsImpl(const TSharedPtr<FJsonObject>& Args)
     }
     else if (USkeletalMesh* SK = Cast<USkeletalMesh>(Asset))
     {
-        for (const TObjectPtr<USkeletalMeshSocket>& S : SK->GetMeshOnlySocketList())
+        USkeleton* Skeleton = SK->GetSkeleton();
+        TSet<FName> MeshSocketNames;
+        if (OwnerFilter == socket_helpers::EOwner::Mesh || OwnerFilter == socket_helpers::EOwner::Any)
         {
-            if (!S) continue;
-            SocketArr.Add(MakeShared<FJsonValueObject>(socket_helpers::SkelSocketToJson(S.Get())));
+            for (const TObjectPtr<USkeletalMeshSocket>& S : SK->GetMeshOnlySocketList())
+            {
+                if (!S) continue;
+                MeshSocketNames.Add(S->SocketName);
+                const bool bOverridesSkeleton = socket_helpers::FindSkeletonSocket(Skeleton, S->SocketName) != nullptr;
+                TSharedPtr<FJsonObject> J = socket_helpers::SkelSocketToJson(S.Get(), TEXT("mesh"), SK, true);
+                J->SetBoolField(TEXT("overrides_skeleton_socket"), bOverridesSkeleton);
+                SocketArr.Add(MakeShared<FJsonValueObject>(J));
+            }
+        }
+        if (OwnerFilter == socket_helpers::EOwner::Skeleton || OwnerFilter == socket_helpers::EOwner::Any)
+        {
+            if (Skeleton)
+            {
+                for (USkeletalMeshSocket* S : Skeleton->Sockets)
+                {
+                    if (!S) continue;
+                    const bool bShadowed = MeshSocketNames.Contains(S->SocketName)
+                        || socket_helpers::FindMeshOnlySocket(SK, S->SocketName) != nullptr;
+                    SocketArr.Add(MakeShared<FJsonValueObject>(
+                        socket_helpers::SkelSocketToJson(S, TEXT("skeleton"), Skeleton, !bShadowed)));
+                    if (USkeletalMeshSocket* MeshSocket = socket_helpers::FindMeshOnlySocket(SK, S->SocketName))
+                    {
+                        socket_helpers::AddCollisionIfNeeded(S->SocketName, MeshSocket, S, SK, Skeleton, Collisions);
+                    }
+                }
+            }
         }
         R->SetStringField(TEXT("kind"), TEXT("skeletal_mesh"));
+        R->SetStringField(TEXT("skeleton"), Skeleton ? Skeleton->GetPathName() : FString());
     }
     else
     {
@@ -2203,6 +2802,8 @@ FSageToolDispatch::FOutcome ListSocketsImpl(const TSharedPtr<FJsonObject>& Args)
     }
     R->SetArrayField(TEXT("sockets"), SocketArr);
     R->SetNumberField(TEXT("count"), SocketArr.Num());
+    R->SetArrayField(TEXT("owner_collisions"), Collisions);
+    R->SetNumberField(TEXT("owner_collision_count"), Collisions.Num());
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -2261,10 +2862,15 @@ FSageToolDispatch::FOutcome AddSocketImpl(const TSharedPtr<FJsonObject>& Args)
 
     if (USkeletalMesh* SK = Cast<USkeletalMesh>(Asset))
     {
-        if (SK->FindSocket(SocketFName))
+        if (socket_helpers::FindMeshOnlySocket(SK, SocketFName))
         {
             return FSageToolDispatch::FOutcome::MakeError(-32602,
-                FString::Printf(TEXT("socket '%s' already exists"), *Name));
+                FString::Printf(TEXT("mesh socket '%s' already exists"), *Name));
+        }
+        if (socket_helpers::FindSkeletonSocket(SK->GetSkeleton(), SocketFName))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("socket '%s' is inherited from the skeleton; use asset.upsert_socket with owner='mesh' and allow_mesh_override_of_skeleton_socket=true to create a mesh-only override"), *Name));
         }
         FScopedTransaction Tx(LOCTEXT("AddSocket", "Add Socket"));
         SK->Modify();
@@ -2288,6 +2894,296 @@ FSageToolDispatch::FOutcome AddSocketImpl(const TSharedPtr<FJsonObject>& Args)
     return FSageToolDispatch::FOutcome::MakeError(-32602,
         FString::Printf(TEXT("asset is %s, expected StaticMesh or SkeletalMesh"),
                         *Asset->GetClass()->GetName()));
+}
+
+FSageToolDispatch::FOutcome GetSocketImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FString Path, Name;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+    }
+    socket_helpers::EOwner OwnerFilter = socket_helpers::EOwner::Any;
+    FString OwnerErr;
+    if (!socket_helpers::ParseOwner(Args, socket_helpers::EOwner::Any, OwnerFilter, OwnerErr))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, OwnerErr);
+    }
+    UObject* Asset = ResolveAsset(Path);
+    if (!Asset) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("asset not found"));
+    if (!Asset->IsA<UStaticMesh>() && !Asset->IsA<USkeletalMesh>())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("asset is %s, expected StaticMesh or SkeletalMesh"),
+                            *Asset->GetClass()->GetName()));
+    }
+    return FSageToolDispatch::FOutcome::MakeSuccess(
+        socket_helpers::BuildSocketReadback(Asset, FName(*Name), OwnerFilter));
+}
+
+FSageToolDispatch::FOutcome UpsertSocketImpl(const TSharedPtr<FJsonObject>& Args)
+{
+    FSageToolDispatch::FOutcome Reject;
+    if (detail::RejectIfPie(Reject)) return Reject;
+
+    FString Path, Name;
+    if (!Args.IsValid() || !Args->TryGetStringField(TEXT("path"), Path))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'path'"));
+    }
+    if (!Args->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("missing 'name'"));
+    }
+
+    socket_helpers::EOwner Owner = socket_helpers::EOwner::Mesh;
+    FString OwnerErr;
+    if (!socket_helpers::ParseOwner(Args, socket_helpers::EOwner::Mesh, Owner, OwnerErr))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, OwnerErr);
+    }
+    if (Owner == socket_helpers::EOwner::Any)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("asset.upsert_socket requires owner='mesh' or owner='skeleton'; owner='any' is read-only"));
+    }
+
+    UObject* Asset = ResolveAsset(Path);
+    if (!Asset) return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("asset not found"));
+
+    FVector Location(0,0,0);
+    FRotator Rotation(0,0,0);
+    FVector Scale(1,1,1);
+    detail::ParseVector3 (Args, TEXT("location"), Location);
+    detail::ParseRotator3(Args, TEXT("rotation"), Rotation);
+    detail::ParseVector3 (Args, TEXT("scale"),    Scale);
+
+    FString BoneNameStr;
+    Args->TryGetStringField(TEXT("bone"), BoneNameStr);
+    if (BoneNameStr.IsEmpty())
+    {
+        Args->TryGetStringField(TEXT("parent_bone"), BoneNameStr);
+    }
+    const FName SocketFName(*Name);
+    const FName BoneName = BoneNameStr.IsEmpty() ? NAME_None : FName(*BoneNameStr);
+    bool bDryRun = false;
+    bool bSave = false;
+    bool bCreateIfMissing = true;
+    bool bAllowMeshOverride = false;
+    bool bConfirmed = false;
+    Args->TryGetBoolField(TEXT("dry_run"), bDryRun);
+    Args->TryGetBoolField(TEXT("save"), bSave);
+    Args->TryGetBoolField(TEXT("create_if_missing"), bCreateIfMissing);
+    Args->TryGetBoolField(TEXT("allow_mesh_override_of_skeleton_socket"), bAllowMeshOverride);
+    Args->TryGetBoolField(TEXT("confirmed"), bConfirmed);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetStringField(TEXT("path"), Asset->GetPathName());
+    R->SetStringField(TEXT("name"), Name);
+    R->SetStringField(TEXT("owner"), socket_helpers::OwnerToString(Owner));
+    R->SetBoolField(TEXT("dry_run"), bDryRun);
+    R->SetBoolField(TEXT("create_if_missing"), bCreateIfMissing);
+    R->SetBoolField(TEXT("allow_mesh_override_of_skeleton_socket"), bAllowMeshOverride);
+    R->SetObjectField(TEXT("before"), socket_helpers::BuildSocketReadback(Asset, SocketFName, socket_helpers::EOwner::Any));
+
+    if (UStaticMesh* SM = Cast<UStaticMesh>(Asset))
+    {
+        if (Owner != socket_helpers::EOwner::Mesh)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("StaticMesh sockets only support owner='mesh'"));
+        }
+        UStaticMeshSocket* Socket = SM->FindSocket(SocketFName);
+        const bool bCreate = Socket == nullptr;
+        if (bCreate && !bCreateIfMissing)
+        {
+            R->SetBoolField(TEXT("changed"), false);
+            R->SetStringField(TEXT("action"), TEXT("missing_refused"));
+            return FSageToolDispatch::FOutcome::MakeSuccess(R);
+        }
+        R->SetStringField(TEXT("action"), bCreate ? TEXT("create_mesh_socket") : TEXT("update_mesh_socket"));
+        R->SetObjectField(TEXT("desired_socket"), socket_helpers::StaticSocketToJson(
+            [&]() {
+                UStaticMeshSocket* Preview = NewObject<UStaticMeshSocket>(GetTransientPackage());
+                Preview->SocketName = SocketFName;
+                Preview->RelativeLocation = Location;
+                Preview->RelativeRotation = Rotation;
+                Preview->RelativeScale = Scale;
+                return Preview;
+            }()));
+        if (bDryRun)
+        {
+            R->SetBoolField(TEXT("changed"), true);
+            R->SetStringField(TEXT("would_mutate_asset"), SM->GetPathName());
+            return FSageToolDispatch::FOutcome::MakeSuccess(R);
+        }
+
+        FScopedTransaction Tx(LOCTEXT("UpsertSocket", "Sage: Upsert Socket"));
+        SM->Modify();
+        if (!Socket)
+        {
+            Socket = NewObject<UStaticMeshSocket>(SM);
+            Socket->SocketName = SocketFName;
+            SM->AddSocket(Socket);
+        }
+        else
+        {
+            Socket->Modify();
+        }
+        Socket->RelativeLocation = Location;
+        Socket->RelativeRotation = Rotation;
+        Socket->RelativeScale = Scale;
+        SM->MarkPackageDirty();
+        SM->PostEditChange();
+        R->SetBoolField(TEXT("changed"), true);
+        R->SetObjectField(TEXT("after"), socket_helpers::BuildSocketReadback(Asset, SocketFName, socket_helpers::EOwner::Any));
+        socket_helpers::SaveLoadedAssetIfRequested(SM, bSave, R);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    USkeletalMesh* Mesh = Cast<USkeletalMesh>(Asset);
+    USkeleton* Skeleton = Cast<USkeleton>(Asset);
+    if (!Mesh && !Skeleton)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("asset is %s, expected StaticMesh, SkeletalMesh, or USkeleton for owner='skeleton'"),
+                            *Asset->GetClass()->GetName()));
+    }
+
+    if (Owner == socket_helpers::EOwner::Mesh)
+    {
+        if (!Mesh)
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("owner='mesh' requires a USkeletalMesh or UStaticMesh path"));
+        }
+        if (!socket_helpers::MeshHasBone(Mesh, BoneName))
+        {
+            return FSageToolDispatch::FOutcome::MakeError(-32602,
+                FString::Printf(TEXT("bone '%s' not found on skeletal mesh"), *BoneName.ToString()));
+        }
+        USkeletalMeshSocket* MeshSocket = socket_helpers::FindMeshOnlySocket(Mesh, SocketFName);
+        USkeletalMeshSocket* SkeletonSocket = socket_helpers::FindSkeletonSocket(Mesh->GetSkeleton(), SocketFName);
+        const bool bCreate = MeshSocket == nullptr;
+        if (bCreate && SkeletonSocket && !bAllowMeshOverride)
+        {
+            R->SetBoolField(TEXT("success"), false);
+            R->SetBoolField(TEXT("changed"), false);
+            R->SetStringField(TEXT("action"), TEXT("skeleton_socket_blocks_mesh_override"));
+            R->SetStringField(TEXT("error"), TEXT("socket exists on the shared skeleton; pass allow_mesh_override_of_skeleton_socket=true to create a mesh-only override"));
+            R->SetObjectField(TEXT("blocking_socket"), socket_helpers::SkelSocketToJson(SkeletonSocket, TEXT("skeleton"), Mesh->GetSkeleton(), true));
+            return FSageToolDispatch::FOutcome::MakeSuccess(R);
+        }
+        if (bCreate && !bCreateIfMissing)
+        {
+            R->SetBoolField(TEXT("changed"), false);
+            R->SetStringField(TEXT("action"), TEXT("missing_refused"));
+            return FSageToolDispatch::FOutcome::MakeSuccess(R);
+        }
+        R->SetStringField(TEXT("action"), bCreate ? TEXT("create_mesh_socket") : TEXT("update_mesh_socket"));
+        R->SetObjectField(TEXT("desired_socket"), socket_helpers::DesiredSkelSocketJson(
+            Name, TEXT("mesh"), Mesh, BoneName, Location, Rotation, Scale));
+        if (SkeletonSocket && bCreate)
+        {
+            R->SetBoolField(TEXT("creates_mesh_override_of_skeleton_socket"), true);
+            R->SetObjectField(TEXT("overridden_skeleton_socket"),
+                socket_helpers::SkelSocketToJson(SkeletonSocket, TEXT("skeleton"), Mesh->GetSkeleton(), false));
+        }
+        if (bDryRun)
+        {
+            R->SetBoolField(TEXT("changed"), true);
+            R->SetStringField(TEXT("would_mutate_asset"), Mesh->GetPathName());
+            R->SetBoolField(TEXT("would_mutate_skeleton"), false);
+            return FSageToolDispatch::FOutcome::MakeSuccess(R);
+        }
+
+        FScopedTransaction Tx(LOCTEXT("UpsertSocket", "Sage: Upsert Socket"));
+        Mesh->Modify();
+        if (!MeshSocket)
+        {
+            MeshSocket = NewObject<USkeletalMeshSocket>(Mesh);
+            MeshSocket->SocketName = SocketFName;
+            Mesh->GetMeshOnlySocketList().Add(TObjectPtr<USkeletalMeshSocket>(MeshSocket));
+        }
+        else
+        {
+            MeshSocket->Modify();
+        }
+        MeshSocket->BoneName = BoneName;
+        MeshSocket->RelativeLocation = Location;
+        MeshSocket->RelativeRotation = Rotation;
+        MeshSocket->RelativeScale = Scale;
+        Mesh->MarkPackageDirty();
+        Mesh->PostEditChange();
+        R->SetBoolField(TEXT("changed"), true);
+        R->SetStringField(TEXT("mutated_asset"), Mesh->GetPathName());
+        R->SetBoolField(TEXT("mutated_skeleton"), false);
+        R->SetObjectField(TEXT("after"), socket_helpers::BuildSocketReadback(Mesh, SocketFName, socket_helpers::EOwner::Any));
+        socket_helpers::SaveLoadedAssetIfRequested(Mesh, bSave, R);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    USkeleton* TargetSkeleton = Skeleton ? Skeleton : (Mesh ? Mesh->GetSkeleton() : nullptr);
+    if (!TargetSkeleton)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602, TEXT("skeletal mesh has no skeleton for owner='skeleton'"));
+    }
+    if (!bDryRun && !bConfirmed)
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            TEXT("owner='skeleton' mutates a shared skeleton asset; pass confirmed:true to proceed"));
+    }
+    if (!socket_helpers::SkeletonHasBone(TargetSkeleton, BoneName))
+    {
+        return FSageToolDispatch::FOutcome::MakeError(-32602,
+            FString::Printf(TEXT("bone '%s' not found on skeleton"), *BoneName.ToString()));
+    }
+    USkeletalMeshSocket* TargetSocket = socket_helpers::FindSkeletonSocket(TargetSkeleton, SocketFName);
+    const bool bCreate = TargetSocket == nullptr;
+    if (bCreate && !bCreateIfMissing)
+    {
+        R->SetBoolField(TEXT("changed"), false);
+        R->SetStringField(TEXT("action"), TEXT("missing_refused"));
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+    R->SetStringField(TEXT("action"), bCreate ? TEXT("create_skeleton_socket") : TEXT("update_skeleton_socket"));
+    R->SetStringField(TEXT("skeleton_asset"), TargetSkeleton->GetPathName());
+    R->SetObjectField(TEXT("desired_socket"), socket_helpers::DesiredSkelSocketJson(
+        Name, TEXT("skeleton"), TargetSkeleton, BoneName, Location, Rotation, Scale));
+    if (bDryRun)
+    {
+        R->SetBoolField(TEXT("changed"), true);
+        R->SetStringField(TEXT("would_mutate_asset"), TargetSkeleton->GetPathName());
+        R->SetBoolField(TEXT("would_mutate_skeleton"), true);
+        return FSageToolDispatch::FOutcome::MakeSuccess(R);
+    }
+
+    FScopedTransaction Tx(LOCTEXT("UpsertSkeletonSocket", "Sage: Upsert Skeleton Socket"));
+    TargetSkeleton->Modify();
+    if (!TargetSocket)
+    {
+        TargetSocket = NewObject<USkeletalMeshSocket>(TargetSkeleton);
+        TargetSocket->SocketName = SocketFName;
+        TargetSkeleton->Sockets.Add(TargetSocket);
+    }
+    else
+    {
+        TargetSocket->Modify();
+    }
+    TargetSocket->BoneName = BoneName;
+    TargetSocket->RelativeLocation = Location;
+    TargetSocket->RelativeRotation = Rotation;
+    TargetSocket->RelativeScale = Scale;
+    TargetSkeleton->MarkPackageDirty();
+    TargetSkeleton->PostEditChange();
+    R->SetBoolField(TEXT("changed"), true);
+    R->SetStringField(TEXT("mutated_asset"), TargetSkeleton->GetPathName());
+    R->SetBoolField(TEXT("mutated_skeleton"), true);
+    R->SetObjectField(TEXT("after"), socket_helpers::BuildSocketReadback(Asset, SocketFName, socket_helpers::EOwner::Any));
+    socket_helpers::SaveLoadedAssetIfRequested(TargetSkeleton, bSave, R);
+    return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
 FSageToolDispatch::FOutcome RemoveSocketImpl(const TSharedPtr<FJsonObject>& Args)
@@ -6899,6 +7795,9 @@ void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
     // Phase 4.5-r2 batch 2: socket management
     Dispatch.RegisterHandler(TEXT("asset.list_sockets"),       GT(&ListSocketsImpl));
     Dispatch.RegisterHandler(TEXT("asset.add_socket"),         GT(&AddSocketImpl));
+    Dispatch.RegisterHandler(TEXT("asset.get_socket"),         GT(&GetSocketImpl));
+    Dispatch.RegisterHandler(TEXT("asset.upsert_socket"),      GT(&UpsertSocketImpl));
+    Dispatch.RegisterHandler(TEXT("asset.update_socket"),      GT(&UpsertSocketImpl));
     Dispatch.RegisterHandler(TEXT("asset.remove_socket"),      GT(&RemoveSocketImpl));
 
     // Phase 4.5-r2 batch 3: textures
@@ -6940,6 +7839,20 @@ void RegisterAssetAdvancedTools(FSageToolDispatch& Dispatch)
     Dispatch.RegisterHandler(TEXT("asset.bulk_rename"),        GT(&BulkRenameImpl));
     Dispatch.RegisterHandler(TEXT("asset.move_folder"),        GT(&MoveFolderImpl));
     Dispatch.RegisterHandler(TEXT("asset.fixup_redirectors"),  GT(&FixupRedirectorsImpl));
+    Dispatch.RegisterHandler(TEXT("asset.create_folder"),      GT(&AssetCreateFolderImpl));
+    Dispatch.RegisterHandler(TEXT("asset.delete_folder"),      GT(&AssetDeleteFolderImpl));
+    Dispatch.RegisterHandler(TEXT("asset.save"),               GT(&AssetSaveImpl));
+    Dispatch.RegisterHandler(TEXT("asset.save_all_dirty"),     GT(&AssetSaveAllDirtyImpl));
+    Dispatch.RegisterHandler(TEXT("asset.create_interchange_pipeline"),
+                                                                 GT(&AssetCreateInterchangePipelineImpl));
+    Dispatch.RegisterHandler(TEXT("asset.import_texture_batch"),GT(&AssetImportTextureBatchImpl));
+    Dispatch.RegisterHandler(TEXT("asset.read_import_sources"), GT(&AssetReadImportSourcesImpl));
+    Dispatch.RegisterHandler(TEXT("asset.health_check"),        GT(&AssetHealthCheckImpl));
+    Dispatch.RegisterHandler(TEXT("asset.generate_report"),     GT(&AssetGenerateReportImpl));
+    Dispatch.RegisterHandler(TEXT("asset.create_thumbnail"),    GT(&AssetCreateThumbnailImpl));
+    Dispatch.RegisterHandler(TEXT("asset.validate"),            GT(&AssetValidateImpl));
+    Dispatch.RegisterHandler(TEXT("asset.set_tags"),            GT(&AssetSetTagsImpl));
+    Dispatch.RegisterHandler(TEXT("fab_ops"),                   GT(&FabOpsImpl));
 
     // Trailing asset tools
     Dispatch.RegisterHandler(TEXT("asset.recenter_pivot"), GT(&RecentrePivotImpl));

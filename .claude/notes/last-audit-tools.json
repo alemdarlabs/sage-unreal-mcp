@@ -1,0 +1,246 @@
+﻿{
+    "repo_root":  "D:\\Steamworks\\sage-unreal-mcp",
+    "server_tool_count":  1251,
+    "plugin_handler_count":  1192,
+    "schema_without_plugin":  [
+                                  "jobs.cancel",
+                                  "jobs.get",
+                                  "jobs.list",
+                                  "jobs.logs",
+                                  "jobs.wait"
+                              ],
+    "plugin_without_schema":  [
+
+                              ],
+    "schema_stub_count":  0,
+    "schema_stubs":  [
+
+                     ],
+    "plugin_not_implemented_count":  0,
+    "plugin_not_implemented":  [
+
+                               ],
+    "note_return_count":  44,
+    "note_returns":  [
+                         {
+                             "file":  "SageAnimationTools.cpp",
+                             "line":  5085,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageAnimationTools.cpp",
+                             "line":  6980,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageAnimationTools.cpp",
+                             "line":  7490,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageAnimationTools.cpp",
+                             "line":  8505,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageAnimationTools.cpp",
+                             "line":  11256,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageAnimationTools.cpp",
+                             "line":  11464,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"), TEXT(\"PoseSearch derived-data rebuild requested through UObject cooked-platform cache API\"));"
+                         },
+                         {
+                             "file":  "SageAssetAdvancedTools.cpp",
+                             "line":  3294,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageAssetAdvancedTools.cpp",
+                             "line":  3407,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageAssetAdvancedTools.cpp",
+                             "line":  3416,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageBlueprintTools.cpp",
+                             "line":  6938,
+                             "text":  "Summary-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageEditorAutomationTools.cpp",
+                             "line":  591,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageEditorAutomationTools.cpp",
+                             "line":  629,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageEditorAutomationTools.cpp",
+                             "line":  4735,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"), TEXT(\"hot reload triggered via LiveCoding.Compile\"));"
+                         },
+                         {
+                             "file":  "SageEditorAutomationTools.cpp",
+                             "line":  4928,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageFoliageTools.cpp",
+                             "line":  96,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageFoliageTools.cpp",
+                             "line":  107,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageGameplayTools.cpp",
+                             "line":  1421,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageGameplayTools.cpp",
+                             "line":  1497,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageGameplayTools.cpp",
+                             "line":  1537,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageGasTools.cpp",
+                             "line":  130,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageGasTools.cpp",
+                             "line":  141,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageGasTools.cpp",
+                             "line":  230,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"), TEXT(\"provide \u0027tags\u0027 array of gameplay tag strings\"));"
+                         },
+                         {
+                             "file":  "SageGasTools.cpp",
+                             "line":  250,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageGasTools.cpp",
+                             "line":  400,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"), TEXT(\"GameplayAbilities plugin not loaded\"));"
+                         },
+                         {
+                             "file":  "SageLandscapeTools.cpp",
+                             "line":  77,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"), TEXT(\"no Landscape actor in current world\"));"
+                         },
+                         {
+                             "file":  "SageLandscapeTools.cpp",
+                             "line":  120,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageLandscapeTools.cpp",
+                             "line":  134,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageLandscapeTools.cpp",
+                             "line":  163,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageLandscapeTools.cpp",
+                             "line":  213,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageLandscapeTools.cpp",
+                             "line":  229,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageLevelTools.cpp",
+                             "line":  1413,
+                             "text":  "if (!RvtCls) R-\u003eSetStringField(TEXT(\"note\"), TEXT(\"RuntimeVirtualTexture module not loaded\"));"
+                         },
+                         {
+                             "file":  "SageLevelTools.cpp",
+                             "line":  1491,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageNetworkingTools.cpp",
+                             "line":  64,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SagePcgTools.cpp",
+                             "line":  94,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SagePcgTools.cpp",
+                             "line":  196,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SagePcgTools.cpp",
+                             "line":  213,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SagePcgTools.cpp",
+                             "line":  253,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageProjectTools.cpp",
+                             "line":  1040,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageProjectTools.cpp",
+                             "line":  1292,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageProjectTools.cpp",
+                             "line":  1738,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageProjectTools.cpp",
+                             "line":  1792,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"), TEXT(\"live coding compile dispatched; check Output Log for result\"));"
+                         },
+                         {
+                             "file":  "SageProjectTools.cpp",
+                             "line":  1990,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"),"
+                         },
+                         {
+                             "file":  "SageWidgetTools.cpp",
+                             "line":  723,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"), TEXT(\"No Run/Execute function found; call via editor context menu or UEditorUtilityLibrary\"));"
+                         },
+                         {
+                             "file":  "SageWidgetTools.cpp",
+                             "line":  832,
+                             "text":  "R-\u003eSetStringField(TEXT(\"note\"), TEXT(\"no PIE world active; widget.list_runtime requires active Play session\"));"
+                         }
+                     ]
+}
