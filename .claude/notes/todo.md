@@ -6,6 +6,24 @@
 
 ---
 
+## npm distribution slice (2026-06-04)
+
+- [x] Added npm-first distribution plan in `.claude/notes/npm-distribution-plan.md`.
+- [x] Added `@alemdarlabs/sage-mcp` package manifest and global `sage` CLI entrypoint.
+- [x] Implemented `sage mcp` stdio launch and `sage server --http` manual server launch.
+- [x] Implemented `sage init <Project.uproject>` plugin install, `.uproject` enablement, and project `.mcp.json` generation.
+- [x] Implemented `sage update`, `sage update --plugin`, `sage doctor`, postinstall binary resolver, and offline/dev escape hatches.
+- [x] Added Node CLI smoke test for init/update/doctor behavior against a temporary Unreal project.
+- [x] Added server/plugin release asset packaging with checksums and GitHub Actions publication workflow.
+- [x] Added tag-build npm publish path for `@alemdarlabs/sage-mcp` via `NPM_TOKEN`.
+- [x] Added global npm install smoke test covering tarball install, postinstall server download, plugin asset download, project init, and doctor.
+- [x] Added `sage init --codex` to register project-scoped `sage mcp` in Codex CLI global MCP config.
+- [x] Added `sage init --claude` to register project-scoped `sage mcp` through Claude Code CLI.
+- [x] Added `npm run release:check` as a local/CI release gate before GitHub Release + npm publish.
+- [ ] Productization follow-up: code signing, auth/license gate, full macOS/Linux release matrix, and package-aware `restart_editor` rebuild/deploy contract.
+
+---
+
 ## Niagara gap sweep source implementation (2026-06-04)
 
 - [x] Replaced Niagara placeholder-success handlers with real source behavior or explicit unsupported MCP errors.

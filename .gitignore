@@ -2,8 +2,10 @@
 build/
 out/
 cmake-build-*/
+dist/
+*.tgz
 
-# Prebuilt third-party (fetch via scripts/fetch-kuzu.sh)
+# Prebuilt third-party
 third_party/
 
 # vcpkg

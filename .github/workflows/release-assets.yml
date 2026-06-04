@@ -1,0 +1,122 @@
+name: Release assets
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version without v prefix. Empty means package.json version.'
+        required: false
+        type: string
+permissions:
+  contents: write
+
+jobs:
+  windows-assets:
+    runs-on: windows-latest
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+      SAGE_BUILD_PLATFORM: Win64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $Version = "${{ github.event.inputs.version }}"
+          if (-not $Version) {
+            $Version = "${{ github.ref_name }}" -replace '^v', ''
+          }
+          if (-not $Version -or $Version -eq "main") {
+            $Version = (Get-Content package.json | ConvertFrom-Json).version
+          }
+          $PackageVersion = (Get-Content package.json | ConvertFrom-Json).version
+          if ($Version -ne $PackageVersion) {
+            throw "Release version '$Version' must match package.json version '$PackageVersion'"
+          }
+          "version=$Version" >> $env:GITHUB_OUTPUT
+
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          choco install ninja -y --no-progress
+          git clone https://github.com/microsoft/vcpkg "$env:VCPKG_ROOT"
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+
+      - name: Configure server
+        shell: pwsh
+        run: cmake --preset release
+
+      - name: Build server
+        shell: pwsh
+        run: cmake --build --preset release --target sage-server
+
+      - name: Build Unreal plugin package when Unreal is available
+        shell: pwsh
+        env:
+          SAGE_UE_ROOT: ${{ secrets.SAGE_UE_ROOT }}
+        run: |
+          if ($env:SAGE_UE_ROOT) {
+            $RunUAT = Join-Path $env:SAGE_UE_ROOT 'Engine\Build\BatchFiles\RunUAT.bat'
+            if (Test-Path $RunUAT) {
+              .\scripts\build-plugin.ps1
+              exit $LASTEXITCODE
+            }
+            Write-Host "SAGE_UE_ROOT is set but RunUAT was not found: $RunUAT"
+          }
+          Write-Host "Unreal Engine is not available on this runner; packaging source SageBridge plugin asset."
+
+      - name: Release readiness check
+        shell: pwsh
+        run: npm run release:check
+
+      - name: Package release assets
+        shell: pwsh
+        run: |
+          node npm/scripts/package-assets.js `
+            --version "${{ steps.version.outputs.version }}" `
+            --out "dist/release-assets/v${{ steps.version.outputs.version }}"
+
+      - name: Pack npm package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/npm | Out-Null
+          npm pack --pack-destination dist/npm
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sage-release-assets-win32-x64
+          path: |
+            dist/release-assets/v${{ steps.version.outputs.version }}/*
+            dist/npm/*.tgz
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          files: |
+            dist/release-assets/v${{ steps.version.outputs.version }}/*
+            dist/npm/*.tgz
+
+      - name: Publish npm package
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        shell: pwsh
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if (-not $env:NODE_AUTH_TOKEN) {
+            throw "NPM_TOKEN secret is required to publish @alemdarlabs/sage-mcp"
+          }
+          npm config set //registry.npmjs.org/:_authToken "$env:NODE_AUTH_TOKEN"
+          npm publish --access public

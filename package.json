@@ -1,0 +1,43 @@
+{
+  "name": "@alemdarlabs/sage-mcp",
+  "version": "0.1.0",
+  "description": "Sage MCP server for Unreal Engine",
+  "homepage": "https://github.com/alemdarlabs/sage-unreal-mcp",
+  "license": "UNLICENSED",
+  "type": "commonjs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alemdarlabs/sage-unreal-mcp.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "sage": "npm/bin/sage.js"
+  },
+  "files": [
+    "npm/bin/",
+    "npm/lib/",
+    "npm/scripts/",
+    "README.md"
+  ],
+  "scripts": {
+    "package:assets": "node npm/scripts/package-assets.js",
+    "postinstall": "node npm/scripts/postinstall.js",
+    "release:check": "node npm/scripts/release-check.js",
+    "test": "node npm/tests/cli-smoke.test.js",
+    "test:global": "node npm/tests/global-install-smoke.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}

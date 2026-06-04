@@ -34,6 +34,87 @@ Most AI dev tools today are *execution layers* — they let an AI run commands. 
 
 Concretely, Sage exposes Unreal Engine to MCP clients (Claude Code, Cursor, etc.) through a persistent C++ server that routes tools to connected editor instances, mediates safe transactional edits via Unreal's native UTransactor, and survives editor restarts (compile/Live Coding cycles, multi-editor sessions).
 
+## npm install flow
+
+The distribution target is npm-first:
+
+```powershell
+npm install -g @alemdarlabs/sage-mcp
+sage init D:\GameDev\Kale\Kale.uproject --ue-root "C:\Program Files\Epic Games\UE_5.7"
+```
+
+`sage init` installs `SageBridge` into `Plugins/SageBridge`, enables it in the `.uproject`, and writes a project-local `.mcp.json` that starts Sage through MCP stdio. This project config is suitable for clients that read workspace MCP JSON, including Claude/Cursor-style setups:
+
+```json
+{
+  "mcpServers": {
+    "sage": {
+      "command": "sage",
+      "args": ["mcp"],
+      "env": {
+        "SAGE_PROJECT_ROOT": "D:\\GameDev\\Kale",
+        "SAGE_REPO_ROOT": "D:\\GameDev\\Kale",
+        "SAGE_UE_ROOT": "C:\\Program Files\\Epic Games\\UE_5.7"
+      }
+    }
+  }
+}
+```
+
+Codex CLI uses its global `~/.codex/config.toml`. Register the same project there explicitly:
+
+```powershell
+sage init D:\GameDev\Kale\Kale.uproject --ue-root "C:\Program Files\Epic Games\UE_5.7" --codex
+```
+
+That runs the equivalent of:
+
+```powershell
+codex mcp add sage --env "SAGE_PROJECT_ROOT=D:\GameDev\Kale" --env "SAGE_REPO_ROOT=D:\GameDev\Kale" --env "SAGE_UE_ROOT=C:\Program Files\Epic Games\UE_5.7" -- sage mcp
+```
+
+Claude Code can also be registered through its own CLI instead of relying only on the project `.mcp.json`:
+
+```powershell
+sage init D:\GameDev\Kale\Kale.uproject --ue-root "C:\Program Files\Epic Games\UE_5.7" --claude
+```
+
+That runs a project-scoped `claude mcp add sage ... -- sage mcp`.
+
+Manual server mode is still available for local debugging:
+
+```powershell
+sage server --http
+```
+
+For development/offline installs, set `SAGE_SKIP_DOWNLOAD=1` or `SAGE_SERVER_PATH=<path-to-sage-server.exe>`. The native binary resolver also checks the repo build outputs under `build/debug/bin`, `build/release/bin`, and `build/RelWithDebInfo/bin`.
+
+Runtime assets are expected on public GitHub Releases using this naming pattern:
+
+- `sage-server-<version>-<platform>-<arch>.zip`
+- `sagebridge-plugin-<version>-<platform>-<arch>.zip`
+
+For Windows x64 package version `0.1.0`, the expected files are:
+
+- `sage-server-0.1.0-win32-x64.zip`
+- `sagebridge-plugin-0.1.0-win32-x64.zip`
+
+The release assets can be produced locally or in GitHub Actions:
+
+```powershell
+npm run package:assets
+```
+
+Before tagging a release, run:
+
+```powershell
+npm run release:check
+```
+
+Tag pushes (`v0.1.0`, etc.) publish the npm package with the `NPM_TOKEN` GitHub secret and upload release assets. If the runner has `SAGE_UE_ROOT` configured as a secret and points at an Unreal Engine install, the workflow packages a binary `SageBridge`; otherwise it publishes a source plugin asset that Unreal can compile on the target machine.
+
+`sage init` first checks local override paths, then the cached plugin package under `~/.sage-mcp`, and finally downloads the matching `sagebridge-plugin` release asset.
+
 ## Documentation
 
 Codebase instructions and design docs live under `.claude/`:
