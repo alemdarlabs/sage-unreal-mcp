@@ -54,7 +54,7 @@ void FSageWebSocketClient::Connect()
     Socket->OnClosed().AddSP(AsShared(),            &FSageWebSocketClient::HandleClosed);
     Socket->OnMessage().AddSP(AsShared(),           &FSageWebSocketClient::HandleMessage);
 
-    UE_LOG(LogSageBridge, Log, TEXT("Connecting WebSocket to %s"), *Config.Url);
+    UE_LOG(LogSageBridge, Verbose, TEXT("Connecting WebSocket to %s"), *Config.Url);
     Socket->Connect();
 
     if (!TickerHandle.IsValid())
@@ -121,7 +121,7 @@ bool FSageWebSocketClient::Tick(float DeltaSeconds)
         TimeUntilReconnect -= DeltaSeconds;
         if (TimeUntilReconnect <= 0.0f && bConnectIntended)
         {
-            UE_LOG(LogSageBridge, Log, TEXT("Reconnecting WebSocket"));
+            UE_LOG(LogSageBridge, Verbose, TEXT("Reconnecting WebSocket"));
             Connect();
         }
     }
@@ -144,11 +144,12 @@ void FSageWebSocketClient::ScheduleReconnect()
         return;
     }
     TimeUntilReconnect = CurrentReconnectDelay;
-    UE_LOG(LogSageBridge, Log, TEXT("Reconnect scheduled in %.1fs (next backoff: %.1fs)"),
+    const float NextReconnectDelay = FMath::Min(CurrentReconnectDelay * 2.0f,
+                                                Config.MaxReconnectDelaySeconds);
+    UE_LOG(LogSageBridge, Verbose, TEXT("Reconnect scheduled in %.1fs (next backoff: %.1fs)"),
            TimeUntilReconnect,
-           FMath::Min(CurrentReconnectDelay * 2.0f, Config.MaxReconnectDelaySeconds));
-    CurrentReconnectDelay = FMath::Min(CurrentReconnectDelay * 2.0f,
-                                       Config.MaxReconnectDelaySeconds);
+           NextReconnectDelay);
+    CurrentReconnectDelay = NextReconnectDelay;
 }
 
 void FSageWebSocketClient::SendHeartbeat()
@@ -170,8 +171,20 @@ void FSageWebSocketClient::HandleConnected()
 
 void FSageWebSocketClient::HandleConnectionError(const FString& Error)
 {
-    UE_LOG(LogSageBridge, Warning, TEXT("WebSocket connection error: %s"), *Error);
     ++ConsecutiveFailures;
+    const FString Detail = Error.IsEmpty() ? TEXT("no socket detail") : Error;
+    if (ConsecutiveFailures == 1)
+    {
+        UE_LOG(LogSageBridge, Log,
+               TEXT("Sage server is not available yet; reconnecting in background (%s)"),
+               *Detail);
+    }
+    else
+    {
+        UE_LOG(LogSageBridge, VeryVerbose,
+               TEXT("WebSocket connection attempt failed while waiting for Sage server (%s)"),
+               *Detail);
+    }
     OnDisconnected.Broadcast(Error);
     ScheduleReconnect();
 }
