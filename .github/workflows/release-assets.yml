@@ -21,6 +21,7 @@ jobs:
       SAGE_BUILD_PLATFORM: Win64
       CC: cl
       CXX: cl
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout
@@ -120,7 +121,7 @@ jobs:
           npm pack --pack-destination dist/npm
 
       - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sage-release-assets-win32-x64
           path: |
@@ -128,7 +129,7 @@ jobs:
             dist/npm/*.tgz
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.version.outputs.version }}
           files: |
