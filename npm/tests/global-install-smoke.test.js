@@ -52,7 +52,35 @@ function readJson(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
+function makeFakeCodex(root) {
+  fs.mkdirSync(root, { recursive: true });
+  const log = path.join(root, 'codex-calls.jsonl');
+  const script = path.join(root, 'fake-codex.js');
+  fs.writeFileSync(script, `
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + '\\n', 'utf8');
+if (args[0] === 'mcp' && args[1] === 'get') {
+  process.stderr.write('not found\\n');
+  process.exit(1);
+}
+if (args[0] === 'mcp' && (args[1] === 'remove' || args[1] === 'add')) {
+  process.exit(0);
+}
+process.stderr.write('unexpected fake codex args: ' + args.join(' ') + '\\n');
+process.exit(2);
+`, 'utf8');
+  const command = process.platform === 'win32' ? path.join(root, 'codex.cmd') : path.join(root, 'codex');
+  if (process.platform === 'win32') {
+    fs.writeFileSync(command, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`, 'utf8');
+  } else {
+    fs.writeFileSync(command, `#!/bin/sh\n"${process.execPath}" "${script}" "$@"\n`, { mode: 0o755 });
+  }
+  return { command, log };
+}
+
 fs.mkdirSync(packDir, { recursive: true });
+const fakeCodex = makeFakeCodex(globalBinDir);
 const serverBinary = resolveServerBinary();
 assert.ok(serverBinary, 'sage-server binary must be built before global install smoke');
 
@@ -72,6 +100,12 @@ assert.equal(fs.existsSync(tarball), true);
 runNpm(['install', '-g', '--prefix', prefix, tarball]);
 assert.equal(fs.existsSync(sageCommand), true);
 assert.equal(fs.existsSync(installedCli), true);
+const codexCalls = fs.readFileSync(fakeCodex.log, 'utf8').trim().split(/\r?\n/).map((line) => JSON.parse(line));
+assert.deepEqual(codexCalls, [
+  ['mcp', 'get', 'sage'],
+  ['mcp', 'remove', 'sage'],
+  ['mcp', 'add', 'sage', '--', 'sage', 'mcp'],
+]);
 
 const projectRoot = path.join(tempRoot, 'Project');
 fs.mkdirSync(projectRoot, { recursive: true });

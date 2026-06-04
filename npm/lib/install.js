@@ -107,24 +107,31 @@ function doctor(projectArg) {
       ok: Array.isArray(project.Plugins) && project.Plugins.some((p) => p && p.Name === 'SageBridge' && p.Enabled === true),
       path: projectPath,
     });
-    checks.push({ name: 'mcp_config', ok: fs.existsSync(configPath), path: configPath });
-    checks.push({
-      name: 'mcp_server_sage',
-      ok: Boolean(sageConfig && sageConfig.command === 'sage' && Array.isArray(sageConfig.args) && sageConfig.args[0] === 'mcp'),
-      path: configPath,
-    });
-    checks.push({
-      name: 'mcp_env_project_root',
-      ok: sageEnv.SAGE_PROJECT_ROOT === projectRoot(projectPath),
-      path: configPath,
-      value: sageEnv.SAGE_PROJECT_ROOT || null,
-    });
-    checks.push({
-      name: 'mcp_env_repo_root',
-      ok: sageEnv.SAGE_REPO_ROOT === projectRoot(projectPath),
-      path: configPath,
-      value: sageEnv.SAGE_REPO_ROOT || null,
-    });
+    const configExists = fs.existsSync(configPath);
+    checks.push({ name: 'mcp_config', ok: true, path: configPath, present: configExists, optional: true });
+    if (configExists) {
+      checks.push({
+        name: 'mcp_server_sage',
+        ok: !sageConfig || Boolean(sageConfig.command === 'sage' && Array.isArray(sageConfig.args) && sageConfig.args[0] === 'mcp'),
+        path: configPath,
+        present: Boolean(sageConfig),
+        optional: true,
+      });
+      if (sageConfig) {
+        checks.push({
+          name: 'mcp_env_project_root',
+          ok: sageEnv.SAGE_PROJECT_ROOT === projectRoot(projectPath),
+          path: configPath,
+          value: sageEnv.SAGE_PROJECT_ROOT || null,
+        });
+        checks.push({
+          name: 'mcp_env_repo_root',
+          ok: sageEnv.SAGE_REPO_ROOT === projectRoot(projectPath),
+          path: configPath,
+          value: sageEnv.SAGE_REPO_ROOT || null,
+        });
+      }
+    }
   }
   return checks;
 }

@@ -25,8 +25,31 @@ npm install -g @alemdarlabs/sage-mcp
 sage doctor
 ```
 
-Install the Unreal plugin into a project and write project-local MCP
-configuration:
+During install, Sage downloads the native server and attempts to register a
+global Codex MCP server named `sage` that launches `sage mcp`. If Codex is not
+installed yet, run this once after installing Codex:
+
+```powershell
+sage setup codex
+```
+
+After that, open Codex from any Unreal project directory. The `sage mcp`
+wrapper discovers the nearest `.uproject` from the current working directory and
+passes that project context to the native server.
+
+Install or repair the Unreal plugin for the current project:
+
+```powershell
+sage bootstrap
+```
+
+`sage bootstrap` can also target a specific project:
+
+```powershell
+sage bootstrap "<absolute-path-to-your-project.uproject>"
+```
+
+Legacy project-local configuration remains available:
 
 ```powershell
 $Project = "<absolute-path-to-your-project.uproject>"
@@ -35,25 +58,17 @@ $UnrealRoot = "<absolute-path-to-your-Unreal-Engine-install>"
 sage init $Project --ue-root $UnrealRoot
 ```
 
-Register the same project with a client:
-
-```powershell
-# Codex CLI
-sage init $Project --ue-root $UnrealRoot --codex
-
-# Claude Code
-sage init $Project --ue-root $UnrealRoot --claude
-```
-
 Validate a project installation:
 
 ```powershell
-sage doctor $Project --json
+sage doctor --json
 ```
 
-`sage init` installs `SageBridge` under `Plugins/SageBridge`, enables the plugin
-in the `.uproject`, and writes `.mcp.json`. If a previous `Plugins/SageBridge`
-directory exists, the installer backs it up before copying the new package.
+`sage bootstrap` installs `SageBridge` under `Plugins/SageBridge` and enables
+the plugin in the `.uproject` without requiring `.mcp.json`. `sage init` does
+the same and also writes project-local MCP config. If a previous
+`Plugins/SageBridge` directory exists, the installer backs it up before copying
+the new package.
 
 ## What Ships
 
@@ -66,12 +81,13 @@ Sage ships as two native components plus a thin npm CLI:
 | `sage` npm CLI | Installer and launcher that downloads native release assets, installs the Unreal plugin, writes MCP config, and starts the server for MCP clients. |
 
 The npm package is lightweight. During `npm install`, the CLI downloads the
-native `sage-server` binary into `~/.sage-mcp`. During `sage init`, it resolves
-or downloads the `SageBridge` plugin package for the target Unreal project.
+native `sage-server` binary into `~/.sage-mcp` and registers Codex when
+available. During `sage bootstrap` or `sage init`, it resolves or downloads the
+`SageBridge` plugin package for the target Unreal project.
 
 ## Current Release
 
-`v0.1.0` is published on npm and GitHub Releases.
+`v0.1.2` is the next release for the zero-config Codex onboarding flow.
 
 ```powershell
 npm view @alemdarlabs/sage-mcp version dist.tarball
@@ -79,9 +95,9 @@ npm view @alemdarlabs/sage-mcp version dist.tarball
 
 Release assets:
 
-- `sage-server-0.1.0-win32-x64.zip`
-- `sagebridge-plugin-0.1.0-win32-x64.zip`
-- `alemdarlabs-sage-mcp-0.1.0.tgz`
+- `sage-server-0.1.2-win32-x64.zip`
+- `sagebridge-plugin-0.1.2-win32-x64.zip`
+- `alemdarlabs-sage-mcp-0.1.2.tgz`
 - `checksums.txt`
 
 GitHub-hosted Windows runners do not include Unreal Engine. The hosted release
@@ -161,6 +177,8 @@ sage --version
 sage doctor [Project.uproject] [--json]
 sage mcp [server args...]
 sage server [--http] [server args...]
+sage setup codex [options]
+sage bootstrap [Project.uproject] [options]
 sage init <Project.uproject> [options]
 sage update
 sage update --plugin <Project.uproject>
@@ -170,11 +188,19 @@ Common `init` options:
 
 ```powershell
 --ue-root <path>         Add SAGE_UE_ROOT to generated MCP config
---codex                  Register the project in Codex CLI
+--codex                  Register global Sage MCP in Codex CLI
 --claude                 Register the project in Claude Code
 --plugin-source <path>   Install from a local SageBridge package/source tree
 --mcp-config <path>      Write MCP config somewhere other than <project>/.mcp.json
 --no-mcp-config          Install plugin without writing MCP config
+```
+
+Common `setup codex` options:
+
+```powershell
+--codex-name <name>      Codex MCP server name. Default: sage
+--codex-command <path>   Codex executable path. Default: codex
+--no-replace             Do not replace an existing non-Sage Codex MCP entry
 ```
 
 ## Configuration
@@ -190,8 +216,11 @@ Common `init` options:
 | `SAGE_PLUGIN_URL` | Override the exact plugin archive URL. |
 | `SAGE_SKIP_DOWNLOAD` | Skip postinstall native binary download for offline or development installs. |
 | `SAGE_POSTINSTALL_STRICT` | Set to `0` to make postinstall download failure non-fatal. |
-| `SAGE_PROJECT_ROOT` | Unreal project root passed to the server in generated MCP config. |
-| `SAGE_REPO_ROOT` | Repository/project root passed to the server in generated MCP config. |
+| `SAGE_SKIP_CODEX_SETUP` | Skip postinstall Codex MCP registration. |
+| `SAGE_CODEX_SETUP_STRICT` | Set to `1` to make postinstall Codex registration failure fatal. |
+| `SAGE_CODEX_COMMAND` | Override the Codex executable used by setup commands. |
+| `SAGE_PROJECT_ROOT` | Unreal project root passed to the server or discovered by `sage mcp`. |
+| `SAGE_REPO_ROOT` | Workspace root passed to the server. Defaults to the discovered project root when available. |
 | `SAGE_UE_ROOT` | Unreal Engine install root used by build and editor workflows. |
 | `SAGE_LOG_LEVEL` | Runtime logging level. |
 | `SAGE_HTTP_HOST`, `SAGE_HTTP_PORT` | HTTP/SSE MCP bind address. Defaults to `127.0.0.1:7777`. |
