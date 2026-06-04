@@ -54,7 +54,7 @@ option(SAGE_BUILD_TESTS          "Build Catch2 test suite" ON)
 option(SAGE_WARNINGS_AS_ERRORS   "Promote warnings to errors" ON)
 
 if(SAGE_SANITIZE AND SAGE_THREAD_SANITIZE)
-    message(FATAL_ERROR "SAGE_SANITIZE ve SAGE_THREAD_SANITIZE aynı anda etkin olamaz")
+    message(FATAL_ERROR "SAGE_SANITIZE and SAGE_THREAD_SANITIZE cannot be enabled at the same time")
 endif()
 
 # ---- Interface targets: warnings & sanitizers -------------------------------

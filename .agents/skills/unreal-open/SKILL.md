@@ -31,13 +31,11 @@ if (-not (Test-Path -LiteralPath $Project)) {
 
 if (-not $UnrealEditor) {
     $ueRoot = $env:SAGE_UE_ROOT
-    if (-not $ueRoot) {
-        $ueRoot = "C:\Program Files\Epic Games\UE_5.7"
-    }
-
-    $candidate = Join-Path $ueRoot "Engine\Binaries\Win64\UnrealEditor.exe"
-    if (Test-Path -LiteralPath $candidate) {
-        $UnrealEditor = $candidate
+    if ($ueRoot) {
+        $candidate = Join-Path $ueRoot "Engine\Binaries\Win64\UnrealEditor.exe"
+        if (Test-Path -LiteralPath $candidate) {
+            $UnrealEditor = $candidate
+        }
     }
 }
 
@@ -53,7 +51,7 @@ if ($UnrealEditor -and (Test-Path -LiteralPath $UnrealEditor)) {
 Example:
 
 ```powershell
-.\open-unreal.ps1 -Project "D:\GameDev\Kale\Kale.uproject" -UnrealEditor "C:\Program Files\Epic Games\UE_5.7\Engine\Binaries\Win64\UnrealEditor.exe"
+.\open-unreal.ps1 -Project "<absolute-path-to-your-project.uproject>" -UnrealEditor "<absolute-path-to-UnrealEditor.exe>"
 ```
 
 ## macOS Fallback

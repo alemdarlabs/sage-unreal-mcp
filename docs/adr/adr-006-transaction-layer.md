@@ -1,64 +1,69 @@
 # ADR-006: Transaction Layer
 
-**Tarih:** 2026-04-27
-**Durum:** Kabul Edildi
+**Date:** 2026-04-27
+**Status:** Accepted
 
-## Bağlam
+## Context
 
-Sage tool'ları Unreal asset/actor mutation'ları yapar. Atomicity, undo desteği, multi-step grouping, conflict detection, audit trail gerekli. Hatalı tool half-applied state bırakırsa debug surface kabusa döner. Kullanıcının manuel `Ctrl+Z` MCP edit'lerini de geri almalı.
+AI-driven editor mutation must be reversible, inspectable, and safe in the face
+of partial failure. Unreal already has a transaction and undo model, so Sage
+should integrate with it instead of inventing an unrelated rollback mechanism.
 
-## Kararlar
+## Decision
 
-### 1. UTransactor Wrapping
-**Karar:** Tool'lar `FScopedTransaction` içinde execute edilir. `Modify()`'lı UObject'ler engine undo stack'ine join eder.
-**Alternatifler:** Custom undo stack, no transactions
-**Gerekçe:** Native integration → kullanıcının `Ctrl+Z`'si MCP edit'leri reverse eder. Paralel state yönetimi yok.
+### Unreal Transactions
 
-### 2. Single-op vs Multi-step
-**Karar:**
-- Single-op (default): her tool call kendi `FScopedTransaction`'ı, atomic
-- Multi-step: `begin_transaction(label) / commit / rollback` boundaries; sub-op'lar `_tx` parametresi alır
+Execute editor mutation tools inside `FScopedTransaction` where the Unreal API
+supports it. Objects that participate in the change must call `Modify()` so they
+join the editor undo stack.
 
-**Alternatifler:** Time-window grouping, flat-only
-**Gerekçe:** Explicit boundaries kullanıcı mental model'ine uyar; "boss arena kur" tek undo step olmalı, 7 değil.
+### Explicit Boundaries
 
-### 3. Optimistic Locking
-**Karar:** Optional `_expected_version` parametresi (asset state hash). Session-scoped `verify_before_modify: true` ile zorunlu.
-**Alternatifler:** Always required, never offered
-**Gerekçe:** Mandatory verbose tek-Claude common case'de; flag strict mode (multi-Claude, manuel + AI concurrent).
+Tools should expose transaction boundaries that match the user's mental model.
+A multi-step operation such as building an arena should be one undo step, not a
+sequence of unrelated tiny undo steps.
 
-### 4. Auto-Rollback on Error
-**Karar:** Exception veya validation fail → `Cancel()`. Multi-step transaction'lar atomic by default.
-**Alternatifler:** Best-effort partial commits
-**Gerekçe:** Half-applied state worst debugging surface. Atomic-by-default safe primitive; opt-in `_atomic: false` narrow case'ler için.
+### Version Checks
 
-### 5. Bulk Operation Atomicity
-**Karar:** Atomic by default, `_atomic: false` opt-in.
-**Gerekçe:** Karar 4 ile aynı, bulk shape için.
+Support optional `_expected_version` checks. A session-scoped
+`verify_before_modify` mode can require these checks before mutation.
 
-### 6. Save Discipline
-**Karar:** Tool execution dirty bırakır, asla auto-save. Kullanıcı `save_assets` ile commit eder.
-**Alternatifler:** Auto-save her modification'da
-**Gerekçe:** Kullanıcı final write authority alır; AI accident'le disk'e yazmaz; dirty state `Ctrl+Z` ile temiz revert edilir; save cross-instance cache invalidation propagation point'idir.
+### Failure Policy
 
-### 7. PIE Modification Policy
-**Karar:** PIE'de modification hard-rejected default. Opt-in `_allow_pie: true`.
-**Alternatifler:** Allow with warning, allow silently
-**Gerekçe:** PIE world değişiklikleri transient; testing sırasında "production" data corruption önlenir.
+Validation failure or execution failure cancels the transaction. Multi-step
+tools are atomic by default.
 
-### 8. Revert Semantics
-**Karar:** `revert_transaction` compensating transaction yaratır (forward inverse), undo-stack rewrite değil.
-**Alternatifler:** Splice into UE undo history
-**Gerekçe:** UE'nin linear undo stack'ı ve audit trail integrity korunur. Splicing UE internal invariant violation riski.
+### Bulk Mutation
 
-## Sonuçlar
+Bulk tools are atomic by default and may expose `_atomic: false` only for narrow
+cases where partial success is useful and explicit.
 
-**Olumlu:**
-- Native UE undo entegrasyonu
-- Atomic transaction primitiv'leri
-- Concurrent modification için opsiyonel locking
-- PIE accidental edit önlenir
+### Save Policy
 
-**Olumsuz:**
-- Multi-step `_tx` parametresi tool API'sini biraz şişirir
-- Compensating revert undo stack'te yeni entry yaratır (kullanıcı için ek undo step)
+Tools may leave assets dirty, but they must not auto-save by default. The user
+or agent must call save tools deliberately.
+
+### PIE Policy
+
+Editor asset mutation is rejected during PIE by default. Tools may expose
+`_allow_pie: true` only when runtime mutation is intentional and safe.
+
+### Revert
+
+`revert_transaction` creates a compensating transaction. It does not rewrite
+the existing undo stack.
+
+## Consequences
+
+Positive:
+
+- Sage changes integrate with Unreal undo.
+- Failed multi-step operations do not leave half-applied state by default.
+- Disk writes remain explicit.
+
+Negative:
+
+- Some Unreal APIs have incomplete transaction support.
+- Compensating revert creates a new undo entry.
+- Concurrent modification still needs optimistic locking where correctness
+  matters.

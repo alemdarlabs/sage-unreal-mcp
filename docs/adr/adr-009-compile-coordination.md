@@ -1,59 +1,66 @@
-# ADR-009: Compile Coordination Strategy
+# ADR-009: Compile Coordination
 
-**Tarih:** 2026-04-27
-**Durum:** Kabul Edildi
+**Date:** 2026-04-27
+**Status:** Accepted
 
-## Bağlam
+## Context
 
-Sage'in C++ değişiklikleri sonrası Unreal Editor ile nasıl koordineli compile/reload yapacağı kritik bir mimari soru. UE'nin 3 reload mekanizması var: Live Coding (LC, hot patch), Hot Reload (deprecated), Full Recompile + Restart. Sage Hot Reload kullanmaz; LC ↔ FullRestart yelpazesinde çalışır. Yanlış strateji seçimi → editor crash, stale reflection metadata veya gereksiz 90s restart cycle.
+After Sage edits C++ source, it must coordinate with Unreal Editor. Unreal has
+several reload paths: Live Coding, deprecated Hot Reload, and full recompile
+plus editor restart.
 
-Karar gerektiren noktalar: default strateji, LC fail policy, multi-editor LC davranışı, patch fragmentation handling, bridge plugin self-reload, reflection diff analiz yöntemi.
+Choosing the wrong path can crash the editor, leave stale reflection metadata,
+or force unnecessary restart cycles.
 
-## Kararlar
+## Decision
 
-### 1. Default Strategy: Auto
-**Karar:** `_strategy: "auto"` default. Server `AnalyzeChanges()` ile karar verir (decision tree: Build.cs/.uplugin/.Target.cs → FullRestartWithRegen; Bridge plugin → FullRestart; Reflection annotation değişimi → FullRestart; Body-only header → Probe; Sadece .cpp → LiveCoding).
-**Alternatifler:** Mandatory explicit strategy her call'da.
-**Gerekçe:** Auto, tool API verbosity'yi minimize eder. Probe + escalate fallback edge case'leri güvenlik ağıyla yakalar.
+### Default Strategy
 
-### 2. LC Failure Policy
-**Karar:** Default `_on_failure: "escalate"` (otomatik FullRestart). PIE aktifse server `ask` zorunlu hale getirir.
-**Alternatifler:** Default `ask`, default `abort`.
-**Gerekçe:** Auto-escalate hızlı; PIE state korunmalı (test runtime data loss önlenir).
+Use `_strategy: "auto"` by default. The server analyzes changed files:
 
-### 3. Multi-Editor + LC
-**Karar:** Aynı module çoklu editor'de yüklü ise default FullRestart escalation (paralel save → shutdown → compile → relaunch). Power user `_strategy: "live_coding_multi"` ile zorlayabilir.
-**Alternatifler:** Default paralel LC her instance'a.
-**Gerekçe:** DLL hash mismatch riski sıfır; safer default for inherently advanced scenario.
+- `Build.cs`, `.uplugin`, `.Target.cs`: full restart with project file refresh.
+- SageBridge plugin changes: full restart.
+- Reflection annotation changes such as UCLASS, UPROPERTY, or UFUNCTION: full
+  restart.
+- Header body-only changes: probe, then escalate if needed.
+- `.cpp`-only implementation changes: Live Coding where available.
 
-### 4. Patch Fragmentation
-**Karar:** 50 patch sonrası bildirimle otomatik FullRestart. Limit `auto_restart_after_n_patches` config'de tunable.
-**Alternatifler:** Sessiz auto-restart, sadece kullanıcı seçimi.
-**Gerekçe:** Sessiz auto sürpriz; manual-only fragmentation'ı çözmez. Bildirim + cancel option ortayolu.
+### Failure Policy
 
-### 5. Bridge Plugin LC Kuralı
-**Karar:** Sage'in kendi bridge plugin'i (`Plugins/SageBridge/`) değiştiğinde her zaman FullRestart. LC asla denenmez.
-**Alternatifler:** LC dene, fail olursa escalate.
-**Gerekçe:** Bridge plugin LC = WebSocket koparma + tool registration kayıp + `IAssetRegistry*`/`ITransactor*` cached pointer invalidation. İstisnasız kural.
+Use `_on_failure: "escalate"` by default. If PIE is active, require explicit
+approval before escalation.
 
-### 6. Reflection Diff Analiz Yöntemi
-**Karar:** V1 regex/line-based (UCLASS, UPROPERTY, UFUNCTION annotation satırları). V2 clang AST (libclang) ile gerçek parse — gelecek versiyon.
-**Alternatifler:** Sadece regex (V1'de kalmak), sadece clang AST (V1'den itibaren).
-**Gerekçe:** Regex %95 case'i yakalar; clang AST 100% doğru ama libclang dependency ağır (50MB+ binary, build complexity). V1'de probe escalation kalan edge case'leri yakalar (LC fail → FullRestart). V2 enterprise/studio kullanım için.
+### Multi-Editor Policy
 
-## Sonuçlar
+If multiple editors load the same module, default to full restart coordination.
+Power users may opt into a Live Coding multi-editor path when they accept the
+risk.
 
-**Olumlu:**
-- Tool API minimal verbose; auto + opsiyonel override pattern
-- LC fail durumunda data loss önlenir (PIE-aware policy)
-- Bridge plugin self-LC kabusu sistemli olarak önlenir
-- Patch fragmentation predictable + tunable
+### Patch Fragmentation
 
-**Olumsuz:**
-- Auto kararı yanlışsa probe latency cost (LC dene + fail + restart cycle)
-- Multi-editor LC için power-user manual override şart
-- V1 regex edge case'lerde gerçek clang AST'a geçiş ileride yatırım gerek
+After a configurable number of Live Coding patches, recommend or trigger a full
+restart with user approval.
 
-## Etkilenen Belgeler
-- `docs/engineering/compile-coordination.md` — bu kararlarla aligned (önceden yazıldı, kararlar onaylandı)
-- `docs/engineering/api-spec.md` — `compile_and_reload`, `analyze_change`, `get_live_coding_status` tool sözleşmeleri
+### Bridge Plugin
+
+Changes to `Plugins/SageBridge/` always require full restart. Do not attempt
+Live Coding for the bridge plugin itself.
+
+### Reflection Diff
+
+Use a regex/line-based V1 reflection diff. A future version may use libclang
+for full AST precision.
+
+## Consequences
+
+Positive:
+
+- Common `.cpp` implementation edits stay fast.
+- Reflection and build-system edits take the safer restart path.
+- Multi-editor compile behavior is explicit.
+
+Negative:
+
+- V1 reflection detection can miss edge cases.
+- Full restarts remain necessary for important classes of changes.
+- Multi-editor compile coordination is operationally complex.

@@ -38,7 +38,7 @@ Structures unclear ideas into a logical narrative: Situation → Complication �
 
 - Identify which input fragment goes to which letter
 - Keep each block tight; one idea per block
-- For Sage: useful in ADR `Bağlam` sections, README "What this is" framing, and public positioning copy
+- For Sage: useful in ADR `Context` sections, README "What this is" framing, and public positioning copy
 
 ## Constraints
 

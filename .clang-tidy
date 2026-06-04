@@ -1,7 +1,7 @@
 ---
-# Sage server static analysis. Hot-path mantığı sağlamlaşana kadar muhafazakar.
-# Devre dışı: -magic-numbers (test fixture'larda gürültülü), -avoid-c-arrays,
-#             -function-cognitive-complexity (Phase 1'de erken).
+# Sage server static analysis. Conservative until hot-path behavior stabilizes.
+# Disabled: -magic-numbers (noisy in test fixtures), -avoid-c-arrays,
+#           -function-cognitive-complexity (too early for Phase 1).
 
 Checks: >
   -*,

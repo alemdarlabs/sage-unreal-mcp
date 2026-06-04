@@ -1435,7 +1435,7 @@ int main(int argc, char* argv[]) {
         .remote  = true,
     });
 
-    // PIE control (Milestone 1.3c → spec'te 1.7'de listelenmişti, hot path).
+    // PIE control (Milestone 1.3c; listed as 1.7 in the spec, hot path).
     registerRemote(sage::mcp::Tool{
         .name        = "run_pie",
         .description = "Start Play-In-Editor. By default uses the editor's "

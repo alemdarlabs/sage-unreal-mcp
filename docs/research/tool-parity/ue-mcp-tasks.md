@@ -1,6 +1,6 @@
-# UE-MCP → Sage: 448 Action Per-Tool Task List
+# UE-MCP to Sage: 448 Action Per-Tool Task List
 
-> **Source:** `/Users/mahmutalemdar/Developer/alemdarlabs/ue-mcp` — TypeScript MCP server + C++ plugin, BUSL-1.1.
+> **Source:** local reference clone of `db-lyon/ue-mcp` - TypeScript MCP server + C++ plugin, BUSL-1.1.
 > **Audit date:** 2026-04-28 (last update: Phase 4 COMPLETE — 443 registered handlers, all domains covered).
 > **Status:** Sage 443 tools · UE-MCP 448 actions · **445 covered · 3 N/A (feedback.submit, demo.step, demo.cleanup)**.
 >

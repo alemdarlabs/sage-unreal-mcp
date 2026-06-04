@@ -1298,10 +1298,10 @@ FSageToolDispatch::FOutcome ProjectGenerateProjectFilesImpl(const TSharedPtr<FJs
 
 // ---- project.create_cpp_class ----------------------------------------------
 
-// Parent class registry: bilinen UE base class'ları için (a) UHT prefix
-// ('A' for AActor descendants, 'U' for UObject descendants) ve (b) include
-// header path. UCLASS reflection prefix'lere bağlı; UHT eksik prefix'i
-// "Class deriving from 'AActor' must be prefixed with 'A'" ile reddeder.
+// Parent class registry for known UE base classes: (a) UHT prefix
+// ('A' for AActor descendants, 'U' for UObject descendants) and (b) include
+// header path. UCLASS reflection depends on prefixes; UHT rejects a missing
+// prefix with "Class deriving from 'AActor' must be prefixed with 'A'".
 struct FParentClassInfo {
     const TCHAR* Prefix;          // "A", "U", ...
     const TCHAR* HeaderInclude;   // "GameFramework/Character.h"

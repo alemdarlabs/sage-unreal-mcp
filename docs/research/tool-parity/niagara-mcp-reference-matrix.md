@@ -4,11 +4,9 @@ Date: 2026-06-04
 
 Purpose: source-backed comparison for the 2026-06-03 Niagara gap sweep. This is not a copy target; it is a parity and product-positioning checklist for Sage's own Niagara surface.
 
-Local audit copies were cloned under:
-
-```text
-C:\Users\mahmu\AppData\Local\Temp\sage-ref-audit-20260604-004937
-```
+Local audit copies were cloned into a temporary audit directory. The temporary
+checkout is not a canonical source; public repositories and docs remain the
+reference targets.
 
 ## Public References Checked
 

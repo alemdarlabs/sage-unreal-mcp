@@ -1,51 +1,81 @@
 # ADR-004: Multi-Editor Support
 
-**Tarih:** 2026-04-27
-**Durum:** Kabul Edildi
+**Date:** 2026-04-27
+**Status:** Accepted
+**Completed by:** ADR-017
 
-## Bağlam
+## Context
 
-Geliştiriciler aynı anda birden fazla UE Editor instance açıyor: host/client multiplayer test, mainline + experimental branch, sample project + ana proje. Server bunları ayırt edebilmeli, tool çağrılarını doğru editor'e route etmeli, paylaşılan kaynakları (knowledge graph, compile binary) yönetmeli.
+Unreal developers often run multiple editor instances at the same time: host and
+client multiplayer tests, mainline and experimental branches, a sample project
+beside the production project, or multiple copies of the same project.
 
-## Kararlar
+Sage must route tool calls to the correct editor and avoid silent mutation of
+the wrong project.
 
-### 1. Editor Identity & Labels
-**Karar:** Her instance handshake'de `{ id, label?, project_id, path, engine_version, session_id, pid }` sunar.
+## Decision
 
-Label kaynakları (priority):
-1. CLI argument: `-MCPLabel=host`
-2. Per-instance config: `Saved/Config/.../SageMCP.ini`
-3. Server-assigned suffix (`MyProject:1`, `:2`)
+### Editor Handshake
 
-**Gerekçe:** Kullanıcı kontrolü açık (CLI/config); fallback davranışı stable.
+Each editor instance registers with:
 
-### 2. Routing Model
-**Karar:** Active editor pointer per Claude session + per-tool `_editor` parametresi + ambiguity hatası.
-**Alternatifler:** Mandatory `_editor` her call'da (verbose); MCP resource model (`editor://host`).
-**Gerekçe:** Smart default tek-instance use case'inin friction'ını siler (yaygın); explicit override multi-targeting için; ambiguity hatası silent wrong-target bug'larını önler.
+```json
+{
+  "id": "...",
+  "label": "...",
+  "project_id": "...",
+  "path": "...",
+  "engine_version": "...",
+  "session_id": "...",
+  "pid": 1234
+}
+```
 
-### 3. Knowledge Graph Sharing
-**Karar:** Slot-scoped, instance-scoped değil. Aynı slot'a bağlanan iki instance tek graph paylaşır.
-**Alternatifler:** Per-instance graph
-**Gerekçe:** Source of truth disk; iki instance da aynı `.uasset`'leri görür. Per-instance graph 2x indexing iş, sync sorunları getirir.
+Labels come from explicit config first, then project name plus hash, then a
+session-derived fallback.
 
-### 4. Concurrent Modification
-**Karar:** Optimistic locking via `_expected_version` parametresi (opt-in); session-scoped `verify_before_modify: true` flag'i ile zorunlu.
-**Alternatifler:** Pessimistic locking, no concurrency control
-**Gerekçe:** Verbosity vs safety arasında dengeli orta. Cross-instance cache invalidation hint'leri AssetRegistry event propagation'ından gelir.
+### Routing
 
-### 5. Shared Module Compile Coordination
-**Karar:** Shared module compile tüm etkilenen editor'leri tespit eder, kullanıcıdan onay ister, paralel `save → shutdown → compile → relaunch → reconnect` orkestrasyonu yapar.
-**Alternatifler:** Silent compile (PIE'leri kırar), refuse if multi-editor
-**Gerekçe:** Tek confirmation step ucuz; silent failure en kötüsü; refusal valid workflows'u bloklar.
+Use an active-editor pointer plus optional per-tool `_editor` routing.
 
-## Sonuçlar
+Routing order:
 
-**Olumlu:**
-- Multi-instance senaryoları natural support
-- Knowledge graph duplication önlenir
-- Compile/restart orchestration safe by default
+1. Explicit `_editor` argument.
+2. Active editor pointer.
+3. Single connected editor fallback.
+4. Ambiguity error when more than one editor is connected and no target is
+   specified.
 
-**Olumsuz:**
-- Active editor mental model kullanıcının takip etmesi gereken state
-- Ambiguity hatası ek round-trip Claude için
+ADR-017 implements this decision.
+
+### Shared State
+
+Shared project state is slot-scoped, not instance-scoped. Two editor instances
+for the same slot can share project metadata, while session routing remains
+instance-aware.
+
+### Conflict Handling
+
+Use optimistic locking through `_expected_version` where tools need it. A
+session-scoped `verify_before_modify` mode can require this check before
+mutation.
+
+### Compile Coordination
+
+When a shared module compile affects multiple editors, Sage detects impacted
+sessions and coordinates save, shutdown, compile, relaunch, and reconnect only
+with explicit user approval.
+
+## Consequences
+
+Positive:
+
+- Single-editor usage remains low-friction.
+- Multi-editor usage is explicit and safe.
+- Wrong-target mutation becomes an error instead of a silent side effect.
+
+Negative:
+
+- Ambiguous sessions require an extra user or agent decision.
+- Compile orchestration is more complex when multiple editors load the same
+  module.

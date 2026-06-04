@@ -20,7 +20,7 @@ The codebase is intentionally cross-platform: server is C++23 + CMake + vcpkg ma
 | Var | Purpose | macOS default | Windows default |
 |---|---|---|---|
 | `VCPKG_ROOT` | vcpkg manifest install root | `$HOME/vcpkg` | `%USERPROFILE%\vcpkg` |
-| `SAGE_UE_ROOT` | Unreal install path (BuildPlugin) | `/Users/Shared/Epic Games/UE_5.7` | `C:\Program Files\Epic Games\UE_5.7` |
+| `SAGE_UE_ROOT` | Unreal install path used by BuildPlugin | `<absolute-path-to-Unreal-Engine-install>` | `<absolute-path-to-Unreal-Engine-install>` |
 | `SAGE_HTTP_PORT` (opt) | server HTTP port | 7777 | 7777 |
 | `SAGE_LOG_LEVEL` (opt) | spdlog level | `info` | `info` |
 
@@ -29,7 +29,7 @@ The codebase is intentionally cross-platform: server is C++23 + CMake + vcpkg ma
 ```bash
 cat >> ~/.zshrc <<'EOF'
 export VCPKG_ROOT="$HOME/vcpkg"
-export SAGE_UE_ROOT="/Users/Shared/Epic Games/UE_5.7"
+export SAGE_UE_ROOT="<absolute-path-to-Unreal-Engine-install>"
 export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
 EOF
 source ~/.zshrc
@@ -39,7 +39,7 @@ source ~/.zshrc
 
 ```powershell
 [Environment]::SetEnvironmentVariable("VCPKG_ROOT",   "$env:USERPROFILE\vcpkg", "User")
-[Environment]::SetEnvironmentVariable("SAGE_UE_ROOT", "C:\Program Files\Epic Games\UE_5.7", "User")
+[Environment]::SetEnvironmentVariable("SAGE_UE_ROOT", "<absolute-path-to-Unreal-Engine-install>", "User")
 ```
 
 Re-open the shell so the variables take effect.

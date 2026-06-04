@@ -48,7 +48,7 @@ tmp/
 .cdb-*
 /C*anim_diff.txt
 
-# Unreal (plugin tarafı)
+# Unreal plugin artifacts
 plugin/Binaries/
 plugin/Intermediate/
 plugin/Saved/

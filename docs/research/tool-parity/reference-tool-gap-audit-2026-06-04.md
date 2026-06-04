@@ -6,7 +6,7 @@ Baseline:
 - Sage source schemas: 693 tools.
 - Sage plugin handlers: 675 handlers.
 - Expected schema-only local tools: `jobs.list`, `jobs.get`, `jobs.wait`, `jobs.logs`, `jobs.cancel`.
-- Reference clones: `C:\Users\mahmu\AppData\Local\Temp\sage-ref-audit-20260604-004937`.
+- Reference clones: local temporary audit checkout, not retained as canonical source.
 
 References checked:
 - Monolith: `tumourlove/monolith`, wiki Tool Reference, and `Docs/API_REFERENCE.md`.

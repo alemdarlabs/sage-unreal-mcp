@@ -1,108 +1,98 @@
-# ADR-016: Distribution Channel — npm-first
+# ADR-016: Distribution Channel - npm-first
 
-**Tarih:** 2026-04-29
-**Durum:** Kabul Edildi
+**Date:** 2026-04-29
+**Status:** Accepted
 
-## Bağlam
+## Context
 
-Sage'in üç dağıtılacak parçası var:
+Sage ships three user-facing pieces:
 
-1. **sage-server** — C++23 native binary (cross-platform)
-2. **SageBridge plugin** — UE plugin (per-engine binary: 5.4, 5.5, 5.6, 5.7)
-3. **MCP client config** — claude code / Cursor / Cline `mcp.json` entry (tek satır)
+1. `sage-server`: native C++23 binary.
+2. `SageBridge`: Unreal Engine plugin package.
+3. MCP client configuration for tools such as Codex, Claude Code, Cursor, or
+   Cline.
 
-Aday kanallar:
-- **Homebrew / apt / winget** — sistem paket yöneticileri (platform-spesifik)
-- **GitHub Releases** — tarball + manuel install
-- **Docker** — headless / CI senaryoları
-- **npm** — AI dev tool ekosisteminin reflexi
-- **FAB / UE Marketplace** — UE plugin için Epic'in resmi kanalı
+Candidate channels:
 
-**Hedef kitle gözlemi**: Sage'in birincil kullanıcısı *AI agent + UE geliştiricisi*. Bu kitle zaten Claude Code'u (`npm install -g @anthropic-ai/claude-code`) ve Codex CLI'yi (`npm install -g @openai/codex`) npm üzerinden yüklüyor. AI dev araç ekosisteminin "tek satır install" reflexi npm.
+- Homebrew, apt, or winget.
+- GitHub Releases.
+- Docker.
+- npm.
+- FAB / Unreal Marketplace for the plugin.
 
-## Karar
+The primary audience is an AI-agent user who also develops in Unreal. That
+audience already installs tools such as Codex CLI and Claude Code through npm.
 
-**Birincil dağıtım kanalı**: `@alemdarlabs/sage-mcp` npm package.
+## Decision
+
+Use `@alemdarlabs/sage-mcp` as the primary distribution package:
 
 ```bash
 npm install -g @alemdarlabs/sage-mcp
-sage init    # MCP client config + UE plugin install wizard
+sage init
 ```
 
-### Mekanizma
+## Mechanism
 
-1. **npm package**: `package.json` `bin` field → `sage` komutu PATH'e eklenir.
-2. **postinstall script**: platform tespit eder (darwin-arm64, darwin-x64, linux-x64, linux-arm64, win32-x64) ve GitHub Releases'tan platforma uygun native binary indirir → `~/.sage-mcp/bin/sage-server` altına kurar.
-3. **`sage` CLI wrapper** (Node.js): native binary'yi exec eder. Node.js gerekmez — sadece npm install pathway için kullanılır.
-4. **`sage init`**: kullanıcıyı 3 adımda gezdirir:
-   - Hangi UE projesi? → uproject path al
-   - Hangi MCP client? → `claude mcp add` veya Cursor/Cline `mcp.json` patch
-   - Engine version tespit → uygun `SageBridge-5.X.zip` indir → `Plugins/SageBridge/` altına aç
+1. The npm package exposes a `sage` CLI through the `bin` field.
+2. `postinstall` resolves the current platform and downloads the matching
+   native `sage-server` archive from GitHub Releases into `~/.sage-mcp`.
+3. The Node.js wrapper launches the native server for MCP clients.
+4. `sage init` installs or updates `SageBridge`, enables it in the target
+   `.uproject`, and writes MCP configuration.
 
-### İkincil Kanallar (paralel)
+## Secondary Channels
 
-- **GitHub Releases**: airgapped / kurum proxy / manuel kurulum için doğrudan platform tarball'ları
-- **Homebrew tap** (`alemdarlabs/homebrew-sage`): macOS Unix-native power-user deneyimi
-- **FAB**: UE plugin için ileri faz (community büyüdüğünde, Epic onay süresi tolere edilebilir hale geldiğinde)
+- **GitHub Releases** for air-gapped, proxy, or manual install flows.
+- **Homebrew tap** for macOS power users if demand justifies it.
+- **FAB / Unreal Marketplace** for a later plugin-focused channel.
 
-## Gerekçe
+## Rationale
 
-1. **Hedef kitle reflexi**: Claude Code ve Codex CLI npm üzerinden geliyor → AI agent geliştirici tabanı `npm i -g` komutuna alışkın. Sage'in aynı kanaldan gelmesi onboarding friction'ı sıfıra indirir.
-2. **Cross-platform tek komut**: npm package darwin/linux/win her üçünde aynı `npm i -g` komutuyla yüklenir. Homebrew (Mac-only) + apt (Linux-only) + winget (Win-only) parçalı deneyim sunar.
-3. **Sürüm yönetimi bedava**: npm semver, `npm outdated`, `npm update -g`, `npm uninstall` zaten kullanıcının bildiği akış. CI'de tek `npm publish` adımı yeter.
-4. **Discoverability**: `npmjs.com` araması + GitHub package ekosistemi + AI dev tool listings ("awesome-mcp-servers" vb.) npm package referans verir; npm registry organic discovery sunar.
-5. **Wrapper modeli ispatlandı**: Codex CLI 2024'te Rust binary'ye geçti ama npm wrapper'ı korudu — postinstall script ile binary indirme pattern'i AI tooling ekosisteminde standart.
-6. **ADR-013 (cpp-httplib) + ADR-015 (ixwebsocket) ile tutarlı disiplin**: "Hedef kullanım profiline göre right-size" — hedef kitle npm reflexi ile geliyor, kanalı ona göre seç.
+1. npm matches the install reflex of the AI development tooling audience.
+2. One command works across Windows, macOS, and Linux.
+3. npm already provides versioning, update, uninstall, and discovery behavior.
+4. GitHub Actions can publish both release assets and the npm package.
+5. The wrapper-binary pattern is proven in AI developer tools.
 
-## Reddedilen Alternatifler
+## Rejected Alternatives
 
-- **Homebrew-first**: macOS-only; Linux/Windows kullanıcılarına ikinci sınıf deneyim. Bottle CI Mac runner'larıyla sınırlı. Discoverability düşük (`brew search` AI tool kitlesinde reflex değil).
-- **GitHub Releases-only**: Manuel PATH yapılandırması, manuel update. Power user OK; mainstream onboarding'i düşürür. Update mekanizması yok (kullanıcı yeni release'i fark etmek zorunda).
-- **Docker-first**: UE Editor ↔ plugin local IPC gerektiriyor; container içinde sage-server izole edilirse host UE plugin'le bridge handshake'i karmaşıklaşır. Headless CI senaryosu için iyi ama mainstream değil.
-- **FAB-only**: UE plugin için resmi kanal ama sage-server'ı kapsamaz; iki ayrı kanal (Marketplace + manuel server install) kullanıcıyı kafa karıştırır. FAB onay süresi (aylar) erken adoption'ı bloklar.
-- **pip / PyPI**: Python ekosistemi MCP server'larında (FastMCP vb.) yaygın ama Sage'in hedef kitlesi (Claude Code/Codex kullanıcıları) zaten npm reflexinde.
+- **Homebrew-first**: macOS-first and fragmented for Windows/Linux users.
+- **GitHub Releases-only**: Requires manual PATH setup and manual updates.
+- **Docker-first**: Complicates localhost IPC with Unreal Editor and is better
+  suited to headless CI.
+- **FAB-only**: Covers the Unreal plugin but not the native MCP server.
+- **pip / PyPI**: Common for Python MCP servers, but not the best fit for
+  Sage's target audience.
 
-## Plugin Dağıtımı — Tamamlayıcı Notlar
+## Plugin Distribution Notes
 
-UE plugin npm package'a **embedded değil**:
-- Boyut: per-engine binary 30-50MB, 4 engine version × 3 platform = 12 ZIP
-- Versiyon koplmaması: server semver bağımsız, plugin engine version'a bağlı
-- Çoğaltma maliyeti: kullanıcı tek engine kullanıyor, gereksiz indirme
+The plugin is not embedded directly in the npm package by default. Engine and
+platform combinations can make plugin artifacts large. `sage init` and
+`sage update --plugin <project>` resolve the correct plugin package and install
+it into `Plugins/SageBridge/`.
 
-Bunun yerine: `sage init` veya `sage update --plugin <project>` GitHub Releases'tan ilgili `SageBridge-<engine>-<platform>.zip`'i çeker, hedef projenin `Plugins/SageBridge/` altına açar, uproject `Plugins` listesine ekler.
+## Consequences
 
-## Sonuçlar
+Positive:
 
-**Olumlu:**
-- Tek install komutu (`npm i -g @alemdarlabs/sage-mcp`) cross-platform
-- AI agent dev kitlesinin reflex kanalı → onboarding friction minimum
-- npm semver / update / discoverability altyapısı bedavaya gelir
-- CI tek pipeline: GitHub Actions matrix → multi-platform binary build → GitHub Release upload + `npm publish` paralel
-- Power user'lar için ikincil kanallar (Homebrew, GitHub Releases) paralel mevcut
+- Cross-platform install through a single command.
+- Low onboarding friction for AI development tool users.
+- Existing npm semver and update workflows.
+- GitHub Releases remain available for direct asset download.
 
-**Olumsuz:**
-- **Postinstall network dependency**: 50-100MB binary download fail ederse `npm i -g` fail olur. Kurum proxy / npm registry mirror senaryolarında `SAGE_BINARY_URL` veya `SAGE_BINARY_PATH` env var ile manuel fallback gerekir. Postinstall script bu env var'ları okuyacak şekilde yazılmalı.
-- **npm CLI bağımlılığı**: Pure C++ / GameDev kullanıcısında Node.js + npm yüklü olmayabilir. Bu kullanıcılar için ikincil Homebrew/GitHub kanalları paralel tutulur.
-- **Codesigning maliyeti**: macOS notarization (Apple Developer ID, $99/yıl) + Windows EV code signing cert ($300-500/yıl) zorunlu — yoksa Gatekeeper/SmartScreen kullanıcıyı düşürür. CI'de sign step ve secrets gerekir.
-- **Per-engine plugin matrisi**: GitHub Actions matrix [5.4, 5.5, 5.6, 5.7] × [Win64, Mac, Linux] = 12 build/release. Build süresi ~30-60dk, CI maliyet kalemi.
+Negative:
 
-## Etkilenen Belgeler ve Sonraki Adımlar
+- Postinstall depends on network access unless the user sets an override.
+- Some game developers may not have Node.js installed.
+- Code signing and notarization remain necessary for mature binary
+  distribution.
+- Full per-engine plugin binary packaging needs self-hosted runners with Unreal
+  Engine installed.
 
-| Adım | Hedef | Faz |
-|---|---|---|
-| `package.json` skeleton + `bin` field (`sage` komutu) | Yeni dosya repo root'ta | Phase 5 başlangıç |
-| `scripts/postinstall.js` — platform tespit + binary download | Yeni dosya | Phase 5 başlangıç |
-| `sage` CLI wrapper (Node.js, exec native binary) | `bin/sage.js` | Phase 5 başlangıç |
-| `sage init` komutu — server'a sub-command olarak | `server/src/cli/init.cpp` | Phase 5 |
-| `.github/workflows/release.yml` — multi-platform CI matrix | Yeni workflow | Phase 5 |
-| Codesigning pipeline (Apple Developer ID, Windows EV cert) | CI secrets + sign step | Phase 5 (cert tedarik sonrası) |
-| `homebrew-sage` tap repo (paralel kanal) | Yeni repo | Phase 5 ikinci dalga |
-| `docs/getting-started.md` — npm install + `sage init` onboarding | Yeni doküman | Phase 5 |
-| FAB plugin başvurusu | Plugin paketleme + Epic submission | Mainstream faz |
+## Versioning
 
-## Versioning Notu
-
-- npm package version === sage-server version (semver)
-- Plugin version: `1.0.0+ue5.7` formatında (server major === plugin major; engine version build metadata)
-- Protocol version: server↔plugin handshake'te negotiate; backwards-compat 1 major version
-- Mismatch'te server reddetsin: `"Plugin v0.9 incompatible with server v1.2 — run `sage update --plugin`"`
+- npm package version equals `sage-server` version.
+- Plugin versions can carry Unreal Engine build metadata.
+- Server and plugin protocol versions must be negotiated during handshake.
+- Incompatible versions should fail with a clear update instruction.

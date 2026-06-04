@@ -192,7 +192,7 @@ Failures return `needs_checkout` for client-side resolution.
 
 ## Audit Log
 
-Every transaction recorded in `~/.sage-mcp/slots/<slot_id>/audit.log` (SQLite). See [Database Schema](database-schema.md) for table definition. Enables:
+Every transaction recorded in `~/.sage-mcp/slots/<slot_id>/audit.log` (SQLite). See [Database Schema](../archive/legacy-graph/database-schema.md) for table definition. Enables:
 
 - "When did Claude last modify this BP?"
 - "What did session X do today?"

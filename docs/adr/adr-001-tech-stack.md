@@ -1,77 +1,106 @@
-# ADR-001: Tech Stack Selection
+# ADR-001: Technology Stack
 
-**Tarih:** 2026-04-27
-**Durum:** Kabul Edildi
+**Date:** 2026-04-27
+**Status:** Accepted
+**Updated by:** ADR-013, ADR-015, ADR-018
 
-## Bağlam
+## Context
 
-Sage Unreal MCP, Unreal Engine için "intelligence layer" odaklı bir MCP server inşa ediyor. Tasarım kritik trade-off'lara dayanıyor:
+Sage Unreal MCP needed a native stack that could work inside Unreal Editor,
+serve MCP clients, package cleanly for studios, and keep latency low for large
+Unreal projects.
 
-- **Plugin tarafı**: Unreal C++ mecbur (engine reflection erişimi).
-- **Server tarafı**: Plugin ile aynı dil mi, farklı dil mi? Persistent süreç olarak nasıl çalışacak?
-- **Transport**: Claude ↔ Server ve Server ↔ Plugin için ayrı protokoller.
-- **Distribution**: Studio'lara dağıtılabilir, single-binary tercih.
-- **Performans tavanı**: Knowledge graph 100K+ node; hot path latency önemli.
+The main constraints were:
 
-Persistent server zorunlu çünkü:
-1. UE Editor restart sırasında MCP bağlantısı kopmamalı.
-2. Knowledge graph state Editor restart'larında yaşamalı.
-3. Multi-editor senaryoları tek server'ın çoklu editor yönetmesini gerektirir.
+- The plugin must use Unreal C++ to access reflection, AssetRegistry,
+  transactions, editor subsystems, and runtime/editor APIs.
+- The server must be a persistent process so editor restarts do not destroy the
+  MCP session.
+- The client transport and the plugin bridge have different lifecycle and
+  protocol needs.
+- Distribution should be practical for game teams and AI development tools.
+- The architecture must leave room for large project understanding features.
 
-## Kararlar
+## Decision
 
-### 1. Plugin Dili
-**Karar:** Unreal C++ (UPlugin formatı)
-**Alternatifler:** Python (PythonScriptPlugin)
-**Gerekçe:** UCLASS/UPROPERTY/UFUNCTION reflection'a tam erişim, AssetRegistry C++ binding, FScopedTransaction native undo entegrasyonu. Python wrapper'lar yer yer eksik (Slate, custom BP node manipulation). Editor + runtime çalışabilirlik.
+### Plugin Language
 
-### 2. Server Dili
-**Karar:** C++23 (modern stack)
-**Alternatifler:** TypeScript/Node, Rust, Python, Go
-**Gerekçe:** Senior Unreal C++ deneyimi var; tek dil mental model'i context-switching'i ortadan kaldırır. KuzuDB asıl API'si C++; Rust/Go binding'leri wrapper. Performans tavanı en yüksek. In-process embed FFI maliyeti olmadan korunur. TS reddedildi: dependency churn, distribution friction. Rust reddedildi: cxx FFI seam, ikinci dil. Python reddedildi: editor-only, GIL, distribution. Maliyet kabul: manuel MCP impl ~1500 LOC, CMake/vcpkg ergonomi.
+Use Unreal C++ in UPlugin format.
 
-### 3. Server Transport (Claude ↔ Server)
-**Karar:** HTTP + SSE (Streamable HTTP)
-**Alternatifler:** stdio, WebSocket-only, gRPC
-**Gerekçe:** stdio server lifetime'ını client lifetime'a bağlar; persistent server için imkansız. HTTP+SSE multi-client native, streaming progress destekler.
+Rationale: Unreal C++ gives direct access to UCLASS, UPROPERTY, UFUNCTION,
+AssetRegistry, FScopedTransaction, Slate, Blueprint graph APIs, and editor
+subsystems. Python wrappers are incomplete for this surface and are not suitable
+as the primary production plugin layer.
 
-### 4. Plugin Transport (Server ↔ Plugin)
-**Karar:** WebSocket (localhost)
-**Alternatifler:** Named pipes / Unix sockets, gRPC, shared memory
-**Gerekçe:** Cross-platform tutarlılık, sub-2ms localhost overhead'i kabul edilebilir, JSON-RPC envelope debug-friendly, gRPC schema rigid. Shared memory engineering complexity disproportionate.
+### Server Language
 
-### 5. Build System
-**Karar:** CMake + vcpkg (manifest mode)
-**Alternatifler:** Meson, Bazel
-**Gerekçe:** C++ industry standard, IDE integration olgun, cross-platform tested. vcpkg manifest mode (`vcpkg.json`) reproducible dependency management.
+Use C++23 for the native server.
 
-### 6. JSON Library
-**Karar:** nlohmann/json (ergonomi) + simdjson (hot path parse)
-**Alternatifler:** rapidjson, Boost.JSON
-**Gerekçe:** nlohmann ergonomisi en iyi; simdjson MCP message parse'ında 5-10x hızlı.
+Rationale: The team already needs C++ for Unreal. Keeping the server in C++
+reduces cross-language boundaries, supports native packaging, and gives the
+highest performance ceiling. TypeScript, Rust, and Python were rejected for this
+phase because they would add distribution friction, FFI seams, or editor/runtime
+limitations.
 
-### 7. Logging
-**Karar:** spdlog
-**Alternatifler:** Boost.Log, glog
-**Gerekçe:** Header-only, structured logging, performans yüksek, ekosistem güçlü.
+### MCP Client Transport
 
-### 8. Test Framework
-**Karar:** Catch2 + ASan + UBSan + TSan
-**Alternatifler:** doctest, GoogleTest
-**Gerekçe:** Catch2 modern macro syntax, ekosistem geniş. Sanitizer'lar C++ memory model belirsizliklerini compile-time guarantee yokluğunu telafi eder.
+Use HTTP + SSE for streamable MCP transport.
 
-## Sonuçlar
+Rationale: stdio ties server lifetime to client lifetime. Sage needs a
+persistent server that can survive editor restarts and support multiple clients.
+HTTP + SSE gives simple request/response behavior plus progress streaming.
 
-**Olumlu:**
-- Tek dil stack (plugin + server), shared header/DTO mümkün
-- Performans tavanı maksimum
-- Native KuzuDB + AssetRegistry erişimi
-- In-process embed gelecek seçenek olarak açık
-- Single-binary distribution kolay
+ADR-013 later selected `cpp-httplib` as the concrete HTTP server library.
 
-**Olumsuz:**
-- Manuel MCP impl 1-2 hafta yatırım
-- CMake/vcpkg ergonomi Cargo'dan geride
-- C++ memory model: sanitizer disiplini şart
-- Async runtime ekosistemi tokio kadar olgun değil
-- İlk geliştirme velocity Rust/TS'ten ~%20 yavaş; uzun vadede telafi
+### Plugin Bridge
+
+Use a localhost WebSocket bridge between server and Unreal Editor.
+
+Rationale: WebSocket is cross-platform, easy to inspect, and acceptable for
+localhost overhead. It keeps the editor bridge independent from the MCP client
+transport.
+
+ADR-015 later selected `ixwebsocket` as the concrete implementation.
+
+### Build System
+
+Use CMake with vcpkg manifest mode.
+
+Rationale: CMake is the standard native build system for C++ tooling and works
+well with IDEs and CI. vcpkg manifest mode keeps dependencies reproducible.
+
+### JSON
+
+Use `nlohmann/json` for ergonomic JSON construction and simdjson for hot-path
+parsing where needed.
+
+### Logging
+
+Use `spdlog`.
+
+### Tests
+
+Use Catch2 plus sanitizers where the platform supports them.
+
+## Consequences
+
+Positive:
+
+- One native language across plugin and server.
+- Direct Unreal API access.
+- High performance ceiling.
+- Clean single-binary server packaging.
+- Clear transport separation between MCP clients and Unreal Editor.
+
+Negative:
+
+- MCP protocol implementation is manual.
+- C++ memory and lifetime bugs require sanitizer discipline and careful review.
+- Initial development velocity is lower than a scripting-first stack.
+
+## Notes
+
+The original graph-oriented storage assumptions were superseded by ADR-018,
+which removed KuzuDB from the active runtime. This ADR remains the active stack
+decision for the native server, plugin, build system, transport split, JSON,
+logging, and test framework.

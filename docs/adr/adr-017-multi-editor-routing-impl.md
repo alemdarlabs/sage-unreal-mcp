@@ -1,106 +1,102 @@
-# ADR-017: Multi-Editor Routing Implementation (Milestone 1.5b)
+# ADR-017: Multi-Editor Routing Implementation
 
-**Tarih:** 2026-04-29
-**Durum:** Kabul Edildi (ADR-004 §2'yi tamamlar — supersede etmez)
+**Date:** 2026-04-29
+**Status:** Accepted
+**Completes:** ADR-004 section 2
 
-## Bağlam
+## Context
 
-ADR-004 (Multi-Editor Support) §2'de "active editor pointer + per-tool `_editor` parametresi + ambiguity hatası" kararı verildi. Phase 1.5a'da `list_editors`, `get_active_editor`, `set_active_editor` MCP tool'ları implement edildi; ancak per-call `_editor` parametresi ve `dispatchTool`'un gerçek session-aware routing'i henüz canlıya geçmemişti.
+ADR-004 selected active-editor routing plus an optional per-tool `_editor`
+parameter. Early dogfooding showed that the implementation still routed remote
+tools through a single active pointer and, in one path, through the first
+connected WebSocket client.
 
-İlk dogfooding loop sırasında (Kale projesinde test eden ikinci Claude) tespit edildi:
-1. Tüm 200+ remote tool implicit "active editor" pointer'ına gidiyor; per-call session targeting yok.
-2. Aynı assistant turn'ünde A'dan oku + B'ye yaz işlemleri paralel tool call olarak gönderilemiyor (tek pointer, son `set_active_editor` kazanır → race).
-3. Bonus mevcut bug: `BridgeServer::dispatchTool` aslında `activeSessionId_`'yi bile kullanmıyordu — `server_->getClients()` setinin ilk öğesini alıyordu (deterministic değil).
+This broke cross-editor workflows such as reading from one project while
+writing to another in the same assistant turn.
 
-Cross-project workflow (FlightProject → Kale uçma component'i kopyalama) ürünün moat değeri — knowledge layer + execution arası köprü — bu tasarım eksiği gerçek bir blocker.
+## Decision
 
-## Karar
+Add optional `_editor` routing to all editor-scoped remote tools.
 
-**Tüm editor-scoped (remote=true) tool'lara opsiyonel `_editor` parametresi tanı.** Routing sırası:
+Routing order:
 
-1. Çağrıda explicit `_editor` (string: session_id, label, veya instance_id) → o session'a route
-2. `_editor` yok → server-wide `activeSessionId_` pointer
-3. Active da yok → tek editor bağlıysa onu implicit kullan
-4. Birden fazla editor + active yok → `EditorNotConnected: "ambiguous target"` hatası
+1. Explicit `_editor` string, matching session ID, label, or instance ID.
+2. Server active editor pointer.
+3. Single connected editor implicit fallback.
+4. Ambiguity error when multiple editors are connected and no target is
+   selected.
 
-### Implementation Mimarisi
+## Implementation
 
-| Katman | Değişiklik |
+| Layer | Change |
 |---|---|
-| `EditorSession` struct | `ix::WebSocket* ws` field eklendi (session_id → ws lookup için) |
-| `BridgeServer::handleHello` | Hello sırasında `s.ws = &ws` kaydediliyor |
-| `BridgeServer::dispatchTool` | Yeni overload: `(tool, args, timeout, targetIdOrLabel)`. Hedef resolution + sessions map'inden ws lookup. Eski `getClients()[0]` bug'ı fix edildi. |
-| `ToolRegistry::RemoteDispatcher` | Signature genişlet: `(tool, args, targetEditor)` |
-| `ToolRegistry::dispatch` | Opsiyonel `targetEditor = {}` parametresi, dispatcher'a forward |
-| `MCPServer::onToolsCall` | Args'tan `_editor` extract et, args'tan sil, dispatcher'a target olarak geç |
-| `MCPServer::onToolsList` | **Runtime schema injection** — her remote tool'a `_editor` opsiyonel property otomatik ekle (DRY: tek noktada, source tool'larda repetition yok) |
-| `main.cpp` | `setRemoteDispatcher` lambda'sını yeni signature'a uyarla |
+| `EditorSession` | Add `ix::WebSocket* ws` for session-to-socket lookup. |
+| `BridgeServer::handleHello` | Store the WebSocket pointer during hello. |
+| `BridgeServer::dispatchTool` | Add target-aware overload and fix first-client routing. |
+| `ToolRegistry::RemoteDispatcher` | Extend signature with target editor. |
+| `ToolRegistry::dispatch` | Forward the optional target editor. |
+| `MCPServer::onToolsCall` | Extract `_editor`, remove it from plugin args, and pass it to dispatch. |
+| `MCPServer::onToolsList` | Inject `_editor` into remote tool schemas at runtime. |
+| `main.cpp` | Update dispatcher lambda signature. |
 
-### Schema Injection Tek Nokta
+## Schema Injection
 
-Tüm 200+ tool definition'ına `_editor` field ekleme yerine, `tools/list` response'u oluştururken her `tool.remote == true` için runtime'da injection yapılır. Avantaj:
+Do not manually add `_editor` to every tool schema. Inject it at `tools/list`
+time for every `remote == true` tool.
 
-- Source tool'lar (main.cpp + phase4_schemas.cpp) değişmez — single-point-of-truth
-- Yeni eklenen remote tool'lar otomatik kazanır
-- Server-side tools (`list_editors`, `ping`, jobs, etc.) stay `remote=false`; `_editor` is omitted where editor routing is meaningless.
+Benefits:
 
-ADR-018 removed the graph server-side tools (`query_graph`, `impact_of`, `references_to`, `find_unused`, `class_hierarchy`, `index_slot`, `index_status`). Remaining server-only tools still omit `_editor` where editor routing is meaningless.
+- One source of truth.
+- New remote tools automatically gain the parameter.
+- Server-only tools such as jobs and health tools do not expose meaningless
+  editor routing parameters.
 
-## Gerekçe
+ADR-018 removed graph server-only tools. Remaining server-only tools still omit
+`_editor`.
 
-1. **DRY**: 200+ tool'a manuel parametre eklemek hem yorucu hem hataya açık (önceki "234 invalid schema" bug'ı bu tarz repetisyondan doğdu). Tek noktada middleware injection sağlam.
-2. **Backwards-compatible**: `_editor` opsiyonel; mevcut tek-editor senaryosu hiçbir şekilde değişmez. Eski client'lar kırılmaz.
-3. **ADR-004 ile uyum**: Karar 2'de yazılmış olan tasarımı canlıya geçirir, supersede etmez. ADR-004'ün "smart default + per-call override + ambiguity error" üçlüsü tam olarak burada.
-4. **Mevcut routing bug fix**: `dispatchTool`'un `getClients()[0]` kullanması zaten broken'dı — multi-editor senaryosunda set_active_editor hiç işe yaramıyordu. Bu commit aynı zamanda o bug'ı kapatır.
-5. **Paralel cross-editor execution**: A'dan oku + B'ye yaz aynı assistant turn'ünde paralel MCP tool call olarak gönderilebilir; her biri kendi `_editor`'ünü taşır, server bridge ayrı session'lara route eder.
+## Rationale
 
-## Reddedilen Alternatifler
+1. DRY schema injection avoids repeating the same parameter across hundreds of
+   tools.
+2. The change is backward-compatible because `_editor` is optional.
+3. It implements ADR-004 without changing plugin handlers.
+4. It fixes the old first-client routing bug.
+5. It enables parallel cross-editor calls in one assistant turn.
 
-- **B — `with_editor({session_id, calls:[...]})` composition tool**: Tool composition'ı bridge layer'a taşır; sequential listed çağrılar atomik bir grupta. Karmaşık (transaction-like semantics), MCP protocol envelope dışı. A'nın sade middleware injection'ı yeterli.
-- **C — Sadece `asset.migrate` tool ekle**: Cross-project asset transfer için pratik ama yetersiz. Component oku A, BP yaz B gibi diğer cross-editor scenario'larda aynı sorun çıkar. C bağımsız bir tool olarak A bittikten sonra eklenecek.
-- **Manuel her tool'a `_editor` ekleme**: Source-side repetition; nlohmann brace-init pitfall'ları, tutarsızlık riski (önceki "234 invalid schema" hatasından öğrendiğimiz ders). Reddedildi.
+## Rejected Alternatives
 
-## Sonuçlar
+- **`with_editor({ session_id, calls })` composition tool**: Moves composition
+  into the bridge layer and creates transaction-like semantics outside the MCP
+  envelope.
+- **Only add `asset.migrate`**: Useful but too narrow; cross-editor read/write
+  workflows need general routing.
+- **Manually add `_editor` to every tool**: Repetition-prone and easy to break.
 
-**Olumlu:**
-- 444 editor-scoped tool için per-call session targeting devreye girdi
-- Mevcut "first client" routing bug'ı fix edildi
-- Source tool definition'ları değişmedi (DRY)
-- Single-editor senaryosu hiçbir şekilde etkilenmedi (geriye uyumlu)
-- Ambiguity error mesajları kullanıcı dostu (`use list_editors`, `pass _editor or call set_active_editor`)
-- Cross-editor paralel tool call mümkün hale geldi
+## Consequences
 
-**Olumsuz:**
-- `EditorSession.ws` raw pointer — ws lifecycle ix::WebSocketServer'a bağlı; close callback'inde sessions map'ten erase ediliyor, ama tasarım gereği "raw pointer + manuel cleanup" güvenliği gerektiriyor. Race açıkken (Close callback ile dispatchTool aynı anda çalışırsa) mutex korumalı.
-- `_editor` parametresi tüm 444 tool'da görünür — `tools/list` response boyutunu hafifçe büyütür (~12KB ek; her tool ~30 byte ekstra schema). Token açısından önemsiz.
-- Plugin tarafı bilinçsiz: server `_editor`'ı plugin'e iletmeden çıkarıyor, plugin handler'lar değişmeden çalışır. Avantaj (cleaner). Dezavantaj: plugin'in target session'ı bilmesi mümkün değil — şimdilik gerek yok.
+Positive:
 
-## Etkilenen Belgeler ve Dosyalar
+- All editor-scoped tools support per-call session targeting.
+- The old first-client routing bug is fixed.
+- Single-editor workflows remain unchanged.
+- Ambiguous multi-editor cases return actionable errors.
+- Cross-editor parallel tool calls are possible.
 
-| Dosya | Değişiklik |
+Negative:
+
+- `EditorSession.ws` is a raw pointer tied to WebSocket server lifecycle and
+  must stay protected by the session mutex.
+- `tools/list` responses are slightly larger.
+- Plugin handlers do not know the selected editor target because the server
+  strips `_editor` before dispatching.
+
+## Verification
+
+Implementation was verified during dogfooding with:
+
+| Scenario | Expected result |
 |---|---|
-| `server/src/bridge/editor_session.h` | `ws` field eklendi |
-| `server/src/bridge/bridge_server.h` | Yeni `dispatchTool` overload + comment update |
-| `server/src/bridge/bridge_server.cpp` | `handleHello` ws kayıt, `dispatchTool` target resolution + ws lookup, eski bug fix |
-| `server/src/mcp/tool_registry.h` | `RemoteDispatcher` signature + `dispatch` param |
-| `server/src/mcp/tool_registry.cpp` | dispatcher forwarding |
-| `server/src/mcp/server.cpp` | `onToolsCall` extract, `onToolsList` injection |
-| `server/src/main.cpp` | dispatcher lambda new signature |
-| `tests/unit/test_tool_registry.cpp` | dispatcher lambda signatures updated |
-
-## Sonraki Adımlar
-
-1. **`asset.migrate` tool** (Gap C, originally proposed but deferred): UE'nin `FAssetToolsModule::MigratePackages` API'sini sarmalayan, source/dest editör session_id alan tool. Per-call routing artık çalıştığı için bu doğrudan iki editor arasında migration yapabilir.
-2. **`_editor` discoverability**: `list_editors` response'unun `tools/list` description'larında daha görünür referansı (örn. "see list_editors for connected editors").
-3. **Plugin-level transaction'lar**: Cross-editor transaction (A'dan oku + B'ye yaz atomik bir grupta) için ADR-006 transaction layer'ı genişletilmesi — Phase 5+ konusu.
-
-## Doğrulama
-
-Implementation 2026-04-29 tarihinde Kale projesi (PID 33303) üzerinde test edildi:
-
-| Senaryo | Beklenti | Sonuç |
-|---|---|---|
-| `get_world` no `_editor` (tek editor) | Implicit fallback → Kale | ✓ DefaultLevel, 108 actor |
-| `get_world` `_editor="Kale@dee10b06"` | Instance_id resolution → Kale | ✓ aynı sonuç |
-| `get_world` `_editor="NonExistent"` | EditorNotConnected | ✓ -32001 "no editor session matches 'NonExistent' (use list_editors)" |
-| `tools/list` schema injection | 444 remote tool'da `_editor` görünür, 12 server-side'da yok | ✓ doğrulandı |
+| `get_world` without `_editor` and one editor connected | Uses implicit fallback. |
+| `get_world` with an instance ID | Routes to the matching editor. |
+| `get_world` with an unknown editor | Returns `EditorNotConnected`. |
+| `tools/list` | Shows `_editor` on remote tools only. |

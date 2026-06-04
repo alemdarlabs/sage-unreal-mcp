@@ -38,7 +38,7 @@ clients with default logging UIs surface them without custom handlers:
       "slot_id":        "9780bcd7c32e...",
       "instance_id":    "HeroFlight@8ca84e8c",
       "label":          "",
-      "project_path":   "D:/Steamworks/HeroFlight/HeroFlight.uproject",
+      "project_path":   "<absolute-path-to-your-project.uproject>",
       "project_id":     "...",
       "engine_version": "5.7.4",
       "pid":            12345

@@ -1,52 +1,54 @@
-# ADR-002: Storage Layer
+# ADR-002: Storage
 
-**Tarih:** 2026-04-27
-**Durum:** Superseded by ADR-018
+**Date:** 2026-04-27
+**Status:** Superseded by ADR-018
 
-> ADR-018 removes the active KuzuDB implementation; this ADR remains historical context only.
+## Context
 
-## Bağlam
+The original design separated two persistence concerns:
 
-Sage iki ayrı persistence concern'i taşıyor:
+1. A graph store for asset and code relationships.
+2. An audit store for operations, sessions, and transaction metadata.
 
-1. **Knowledge graph**: 100K+ node, graph traversal queries (impact analysis, references), incremental update, slot-bazlı izolasyon.
-2. **Audit log + slot index**: structured tabular data (transaction history, slot metadata, server registry), ACID, basit queries.
+At the time, these concerns appeared to have different access patterns.
 
-Her ikisi için doğru depolama farklı.
+## Decision
 
-## Kararlar
+Use KuzuDB for the graph store and SQLite for audit metadata.
 
-### 1. Knowledge Graph Storage
-**Karar:** KuzuDB (embedded, single-file)
-**Alternatifler:** Neo4j (server overhead), DuckDB (analytical, graph-native değil), in-memory only
-**Gerekçe:** Native graph database, embedded deployment, columnar storage analytical query'lere uygun, Cypher dialect Unreal reference traversal use case'ine maps. Slot başına ayrı `.kuzu` dosyası → izolasyon kolay. Storage ileride `GraphStore` trait arkasına soyutlanır, gerekirse swap.
+The planned layout was slot-based:
 
-### 2. Audit + Index Storage
-**Karar:** SQLite
-**Alternatifler:** RocksDB (overkill), KuzuDB içine gömülü tablolar (concern karışır), flat file
-**Gerekçe:** Mature, transactional, ubiquitous tooling (CLI, GUI, debug); separation of concerns (graph storage farklı access pattern'ine sahip).
-
-### 3. Storage Layout
-**Karar:** Slot-bazlı klasör hiyerarşisi:
-```
+```text
 ~/.sage-mcp/
-├── slots/<slot_id>/
-│   ├── manifest.json
-│   ├── graph.kuzu/
-│   ├── snapshots/
-│   └── audit.log
-├── index.db  (SQLite, slot index)
-└── server.db (SQLite, transport/sessions/registry)
+|-- slots/
+|   `-- <slot-id>/
+|       |-- graph.kuzu/
+|       `-- audit.sqlite
+`-- config.json
 ```
-**Gerekçe:** Slot izolasyonu net (silmek/taşımak kolay); backup/restore basit; KuzuDB single-file çoklu-dosya sync sorununu önler.
 
-## Sonuçlar
+## Rationale
 
-**Olumlu:**
-- KuzuDB Cypher Unreal traversal'larında idiomatik
-- SQLite zengin tooling (CLI debug, ad-hoc query)
-- Slot izolasyonu data corruption blast radius'unu sınırlar
+KuzuDB was selected for embedded graph traversal and Cypher-style querying.
+SQLite was selected for durable, transactional, easy-to-debug operational
+metadata.
 
-**Olumsuz:**
-- KuzuDB community küçük (Neo4j'e göre); bug'a takılırsak `GraphStore` abstraction lazım
-- İki ayrı veritabanı = iki ayrı backup discipline
+## Consequences
+
+Positive:
+
+- Graph traversal had a dedicated storage engine.
+- Audit metadata stayed separate from graph data.
+- Slot isolation limited data corruption blast radius.
+
+Negative:
+
+- Two persistence systems increased build, packaging, and backup complexity.
+- KuzuDB introduced native runtime distribution risk.
+- The graph duplicated data Unreal already exposes through live systems.
+
+## Supersession
+
+ADR-018 removed KuzuDB from the active runtime and build graph. Current Sage
+project understanding is live-source-backed and editor-backed. Any future
+persistent index requires a new ADR.

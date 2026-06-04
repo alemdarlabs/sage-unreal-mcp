@@ -6,7 +6,7 @@ Make Sage usable on a fresh machine with one global npm install and one project 
 
 ```bash
 npm install -g @alemdarlabs/sage-mcp
-sage init D:\GameDev\Kale\Kale.uproject
+sage init <absolute-path-to-your-project.uproject>
 ```
 
 The user should not manually keep a server terminal open for normal MCP use.

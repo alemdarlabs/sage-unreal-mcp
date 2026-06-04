@@ -290,8 +290,9 @@ Bulk-renames every BP member variable whose FName is not a valid C++
 identifier into a sanitised form. Built-in algorithm (sage-side, no
 caller logic):
 
-1. Turkish transliteration (`ç`→`c`, `ğ`→`g`, `ı`→`i`, `İ`→`I`,
-   `ö`→`o`, `ş`→`s`, `ü`→`u` and uppercase pairs).
+1. Known Latin diacritic transliteration (for example `U+00E7 -> c`,
+   `U+011F -> g`, `U+0131 -> i`, `U+0130 -> I`, `U+00F6 -> o`,
+   `U+015F -> s`, `U+00FC -> u`, plus uppercase pairs).
 2. Replace any non-`[A-Za-z0-9_]` with `_`.
 3. Collapse runs of `_`.
 4. Trim leading/trailing `_`.
@@ -394,14 +395,14 @@ emits.
 |---|---|---|
 | `Variable 01 Black` | `Variable_01_Black` | spaces |
 | `100Damage` | `_100Damage` | number_prefix |
-| `Hız` | `Hiz` | transliteration |
+| `H\u0131z` | `Hiz` | transliteration |
 | `X-Position` | `X_Position` | special_chars |
 | `class` | `class_Var` | cpp_keyword |
 | `Speed (m/s)` | `Speed_m_s` | spaces, special_chars |
-| `🚀Rocket` | `Rocket` | non_ascii |
+| `\U0001F680Rocket` | `Rocket` | non_ascii |
 | `auto` | `auto_Var` | cpp_keyword |
 | `Damage(per sec)` | `Damage_per_sec` | spaces, special_chars |
-| `ÇokTürkçeBirÖrnekValue` | `CokTurkceBirOrnekValue` | transliteration |
+| `\u00C7okT\u00FCrkceBir\u00D6rnekValue` | `CokTurkceBirOrnekValue` | transliteration |
 
 Variables already valid C++ identifiers (`SimpleBool`, `bIsActive`,
 `IntArray`, `VectorStruct`, `FlightTypeEnum`, `ComponentObj`,
@@ -411,7 +412,7 @@ unchanged. Container types (`is_array=true`) and structured types
 
 **Naming rules in summary**:
 - C++ identifier regex: `^[A-Za-z_][A-Za-z0-9_]*$`
-- Non-ASCII: transliterated when Turkish, replaced with `_` otherwise
+- Non-ASCII: transliterated when a known mapping exists, replaced with `_` otherwise
 - C++ reserved words: 65+ keywords from the C++17/20/UE-namespaced set —
   `auto`, `class`, `register`, `template`, `operator`, `public`,
   `private`, `protected`, `friend`, `mutable`, `extern`, `constexpr`,

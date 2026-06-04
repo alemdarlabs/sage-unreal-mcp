@@ -1,66 +1,55 @@
-# ADR-014: Slot ID Hash — Blake3 over SHA-256
+# ADR-014: Slot ID Hash - Blake3
 
-**Tarih:** 2026-04-27
-**Durum:** Kabul Edildi (ADR-003 §1 hash algoritma seçimini supersede eder; bileşen seçimi değişmedi)
+**Date:** 2026-04-28
+**Status:** Accepted
+**Supersedes:** ADR-003 hash algorithm only
 
-## Bağlam
+## Context
 
-ADR-003 slot_id formülasyonunu `sha256(project_id || canonical_path || engine_major)` olarak tanımladı. Plugin scaffolding (Milestone 1.2) sırasında UE 5.7 source taraması yapıldı:
+ADR-003 originally specified SHA-256 for slot identity:
 
-- `Engine/Source/Runtime/Core/Public/Hash/`: **Blake3**, BuzHash, CityHash, Fnv, xxhash
-- `Engine/Source/Runtime/Core/Public/Misc/SecureHash.h`: SHA-1, MD5
-- **SHA-256 built-in olarak yok**
-
-Seçenekler:
-1. Public domain SHA-256 implementation embed (~200 LOC, audit + maintenance burden)
-2. External dep (vcpkg `picosha2`, OpenSSL)
-3. UE built-in cryptographic hash kullan: **Blake3**
-
-## Karar
-
-**Blake3 kullan.** Slot identity için kriptografik güç yeterli, UE built-in olduğu için plugin tarafı external dep'siz.
-
-### Gerekçe
-
-1. **UE built-in**: `Hash/Blake3.h` (`FBlake3`, `FBlake3Hash`) UE 5.x'te core modülünde mevcut. Plugin tarafı için sıfır external dependency, sıfır maintenance.
-2. **Cryptographic strength**: Blake3 modern cryptographic hash; 256-bit output, pre-image + collision resistance SHA-256 ile karşılaştırılabilir, BLAKE2 + Bao tabanlı, public review. Slot identity için fazlasıyla güçlü.
-3. **Performans**: Blake3 SHA-256'dan ~5-10x daha hızlı (single-threaded), SIMD-accelerated, parallelizable. Slot identity computation nadir ama hesaplama maliyeti gözle görülür şekilde düşer.
-4. **Server-side parity**: vcpkg `blake3` paketi mevcut; Phase 2'de server slot validasyonu gerekirse aynı algoritma minimal cost ile eklenir.
-5. **Embed yapmama gerekçesi**: "Public domain SHA-256 satır" gerçekte sıfır maintenance değil — endianness, edge case'ler, platform-specific SIMD tuning gerek. Built-in kullanmak idiomatic.
-
-### Slot ID Formula (ADR-003 §1 revizyonu)
-
-```
-slot_id = blake3(project_id || \x00 || canonical_path || \x00 || engine_major)
+```text
+sha256(project_id || canonical_path || engine_major)
 ```
 
-- `\x00` (null byte) bileşen separator → bileşen sınırı disambig (gelecekte bir bileşen `||` içerse çakışma olmasın)
-- 256-bit (32 byte) output → 64 char lowercase hex string
-- Input encoding: UTF-8 (`FTCHARToUTF8` UE plugin tarafında)
+During Unreal plugin scaffolding, UE 5.x source inspection showed that Blake3 is
+available through Unreal's built-in hash utilities.
 
-ADR-003'ün diğer kararları (component sources, duplicate ProjectID davranışı, synthetic fallback, project migration) bu kararla etkilenmedi.
+## Decision
 
-## Sonuçlar
+Use Blake3 for slot identity hashing:
 
-**Olumlu:**
-- Plugin tarafı sıfır external dep
-- Server tarafı (Phase 2) vcpkg üzerinden minimal cost ile parite sağlar
-- Daha hızlı identity hesaplama (low-impact ama free win)
-- UE built-in: ASan/UBSan altında valide edilmiş code
+```text
+slot_id = blake3(project_id || "\0" || canonical_path || "\0" || engine_major)
+```
 
-**Olumsuz:**
-- "Blake3" SHA-256 kadar yaygın değil; paydaşlar identification'ı açıklarken kısa not gerekir
-- ADR-003 metni güncellenmeli (supersede notu)
+Only the hash algorithm changes. ADR-003's identity components remain active.
 
-## Etkilenen Belgeler
+## Rationale
 
-- `docs/adr/adr-003-identity-model.md` — §1 başına supersede notu eklenecek
-- `plugin/Source/SageBridge/Private/Identity/SageSlotID.cpp` — Blake3 ile compute (Milestone 1.2)
-- (Phase 2) `server/src/identity/slot_id.cpp` — vcpkg `blake3` paketi ile
+1. Unreal provides Blake3 in engine code, so the plugin does not need an extra
+   hashing dependency.
+2. Blake3 provides modern cryptographic strength and a 256-bit output.
+3. It is faster than SHA-256 for this workload.
+4. vcpkg can provide server-side parity if needed.
+5. Using Unreal's built-in implementation avoids maintaining a bundled SHA-256
+   implementation.
 
-## Alternatifler Reddedilme Nedenleri
+## Consequences
 
-- **SHA-256 (public domain embed)**: 200 LOC + test gereksinimi + endian ele alma. Built-in mevcutsa embed gereksiz NIH.
-- **SHA-256 (external dep, e.g. picosha2)**: Plugin tarafı için ek dep zinciri (Build.cs ThirdParty integration). Built-in tercih edilir.
-- **OpenSSL EVP_sha256**: UE OpenSSL ile geliyor ama plugin tarafı OpenSSL header expose etmek için ekstra Build.cs uyarlaması; Blake3 daha temiz.
-- **SHA-1**: Cryptographic broken (collision saldırıları); identity için yeterli olsa da future-proof değil. Reject.
+Positive:
+
+- No external plugin dependency.
+- Faster identity hashing.
+- Clear parity path for the server.
+
+Negative:
+
+- Blake3 is less universally familiar than SHA-256.
+- Documentation must mention that ADR-014 supersedes only the algorithm in
+  ADR-003.
+
+## Notes
+
+Use `\0` between components to preserve unambiguous boundaries. Encode input as
+UTF-8 on the Unreal side.

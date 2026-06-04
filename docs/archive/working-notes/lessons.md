@@ -1,6 +1,6 @@
 # Lessons
 
-> Per CLAUDE.md §Self-Improvement Loop. Patterns observed during implementation
+> Historical self-improvement loop notes. Patterns observed during implementation
 > that should change future behavior.
 
 ## Polling on the agent side is a server-side missing-tool problem
@@ -137,7 +137,7 @@ gate that catches the variable-type-silent-degrade case.
 ## BP variable FNames are not C++ identifiers
 
 **Symptom**: `BP_ConversionTest` accepts `Variable 01 Black`, `100Damage`,
-`Hız`, `class`, `🚀Rocket`, `auto`, `Damage(per sec)` etc. as variable
+`H\u0131z`, `class`, `\U0001F680Rocket`, `auto`, `Damage(per sec)` etc. as variable
 FNames and compiles cleanly. The BP saves, the variable is settable from
 the editor, the value flows. None of those FNames are valid C++
 identifiers.
@@ -153,7 +153,7 @@ translation produced at C++-write time.
 **Rule**:
 - Sanitise the BP first. `bp.sanitize_variable_names dry_run=true`
   surfaces the mapping; `dry_run=false` applies it. The algorithm is
-  built into the tool — Turkish transliteration, non-ASCII strip, run
+  built into the tool: known diacritic transliteration, non-ASCII strip, run
   collapse, leading-digit fix, C++ keyword suffix, 128-char cap, and
   collision resolution by `_2`/`_3` suffixes.
 - Both `bp.rename_variable` and `bp.sanitize_variable_names` enforce
@@ -201,8 +201,8 @@ write paths you'd need most.
 ## Don't scope-cut for "MVP" reasons
 
 **Symptom**: Proposed Tier B as Blueprint-read-only "to fit a 1-week MVP",
-splitting read/write across phases. User pushed back: "bir daha bir MVP'ye
-sığdırmak için bir şey yapma, sana ne amk? Sen işini yap!"
+splitting read/write across phases. User pushed back hard: do not cut scope to
+fit an MVP; deliver the real feature.
 
 **Root**: Sage is a production system, not a sprint MVP. Splitting natural
 feature pairs (read/write, get/set, ingest/query) into separate phases to
@@ -884,54 +884,50 @@ on a tool predicate? If yes, do that. Source-side per-tool
 repetition is allowed only when the value differs per-tool (which
 schema-routing metadata never does).
 
-## C++ proje plugin install: dylib + Source/ ikisi birden gerek
+## C++ project plugin install: both binary and Source are required
 
-**Symptom**: SuperheroFlightAnimations bootstrap_module ile C++ projesine
-yükseltildikten sonra editor "could not compile plugin SageBridge" hatası
-verdi ve açılmadı. BP-only Kale'de aynı plugin (sadece dylib + uplugin) iyi
-çalışıyordu.
+**Symptom**: After SuperheroFlightAnimations was promoted to a C++ project with
+`bootstrap_module`, Unreal failed to open with "could not compile plugin
+SageBridge". The same plugin worked in a Blueprint-only project when only the
+binary and `.uplugin` were copied.
 
-**Root**: UE'nin "shipped plugin = sadece Binaries yeter" optimizasyonu
-yalnız BP-only projeler için çalışır. Proje C++ olunca (`.uproject` Modules
-array'i dolduğunda) UBT proje target'ı oluştururken bağlı plugin'leri de
-target ağacına alır ve onları **source'tan** rebuild eder. Plugin
-`.uplugin`'inde `Installed: true` olsa bile bu kural değişmez — Installed
-flag yalnız "Marketplace store" senaryosunu işaretler, UBT host-target
-build'ini etkilemez.
+**Root**: Unreal's "installed plugin binary is enough" behavior only holds for
+Blueprint-only projects. When a `.uproject` has a `Modules` array, UBT builds a
+host target and includes referenced plugins in the target graph. Those plugins
+are rebuilt from source even when their `.uplugin` has `Installed: true`.
 
-**Rule**: Per-project plugin install'ında her projeye **3 şey kopyalanmalı**:
+**Rule**: Per-project plugin install must copy all three parts:
 1. `<Project>/Plugins/SageBridge/SageBridge.uplugin`
-2. `<Project>/Plugins/SageBridge/Binaries/<Platform>/UnrealEditor-SageBridge.dylib` + `UnrealEditor.modules` (BP-only proje için yeter)
-3. `<Project>/Plugins/SageBridge/Source/` (C++ proje için + sürdürülebilir editor build için)
+2. `<Project>/Plugins/SageBridge/Binaries/<Platform>/UnrealEditor-SageBridge.*` plus `UnrealEditor.modules`
+3. `<Project>/Plugins/SageBridge/Source/`
 
-Source size ~1MB, ihmal edilebilir. BP-only projede Source/ olması zarar
-vermez (UE precompiled binary'i hâlâ görür ve kullanır), C++ projede
-mecburi. **Default: hep ikisini birden kopyala.**
+Source size is small and harmless in Blueprint-only projects, but mandatory for
+C++ host projects. Default to copying both binaries and source.
 
-**Apply**: `sage init` (npm-pkg phase) bu üçünü birden kopyalar; Mac/Linux
-için `cp -R Source` + `cp Binaries/Mac/*`. Dev döngüsünde dylib swap
-yaparken Source mismatch'i olmasın diye Source da güncel tutulmalı (rev
-mismatch UE compile fail eder).
+**Apply**: `sage init` must copy all three parts. Development binary swaps must
+also keep `Source/` current to avoid source/binary revision mismatch.
 
-**Engine plugin alternatifi**: `<UE>/Engine/Plugins/Marketplace/SageBridge/`
-altına engine-level kurulum hâlinde Source dahil her şey bir kez kurulur,
-tüm projeler paylaşır. Ama bu engine version başına ayrı kurulum gerektirir
-(5.4/5.5/5.6/5.7) — `sage init` per-project install'ı default tuttuğumuz
-için (ADR-016) Engine kurulumu opsiyonel "advanced install" path'i olarak
-ileride eklenir.
+**Engine plugin alternative**: An engine-level install under
+`<UE>/Engine/Plugins/Marketplace/SageBridge/` can install source and binaries
+once per engine version. Because ADR-016 keeps per-project install as the
+default, engine-level install should remain an advanced path.
 
-## Sage build: raw PowerShell değil wrapper kullan
+## Sage build: use wrappers instead of raw PowerShell
 
-**Symptom**: Codex ham PowerShell session'ında `cmake --build` çalıştırınca Ninja sessiz/idle kaldı; `cl.exe` spawn/output görünmedi ve build dakikalarca ilerlemedi.
+**Symptom**: Running `cmake --build` from a raw PowerShell session left Ninja
+apparently idle. `cl.exe` did not show compile output for minutes.
 
-**Root**: MSVC toolchain yalnız `cl.exe` path'inden ibaret değil. `INCLUDE`, `LIB`, `LIBPATH` vcvars64.bat ile parent PowerShell session'ına yüklenmezse CMake/Ninja cached compiler path'i görse bile compile/link ortamı eksik kalır. `$env:VCPKG_ROOT` tek başına yeterli değil.
+**Root**: The MSVC toolchain is not only `cl.exe` on PATH. `INCLUDE`, `LIB`, and
+`LIBPATH` must be loaded into the same process environment through vcvars. A
+cached compiler path and `$env:VCPKG_ROOT` are not enough.
 
 **Rule**:
-- Server build için raw `cmake --build` çağırma; `scripts\build-server.ps1` kullan.
-- Server + plugin için `scripts\build-all.ps1` kullan.
-- Direkt `ninja` veya `cl.exe` çağırma; yalnız build-system debug istenirse istisna.
-- Wrapper'lar `scripts\dev-shell.ps1` dot-source ederek vcvars ortamını aynı process'te yükler.
-- Hedef executable `sage-server`; `sage-tools` sadece static lib.
+- Use `scripts\build-server.ps1` for server builds.
+- Use `scripts\build-all.ps1` for server plus plugin builds.
+- Do not call `ninja` or `cl.exe` directly unless debugging the build system.
+- Wrappers dot-source `scripts\dev-shell.ps1` so the vcvars environment is
+  loaded into the same process.
+- The executable target is `sage-server`; `sage-tools` is a static library.
 
 **Apply**:
 ```powershell
@@ -940,106 +936,178 @@ ileride eklenir.
 .\scripts\build-all.ps1 -SkipServer
 ```
 
-## AnimBlueprint transition rule: string değil K2 graph yaz
+## AnimBlueprint transition rules: write K2 graphs, not strings
 
-**Symptom**: `animation.set_transition_rule` sadece açıklamada vardı; transition `BoundGraph` içinde `bCanEnterTransition` pin'i gerçek producer node'a bağlı olmadığı için state-machine transition'ları compile/runtime açısından güvenilir değildi.
+**Symptom**: `animation.set_transition_rule` existed only as a description.
+The transition `BoundGraph` did not connect `bCanEnterTransition` to a real
+producer node, so state-machine transitions were unreliable at compile and
+runtime.
 
-**Root**: AnimBlueprint transition rule bir string/default-value alanı değil. UE compiler `UAnimationTransitionGraph` içindeki `UAnimGraphNode_TransitionResult::bCanEnterTransition` input'unun K2 node graph ile beslenmesini bekler.
+**Root**: An AnimBlueprint transition rule is not a string/default-value field.
+The compiler expects the `UAnimGraphNode_TransitionResult::bCanEnterTransition`
+input inside the `UAnimationTransitionGraph` to be driven by a K2 node graph.
 
 **Rule**:
-- Literal bile olsa `bCanEnterTransition` default value set edilmemeli; gerçek bool output pin'i bağlanmalı.
-- Complex expression önce typed/structured AST olarak modellenmeli; string shorthand bunun üstüne convenience parser olmalı.
-- Desteklenen expression subset'i güvenli K2 node üretimiyle sınırlı tutulmalı: variable get, numeric compare, bool equality, string/name equality, AND/OR/NOT.
-- Rule graph rewrite transaction içinde yapılmalı, eski non-result node'lar temizlenmeli ve Blueprint structurally modified işaretlenmeli.
+- Do not set `bCanEnterTransition` as a default value, even for literals. Wire a
+  real bool output pin.
+- Model complex expressions as a typed/structured AST first. String shorthand
+  is only a convenience parser on top.
+- Limit the supported expression subset to safe K2 generation: variable get,
+  numeric compare, bool equality, string/name equality, AND, OR, and NOT.
+- Rewrite the rule graph inside a transaction, clean old non-result nodes, and
+  mark the Blueprint structurally modified.
 
-**Apply**: `animation.set_transition_rule` artık string shorthand (`Speed > 10 && bGrounded`) ve JSON AST (`{ "and": [...] }`) kabul eder; `animation.read_transition_rule` ile `bCanEnterTransition.linked_nodes[]` doğrulanır.
+**Apply**: `animation.set_transition_rule` accepts string shorthand
+(`Speed > 10 && bGrounded`) and JSON AST (`{ "and": [...] }`). Verify with
+`animation.read_transition_rule` and `bCanEnterTransition.linked_nodes[]`.
 
 ## SageBridge default project deploy targets
 
-**Rule**: Mahmut'un bu repo için "deploy et" talebi varsayılan olarak iki projeye gider:
-- `D:\Steamworks\Lyra\Plugins\SageBridge`
-- `D:\Steamworks\HeroFlight\Plugins\SageBridge`
+**Rule**: Historical shorthand deploy requests in this repository targeted the
+local Lyra and HeroFlight development projects. Treat these as historical notes,
+not public defaults.
 
-**Deploy source**: `D:\Steamworks\sage-unreal-mcp\build\plugin`
+**Deploy source**: `build\plugin`
 
 **Copy set**:
 1. `SageBridge.uplugin`
 2. `Binaries\Win64\*`
-3. `Source\` tamamı
+3. Entire `Source\`
 
-**Safety**: Önce `UnrealEditor` process yok mu kontrol et. Editor açıksa DLL/source üstüne yazma; kullanıcı hot-swap riskini açıkça onaylamadıkça bekle. Dış proje klasörleri sandbox dışı olduğundan gerekirse escalated shell kullan.
+**Safety**: Check that `UnrealEditor` is not running before writing DLLs or
+source over a target project. If the editor is open, wait unless the user
+explicitly accepts hot-swap risk.
 
-## UE 5.7 AnimGraph exposed input binding yolu
+## UE 5.7 AnimGraph exposed input binding path
 
-**Rule**: AnimGraph node runtime variable binding için deprecated `PropertyBindings_DEPRECATED` alanına yazma. UE 5.7 canonical path, node üzerindeki instanced binding objesinin `PropertyBindings` map'ine `FAnimGraphNodePropertyBinding` eklemek ve source path'i `IPropertyAccessEditor` ile resolve/validate etmektir.
+**Rule**: Do not write deprecated `PropertyBindings_DEPRECATED` for AnimGraph
+node runtime variable binding. The UE 5.7 canonical path is to add an
+`FAnimGraphNodePropertyBinding` to the instanced binding object's
+`PropertyBindings` map and resolve/validate the source path through
+`IPropertyAccessEditor`.
 
 **Apply**:
-- Target property önce `UAnimGraphNode_Base::GetPinProperty(PropertyName)` ile doğrulanır.
-- Source path `SkeletonGeneratedClass` üzerinden `ResolvePropertyAccess` ile çözülür.
-- Type uyumu `GetPropertyCompatibility` ile kontrol edilir; incompatible binding asset'e yazılmaz.
-- Optional input pin varsa `SetPinVisibility(true, OptionalPinIndex)` ile expose edilir, sonra pin linkleri kırılır.
-- Binding sonrası node `ReconstructNode()` edilir ve Blueprint structurally modified işaretlenir.
-- Debug için `animation.read_anim_node_properties` ile pin görünürlüğü, link count ve binding listesi okunur.
+- Validate the target property with `UAnimGraphNode_Base::GetPinProperty(PropertyName)`.
+- Resolve the source path from `SkeletonGeneratedClass` with `ResolvePropertyAccess`.
+- Check type compatibility with `GetPropertyCompatibility`; do not write
+  incompatible bindings.
+- If an optional input pin exists, expose it with
+  `SetPinVisibility(true, OptionalPinIndex)`, then break old pin links.
+- After binding, call `ReconstructNode()` and mark the Blueprint structurally
+  modified.
+- Debug with `animation.read_anim_node_properties` for pin visibility, link
+  count, and binding list.
 
-## EGraphRemoveFlags namespace-plain enum: bitwise OR int döner
+## EGraphRemoveFlags namespace plain enum: bitwise OR returns int
 
-**Symptom**: `FBlueprintEditorUtils::RemoveGraph(BP, Graph, EGraphRemoveFlags::Recompile | EGraphRemoveFlags::MarkTransient)` 2026-05-06 Cluster G real impl build'inde compile error verdi:
+**Symptom**: This call failed to compile during the Cluster G implementation:
+
+```cpp
+FBlueprintEditorUtils::RemoveGraph(
+    BP,
+    Graph,
+    EGraphRemoveFlags::Recompile | EGraphRemoveFlags::MarkTransient);
 ```
+
+Compiler error:
+
+```text
 error C2664: cannot convert argument 3 from 'int' to 'EGraphRemoveFlags::Type'
 note: Conversion to enumeration type requires an explicit cast
 ```
 
-**Root**: `EGraphRemoveFlags` namespace içinde **plain enum** (UE 5.7 `Kismet2/BlueprintEditorUtils.h:448`). Plain enum'da bitwise OR int döner; namespace-scoped `Type` enum'una implicit conversion yok. Bu modern `enum class` davranışı değil — UE'nin C++03-uyumlu eski enum pattern'i.
+**Root**: `EGraphRemoveFlags` is a namespace-scoped plain enum in UE 5.7
+(`Kismet2/BlueprintEditorUtils.h`). Bitwise OR on plain enum values returns
+`int`, not `EGraphRemoveFlags::Type`. This is Unreal's older C++03-compatible
+enum pattern, not modern `enum class` behavior.
 
-**Rule**: UE'de `EGraphRemoveFlags::Default` zaten `Recompile | MarkTransient` kombinasyonunu temsil eder — onu kullan. İstisnai bir kombo gerekirse `static_cast<EGraphRemoveFlags::Type>(Recompile | MarkTransient)` yaz.
+**Rule**: Use `EGraphRemoveFlags::Default`, which already represents
+`Recompile | MarkTransient`. If an unusual combination is required, cast
+explicitly to `EGraphRemoveFlags::Type`.
 
-**How to apply**: Yeni UE namespace-enum API'si gördüğünde önce header'a bak:
-- `enum class Foo` (modern) → bitwise OR enum dönmüyor (sadece operator overload varsa).
-- `namespace EFoo { enum Type { ... } }` (eski UE) → bitwise OR int döner; pre-defined kombolar (Default, All, vs.) varsa onları kullan.
+**How to apply**: When using a new Unreal namespace enum API, inspect the
+header first:
+- `enum class Foo`: bitwise OR returns an enum only if overloads exist.
+- `namespace EFoo { enum Type { ... } }`: bitwise OR returns `int`; use
+  predefined combinations such as `Default` or `All` when available.
 
-## UAnimGraphNode_LinkedAnimLayer: Interface + Layer önce, ReconstructNode sonra
+## UAnimGraphNode_LinkedAnimLayer: set Interface and Layer before ReconstructNode
 
-**Symptom**: Cluster G `add_linked_anim_layer_node` ilk taslakta UAnimGraphNode_LinkedAnimLayer spawn ediliyor, sonra `Node->Node.Interface` set ediliyor, ardından manuel pin allocate deneniyordu — pose pin'leri eksik geliyordu.
+**Symptom**: The first Cluster G draft spawned `UAnimGraphNode_LinkedAnimLayer`,
+then set `Node->Node.Interface`, then tried to allocate pins manually. Pose pins
+were missing.
 
-**Rule**: UAnimGraphNode_LinkedAnimLayer canonical pipeline:
-1. `NewObject<UAnimGraphNode_LinkedAnimLayer>(AnimGraph)` + `CreateNewGuid()` + position + `AnimGraph->AddNode(...)`.
-2. **PostPlacedNewNode'dan ÖNCE** inner struct property'leri set:
-   - `Node->Node.Interface = UClass*` (anim layer interface BPGC, TSubclassOf<UAnimInstance>)
-   - `Node->Node.Layer = FName(LayerFunctionName)` (interface'in declared function adı)
-   - (opsiyonel) `Node->Node.InstanceClass = UClass*` (compile-time forced child class)
-3. `Node->PostPlacedNewNode()` → `Node->AllocateDefaultPins()` → `Node->ReconstructNode()`.
+**Rule**: Use the canonical pipeline:
+1. `NewObject<UAnimGraphNode_LinkedAnimLayer>(AnimGraph)` plus `CreateNewGuid()`,
+   position, and `AnimGraph->AddNode(...)`.
+2. Before `PostPlacedNewNode`, set inner struct properties:
+   - `Node->Node.Interface = UClass*`
+   - `Node->Node.Layer = FName(LayerFunctionName)`
+   - Optional: `Node->Node.InstanceClass = UClass*`
+3. Call `PostPlacedNewNode()`, `AllocateDefaultPins()`, and `ReconstructNode()`.
 
-`ReconstructNode` Interface UClass + Layer FName'i okuyup layer fonksiyonunun signature'ına göre InputPose / OutputPose pin'lerini ALLOCATE eder. Önceden set etmezsen pin set'i yanlış (boş) gelir; manuel `CreatePin` çağrıları schema mismatch yaratır.
+`ReconstructNode` reads the interface class and layer name, then allocates
+InputPose and OutputPose pins from the layer function signature. If the
+properties are not set first, the pin set is wrong. Manual `CreatePin` calls
+create schema mismatches.
 
-**How to apply**: Tüm `UAnimGraphNode_*` türevlerinde inner `FAnimNode_*` struct property'lerini PostPlacedNewNode öncesi set et. Pin allocation reflection-driven; struct property'leri pin signature'ı belirler.
+**How to apply**: For `UAnimGraphNode_*` types, set inner `FAnimNode_*` struct
+properties before `PostPlacedNewNode`. Pin allocation is reflection-driven.
 
-## Cluster G ALI factory: BPTYPE_Interface + AnimationGraphSchema duality
+## Cluster G ALI factory: BPTYPE_Interface plus AnimationGraphSchema
 
-**Rule**: Anim Layer Interface (ALI) = UAnimBlueprint + `BlueprintType = BPTYPE_Interface` + Skeleton ref + AnimationGraphSchema-bound function graphs. Plain `UInterface` mantığıyla karıştırma:
-- `UInterface` (regular BP interface) = method declarations only, no graph storage.
-- `UAnimLayerInterface` (BPTYPE_Interface UAnimBlueprint) = AnimGraph schema'lı declared functions; her function pose-output bir layer.
+**Rule**: An Anim Layer Interface is a `UAnimBlueprint` with
+`BlueprintType = BPTYPE_Interface`, a skeleton reference, and
+AnimationGraphSchema-bound function graphs. Do not treat it like a plain
+`UInterface`.
+
+- `UInterface`: regular Blueprint interface; method declarations only.
+- `UAnimLayerInterface`: interface-type `UAnimBlueprint`; declared functions
+  use AnimGraph schema and each pose-output function is a layer.
 
 **How to apply**:
-- ALI factory: `UAnimBlueprintFactory + TargetSkeleton + BlueprintType=BPTYPE_Interface`. Interface filter for anim layer: `IsChildOf(UAnimBlueprint) && BlueprintType==BPTYPE_Interface`.
-- Layer function declaration: `FBlueprintEditorUtils::CreateNewGraph(IfaceBP, FuncName, UEdGraph::StaticClass(), UAnimationGraphSchema::StaticClass())` + push to `IfaceBP->FunctionGraphs`.
-- Child override graph: aynı CreateNewGraph + push to **child BP'nin** `FBPInterfaceDescription::Graphs` (interface BP'nin değil — child-side override semantik).
-- `IfaceCls->ClassGeneratedBy` üzerinden `UAnimBlueprint*`'ya geri dön ve `BlueprintType==BPTYPE_Interface` doğrulayarak ALI tespiti yap.
+- ALI factory: `UAnimBlueprintFactory`, `TargetSkeleton`, and
+  `BlueprintType=BPTYPE_Interface`.
+- Layer declaration: `FBlueprintEditorUtils::CreateNewGraph(IfaceBP, FuncName,
+  UEdGraph::StaticClass(), UAnimationGraphSchema::StaticClass())`, then push to
+  `IfaceBP->FunctionGraphs`.
+- Child override graph: create the graph on the child Blueprint and push it to
+  the child Blueprint's `FBPInterfaceDescription::Graphs`, not to the interface
+  Blueprint.
+- Resolve ALI identity through `IfaceCls->ClassGeneratedBy`, cast back to
+  `UAnimBlueprint*`, and validate `BlueprintType==BPTYPE_Interface`.
 
-## Cross-cluster collection mismatch: spawn site != lookup site
+## Cross-cluster collection mismatch: spawn site is not lookup site
 
-**Symptom**: Lyra Sage Gap #25 (2026-05-06). Cluster G `add_layer_function_override` override graph'ı `BP->ImplementedInterfaces[<i>].Graphs` içine spawn ediyordu (canonical UE child-side semantic), ama Cluster A/D `ResolveAnimGraphTarget` resolver'ı sadece `BP->FunctionGraphs` + state machine sub-graph'larını arıyordu. Sonuç: Cluster G ile spawn edilen graph'lar fiziksel olarak BP'de var (Editor UI'da görünür), CDO'da node referansları doğru, ama Cluster A/D'nin `graph_name` lookup'ı bunları "graph not found" diye reddediyordu. Plus aynı collection blindspot'ı `bp.list_functions`, `animation.read_anim_blueprint`, `bp.list_graphs` (= `CollectAllGraphs`) → `bp.full_dump.functions[]`'a kadar zincirleme propagate oluyordu.
+**Symptom**: Lyra Sage Gap #25 (2026-05-06). Cluster G spawned layer override
+graphs into `BP->ImplementedInterfaces[<i>].Graphs`, which is canonical
+child-side UE behavior. Cluster A/D `ResolveAnimGraphTarget` searched only
+`BP->FunctionGraphs` plus state-machine subgraphs. The graphs existed in the
+Blueprint and appeared in the editor, but generic lookup returned "graph not
+found". The same blind spot propagated through `bp.list_functions`,
+`animation.read_anim_blueprint`, `bp.list_graphs`, and `bp.full_dump`.
 
-**Rule**: Yeni bir tool/cluster bir UE collection'a yazıyorsa, mevcut tool'ların bu collection'ı OKUYUP OKUMADIĞINI denetle. Spawn site ile lookup site farkı = silent regression. UBlueprint için graph collection'ları:
-- `BP->FunctionGraphs` (regular function bodies)
-- `BP->UbergraphPages` (event graph)
-- `BP->MacroGraphs` (macros)
-- `BP->DelegateSignatureGraphs` (event dispatchers)
-- `BP->ImplementedInterfaces[<i>].Graphs` (override functions per implemented interface)
-- State machine sub-graphs (içinde bound graph'lar)
-- Composite collapsed sub-graphs (`UK2Node_Composite::BoundGraph`, recursive)
+**Rule**: When a new tool writes to a UE collection, verify that existing read,
+lookup, list, dump, and mutation helpers also read that collection. Spawn-site
+and lookup-site mismatch is a silent regression.
+
+Blueprint graph collections include:
+
+- `BP->FunctionGraphs`
+- `BP->UbergraphPages`
+- `BP->MacroGraphs`
+- `BP->DelegateSignatureGraphs`
+- `BP->ImplementedInterfaces[<i>].Graphs`
+- State-machine subgraphs
+- Composite collapsed subgraphs such as `UK2Node_Composite::BoundGraph`
 
 **How to apply**:
-- Resolver/lookup helper'ları (`FindFunctionGraph`, `ResolveAnimGraphTarget`, `CollectAllGraphs`) hepsini kapsamalı; yeni collection eklenirse hepsi güncellenmeli.
-- List/dump tool'ları (`bp.list_functions`, `bp.list_graphs`, `read_anim_blueprint`, `bp.full_dump`) "kind" enum'una yeni türler eklemeli (örn. `interface_override`, `composite`) ve disambiguating field'ları (interface class adı, parent graph adı) sağlamalı — kullanıcı confusion riskini kapatır.
-- Yeni cluster eklerken integration test: spawn → list → resolve → mutate akışını **mevcut** generic tool'larla deneyip "graph not found" gibi hatalara bak. Cluster G v1'de bu adım atlanmıştı; Lyra Claude verify oturumunda Gap #25 olarak çıktı.
-- DRY: tek bir `IterateAllGraphs(BP, callback)` helper yaz, tüm consumer'lar onu kullansın. Yeni collection eklendiğinde tek nokta update.
+- Resolver helpers such as `FindFunctionGraph`, `ResolveAnimGraphTarget`, and
+  `CollectAllGraphs` must cover all graph collections.
+- List/dump tools must expose a `kind` value such as `interface_override` or
+  `composite` and include disambiguating fields like interface class and parent
+  graph.
+- New clusters need integration tests that run spawn, list, resolve, and mutate
+  through existing generic tools.
+- Prefer one `IterateAllGraphs(BP, callback)` helper so new collections are
+  added in one place.

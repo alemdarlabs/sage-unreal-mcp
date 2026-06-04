@@ -1,68 +1,85 @@
 # Sage Unreal MCP - Agent Guide
 
-Bu dosya repo içindeki canonical çalışma rehberidir. Eski hidden workspace yapısı kaldırıldı; kalıcı dokümanlar `docs/`, aktif skill tanımları `.agents/skills/` altındadır.
+This file is the canonical working guide for the repository. The old hidden
+workspace layout has been removed. Durable documentation lives under `docs/`;
+active Codex skill definitions live under `.agents/skills/`.
 
-## İletişim
+## Communication
 
-- Kullanıcıyla Türkçe konuş. Kod identifier'ları, komutlar, path'ler ve commit mesajları İngilizce kalabilir.
-- Kullanıcı özellikle "önce onay al" diyorsa dosya değiştirme, sadece plan ve gerekçe ver.
-- Kullanıcı "derleme yapma", "server başlatma" veya benzeri sınır koyarsa bu sınır kapalıdır; tekrar açılana kadar build/server/PIE başlatma.
-- Yapılan işin doğrulamasını ayrı söyle: dosya düzenleme, build, test, deploy, server health ve runtime proof aynı şey değildir.
+- Speak Turkish with the user unless they explicitly ask for another language.
+  Code identifiers, commands, paths, commit messages, and public documentation
+  can remain English.
+- If the user asks for approval before changes, do not edit files. Provide the
+  plan and rationale only.
+- If the user says not to build, start the server, launch PIE, or perform a
+  similar action, that boundary stays closed until the user explicitly reopens
+  it.
+- Report verification claims separately. File edits, build success, tests,
+  deployment, server health, and runtime proof are different facts.
 
-## Uzmanlık Yönlendirme
+## Skill Routing
 
-İşin baskın alanına göre mevcut `.agents/skills/` skill'lerinden en uygun olanı kullan. Eksik özel skill varsa kaynak kodu okuyarak aynı uzmanlık disipliniyle ilerle.
+Use the most relevant skill under `.agents/skills/` for the dominant domain of
+the task. If a specialized skill is missing, inspect source and proceed with the
+same discipline.
 
-| Alan | Öncelikli skill / yaklaşım |
+| Domain | Preferred skill or approach |
 |---|---|
-| Unreal C++ plugin, UCLASS, AssetRegistry, Slate, Live Coding | Source-backed Unreal inceleme; review için `code-review` |
-| C++23 server, CMake, vcpkg, paketleme | `devops-assistant`, gerekirse `code-review` |
-| MCP protocol, JSON-RPC, tool schema tasarımı | Kaynak + `knowledge-structuring` |
-| Tool parity, rakip repo kıyasları | `competitive-intelligence`, `deep-research-synthesizer` |
-| Docs, ADR, bilgi mimarisi | `knowledge-structuring`, `tone-style-enforcer`, `scqa-writing` |
-| CI/CD, release, npm dağıtımı | `devops-assistant` |
-| Güvenlik, auth, sandbox | Source-backed security review |
-| Test stratejisi ve regression riski | `code-review`, QA lens |
+| Unreal C++ plugin, UCLASS, AssetRegistry, Slate, Live Coding | Source-backed Unreal inspection; `code-review` for reviews |
+| C++23 server, CMake, vcpkg, packaging | `devops-assistant`; `code-review` when implementation risk matters |
+| MCP protocol, JSON-RPC, tool schema design | Source inspection plus `knowledge-structuring` |
+| Tool parity and competitor repository comparisons | `competitive-intelligence`, `deep-research-synthesizer` |
+| Documentation, ADRs, information architecture | `knowledge-structuring`, `tone-style-enforcer`, `scqa-writing` |
+| CI/CD, release, npm distribution | `devops-assistant` |
+| Security, auth, sandboxing | Source-backed security review |
+| Test strategy and regression risk | `code-review` with a QA lens |
 
-## Ürün Durumu
+## Product State
 
-Sage Unreal MCP, Unreal Engine için C++23 tabanlı bir MCP server ve `SageBridge` Unreal plugin'inden oluşur. Sistem artık KuzuDB tabanlı graph runtime kullanmaz; ADR-018 ile bu katman kaldırıldı. Project understanding tarafı live Unreal inspection, reflection, AssetRegistry, source search ve domain-specific diagnostics üzerinden ilerler.
+Sage Unreal MCP is a C++23 MCP server plus the `SageBridge` Unreal Editor
+plugin. The system no longer uses the KuzuDB-backed graph runtime; ADR-018
+removed that layer. Project understanding now comes from live Unreal
+inspection, reflection, AssetRegistry queries, source search, logs, and
+domain-specific diagnostics.
 
-Güncel audit komutu:
+Current source audit command:
 
 ```powershell
 .\scripts\audit-tools.ps1 -Json
 ```
 
-2026-06-04 kaynak audit sonucu:
+Current audit result, verified on 2026-06-05:
 
 - `server_tool_count`: 1243
 - `plugin_handler_count`: 1191
 - `plugin_without_schema`: 0
 - `schema_stub_count`: 0
 - `plugin_not_implemented_count`: 0
-- `schema_without_plugin`: sadece server-only `jobs.*` yönetim tool'ları
+- `schema_without_plugin`: server-only `jobs.*` management tools
 
-Repo public görünebilir, fakat bu açık kaynak lisansı anlamına gelmez. LICENSE dosyası yoksa kod için permissive kullanım hakkı varsayma. Dağıtım stratejisi npm-first binary paketleme + ileride runtime auth/license gate şeklindedir.
+The repository may be public, but that does not make it open source. Do not
+assume permissive usage rights unless a license explicitly grants them. The
+distribution model is npm-first binary packaging, with runtime authentication
+and licensing planned as a separate product layer.
 
-## Canonical Klasör Yapısı
+## Canonical Layout
 
 ```text
 sage-unreal-mcp/
 |-- .agents/                 # Codex skill definitions
-|-- .github/                 # CI / release workflows
+|-- .github/                 # CI and release workflows
 |-- docs/
 |   |-- adr/                 # Architectural Decision Records
 |   |-- architecture/        # Active architecture docs
 |   |-- engineering/         # API, build, project structure, pipelines
-|   |-- release/             # npm / binary distribution notes
+|   |-- release/             # npm and binary distribution notes
 |   |-- research/            # Reference parity and market research
 |   `-- archive/             # Historical notes, retired designs, gap logs
 |-- npm/                     # npm package wrapper and postinstall logic
 |-- plugin/                  # Unreal SageBridge plugin
 |-- scripts/                 # Build, package, smoke, audit helpers
 |-- server/                  # C++23 MCP server
-|-- tests/                   # Catch2 unit/integration tests
+|-- tests/                   # Catch2 unit and integration tests
 |-- AGENTS.md                # This file
 |-- README.md
 |-- BUILD.md
@@ -72,9 +89,11 @@ sage-unreal-mcp/
 `-- vcpkg.json
 ```
 
-Kök dizine geçici log, smoke output, debugger dump veya tek seferlik analiz dosyası bırakma. Bunlar `artifacts/`, `logs/`, işletim sistemi temp dizini veya build çıktısı altında kalmalı ve git'e girmemelidir.
+Do not leave temporary logs, smoke output, debugger dumps, or one-off analysis
+files in the repository root. Keep them under ignored artifact/log/temp/build
+locations.
 
-## Önemli Dokümanlar
+## Important Documents
 
 - [Architecture](docs/architecture/architecture.md)
 - [Tech Stack](docs/engineering/tech-stack.md)
@@ -87,11 +106,13 @@ Kök dizine geçici log, smoke output, debugger dump veya tek seferlik analiz do
 - [npm Distribution Plan](docs/release/npm-distribution-plan.md)
 - [Reference Tool Parity Research](docs/research/tool-parity/)
 
-Historical gap logs and old working notes live under `docs/archive/working-notes/`. Bunları aktif doğruluk kaynağı gibi kullanma; önce source ve audit scriptleriyle doğrula.
+Historical gap logs and old working notes live under
+`docs/archive/working-notes/`. Treat them as evidence, not current truth. Verify
+against source and audit scripts before acting on them.
 
-## Build ve Run
+## Build And Run
 
-Derleme komutları, kullanıcı açıkça istemediği sürece çalıştırılmaz.
+Do not run builds unless the user explicitly asks for them.
 
 ```powershell
 # Server
@@ -101,59 +122,72 @@ cmake --build --preset debug --target sage-server
 # Plugin package
 .\scripts\build-plugin.ps1
 
-# Tool audit, build gerektirmez
+# Tool audit; does not require a build
 .\scripts\audit-tools.ps1 -Json
 ```
 
-Server manuel debug için:
+Manual server debugging:
 
 ```powershell
-$env:SAGE_REPO_ROOT = "D:\Steamworks\sage-unreal-mcp"
-$env:SAGE_UE_ROOT = "C:\Program Files\Epic Games\UE_5.7"
+$env:SAGE_REPO_ROOT = (Get-Location).Path
+$env:SAGE_UE_ROOT = "<absolute-path-to-your-Unreal-Engine-install>"
 $env:SAGE_LOG_LEVEL = "info"
 .\build\debug\bin\sage-server.exe
 ```
 
-npm release hattı:
+npm release checks:
 
 ```powershell
 npm run package:assets
 npm run release:check
 ```
 
-GitHub Actions npm publish için `NPM_TOKEN` secret gerekir. Bu secret yoksa publish adımı fail-fast davranmalıdır. GitHub-hosted runner üzerinde Unreal Engine olmadığı için release workflow source `SageBridge` plugin asset paketler; `RunUAT BuildPlugin` sadece UE kurulu self-hosted Windows runner üzerinde yapılabilir.
+GitHub Actions npm publishing requires the `NPM_TOKEN` repository secret. If
+the secret is missing, the publish step should fail fast. GitHub-hosted Windows
+runners do not include Unreal Engine, so the hosted release workflow packages a
+source `SageBridge` plugin asset. Binary `RunUAT BuildPlugin` packaging requires
+a self-hosted Windows runner with Unreal Engine installed.
 
 ## Production Project Guard
 
-Gerçek Unreal projelerinde destructive op disiplini zorunludur:
+Destructive operations against real Unreal projects require discipline:
 
-- Major Blueprint mutation, reparent, delete veya conversion öncesi `bp.full_dump` al.
-- `confirmed:true` isteyen tool'larda kullanıcıdan explicit onay almadan ilerleme.
-- Production projede manuel `Remove-Item -Recurse`, plugin `Source/` wipe, `.uproject` Modules silme gibi işlemleri otomatik yapma.
-- Multi-editor ortamında `_editor` parametresini explicit ver.
-- Source control durumunu kontrol etmeden geniş mutation yapma.
-- Kale/HeroFlight gibi hedeflere deploy istendiğinde build, copy, enable ve hash doğrulama adımlarını ayrı ayrı raporla.
+- Take `bp.full_dump` before major Blueprint mutation, reparenting, deletion, or
+  conversion.
+- Do not proceed with tools that require `confirmed:true` until the user gives
+  explicit approval.
+- Do not automatically run manual recursive deletes, wipe plugin `Source/`, or
+  remove `.uproject` `Modules` entries in production projects.
+- Pass `_editor` explicitly in multi-editor workflows.
+- Check source control state before broad mutation.
+- When deployment is requested for target projects, report build, copy, enable,
+  and hash verification as separate steps.
 
 ## Engineering Rules
 
-- Önce gerçek kaynak dosyaları oku; eski notlara veya hafızaya tek başına güvenme.
-- Repo kirli olabilir. Kullanıcıya ait değişiklikleri revert etme.
-- Manuel dosya editlerinde `apply_patch` kullan. Mekanik taşıma/silme için native PowerShell veya git komutları kullanılabilir.
-- Windows'ta recursive delete/move öncesi path'in workspace içinde olduğunu doğrula.
-- Unreal editor mutation kodu GameThread'e marshal edilmeli.
-- MCP schema değişikliğinde `tools/list` ve `scripts/audit-tools.ps1` ile parity kontrolü yap.
-- C++ plugin deploy için üçlü kural geçerli: `.uplugin`, `Binaries/<Platform>/`, `Source/`.
-- Repo skill'leri Windows-first veya gerçek cross-platform olmalı; macOS-only tarifleri production workflow için canonical yazma.
-- Build/test çalıştıysa sonucu söyle; çalışmadıysa "çalıştırmadım" de.
+- Read real source files first. Do not rely on old notes or memory alone.
+- The repository may be dirty. Do not revert user-owned changes.
+- Use `apply_patch` for manual file edits. Native PowerShell or git commands
+  are acceptable for mechanical moves or deletes.
+- On Windows, verify recursive delete or move targets are inside the intended
+  workspace before executing.
+- Unreal editor mutation code must marshal to the Game Thread.
+- For MCP schema changes, verify parity with `tools/list` and
+  `scripts/audit-tools.ps1`.
+- C++ plugin deployment has a three-part rule: `.uplugin`,
+  `Binaries/<Platform>/`, and `Source/`.
+- Repository skills must be Windows-first or genuinely cross-platform. Do not
+  make macOS-only instructions canonical for production workflows.
+- If build or tests ran, report their result. If they did not run, say so.
 
-## Kapanış Kontrolü
+## Closeout Check
 
-Bir işi bitirmeden önce minimum kontrol:
+Minimum check before finishing a task:
 
 ```powershell
 git status --short
-rg -n "\.claude|\.Codex" README.md docs server plugin scripts npm --glob '!docs/archive/**' --glob '!build/**'
+rg --pcre2 --hidden -n "[\x{00E7}\x{011F}\x{0131}\x{00F6}\x{015F}\x{00FC}\x{00C7}\x{011E}\x{0130}\x{00D6}\x{015E}\x{00DC}]" -g "*.md" -g "*.txt" -g "!build/**" -g "!node_modules/**" -g "!.git/**"
 .\scripts\audit-tools.ps1 -Json
 ```
 
-Derleme sadece kullanıcı doğru zamanı söylediğinde yapılır.
+Builds run only when the user says it is the right time.

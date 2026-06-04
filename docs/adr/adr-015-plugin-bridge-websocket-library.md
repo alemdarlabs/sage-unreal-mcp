@@ -1,68 +1,49 @@
-# ADR-015: Plugin↔Server WebSocket Library — ixwebsocket
+# ADR-015: Plugin Bridge WebSocket Library - ixwebsocket
 
-**Tarih:** 2026-04-27
-**Durum:** Kabul Edildi (ADR-001 plugin bridge transport seçimini supersede eder)
+**Date:** 2026-04-28
+**Status:** Accepted
+**Supersedes:** ADR-001 plugin bridge library choice
 
-## Bağlam
+## Context
 
-ADR-001 plugin↔server bridge için **uWebSockets** kararı verdi (high-perf, async, libuv-based). Plugin Scaffolding (Milestone 1.2) sonrası bridge implementation aşamasında seçim yeniden değerlendirildi.
+ADR-001 initially favored uWebSockets for the server-to-plugin bridge. During
+bridge implementation, the team re-evaluated the choice against Sage's actual
+profile:
 
-Seçim kriterleri:
-- **Kullanım profili**: 1-N (tipik: 1-5) plugin instance, low-frequency tool dispatch (request-response). Yüksek concurrent throughput zorunluluğu yok.
-- **Sync vs async**: Tool dispatch protokol semantiği request-response (Claude → server → plugin → server → Claude). `std::promise<ToolResult>` + future pattern sync'e doğru kayıyor.
-- **Build complexity**: vcpkg manifest mode'da minimum dep yükü.
-- **Cross-platform**: Win64 + Mac (arm64+x64) + Linux first-class destekli.
+- Localhost-only traffic.
+- Request/response tool dispatch.
+- Low client count.
+- Cross-platform packaging.
+- Simple CMake/vcpkg integration.
 
-## Karar
+## Decision
 
-**ixwebsocket** kullan.
+Use `ixwebsocket` for the plugin bridge.
 
-### Gerekçe
+## Rationale
 
-1. **API ergonomi**: `ix::WebSocketServer` + `setOnClientMessageCallback` pattern'i 30-50 satır impl'e iniyor. uWebSockets'in template-heavy event loop binding'i + uSockets callback dance'ı tool dispatch sync future pattern'ine zıt.
-2. **Sync model match**: Sage tool dispatch inherently request-response. `std::promise<ToolResult>` + future await ile temiz, async event loop'un faydası yok bu profilde.
-3. **Cross-platform**: Win/macOS/Linux first-class; vcpkg `ixwebsocket` standart paket; OpenSSL/mbedTLS opsiyonel feature (`ixwebsocket[ssl]`).
-4. **Dep ağırlığı**: ~3000 LOC, self-contained. uWebSockets uSockets + libuv (transitive) zinciri çeker; binary size ve build time daha yüksek.
-5. **Future-proof**: Bottleneck oluşursa transport'ı interface ile abstract edip swap edilir; şimdi over-engineering.
-6. **ADR-013 ile tutarlı**: HTTP server için cpp-httplib (header-only, kullanım profiline göre right-size). Aynı disiplin bridge'e de uygulanıyor.
+1. Sage does not need a high-throughput public WebSocket server.
+2. The request/response model maps cleanly to promises/futures.
+3. Build and packaging integration is simpler than uWebSockets.
+4. vcpkg support is straightforward.
+5. The choice matches the right-size dependency discipline used by ADR-013.
 
-### Reddedilen Alternatifler
+## Consequences
 
-- **uWebSockets** (ADR-001 orijinal): Yüksek perf — Sage'in 1-N instance profilinde gereksiz. uSockets/libuv async runtime callback-heavy → sync future pattern ile mismatch. Build/binary footprint daha ağır.
-- **Boost.Beast**: Dev overhead büyük; idiomatic API yok; Boost transitive deps ağır.
-- **websocketpp**: Aktif değil (~2018'den beri stagnant), modern C++ bağlamında tercih edilmez.
+Positive:
 
-## Server-side Threading Model
+- Lower integration risk.
+- Simpler Windows/macOS/Linux packaging.
+- Cleaner synchronous request/response bridge code.
 
-- `ix::WebSocketServer::start()` async — kendi accept + per-connection worker thread'lerini açar.
-- HTTP+SSE transport (cpp-httplib) `listen()` ana thread'i bloklar.
-- Bridge ana thread'den önce `start()` ile başlatılır, HTTP listen sonrası durdurulur.
-- Bridge callback'leri ixwebsocket worker thread'lerinde koşar; shared state (session map) `std::mutex` ile korunur.
+Negative:
 
-## Wire Protocol (özet)
+- Lower theoretical throughput than uWebSockets.
+- The bridge still needs careful lifecycle and close-handling code.
+- The server owns the bridge thread lifecycle.
 
-JSON over WebSocket. Üst seviye envelope `type` field ile dispatch.
+## Implementation Notes
 
-**Plugin → Server:** `hello`, `heartbeat`, `tool_result`, `event`
-**Server → Plugin:** `welcome`, `heartbeat_ack`, `tool_call`, `error`
-
-Detay: `server/src/bridge/protocol.h`.
-
-## Sonuçlar
-
-**Olumlu:**
-- 30-100 LOC bridge implementation; vcpkg tek dep
-- Sync `std::promise<ToolResult>` pattern doğal eşleşme (Milestone 1.3b)
-- Cross-platform Windows/macOS/Linux out-of-the-box
-- Binary size küçük, build time düşük
-
-**Olumsuz:**
-- Yüksek concurrent load'da ixwebsocket thread-per-conn modelinin sınırı (~1k bağlantı). Sage'in 1-10 plugin senaryosunda iz bırakmaz; bottleneck olursa transport interface ile swap edilebilir.
-- Phase 1'de plain WS (localhost). Production hardening (TLS, auth) Phase 2'de `ixwebsocket[ssl]` ile aktif edilir.
-
-## Etkilenen Belgeler
-
-- `docs/engineering/tech-stack.md` — "WebSocket: uWebSockets" satırı `ixwebsocket` ile güncellenecek (ADR-015)
-- `vcpkg.json` — `ixwebsocket` dependency eklendi
-- `server/src/bridge/bridge_server.{h,cpp}` — ixwebsocket-based implementation
-- `server/CMakeLists.txt` — `sage-bridge` static lib + `find_package(ixwebsocket)`
+The bridge starts before the HTTP listener accepts MCP traffic and stops during
+server shutdown. Tool dispatch remains request/response oriented; event streams
+can be layered separately if needed.

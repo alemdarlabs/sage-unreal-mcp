@@ -70,13 +70,13 @@ Write-Output "forced UnrealEditor shutdown"
 Example:
 
 ```powershell
-.\close-unreal.ps1 -Project "D:\GameDev\Kale\Kale.uproject"
+.\close-unreal.ps1 -Project "<absolute-path-to-your-project.uproject>"
 ```
 
 Force close, only after explicit user approval:
 
 ```powershell
-.\close-unreal.ps1 -Project "D:\GameDev\Kale\Kale.uproject" -Force
+.\close-unreal.ps1 -Project "<absolute-path-to-your-project.uproject>" -Force
 ```
 
 ## macOS Fallback

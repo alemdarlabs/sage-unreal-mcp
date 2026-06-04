@@ -265,7 +265,7 @@ get_live_coding_status(_editor?) → {
 
 ## See Also
 
-- [Architecture](architecture.md) — system context
+- [Architecture](../architecture/architecture.md) — system context
 - [Transactions](transactions.md) — how tx interacts with LC
 - [ADR-001](../adr/adr-001-tech-stack.md) — engine version choice
 - [ADR-004 Multi-Editor](../adr/adr-004-multi-editor.md) — multi-editor compile coordination

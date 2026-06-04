@@ -1024,7 +1024,7 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="animation.set_linked_anim_layer",
-        .description="PIE/editor-preview runtime tool: call USkeletalMeshComponent::LinkAnimClassLayers / UnlinkAnimClassLayers on a live actor. `actor` is a PIE actor path/label/name; `layer_class` is a UAnimInstance subclass UClass path. `mesh_component` optional (defaults to first SkeletalMeshComponent). `mode` ∈ {'link','unlink'} (default 'link'); 'unlink' uses UnlinkAnimClassLayers. PIE world dışında editor preview-only warning döner ve hiçbir package dirty yapmaz. Use this to verify asset authoring drives the linked child class at runtime without packaging. Returns {actor, mesh, layer_class, linked, previous_layers[], mode, errors[], _warning?}.",
+        .description="PIE/editor-preview runtime tool: call USkeletalMeshComponent::LinkAnimClassLayers / UnlinkAnimClassLayers on a live actor. `actor` is a PIE actor path/label/name; `layer_class` is a UAnimInstance subclass UClass path. `mesh_component` optional (defaults to first SkeletalMeshComponent). `mode` in {'link','unlink'} (default 'link'); 'unlink' uses UnlinkAnimClassLayers. Outside PIE, the tool returns an editor-preview-only warning and does not dirty any package. Use this to verify asset authoring drives the linked child class at runtime without packaging. Returns {actor, mesh, layer_class, linked, previous_layers[], mode, errors[], _warning?}.",
         .inputSchema=obj({{"actor",str()},{"layer_class",str()},{"mesh_component",str()},{"mode",str()}},{"actor","layer_class"}),
         .handler=nullptr,.remote=true});
 
@@ -3749,10 +3749,10 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
                      "escapes outside the project are rejected. Defaults: "
                      "include_function_graphs=true, include_referenced_assets=true, "
                      "include_component_defaults=true, include_t3d=false. "
-                     "Designed as a destructive-change safety net — capture "
-                     "before BP→C++ conversion / delete / restructure, diff or "
-                     "audit afterward. Cevap schema_version='1' + captured_at "
-                     "(ISO8601) içerir.",
+                     "Designed as a destructive-change safety net: capture "
+                     "before Blueprint-to-C++ conversion, deletion, or restructuring, "
+                     "then diff or audit afterward. Response includes "
+                     "schema_version='1' and captured_at (ISO8601).",
         .inputSchema=obj({{"path",str()},
                           {"output_path",str()},
                           {"include_function_graphs",bln()},

@@ -1,59 +1,66 @@
-# ADR-003: Slot Identity Model
+# ADR-003: Project Identity Model
 
-**Tarih:** 2026-04-27
-**Durum:** Kabul Edildi
+**Date:** 2026-04-27
+**Status:** Accepted
+**Updated by:** ADR-014, ADR-018
 
-## Bağlam
+## Context
 
-Multi-editor desteği şu senaryoları cevaplamak zorunda:
+Multi-editor support must distinguish these cases:
 
-- Aynı projenin 2 instance'ı açık (host/client multiplayer test)
-- Aynı projenin 2 kopyası farklı path'lerde (backup, git worktree, sample fork)
-- Aynı isimli farklı projeler (collision)
-- Aynı proje farklı engine version'larda (5.4 + 5.5)
-- Proje taşındığında ID stable kalmalı veya migration prompt vermeli
+- Two instances of the same project are open for host/client testing.
+- Two copies of the same project exist at different paths.
+- Different projects share the same display name.
+- The same project is opened with different Unreal Engine versions.
+- A project is moved and should either keep identity or trigger a migration
+  prompt.
 
-Naif "proje adı" identity collision yapar; "tam path" taşımada kırılır; "ProjectID" klonlamada blind.
+Naive project-name identity collides. Full-path identity breaks when a project
+moves. ProjectID-only identity can merge clones incorrectly.
 
-## Kararlar
+## Decision
 
-### 1. Slot ID Formula
-> **Hash algoritması ADR-014 ile Blake3'e revize edildi** (UE built-in, performans). Bileşen kompozisyonu aşağıda olduğu gibi kalır.
+Use a composite slot identifier:
 
-**Karar:** `slot_id = blake3(project_id || \x00 || canonical_path || \x00 || engine_major)`  (orijinal: `sha256(...)`, ADR-014 ile değiştirildi)
-**Alternatifler:** project_id alone, canonical_path alone, hybrid (project_id + path)
-**Gerekçe:** Üç bileşen birleşince tüm gözlemlenen senaryolar doğru çözülür: aynı proje 2 instance → aynı slot; klon → ayrı slot; isim collision → ayrı slot (ProjectID farklı); engine version bump → ayrı slot (reflection metadata uyumsuz).
+```text
+slot_id = blake3(project_id || "\0" || canonical_path || "\0" || engine_major)
+```
 
-### 2. Component Sources
-**Karar:**
-- `project_id`: Unreal'ın `DefaultGame.ini` `[GeneralProjectSettings] ProjectID` GUID'i
-- `canonical_path`: `realpath()` + case-normalized + symlink resolved
-- `engine_major`: `"5.4"`, `"5.5"` (minor version'ları yok say)
+ADR-014 replaced the original SHA-256 algorithm with Blake3. The component
+model remains unchanged.
 
-**Gerekçe:** Project ID engine'in kendi GUID'i, stable + unique-by-default. Canonical path platform fragmantation'unu önler (Windows case-insensitive, macOS APFS case-sensitive). Engine major reflection ABI breaks'ini ayırır.
+Inputs:
 
-### 3. Duplicate ProjectID Davranışı
-**Karar:** Default **separate slots**, opt-in `merge_slots(source, target)` ile birleştir
-**Alternatifler:** Default merge
-**Gerekçe:** Yanlış merge → data corruption (irreversible); yanlış separate → 2x storage (reversible). Safe by default, explicit by intent.
+- `project_id`: Unreal `[GeneralProjectSettings] ProjectID`.
+- `canonical_path`: platform-normalized project path.
+- `engine_major`: major engine version family, such as `5.4` or `5.5`.
 
-### 4. Synthetic ID Fallback
-**Karar:** ProjectID yoksa kullanıcıya prompt; reddederse `synthetic:sha256(canonical_path + engine_major)`. Synthetic slot flagged.
-**Alternatifler:** Sessizce GUID üret ve `.ini`'ye yaz, fail
-**Gerekçe:** `.ini` değişimi source control'da görünür, sürpriz olmamalı. Synthetic flag engine_major değişiminde re-index tetikler.
+## Additional Rules
 
-### 5. Project Migration
-**Karar:** Path değişiminde otomatik orphan, server detect → "migrate?" prompt
-**Alternatifler:** Otomatik migrate, hiçbir şey yapma
-**Gerekçe:** Otomatik migrate yanlış pozitif riski (klonlamayı taşıma sanmak). Prompt kullanıcı niyetini doğrular.
+- Duplicate ProjectID defaults to separate slots. Explicit merge remains a user
+  action.
+- Missing ProjectID triggers a user-facing prompt. If the user declines to write
+  a ProjectID, Sage can use a synthetic path-based identity and mark it as
+  synthetic.
+- Path changes create an orphan candidate and should prompt for migration.
+  Automatic migration is unsafe because clones can look like moves.
 
-## Sonuçlar
+## Consequences
 
-**Olumlu:**
-- Tüm gözlemlenen multi-editor senaryoları temiz çözülür
-- Data isolation by default
-- Engine version değişikliklerinde data corruption önlenir
+Positive:
 
-**Olumsuz:**
-- 2x storage maliyeti gerçekten paylaşılması gereken klonlarda (`merge_slots` ile çözülür)
-- Synthetic ID tracking ek complexity
+- Multi-editor cases are distinguishable.
+- Engine version changes do not silently corrupt metadata.
+- Clone and move behavior is explicit.
+
+Negative:
+
+- Real shared clones may consume duplicate storage until explicitly merged.
+- Synthetic identities require re-index or refresh behavior when project paths
+  change.
+
+## Current Status
+
+The KuzuDB graph slot storage originally associated with this model was removed
+by ADR-018. The identity model still applies to editor routing, project
+disambiguation, and any future persistent project metadata.

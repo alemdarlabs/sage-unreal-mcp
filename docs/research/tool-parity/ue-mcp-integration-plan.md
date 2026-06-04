@@ -1,12 +1,12 @@
-# UE-MCP → Sage Integration Roadmap
+# UE-MCP to Sage Integration Roadmap
 
-> **Source:** `/Users/mahmutalemdar/Developer/alemdarlabs/ue-mcp` (TypeScript MCP server + C++ plugin, 448 distinct actions, BUSL-1.1 → Apache after 4 yr).
-> **Target:** Sage Unreal MCP — **443 tool handler · Phase 4 COMPLETE (2026-04-28)**
-> **Parity:** 445 / 448 (%99.3) — 3 N/A (feedback.submit, demo.step, demo.cleanup)
-> **Strategy (doğrulandı):** Full feature parity per subsystem. Read+write birlikte shipped. Scope cut yapılmadı.
+> **Source:** local reference clone of `db-lyon/ue-mcp` (TypeScript MCP server + C++ plugin, 448 distinct actions, BUSL-1.1 to Apache after 4 years).
+> **Target:** Sage Unreal MCP - **443 tool handler - Phase 4 COMPLETE (2026-04-28)**
+> **Parity:** 445 / 448 (%99.3) - 3 N/A (feedback.submit, demo.step, demo.cleanup)
+> **Strategy (validated):** Full feature parity per subsystem. Read and write shipped together. Scope was not cut.
 
-> **NOT:** Bu belge entegrasyon planını kayıt altına alır. Plan tamamlanmıştır.
-> Güncel coverage detayı için bkz. [`ue-mcp-tasks.md`](ue-mcp-tasks.md).
+> **Note:** This document records the integration plan. The plan is complete.
+> For current coverage detail, see [`ue-mcp-tasks.md`](ue-mcp-tasks.md).
 
 ---
 

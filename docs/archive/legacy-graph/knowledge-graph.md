@@ -43,6 +43,6 @@ A future project-understanding layer is allowed, but it needs a new ADR. The def
 
 ## See Also
 
-- [ADR-018: Remove KuzuDB Graph Layer](../decisions/adr-018-remove-kuzudb-graph-layer.md)
-- [Architecture](architecture.md)
-- [API Spec](api-spec.md)
+- [ADR-018: Remove KuzuDB Graph Layer](../../adr/adr-018-remove-kuzudb-graph-layer.md)
+- [Architecture](../../architecture/architecture.md)
+- [API Spec](../../engineering/api-spec.md)

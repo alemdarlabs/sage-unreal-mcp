@@ -1190,21 +1190,19 @@ FSageToolDispatch::FOutcome BpRenameVariableImpl(const TSharedPtr<FJsonObject>& 
 
 namespace
 {
-    // Map upper+lower Turkish letters to their ASCII fold. We deliberately do
-    // not map 'ı' to 'I' (that would collide Turkish dotless-i with English I)
-    // — instead 'ı'/'İ' both fold to 'i'/'I' and the originals are visually
-    // marked in the meta DisplayName.
+    // Map locale-specific Latin letters to their ASCII fold. Dotless-i folds to
+    // lower-case i to avoid colliding with English uppercase I.
     static const TMap<TCHAR, TCHAR>& GetTurkishFold()
     {
         static TMap<TCHAR, TCHAR> M;
         if (M.Num() == 0)
         {
-            M.Add(TEXT('ç'), TEXT('c')); M.Add(TEXT('Ç'), TEXT('C'));
-            M.Add(TEXT('ğ'), TEXT('g')); M.Add(TEXT('Ğ'), TEXT('G'));
-            M.Add(TEXT('ı'), TEXT('i')); M.Add(TEXT('İ'), TEXT('I'));
-            M.Add(TEXT('ö'), TEXT('o')); M.Add(TEXT('Ö'), TEXT('O'));
-            M.Add(TEXT('ş'), TEXT('s')); M.Add(TEXT('Ş'), TEXT('S'));
-            M.Add(TEXT('ü'), TEXT('u')); M.Add(TEXT('Ü'), TEXT('U'));
+            M.Add(TEXT('\u00E7'), TEXT('c')); M.Add(TEXT('\u00C7'), TEXT('C'));
+            M.Add(TEXT('\u011F'), TEXT('g')); M.Add(TEXT('\u011E'), TEXT('G'));
+            M.Add(TEXT('\u0131'), TEXT('i')); M.Add(TEXT('\u0130'), TEXT('I'));
+            M.Add(TEXT('\u00F6'), TEXT('o')); M.Add(TEXT('\u00D6'), TEXT('O'));
+            M.Add(TEXT('\u015F'), TEXT('s')); M.Add(TEXT('\u015E'), TEXT('S'));
+            M.Add(TEXT('\u00FC'), TEXT('u')); M.Add(TEXT('\u00DC'), TEXT('U'));
         }
         return M;
     }
@@ -6555,14 +6553,15 @@ FSageToolDispatch::FOutcome BpSetActorTickSettingsImpl(const TSharedPtr<FJsonObj
 
 // ---- bp.full_dump  (Phase 5 / Gap #6) ----------------------------------------
 //
-// Atomik snapshot: BP'nin tüm state'ini tek çağrıda toplar (header, variables,
-// components+defaults, functions+graphs+params+locals, event_dispatchers,
-// interfaces, cdo_properties, dependencies, optional T3D). Conversion-öncesi
-// audit/restore reference için. Çağrı zaten game thread'de (GT wrapper),
-// alt-impl'lere direct çağrı yapılır — double-marshalling yok.
+// Atomic snapshot: collect the full Blueprint state in one call (header,
+// variables, components+defaults, functions+graphs+params+locals,
+// event_dispatchers, interfaces, cdo_properties, dependencies, optional T3D).
+// This is a pre-conversion audit/restore reference. The call already runs on
+// the game thread through the GT wrapper, so sub-implementations are invoked
+// directly without double-marshalling.
 //
-// output_path verilirse JSON dosyaya yazılır; project-relative kabul edilir
-// (FPaths::ProjectDir() altında resolve), absolute path da kabul edilir.
+// When output_path is provided, JSON is written to disk. Project-relative paths
+// resolve under FPaths::ProjectDir(); absolute paths are also accepted.
 
 FSageToolDispatch::FOutcome BpFullDumpImpl(const TSharedPtr<FJsonObject>& Args)
 {
