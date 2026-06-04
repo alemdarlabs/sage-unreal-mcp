@@ -27,7 +27,7 @@ public:
     {
         FString Url{TEXT("ws://127.0.0.1:7778/bridge")};
         float InitialReconnectDelaySeconds = 1.0f;
-        float MaxReconnectDelaySeconds     = 30.0f;
+        float MaxReconnectDelaySeconds     = 5.0f;
         float HeartbeatIntervalSeconds     = 15.0f;
         bool  bAutoReconnect               = true;
     };

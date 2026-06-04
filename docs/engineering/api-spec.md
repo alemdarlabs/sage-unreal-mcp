@@ -63,7 +63,7 @@ which is the deterministic blocking-tool path.
 - **Endpoint**: `ws://localhost:<port>/bridge`
 - **Default port**: 7778 (configurable via `SAGE_WS_PORT`)
 - **Envelope**: JSON-RPC 2.0
-- **Resilience**: Plugin reconnects with exponential backoff (initial 1s, max 30s)
+- **Resilience**: Plugin reconnects with exponential backoff (initial 1s, max 5s)
 - **Heartbeat**: Plugin → server every 15s; server marks lost after 30s silence
 
 ### Handshake (plugin → server)

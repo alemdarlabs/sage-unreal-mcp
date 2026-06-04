@@ -28,8 +28,8 @@ public:
 
     /** Reconnect delay ceiling (s). */
     UPROPERTY(EditAnywhere, Config, Category = "Connection",
-              meta = (ClampMin = "5.0", ClampMax = "300.0"))
-    float MaxReconnectDelaySeconds = 30.0f;
+              meta = (ClampMin = "1.0", ClampMax = "60.0"))
+    float MaxReconnectDelaySeconds = 5.0f;
 
     /** Heartbeat ping cadence (s). Server marks connection lost after 2x missed beats. */
     UPROPERTY(EditAnywhere, Config, Category = "Connection",

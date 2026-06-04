@@ -101,7 +101,7 @@ def main() -> int:
         wait_seconds = 45
     else:
         print(f"[editor] reusing already-running editor (plugin should reconnect)")
-        wait_seconds = 60  # plugin backoff might be at the 30s cap
+        wait_seconds = 20  # plugin backoff should stay near the 5s cap
 
     # wait for plugin
     print(f"[wait] plugin handshake (up to {wait_seconds}s)...")
