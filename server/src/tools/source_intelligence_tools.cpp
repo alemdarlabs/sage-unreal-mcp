@@ -60,11 +60,6 @@ ToolResult invalid(std::string detail) {
         sage::mcp::ErrorCode::InvalidParams, std::move(detail)));
 }
 
-ToolResult internal(std::string detail) {
-    return std::unexpected(sage::mcp::ErrorObject::fromCode(
-        sage::mcp::ErrorCode::InternalError, std::move(detail)));
-}
-
 std::string trim(std::string_view v) {
     std::size_t a = 0;
     while (a < v.size() && std::isspace(static_cast<unsigned char>(v[a])) != 0) ++a;
@@ -138,11 +133,6 @@ std::vector<std::string> linesOf(std::string_view text) {
 int lineNumberAt(std::string_view text, std::size_t offset) {
     offset = std::min(offset, text.size());
     return 1 + static_cast<int>(std::count(text.begin(), text.begin() + static_cast<std::ptrdiff_t>(offset), '\n'));
-}
-
-std::string lineAt(const std::vector<std::string>& lines, int line) {
-    if (line <= 0 || static_cast<std::size_t>(line) > lines.size()) return {};
-    return trim(lines[static_cast<std::size_t>(line - 1)]);
 }
 
 std::optional<std::string> stringArg(const Json& params,

@@ -149,11 +149,11 @@ std::optional<nlohmann::json> MCPServer::handleRaw(const nlohmann::json& payload
         req = Request::fromJson(payload);
     } catch (const std::exception& ex) {
         ErrorObject err = ErrorObject::fromCode(ErrorCode::InvalidRequest, ex.what());
-        return Response::failure(nullptr, std::move(err)).toJson();
+        return std::optional<nlohmann::json>{Response::failure(nullptr, std::move(err)).toJson()};
     }
     auto resp = handle(req);
     if (!resp) return std::nullopt;
-    return resp->toJson();
+    return std::optional<nlohmann::json>{resp->toJson()};
 }
 
 Response MCPServer::onInitialize(Id id, const nlohmann::json& /*params*/) {
