@@ -64,9 +64,20 @@ jobs:
       - name: Install build tools
         shell: pwsh
         run: |
-          choco install ninja -y --no-progress
-          git clone https://github.com/microsoft/vcpkg "$env:VCPKG_ROOT"
-          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $RepoVcpkg = Join-Path $env:GITHUB_WORKSPACE 'vcpkg'
+          $env:VCPKG_ROOT = $RepoVcpkg
+          "VCPKG_ROOT=$RepoVcpkg" >> $env:GITHUB_ENV
+          if (-not (Test-Path (Join-Path $RepoVcpkg '.git'))) {
+            git clone https://github.com/microsoft/vcpkg "$RepoVcpkg"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          & "$RepoVcpkg\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Configure server
         shell: pwsh
