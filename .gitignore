@@ -34,6 +34,13 @@ Thumbs.db
 # Logs
 *.log
 logs/
+sage-server*.err
+sage-server*.out
+
+# Local debugger / one-off analysis artifacts
+.cdb-*
+/C*anim_diff.txt
+.claude/scheduled_tasks.lock
 
 # Unreal (plugin tarafı)
 plugin/Binaries/
