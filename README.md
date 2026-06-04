@@ -1,4 +1,4 @@
-# Sage Unreal MCP
+﻿# Sage Unreal MCP
 
 [![npm](https://img.shields.io/npm/v/@alemdarlabs/sage-mcp?label=npm)](https://www.npmjs.com/package/@alemdarlabs/sage-mcp)
 [![release](https://img.shields.io/github/v/release/alemdarlabs/sage-unreal-mcp?label=release)](https://github.com/alemdarlabs/sage-unreal-mcp/releases)
@@ -87,7 +87,7 @@ available. During `sage bootstrap` or `sage init`, it resolves or downloads the
 
 ## Current Release
 
-`v0.1.2` is the next release for the zero-config Codex onboarding flow.
+`v0.1.3` is the next release for the zero-config Codex onboarding flow.
 
 ```powershell
 npm view @alemdarlabs/sage-mcp version dist.tarball
@@ -95,9 +95,9 @@ npm view @alemdarlabs/sage-mcp version dist.tarball
 
 Release assets:
 
-- `sage-server-0.1.2-win32-x64.zip`
-- `sagebridge-plugin-0.1.2-win32-x64.zip`
-- `alemdarlabs-sage-mcp-0.1.2.tgz`
+- `sage-server-0.1.3-win32-x64.zip`
+- `sagebridge-plugin-0.1.3-win32-x64.zip`
+- `alemdarlabs-sage-mcp-0.1.3.tgz`
 - `checksums.txt`
 
 GitHub-hosted Windows runners do not include Unreal Engine. The hosted release

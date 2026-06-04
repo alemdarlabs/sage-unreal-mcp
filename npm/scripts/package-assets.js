@@ -69,6 +69,11 @@ function stageServer(tempRoot, serverPath) {
   const stage = path.join(tempRoot, 'server');
   ensureDir(stage);
   fs.copyFileSync(serverPath, path.join(stage, serverExeName()));
+  for (const entry of fs.readdirSync(path.dirname(serverPath), { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.toLowerCase().endsWith('.dll')) {
+      fs.copyFileSync(path.join(path.dirname(serverPath), entry.name), path.join(stage, entry.name));
+    }
+  }
   if (process.platform !== 'win32') fs.chmodSync(path.join(stage, serverExeName()), 0o755);
   return stage;
 }

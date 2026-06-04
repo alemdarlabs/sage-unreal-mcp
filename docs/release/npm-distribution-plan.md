@@ -1,4 +1,4 @@
-# Sage npm distribution plan
+﻿# Sage npm distribution plan
 
 ## Goal
 
@@ -81,11 +81,11 @@ sage-server-<version>-<platform-key>.zip
 sagebridge-plugin-<version>-<platform-key>.zip
 ```
 
-For Windows x64 `0.1.2`:
+For Windows x64 `0.1.3`:
 
 ```text
-sage-server-0.1.2-win32-x64.zip
-sagebridge-plugin-0.1.2-win32-x64.zip
+sage-server-0.1.3-win32-x64.zip
+sagebridge-plugin-0.1.3-win32-x64.zip
 ```
 
 Development/test overrides:

@@ -26,6 +26,7 @@ function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd || repoRoot,
     encoding: 'utf8',
+    input: options.input,
     env: {
       ...process.env,
       SAGE_DATA_DIR: dataDir,
@@ -137,5 +138,22 @@ assert.equal(mcpConfig.mcpServers.sage.env.SAGE_UE_ROOT, fakeUeRoot);
 const doctor = runSage(['doctor', projectPath, '--json']);
 const report = JSON.parse(doctor.stdout);
 assert.equal(report.ok, true);
+
+const mcpInput = [
+  { jsonrpc: '2.0', method: 'initialize', id: 1, params: {} },
+  { jsonrpc: '2.0', method: 'notifications/initialized', params: {} },
+  { jsonrpc: '2.0', method: 'tools/call', id: 2, params: { name: 'status', arguments: {} } },
+].map((message) => JSON.stringify(message)).join('\n') + '\n';
+const mcp = run(process.execPath, [installedCli, 'mcp'], {
+  cwd: projectRoot,
+  input: mcpInput,
+  env: { SAGE_LOG_LEVEL: 'error' },
+});
+const mcpResponses = mcp.stdout.trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+const statusResponse = mcpResponses.find((response) => response.id === 2);
+assert.ok(statusResponse, mcp.stdout);
+assert.equal(statusResponse.result.structuredContent.env.SAGE_PROJECT_ROOT, projectRoot);
+assert.equal(statusResponse.result.structuredContent.env.SAGE_REPO_ROOT, projectRoot);
+assert.equal(statusResponse.result.structuredContent.project.looks_like_unreal_project, true);
 
 console.log('global install smoke ok');

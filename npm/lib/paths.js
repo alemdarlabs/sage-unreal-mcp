@@ -38,17 +38,17 @@ function pluginInstallDir(version = packageVersion(), key = platformKey()) {
 function devServerCandidates() {
   const root = packageRoot();
   return [
-    path.join(root, 'build', 'debug', 'bin', serverExeName()),
     path.join(root, 'build', 'release', 'bin', serverExeName()),
     path.join(root, 'build', 'RelWithDebInfo', 'bin', serverExeName()),
+    path.join(root, 'build', 'debug', 'bin', serverExeName()),
   ];
 }
 
 function resolveServerBinary() {
   const candidates = [];
   if (process.env.SAGE_SERVER_PATH) candidates.push(process.env.SAGE_SERVER_PATH);
-  candidates.push(installedServerPath());
   candidates.push(...devServerCandidates());
+  candidates.push(installedServerPath());
   for (const candidate of candidates) {
     if (candidate && fs.existsSync(candidate)) return path.resolve(candidate);
   }

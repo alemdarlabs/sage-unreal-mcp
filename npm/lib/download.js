@@ -159,8 +159,13 @@ async function ensureServerBinary(options = {}) {
   extractArchive(archivePath, extractDir);
   const extracted = findExtractedServer(extractDir);
   if (!extracted) throw new Error(`Archive did not contain ${serverExeName()}`);
-  ensureDir(binInstallDir(version, key));
-  fs.copyFileSync(extracted, target);
+  const installDir = binInstallDir(version, key);
+  ensureDir(installDir);
+  for (const entry of fs.readdirSync(path.dirname(extracted), { withFileTypes: true })) {
+    if (entry.isFile()) {
+      fs.copyFileSync(path.join(path.dirname(extracted), entry.name), path.join(installDir, entry.name));
+    }
+  }
   if (process.platform !== 'win32') fs.chmodSync(target, 0o755);
   return target;
 }
