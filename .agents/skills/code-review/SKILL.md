@@ -31,7 +31,7 @@ Analyzes code to ensure quality, efficiency, and maintainability.
 - Suggest concrete improvements (modern C++23 idioms preferred)
 - For UE plugin code: respect engine conventions (UCLASS, UPROPERTY, FScopedTransaction, GameThread vs WorkerThread discipline)
 - For server code: prefer `std::expected<T, E>`, RAII, smart pointers; flag raw new/delete
-- Reference `.Codex/docs/` and AGENTS.md `Code Conventions` for project-specific rules
+- Reference `AGENTS.md`, `docs/engineering/`, and `docs/adr/` for project-specific rules
 
 ## Constraints
 

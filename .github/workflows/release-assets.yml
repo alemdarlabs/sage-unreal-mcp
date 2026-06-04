@@ -71,20 +71,20 @@ jobs:
         shell: pwsh
         run: cmake --build --preset release --target sage-server
 
-      - name: Build Unreal plugin package when Unreal is available
+      - name: Build native tests
         shell: pwsh
-        env:
-          SAGE_UE_ROOT: ${{ secrets.SAGE_UE_ROOT }}
+        run: cmake --build --preset release --target sage-tests
+
+      - name: Run native tests
+        shell: pwsh
+        run: ctest --preset release --output-on-failure
+
+      - name: Note Unreal plugin packaging mode
+        shell: pwsh
         run: |
-          if ($env:SAGE_UE_ROOT) {
-            $RunUAT = Join-Path $env:SAGE_UE_ROOT 'Engine\Build\BatchFiles\RunUAT.bat'
-            if (Test-Path $RunUAT) {
-              .\scripts\build-plugin.ps1
-              exit $LASTEXITCODE
-            }
-            Write-Host "SAGE_UE_ROOT is set but RunUAT was not found: $RunUAT"
-          }
-          Write-Host "Unreal Engine is not available on this runner; packaging source SageBridge plugin asset."
+          Write-Host "GitHub-hosted Windows runners do not include Unreal Engine."
+          Write-Host "This workflow packages the source SageBridge plugin asset."
+          Write-Host "Binary BuildPlugin packaging requires a self-hosted Windows runner with Unreal Engine installed."
 
       - name: Release readiness check
         shell: pwsh

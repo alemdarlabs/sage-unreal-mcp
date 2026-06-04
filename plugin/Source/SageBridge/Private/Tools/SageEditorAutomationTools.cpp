@@ -560,7 +560,7 @@ FSageToolDispatch::FOutcome RunPythonImpl(const TSharedPtr<FJsonObject>& Args)
 
 // Build operations are long-running (lighting can take hours on large levels)
 // and consume the editor — we require explicit confirmation per the
-// production project disciple in CLAUDE.md.
+// production project discipline in AGENTS.md.
 bool RequireConfirmed(const TSharedPtr<FJsonObject>& Args, const TCHAR* Tool, FSageToolDispatch::FOutcome& Out)
 {
     bool bConfirmed = false;

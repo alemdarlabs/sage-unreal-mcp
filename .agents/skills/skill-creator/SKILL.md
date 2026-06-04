@@ -1,22 +1,20 @@
 ---
 name: skill-creator
-description: Generates new Codex Skills in Anthropic Agent Skills format with proper frontmatter, scoped description, and structured sections. Invoke when the user wants to add a new skill to .Codex/skills/ in Sage.
+description: Generates or updates Codex Skills in Anthropic Agent Skills format with valid frontmatter, scoped trigger descriptions, and concise project-specific instructions. Invoke when adding or revising skills under .agents/skills/ in Sage.
 ---
 
-# Skill Creator (Meta)
+# Skill Creator
 
 ## Overview
 
-Produces ready-to-use Codex Skills in Anthropic Agent Skills format, dropped at `.Codex/skills/<name>/SKILL.md`.
+Produces ready-to-use Codex skills in Anthropic Agent Skills format. In this repository, canonical skills live under `.agents/skills/<name>/SKILL.md`.
 
-**Keywords**: skill, creator, meta, anthropic, agent-skills, Codex
-
-## Anthropic Format Reference
+## Format Reference
 
 ```markdown
 ---
 name: <kebab-case-name>
-description: <one-line; trigger conditions; ≤1024 chars>
+description: <one-line trigger condition; 50-1024 chars>
 ---
 
 # <Title Case Name>
@@ -28,27 +26,21 @@ description: <one-line; trigger conditions; ≤1024 chars>
 ## Constraints
 ```
 
-Frontmatter accepts only `name` and `description` (no `license`, no other fields unless Anthropic adds them).
-
-## Output Format
-
-- Folder name (kebab-case, matches `name` field)
-- Full SKILL.md content per the Anthropic structure above
-- Description tuned with "Invoke when..." pattern for clean triggering
+Frontmatter accepts only `name` and `description`.
 
 ## Instructions
 
-- Ask for the skill's purpose and trigger condition explicitly
-- Pick a clear `name` (kebab-case, no `-skill` suffix — convention in this repo)
-- Write `description` as a model-invocation hint: **action + context**
-  - Good: "Reviews C++ code for memory safety. Invoke when reviewing server or plugin source."
-  - Bad: "Code reviewer." (too short, won't trigger reliably)
-- Structure body per the reference template
-- For Sage: include token discipline note and project-specific guidance (UE, C++23, CMake/vcpkg, KuzuDB) where relevant
+- Pick a clear kebab-case `name` matching the folder name.
+- Write `description` as an invocation hint: action + context + when to use.
+- Keep bodies concise and operational; avoid session-history dumps.
+- Use current repo paths: `AGENTS.md`, `docs/`, `.agents/skills/`, `server/`, `plugin/`, `scripts/`, `npm/`.
+- Make platform guidance Windows-first when the workflow targets the current Sage production environment; include macOS/Linux fallback only when real and tested enough to be useful.
+- For Sage-specific guidance, reference C++23, CMake/vcpkg, Unreal plugin packaging, MCP schemas, source-backed inspection, ADR-018 retired graph runtime, and npm-first distribution where relevant.
 
 ## Constraints
 
-- Description must be 50-1024 characters
-- Frontmatter only `name` + `description` — nothing else
-- Output must be drop-in ready: no further editing required
-- Token discipline: skill body itself should respect Sage's principles (concise, ID-first)
+- Description must be 50-1024 characters.
+- Frontmatter must contain only `name` and `description`.
+- Do not point new skills at removed hidden workspaces.
+- Do not write macOS-only recipes for Windows production workflows.
+- Token discipline: skill body should be short enough to load without bloating context.

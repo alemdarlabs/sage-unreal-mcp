@@ -1,7 +1,7 @@
 #pragma once
 
 // JSON-RPC 2.0 standard codes + Sage-specific extensions.
-// Reference: .claude/docs/api-spec.md §Error Codes.
+// Reference: docs/engineering/api-spec.md (Error Codes).
 
 namespace sage::mcp {
 

@@ -6,7 +6,7 @@ class FJsonObject;
 
 /**
  * Editor identity snapshot, sent to the Sage server in the handshake.
- * Matches `.claude/docs/api-spec.md` §Handshake schema.
+ * Matches docs/engineering/api-spec.md handshake schema.
  */
 struct SAGEBRIDGE_API FSageEditorIdentity
 {

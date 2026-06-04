@@ -260,12 +260,6 @@ std::vector<fs::path> collectDocRoots(const Json& params) {
     for (const std::string& s : stringArrayArg(params, "docs_roots")) addIfDir(roots, s);
     const fs::path base = rootArg(params);
     addIfDir(roots, base / "docs");
-    addIfDir(roots, base / ".claude" / "docs");
-    addIfDir(roots, base / ".claude" / "notes");
-    addIfDir(roots, base / ".claude" / "decisions");
-    addIfDir(roots, base / ".Codex" / "docs");
-    addIfDir(roots, base / ".Codex" / "notes");
-    addIfDir(roots, base / ".Codex" / "decisions");
     const fs::path engine = engineRootArg(params);
     addIfDir(roots, engine / "Engine" / "Documentation" / "Source");
     if (roots.empty()) addIfDir(roots, base);
@@ -657,9 +651,7 @@ std::vector<std::string> parseBuildDeps(std::string_view text) {
 
 std::vector<fs::path> decisionFiles(const fs::path& root) {
     std::vector<fs::path> roots;
-    addIfDir(roots, root / ".claude" / "decisions");
-    addIfDir(roots, root / ".Codex" / "decisions");
-    addIfDir(roots, root / "docs" / "decisions");
+    addIfDir(roots, root / "docs" / "adr");
     addIfDir(roots, root / "decisions");
     return walkFiles(roots, true, 2000);
 }

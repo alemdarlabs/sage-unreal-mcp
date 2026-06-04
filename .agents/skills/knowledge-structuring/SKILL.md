@@ -1,6 +1,6 @@
 ---
 name: knowledge-structuring
-description: Organizes unstructured information into clear frameworks, hierarchies, or structured notes. Invoke for graph schema design, ADR drafting, domain modeling, or taxonomy work in Sage.
+description: Organizes unstructured information into clear frameworks, hierarchies, or structured notes. Invoke for ADR drafting, domain modeling, taxonomy work, documentation restructuring, or source-backed project understanding in Sage.
 ---
 
 # Knowledge Structuring
@@ -29,8 +29,8 @@ Transforms messy input into structured, usable knowledge artifacts (schemas, tax
 
 - Identify major topics first; reorganize content under them
 - Group related ideas; prefer nesting up to 3 levels deep
-- For graph schema (KuzuDB / Cypher in Sage): use Node / Edge / Property layers explicitly
-- For ADR drafting: follow `.Codex/decisions/` template — Bağlam, Kararlar (with sub-decisions), Sonuçlar
+- For active Sage project modeling: prefer source-backed entities, relationships, ownership, and verification evidence over retired persistent graph assumptions
+- For ADR drafting: place records under `docs/adr/` and use `Context`, `Decision`, `Consequences`, and `Status`
 - Mark uncertain or disputed items explicitly
 
 ## Constraints

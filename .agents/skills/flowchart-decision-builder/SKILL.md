@@ -41,7 +41,7 @@ stateDiagram-v2
 - Map every conditional path explicitly
 - Maintain logical flow — entry on top/left, exit on bottom/right
 - For state machines: explicit transitions with trigger labels (event names, not vague descriptions)
-- For Sage: prefer Mermaid since `.Codex/docs/` already uses ASCII state diagrams; Mermaid renders cleanly in GitHub and Markdown viewers
+- For Sage: prefer Mermaid in `docs/` because it is source-controllable and renders cleanly in GitHub and Markdown viewers
 
 ## Constraints
 
