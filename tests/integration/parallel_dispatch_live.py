@@ -133,12 +133,11 @@ def main() -> int:
     if not editor:
         print("  plugin never connected — abort"); proc.terminate(); return 4
     print(f"  plugin connected after {time.monotonic()-t_spawn:.1f}s: "
-          f"slot={editor.get('slot_id','?')[:12]}... "
+          f"slot={editor.get('slot_id','')[:12]}... "
           f"instance={editor.get('instance_id')}")
 
-    # 6. Stress mix — same shape as the HeroFlight failure: heavy local kuzu
-    #    writer (index_slot) + REMOTE batch (asset.list/search) + cheap
-    #    server-side (list_editors). All in flight at once.
+    # 6. Stress mix: REMOTE asset.list/search batch + cheap server-side
+    #    editor management calls, all in flight at once.
     slot_id = editor.get("slot_id")
     calls = [
         ("editor.ping",       {"message":"a"}),
@@ -164,7 +163,7 @@ def main() -> int:
     ]
     N = len(calls)
     print(f"\n[stress] {N} parallel mixed tool/calls "
-          f"(REMOTE asset.* + LOCAL list_editors/class_hierarchy + ping)...")
+          f"(REMOTE asset.* + LOCAL editor management + ping)...")
 
     def call_one(i: int, name: str, args: dict):
         return i, name, post_jsonrpc({
@@ -201,7 +200,7 @@ def main() -> int:
             failed_ids.append(i)
             print(f"  #{i:2d} {name:20s} XXX in {elapsed:5.2f}s: {resp}")
 
-    # 8. Server still alive?
+    # 8. Server still alive
     server_alive = proc.poll() is None
     print(f"\n[health] sage-server process alive: {server_alive}")
     if not server_alive:

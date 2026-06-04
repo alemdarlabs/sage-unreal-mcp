@@ -1,7 +1,7 @@
 # ADR-010: Knowledge Graph Schema Design
 
 **Tarih:** 2026-04-27
-**Durum:** Kabul Edildi (V1; bazı özellikler V2 research bekliyor)
+**Durum:** Superseded by ADR-018 (V1; bazı özellikler V2 research bekliyor)
 
 ## Bağlam
 

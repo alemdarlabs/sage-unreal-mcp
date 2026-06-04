@@ -3772,12 +3772,12 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="asset.search_fts",
-        .description="Full-text search over asset names. Exact FTS5 ranking available in sage-server KuzuDB.",
+        .description="AssetRegistry-backed name search over assets. No external index is required.",
         .inputSchema=obj({{"query",str()},{"max_results",i32()},{"path",str()}},{"query"}),
         .handler=nullptr,.remote=true});
 
     reg(registry, Tool{.name="asset.reindex_fts",
-        .description="Trigger a full FTS index rebuild in sage-server KuzuDB. Returns confirmation.",
+        .description="Refresh request for AssetRegistry-backed search. Returns confirmation; no external index is rebuilt.",
         .inputSchema=obj({}),
         .handler=nullptr,.remote=true});
 
@@ -4101,15 +4101,6 @@ void registerPhase4Schemas(mcp::ToolRegistry& registry) {
     reg(registry, Tool{.name="reflection.create_tag",
         .description="Create a new GameplayTag entry in DefaultGameplayTags.ini.",
         .inputSchema=obj({{"tag",str()},{"comment",str()}},{"tag"}),
-        .handler=nullptr,.remote=true});
-
-    // ========================================================================
-    // _scan_asset_registry (internal Phase 2 helper)
-    // ========================================================================
-
-    reg(registry, Tool{.name="_scan_asset_registry",
-        .description="Internal: full asset registry scan used by the knowledge graph indexer.",
-        .inputSchema=obj({{"path",str()},{"max_results",i32()}}),
         .handler=nullptr,.remote=true});
 
 }  // registerPhase4Schemas

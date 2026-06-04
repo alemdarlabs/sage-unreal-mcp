@@ -57,14 +57,7 @@ $serverOnlyExact = @(
     'wait_for_editor',
     'list_editors',
     'get_active_editor',
-    'set_active_editor',
-    'class_hierarchy',
-    'query_graph',
-    'impact_of',
-    'references_to',
-    'find_unused',
-    'index_slot',
-    'index_status'
+    'set_active_editor'
 )
 
 $serverOnlyPrefixes = @(
@@ -110,8 +103,7 @@ function Test-ServerOnlyTool {
 $schemaWithoutPlugin = Compare-Object $serverNames $pluginNames |
     Where-Object {
         $_.SideIndicator -eq '<=' -and
-        -not (Test-ServerOnlyTool $_.InputObject) -and
-        $_.InputObject -notmatch '^index_'
+        -not (Test-ServerOnlyTool $_.InputObject)
     } |
     ForEach-Object { $_.InputObject }
 

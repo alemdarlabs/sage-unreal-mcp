@@ -3376,7 +3376,7 @@ FSageToolDispatch::FOutcome SearchFtsImpl(const TSharedPtr<FJsonObject>& Args)
         double N; if (Args->TryGetNumberField(TEXT("max_results"), N)) MaxResults = (int32)N;
     }
 
-    // FTS via asset name partial match — full FTS index lives in sage-server KuzuDB
+    // FTS-style search via AssetRegistry asset-name partial match.
     FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
     FARFilter Filter;
     Filter.PackagePaths.Add(FName(*SearchPath));
@@ -3405,7 +3405,7 @@ FSageToolDispatch::FOutcome SearchFtsImpl(const TSharedPtr<FJsonObject>& Args)
     R->SetArrayField (TEXT("results"), Results);
     R->SetNumberField(TEXT("count"),   Results.Num());
     R->SetStringField(TEXT("note"),
-        TEXT("FTS index (sage-server KuzuDB) provides richer semantic search when connected"));
+        TEXT("AssetRegistry name search; no external index is required"));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 
@@ -3414,8 +3414,7 @@ FSageToolDispatch::FOutcome ReindexFtsImpl(const TSharedPtr<FJsonObject>& Args)
     auto R = MakeShared<FJsonObject>();
     R->SetBoolField  (TEXT("triggered"), true);
     R->SetStringField(TEXT("note"),
-        TEXT("FTS reindex is handled server-side via sage-server knowledge graph; "
-             "trigger via index_project or server restart"));
+        TEXT("AssetRegistry-backed search uses the editor's current registry state"));
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }
 

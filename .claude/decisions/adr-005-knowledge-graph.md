@@ -1,7 +1,9 @@
 # ADR-005: Knowledge Graph Indexing Strategy
 
 **Tarih:** 2026-04-27
-**Durum:** Kabul Edildi
+**Durum:** Superseded by ADR-018
+
+> ADR-018 removes the active KuzuDB implementation; this ADR remains historical context only.
 
 ## Bağlam
 

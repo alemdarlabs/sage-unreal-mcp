@@ -42,9 +42,9 @@ Tüm 200+ tool definition'ına `_editor` field ekleme yerine, `tools/list` respo
 
 - Source tool'lar (main.cpp + phase4_schemas.cpp) değişmez — single-point-of-truth
 - Yeni eklenen remote tool'lar otomatik kazanır
-- Server-side tool'lar (knowledge graph queries, list_editors, ping, vs.) `remote=false` olduğundan otomatik exclude — `_editor` anlamsız olduğu yerde görünmez
+- Server-side tools (`list_editors`, `ping`, jobs, etc.) stay `remote=false`; `_editor` is omitted where editor routing is meaningless.
 
-12 server-side tool `_editor` almaz: `query_graph`, `impact_of`, `references_to`, `find_unused`, `class_hierarchy`, `index_slot`, `index_status`, `list_editors`, `get_active_editor`, `set_active_editor`, `restart_editor`, `ping`. Diğer 444 tool'a injection uygulanır.
+ADR-018 removed the graph server-side tools (`query_graph`, `impact_of`, `references_to`, `find_unused`, `class_hierarchy`, `index_slot`, `index_status`). Remaining server-only tools still omit `_editor` where editor routing is meaningless.
 
 ## Gerekçe
 

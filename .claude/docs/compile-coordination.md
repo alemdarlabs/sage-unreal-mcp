@@ -1,6 +1,6 @@
 # Compile Coordination (Live Coding vs Full Restart)
 
-How Sage decides between Live Coding (hot patch) and full editor restart for C++ changes. The trickiest scenario in the system because it touches plugin lifecycle, multi-editor coordination, knowledge graph integrity, and conversation continuity.
+How Sage decides between Live Coding (hot patch) and full editor restart for C++ changes. The trickiest scenario in the system because it touches plugin lifecycle, multi-editor coordination, editor lifecycle integrity, and conversation continuity.
 
 ## The Yelpaze: 3 Reload Mechanisms
 
@@ -179,7 +179,7 @@ Default: **multi-editor + LC = full restart escalation**. Power user can force `
 
 | State | Outcome |
 |---|---|
-| Knowledge graph | ✅ Preserved (server-side, untouched by LC) |
+| Audit / slot metadata | Preserved in server-side SQLite/state where implemented |
 | Operation queue | ✅ Preserved; paused during LC |
 | Open assets | ✅ Preserved (UE memory) |
 | Editor undo stack | ✅ Preserved |
@@ -191,7 +191,7 @@ Default: **multi-editor + LC = full restart escalation**. Power user can force `
 Server pre-LC steps:
 1. Pause pending tool calls
 2. Commit/cancel open transactions
-3. Optional KuzuDB checkpoint (rare; for paranoid recovery)
+3. Optional audit/job-state checkpoint when implemented
 
 Server post-LC steps:
 1. AssetRegistry hash check (reflection diff?)

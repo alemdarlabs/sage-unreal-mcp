@@ -1,140 +1,107 @@
 # Architecture
 
-> Status: Implementation complete — Phase 1+2+3+4 doğrulandı (2026-04-28 · 82 commit · 443 tool).
-> Mimari aşağıda tarif edildiği şekilde inşa edilmiş ve UE 5.7.4'te çalışmaktadır.
+> Status: Active topology after ADR-018. The KuzuDB-backed graph layer and graph query tools are retired.
 
 ## Overview
 
-Sage Unreal MCP is an MCP server that turns Unreal Engine into a first-class peer for AI agents. Two layers:
+Sage Unreal MCP is an MCP server that turns Unreal Engine into a first-class peer for AI agents.
 
-- **Execution layer** — tool calls that mutate engine state (spawn actor, modify property, save asset, compile module).
-- **Intelligence layer** — a project knowledge graph the agent queries before acting (impact analysis, dependency tracing, class hierarchy, reference topology).
+The active architecture has two responsibilities:
 
-The intelligence layer is the moat. Most current MCPs in the engine space stop at execution; Sage treats execution and understanding as inseparable.
+- **Execution**: route MCP tool calls into the right Unreal Editor instance and apply Unreal-native operations safely.
+- **Inspection**: answer project questions through live Unreal APIs, reflection, AssetRegistry-backed tools, source search, logs, and domain-specific diagnostics.
+
+There is no embedded KuzuDB graph database in the active runtime. Future persistent indexing requires a fresh ADR and must not reintroduce KuzuDB by default.
 
 ## System Components
 
-```
-┌──────────────────────────────────────────────┐
-│  MCP Client (Claude Code, Cursor, ...)       │
-└──────────────────┬───────────────────────────┘
-                   │ MCP over HTTP+SSE
-                   │ (persistent, multi-client)
-                   ▼
-┌──────────────────────────────────────────────┐
-│  Sage Server (long-lived process)            │
-│  ├─ MCP protocol layer                       │
-│  ├─ Tool router & operation queue (persisted)│
-│  ├─ Knowledge graph (KuzuDB, on-disk)        │
-│  ├─ Audit log + slot index (SQLite)          │
-│  ├─ Editor lifecycle manager                 │
-│  └─ WebSocket server (for plugins)           │
-└──────────────────┬───────────────────────────┘
-                   │ WebSocket (localhost)
-                   │ JSON-RPC envelope
-                   │ resilient, auto-reconnect
-                   ▼
-┌──────────────────────────────────────────────┐
-│  Unreal Editor (ephemeral, may restart)      │
-│  └─ Sage Bridge Plugin                       │
-│      ├─ FWebSocketsModule (client)           │
-│      ├─ AssetRegistry listener               │
-│      ├─ UTransactor wrapper                  │
-│      ├─ Reflection traverser                 │
-│      └─ Background indexing workers          │
-└──────────────────────────────────────────────┘
-```
-
-### Process Model Invariants
-
-- Server is the single source of truth for persisted state. Editor process state is volatile, reconstructable.
-- Editor can crash, restart, recompile, or be one of several instances; server survives all.
-- MCP client maintains one persistent connection to server; server multiplexes to N editor instances.
-
-## Data Flow
-
-### Tool Call (single-op)
-
-```
-Claude → Server: { tool: "modify_actor_property", args: {...}, _editor: "host" }
-Server: validate, route to slot, persist op-queue entry
-Server → Plugin (host): { tx_id, tool, args }
-Plugin: open FScopedTransaction, call UObject::Modify(), apply mutation
-Plugin → Server: { tx_id, status: "committed", before/after_hash }
-Server: update KuzuDB graph, write audit log entry
-Server → Claude: { tx_id, success, undo_handle }
+```text
++-------------------------------------------+
+| MCP Client (Codex, Claude Code, Cursor)   |
++----------------------+--------------------+
+                       |
+                       | MCP over HTTP + SSE
+                       v
++-------------------------------------------+
+| Sage Server (long-lived process)          |
+| - MCP protocol layer                      |
+| - Tool registry and schema shaping        |
+| - Multi-editor routing                    |
+| - Audit log / slot metadata (SQLite)      |
+| - Job orchestration                       |
+| - WebSocket bridge for plugins            |
++----------------------+--------------------+
+                       |
+                       | JSON-RPC over WebSocket
+                       v
++-------------------------------------------+
+| Unreal Editor + SageBridge plugin         |
+| - Tool dispatch                           |
+| - FScopedTransaction / UTransactor use    |
+| - Reflection and AssetRegistry access     |
+| - Blueprint, asset, level, material,      |
+|   animation, Niagara, UMG, and project    |
+|   operations                              |
++-------------------------------------------+
 ```
 
-### Knowledge Graph Query
+## Process Model
 
-```
-Claude → Server: { tool: "impact_of", args: { target: "BP_Enemy" } }
-Server: KuzuDB Cypher query (incoming edges to BP_Enemy node)
-Server: tier-aware response shaping (T1/T2 only by default)
-Server → Claude: { results: [...], pagination_cursor }
-```
+- The server survives editor restarts and reconnects.
+- The plugin is editor-local and reconnects to the server over WebSocket.
+- Multiple editor instances can be connected at the same time.
+- Editor-scoped tools accept `_editor` and are routed explicitly when multiple editors are connected.
+- Server-only tools do not accept `_editor`.
 
-### Editor Restart Orchestration
+## Tool Call Flow
 
-See [`compile-coordination.md`](compile-coordination.md) for the full restart flow.
-
-## Multi-Editor Support
-
-A single Sage server can be connected to multiple Unreal Editor instances simultaneously. See [ADR-004](../decisions/adr-004-multi-editor.md) for routing model and [knowledge-graph.md](knowledge-graph.md) for slot-shared graph behavior.
-
-Key concepts:
-- **Slot ID**: identity hash of `(project_id, canonical_path, engine_major)`. See [ADR-003](../decisions/adr-003-identity-model.md).
-- **Active editor pointer**: per-Claude-session, switches via `set_active_editor`.
-- **`_editor` parameter**: per-tool override.
-- **Disambiguation error**: returned when active is null and `_editor` not given in multi-instance state.
-
-## Lifecycle & Resilience
-
-### Editor Connection State Machine
-
-```
-EDITOR_OFFLINE → CONNECTING → HANDSHAKING → CONNECTED
-                                              │
-                          ┌───────────────────┤
-                          ▼                   │
-                     EDITOR_LOST              │ (intentional)
-                     (grace 30s)              ▼
-                          │             RESTARTING
-                          ▼                   │
-                     EDITOR_DEAD              │
-                          │                   │
-                          └─── relaunch ──────┘
+```text
+Client -> Server: tools/call { name, arguments, _editor? }
+Server: validate schema, resolve editor, enqueue/dispatch
+Server -> Plugin: JSON-RPC bridge request
+Plugin: run Unreal operation, marshal mutations to GameThread when needed
+Plugin -> Server: success/error payload
+Server -> Client: normalized MCP response
 ```
 
-- **EDITOR_LOST** vs **RESTARTING**: a sudden disconnect enters EDITOR_LOST with a 30-second grace; an intentional restart (tool-initiated) enters RESTARTING immediately.
-- Heartbeat: plugin → server every 15s; missing 2 consecutive marks the connection lost.
+For mutations, the plugin uses Unreal-native transactions where available and returns structured errors rather than silently swallowing partial work.
 
-### State Preservation Across Editor Restart
+## Inspection Flow
 
-| State | Storage | Survives editor restart? |
+Source-backed inspection replaces the retired graph database:
+
+- Asset discovery: `asset.list`, `asset.search`, `asset.read_properties`, and domain asset tools.
+- Class/reflection discovery: `reflect_class`, `list_classes`, `find_implementers`, `class_default_object`, and related reflection tools.
+- Source research: project and engine C++ readers/searchers plus Unreal API reference tools.
+- Blueprint safety: `bp.full_dump` before major mutation, reparent, delete, or conversion work.
+- Runtime/project state: editor, PIE, logs, crash forensics, world, actor, component, material, animation, Niagara, GAS, UMG, and sequencer tools.
+
+The removed graph tools are: `index_slot`, `index_status`, `impact_of`, `references_to`, `find_unused`, `class_hierarchy`, and `query_graph`.
+
+## State Preservation
+
+| State | Storage | Survives editor restart |
 |---|---|---|
-| Knowledge graph | KuzuDB on disk | Yes |
-| Audit log | SQLite on disk | Yes |
-| Operation queue (in-flight tool calls) | SQLite on disk | Yes (replayed) |
-| Conversation context | Client side | Yes (connection unbroken) |
-| Open assets / world | Snapshot on disk | Yes (restored) |
-| Editor selection | Snapshot (optional) | Default no |
-| Editor undo/redo stack | Editor memory | No (UE limit) |
-| Plugin internal cache | Memory | No (rebuilt) |
+| Audit log / slot metadata | SQLite / filesystem | Yes |
+| In-flight job metadata | Server memory / job layer | Server-dependent |
+| Connected editor identity | Server session state | Rebuilt on reconnect |
+| Open assets / world state | Unreal project/editor state | Unreal-dependent |
+| Editor undo/redo stack | Editor memory | No |
+| Plugin caches | Plugin memory | No, rebuilt |
 
-### Edge Cases
+## Edge Cases
 
-- User manually closes editor → `user_initiated_shutdown` flag, server does not auto-relaunch; client prompted.
-- Editor crash mid-transaction → UTransactor cleans partial state on restart; server marks transaction `errored`.
-- Compile fails after shutdown → server can relaunch the previous binary and report compile error.
-- Server crash with editor running → plugin reconnects with backoff; KuzuDB on disk; resume.
+- User manually closes editor: server keeps running; tools that require an editor return a connection error.
+- Editor crash mid-transaction: plugin disconnects; server reports the failed call and waits for reconnect.
+- Compile/restart path: handled by compile coordination and restart orchestration.
+- Server restart: connected plugins reconnect with backoff.
 
 ## See Also
 
-- [Tech Stack](tech-stack.md) — language, library, build choices
-- [API Spec](api-spec.md) — tool catalog, transports, token optimization
-- [Database Schema](database-schema.md) — KuzuDB + SQLite layouts
-- [Knowledge Graph](knowledge-graph.md) — indexing strategy, schema
-- [Transactions](transactions.md) — transaction layer detail
-- [Compile Coordination](compile-coordination.md) — Live Coding vs full restart
-- [Decisions](../decisions/) — ADR log
+- [Tech Stack](tech-stack.md)
+- [API Spec](api-spec.md)
+- [Database Schema](database-schema.md)
+- [Knowledge Graph](knowledge-graph.md)
+- [Transactions](transactions.md)
+- [Compile Coordination](compile-coordination.md)
+- [ADR-018](../decisions/adr-018-remove-kuzudb-graph-layer.md)

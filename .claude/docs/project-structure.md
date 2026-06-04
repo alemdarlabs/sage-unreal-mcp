@@ -1,119 +1,91 @@
 # Project Structure
 
-Gerçek proje yapısı (Phase 4 sonrası · 2026-04-28).
+Current source layout after ADR-018.
 
-## Directory Layout
-
-```
+```text
 sage-unreal-mcp/
-├── CLAUDE.md                       # Codebase instructions for Claude
-├── README.md                       # Public-facing description
-├── LICENSE                         # Apache-2.0 (ADR-016 önerisi)
-├── .clang-format                   # Code style (repo kökünde)
-├── .clang-tidy                     # Static analysis (repo kökünde)
-├── .gitignore
-│
-├── .claude/                        # Claude Code workspace metadata
-│   ├── agents/                     # 13 expert agent definitions
-│   ├── decisions/                  # ADR documents (one per decision area)
-│   ├── docs/                       # This directory; system docs
-│   ├── notes/                      # Scratch, todo, lessons
-│   └── skills/                     # Automation skills
-│
-├── plugin/                         # Unreal C++ plugin (Phase 1-4 complete)
-│   ├── SageBridge.uplugin
-│   ├── Source/
-│   │   └── SageBridge/
-│   │       ├── Public/             # Header'lar
-│   │       ├── Private/
-│   │       │   ├── SageBridgeSubsystem.cpp
-│   │       │   ├── SageToolDispatch.cpp
-│   │       │   └── Tools/          # 32 dosya · 443 handler
-│   │       │       ├── SageActorTools.cpp
-│   │       │       ├── SageAnimationTools.cpp  (46 tool)
-│   │       │       ├── SageAssetAdvancedTools.cpp
-│   │       │       ├── SageAssetTools.cpp
-│   │       │       ├── SageAudioTools.cpp      (5 tool)
-│   │       │       ├── SageBlueprintTools.cpp
-│   │       │       ├── SageEditorAutomationTools.cpp
-│   │       │       ├── SageFoliageTools.cpp    (7 tool)
-│   │       │       ├── SageGameplayTools.cpp   (45 tool)
-│   │       │       ├── SageGasTools.cpp        (9 tool)
-│   │       │       ├── SageLandscapeTools.cpp  (11 tool)
-│   │       │       ├── SageLevelTools.cpp      (22 tool)
-│   │       │       ├── SageMaterialGraphTools.cpp
-│   │       │       ├── SageNetworkingTools.cpp (11 tool)
-│   │       │       ├── SageNiagaraTools.cpp    (26 tool)
-│   │       │       ├── SagePcgTools.cpp        (16 tool)
-│   │       │       ├── SageWidgetTools.cpp
-│   │       │       └── ...
-│   │       └── SageBridge.Build.cs
-│   └── Resources/
-│
-├── server/                         # C++23 MCP server (Phase 1-4 complete, 454 şema)
-│   ├── CMakeLists.txt
-│   ├── vcpkg.json
-│   ├── src/
-│   │   ├── main.cpp
-│   │   ├── mcp/                    # Manual MCP impl
-│   │   ├── transport/              # HTTP+SSE, WebSocket
-│   │   ├── graph/                  # KuzuDB layer + GraphStore trait
-│   │   ├── audit/                  # SQLite audit
-│   │   ├── lifecycle/              # Editor lifecycle manager
-│   │   └── tools/                  # Tool implementations
-│   └── include/
-│
-├── tests/                          # Catch2 unit tests (server tarafı; 35 test)
-│   ├── CMakeLists.txt
-│   └── unit/
-│
-└── docs/                           # External / public-facing docs (başlatılmadı)
+|-- README.md
+|-- CLAUDE.md
+|-- AGENTS.md
+|-- CMakeLists.txt
+|-- vcpkg.json
+|-- .claude/
+|   |-- agents/
+|   |-- decisions/
+|   |-- docs/
+|   |-- notes/
+|   `-- skills/
+|-- plugin/
+|   |-- SageBridge.uplugin
+|   `-- Source/SageBridge/
+|       |-- Public/
+|       |-- Private/
+|       |   |-- SageBridgeSubsystem.cpp
+|       |   |-- SageToolDispatch.cpp
+|       |   `-- Tools/
+|       `-- SageBridge.Build.cs
+|-- server/
+|   |-- CMakeLists.txt
+|   |-- include/
+|   `-- src/
+|       |-- main.cpp
+|       |-- audit/
+|       |-- lifecycle/
+|       |-- mcp/
+|       |-- tools/
+|       `-- transport/
+|-- tests/
+|   |-- CMakeLists.txt
+|   |-- integration/
+|   `-- unit/
+|-- scripts/
+`-- docs/
 ```
+
+## Removed Areas
+
+The following paths were removed with ADR-018:
+
+- `server/src/graph/`
+- `plugin/Source/SageBridge/*/Tools/SageIndexTools.*`
+- Kuzu/graph smoke tests under `tests/integration/`
+- `scripts/fetch-kuzu.ps1`
+- `scripts/fetch-kuzu.sh`
+- `third_party/kuzu` local dependency directory
+
+## Server Modules
+
+- `mcp/`: JSON-RPC envelope, MCP registry, schema shaping.
+- `transport/`: HTTP + SSE server and WebSocket bridge server.
+- `audit/`: audit and local persistence surfaces.
+- `lifecycle/`: editor connection state, restart orchestration, routing support.
+- `tools/`: server-side tool schemas and any local server tools.
+
+## Plugin Module
+
+`SageBridge` owns editor-facing Unreal operations:
+
+- WebSocket client, reconnect, heartbeat.
+- Tool dispatch and response shaping.
+- GameThread-safe editor mutations.
+- Reflection, AssetRegistry-backed inspection, Blueprint, material, level, animation, Niagara, UMG, gameplay, GAS, PCG, and related domain tools.
 
 ## Naming Conventions
 
-- **Files**: `PascalCase.h` / `PascalCase.cpp` for C++ (UE convention), `kebab-case.md` for docs
-- **C++ classes**: `PascalCase` (`FSageServer`, UE `U`/`A`/`F` prefix for plugin types)
-- **C++ methods**: `PascalCase` for public, `lowerCamelCase` allowed for impl detail (consistent within file)
-- **Variables**: `lowerCamelCase`
-- **Constants**: `UPPER_SNAKE_CASE`
-- **Enums**: `PascalCase` for type, `PascalCase` for values
-- **CMake targets**: `kebab-case` (`sage-server`, `sage-mcp-impl`)
-- **vcpkg ports**: standard kebab (`spdlog`, `nlohmann-json`)
+- C++ files follow Unreal conventions: `PascalCase.h` / `PascalCase.cpp`.
+- Markdown/docs use `kebab-case.md`.
+- CMake targets use `kebab-case`.
+- Tool names use dotted domains such as `asset.search`, `bp.full_dump`, `editor.search_log`.
 
-## Module Organization
+## Build Output
 
-### Server (C++23)
-
-- `mcp/` — protocol implementation (JSON-RPC envelope, capability handshake, tool registration)
-- `transport/` — HTTP+SSE server, WebSocket server (separate concern from MCP semantics)
-- `graph/` — `GraphStore` trait + `KuzuGraphStore` impl
-- `audit/` — `AuditLog` interface + SQLite impl
-- `lifecycle/` — editor connection state machine, restart orchestration
-- `tools/` — one file per tool group (modification, indexing, slot management, ...)
-- `domain/` — DTOs, value types (Editor, Slot, TransactionId, AssetRef)
-
-### Plugin (Unreal C++)
-
-`SageBridge` module (single, may split as needed):
-- `WebSocketClient` — connection, reconnect, heartbeat
-- `RegistryListener` — AssetRegistry event subscription
-- `TransactionWrapper` — FScopedTransaction integration
-- `IndexerWorker` — FRunnable-based indexing thread pool
-- `ToolDispatch` — incoming tool call execution
-- `ReflectionTraverser` — UClass/UProperty/UFunction walking
-
-## Build Output Layout
-
-```
+```text
 build/
-├── debug/
-│   ├── sage-server          (with sanitizers)
-│   └── tests/
-└── release/
-    └── sage-server
+|-- debug/
+|   |-- bin/sage-server.exe
+|   `-- tests/
+|-- release/
+`-- plugin/
 ```
 
-## Configuration
-
-Configuration via TOML: `sage.toml` next to the binary, or path via `SAGE_CONFIG`. Environment variables override file values. See [README](../../README.md) for env vars.
+There is no `sage-graph` target and no Kuzu runtime DLL in the active build output.

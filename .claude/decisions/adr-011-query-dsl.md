@@ -1,7 +1,7 @@
 # ADR-011: Query DSL (Knowledge Graph Sorgu Mekanizması)
 
 **Tarih:** 2026-04-27
-**Durum:** Kabul Edildi (V1)
+**Durum:** Superseded by ADR-018 (V1)
 
 ## Bağlam
 

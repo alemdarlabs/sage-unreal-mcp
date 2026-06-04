@@ -9,11 +9,11 @@ Bu projede `.claude/agents/` altında 13 uzman agent tanımlıdır. **Her konuş
 | Unreal C++ plugin, UCLASS/UPROPERTY/UFUNCTION reflection, AssetRegistry, FScopedTransaction, Slate, Live Coding | Unreal Architect | `/unreal-architect` |
 | Modern C++23 server, CMake, vcpkg, async, sanitizers, performans | C++ Architect | `/cpp-architect` |
 | MCP protocol, JSON-RPC envelope, transport (HTTP+SSE, WebSocket), tool schema design | MCP Protocol | `/mcp-protocol` |
-| Knowledge graph şeması, KuzuDB, Cypher queries, indexing strategy | Graph Architect | `/graph-architect` |
+| Retired graph layer, source-backed project understanding, impact/reference analysis strategy | Graph Architect | `/graph-architect` |
 | AI/LLM entegrasyonu, agent davranışı, MCP tool ergonomics | AI/ML Engineer | `/ai-engineer` |
 | Şifreleme, güvenlik, auth, sandbox | Security Engineer | `/security-engineer` |
 | WebSocket, real-time event streaming, heartbeat, reconnect | Real-time Engineer | `/realtime-engineer` |
-| KuzuDB, SQLite, veri modeli, query optimizasyonu | Database Architect | `/db-architect` |
+| SQLite/audit storage, runtime data model, query optimizasyonu | Database Architect | `/db-architect` |
 | Test stratejisi, QA, sanitizer kullanımı, edge case'ler | QA Engineer | `/qa-engineer` |
 | CI/CD, build pipeline, vcpkg, plugin packaging, distribution | DevOps Engineer | `/devops-engineer` |
 | Ürün önceliklendirme, MVP scope, feature kararları | Product Owner | `/product-owner` |
@@ -32,7 +32,7 @@ Bu projede `.claude/agents/` altında 13 uzman agent tanımlıdır. **Her konuş
 
 `sage-unreal-mcp` is the Unreal Engine implementation, the first of the family. Planned siblings: `sage-unity-mcp`, `sage-godot-mcp`.
 
-**Status (2026-04-30): production code aktif** — Phase 1+2+3+4 + Milestone 1.5b tamamlandı, ilk gerçek dogfooding turu (11 gap fix tek oturumda) bitti, Mac→Windows production transition başlıyor. Mimari kararlar [`.claude/decisions/`](.claude/decisions/) (17 ADR), sistem dokümantasyonu [`.claude/docs/`](.claude/docs/), kabul edilen davranış kuralları [`.claude/notes/lessons.md`](.claude/notes/lessons.md).
+**Status (2026-04-30): production code aktif** — Phase 1+2+3+4 + Milestone 1.5b tamamlandı, ilk gerçek dogfooding turu (11 gap fix tek oturumda) bitti, Mac→Windows production transition başlıyor. Mimari kararlar [`.claude/decisions/`](.claude/decisions/) (18 ADR), sistem dokümantasyonu [`.claude/docs/`](.claude/docs/), kabul edilen davranış kuralları [`.claude/notes/lessons.md`](.claude/notes/lessons.md).
 
 ## Ticari Bağlam (KRİTİK)
 
@@ -52,7 +52,7 @@ Bu projede `.claude/agents/` altında 13 uzman agent tanımlıdır. **Her konuş
 |---|---|
 | Plugin | Unreal C++ (UPlugin) |
 | Server | C++23 (modern, manuel MCP impl) |
-| Knowledge graph | KuzuDB (embedded, Cypher) |
+| Project understanding | Live Unreal reflection + AssetRegistry + source-backed tools |
 | Audit / index | SQLite |
 | Server transport | HTTP + SSE (Streamable HTTP) |
 | Plugin transport | WebSocket (FWebSocketsModule + uWebSockets) |
@@ -85,12 +85,12 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 
 ## Şu Anki Durum (Snapshot)
 
-> Tek satırda durum: **560 tool · 17 ADR · Phase 1+2+3+4 + Milestone 1.5b + Cluster G AnimLayerInterface real impl TAMAM · multi-editor per-call routing + bp.full_dump + bootstrap_module + UBT rebuild + state-machine rule authoring + AnimLayerInterface authoring CANLI · Lyra Gap #21+#24 fix edildi · Mac→Windows transition (2026-04-30)**.
+> Tek satırda durum: **560 tool · 18 ADR · Phase 1+2+3+4 + Milestone 1.5b + Cluster G AnimLayerInterface real impl TAMAM · multi-editor per-call routing + bp.full_dump + bootstrap_module + UBT rebuild + state-machine rule authoring + AnimLayerInterface authoring CANLI · Lyra Gap #21+#24 fix edildi · Mac→Windows transition (2026-04-30)**.
 
 - **Önceki test ortamı (Mac, dogfooding)**: `~/Developer/alemdarlabs/Kale/Kale.uproject` (Game Animation Sample, Motion Matching) + `~/Developer/alemdarlabs/SuperheroFlightAnimations/SuperheroFlightAnimations.uproject` (state machine + ActorComponent flight, dogfooding sırasında C++'a yükseltildi) + `~/Developer/alemdarlabs/SageTest/SageTest.uproject` (eski Third Person + Blueprint).
 - **Şimdi (2026-04-30)**: Mahmut Windows tarafına geçti, **gerçek production project'lerde** Sage'i kullanmaya başlıyor. Bkz. auto-memory `feedback_real_projects_caution.md` (destructive op disiplini) ve `project_windows_transition.md` (platform farkları).
-- **Knowledge graph (Mac SageTest slot'unda canlı)**: 8359 asset · 16093 DEPENDS_ON · 8337 UClass · 8336 INHERITS_FROM. Diğer slot'lar (Kale, SuperheroFlight, Windows projeleri) henüz indexlenmedi — `index_slot` çağrısı ile aktive olur.
-- **Multi-editor (ADR-017)**: Tüm 444 editor-scoped tool opsiyonel `_editor` parametresi alıyor (session_id / label / instance_id / project-name prefix). Routing önceliği: explicit > active pointer > tek editor implicit > ambiguity error. 12 server-side tool (knowledge graph + ping + editor mgmt) `_editor` almaz.
+- **KuzuDB graph layer**: Removed by ADR-018. `index_slot`, `index_status`, `impact_of`, `references_to`, `find_unused`, `class_hierarchy`, and `query_graph` are not active tools. Project understanding now uses live Unreal inspection, reflection, AssetRegistry-backed tools, source search, and domain diagnostics.
+- **Multi-editor (ADR-017)**: Tüm 444 editor-scoped tool opsiyonel `_editor` parametresi alıyor (session_id / label / instance_id / project-name prefix). Routing önceliği: explicit > active pointer > tek editor implicit > ambiguity error. server-only tool'lar (jobs/ping/editor mgmt gibi) `_editor` almaz.
 - **İlk dogfooding turu sonuçları (2026-04-29, 11 gap, hepsi tek oturumda fix)**:
   - Pre: 235 invalid schema fix (nlohmann brace-init pitfall, `obj()` helper rewrite)
   - Gap #1+#2: `asset.search` query optional + `asset.list` class/kind/offset/fields filter+pagination+projection
@@ -108,11 +108,11 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
   - Repo public push (`git@github.com:alemdarlabs/sage-unreal-mcp.git` boş repo, henüz push edilmedi)
 - **Skills**: `/unreal-close` + `/unreal-open` editor restart loop autonomous (Mac); MCP tool olarak `restart_editor` (Mac+Win, yeni `rebuild_project_modules` flag).
 - **Dokümantasyon**:
-  - [`.claude/notes/diagram.md`](.claude/notes/diagram.md) — milestone akışı + tool dağılımı + knowledge graph şeması
+  - [`.claude/notes/diagram.md`](.claude/notes/diagram.md) - milestone flow, tool distribution, retired graph context
   - [`.claude/notes/ue-mcp-integration-plan.md`](.claude/notes/ue-mcp-integration-plan.md) — UE-MCP 562 action'a karşı Sage yol haritası
   - [`.claude/notes/ue-mcp-tasks.md`](.claude/notes/ue-mcp-tasks.md) — per-tool task listesi
   - [`.claude/notes/lessons.md`](.claude/notes/lessons.md) — kabul edilen kurallar (en kritik: MVP scope-cut yasak, BP/Material GameThread marshal, nlohmann brace-init pitfall, MCP Streamable HTTP partial-impl, BridgeServer routing TODO trap, DRY middleware injection, C++ proje plugin install Source+Binaries)
-  - [`.claude/decisions/`](.claude/decisions/) — 17 ADR (son: ADR-017 multi-editor-routing-impl, ADR-016 distribution-channel-npm)
+  - [`.claude/decisions/`](.claude/decisions/) — 18 ADR (son: ADR-018 remove-kuzudb-graph-layer)
 - **Yeni session devraldığında ilk bakılacak**: bu dosya → auto-memory (`sage_current_state.md` + `project_windows_transition.md` + `feedback_real_projects_caution.md`) → `.claude/notes/diagram.md` → `.claude/decisions/adr-017-multi-editor-routing-impl.md` → son commit `git log --oneline -12`.
 
 ## Tool Tablosu (özet — 457 toplam, 444 _editor-aware + 13 server-only)
@@ -120,8 +120,8 @@ Detay: [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md)
 | Phase | Domain | Tool sayısı |
 |---|---|---|
 | 1 | Actor/Component/Asset/Editor/Level/PIE/Material/Tx/CAS/Multi-editor/Compile/QA/SCM | 44 |
-| 2 | Knowledge graph (index_*, impact_of, references_to, find_unused, query_graph) | 6 |
-| 3 | restart_editor + class_hierarchy | 2 |
+| 2 | Retired KuzuDB graph tools (removed by ADR-018) | 0 |
+| 3 | restart_editor | 1 |
 | 4.1 | Reflection (reflect_class/struct/enum, list_*, find_implementers, CDO) | 8 |
 | 4.2-r1 | Blueprint authoring round 1 (`bp.*`) | 17 |
 | 4.3 | Material graph authoring (`mat.*`) | 13 |
@@ -240,7 +240,7 @@ Mac'te dogfooding sırasında SageTest + SuperheroFlightAnimations gibi **throwa
 4. **Multi-editor isim çakışması** — production project + Sage geliştirme repo'su aynı anda açıkken `_editor` parametresi her tool çağrısında explicit. Implicit fallback (tek editor) production senaryosunda riskli.
 5. **`SAGE_UE_ROOT` + `SAGE_REPO_ROOT` env var ile server başlat** — paths tutmak için; production project SAGE_REPO_ROOT'a karışmasın.
 6. **Major mutation öncesi source control kontrol** (`git status` veya equivalent) — clean working tree yoksa kullanıcıdan onay iste.
-7. **Knowledge layer'dan yararlan** — körü körüne mutate etmek yerine `index_slot` + `references_to(...)` ile etki çıkar. `bp.full_dump` ile kombinlenince double safety net.
+7. **Live/source-backed inspection kullan** - do not mutate blindly; use `asset.*`, `reflect_*`, `list_classes`, source search, and domain diagnostics to understand impact. `bp.full_dump` remains the production safety net.
 
 ## İlk Dogfooding Turu Çıktıları (2026-04-29)
 
@@ -266,7 +266,7 @@ Mac'te ikinci Claude Code session'ı (Kale projesi) gerçek MCP-client testi yap
 ## Environment Variables
 
 ```bash
-# SAGE_DATA_DIR=~/.sage-mcp                # KuzuDB + SQLite storage path
+# SAGE_DATA_DIR=~/.sage-mcp                # SQLite/audit/runtime data path
 # SAGE_LOG_LEVEL=info                      # spdlog level
 # SAGE_HTTP_PORT=7777                      # MCP HTTP+SSE port
 # SAGE_WS_PORT=7778                        # WebSocket port for plugins
@@ -347,7 +347,7 @@ Mac'te ikinci Claude Code session'ı (Kale projesi) gerçek MCP-client testi yap
 
 - **Simplicity First**: Make every change as simple as possible. Impact minimal code.
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
-- **Intelligence as Moat, Execution as Foundation**: Sage'in diferansiyatörü intelligence layer (knowledge graph). Ama implementation sıralaması execution-first (ADR-012) — önce agent eyleyebilsin, sonra anlayışı üstüne dökülür. Phase 1 = execution, Phase 2 = knowledge.
+- **Source-backed Understanding, Execution as Foundation**: The KuzuDB-backed intelligence layer was removed by ADR-018. Sage now combines a broad Unreal tool surface with live inspection, reflection, source search, and safe mutation discipline.
 - **Token Discipline**: Every tool response respects the optimization principles in [`.claude/docs/api-spec.md`](.claude/docs/api-spec.md). No bloat.
 
 ## Documentation
@@ -355,13 +355,13 @@ Mac'te ikinci Claude Code session'ı (Kale projesi) gerçek MCP-client testi yap
 - [Architecture](.claude/docs/architecture.md) — Sistem mimarisi (topology, lifecycle, multi-editor)
 - [Tech Stack](.claude/docs/tech-stack.md) — Teknoloji kararları ve gerekçeleri
 - [API Spec](.claude/docs/api-spec.md) — MCP tool catalog, transport protocols, token optimization
-- [Database Schema](.claude/docs/database-schema.md) — KuzuDB graph schema + SQLite tables
+- [Database Schema](.claude/docs/database-schema.md) — active SQLite/audit storage + retired KuzuDB note
 - [Project Structure](.claude/docs/project-structure.md) — Klasör yapısı ve konvansiyonlar
-- [Knowledge Graph](.claude/docs/knowledge-graph.md) — 3-tier indexing detayı + schema
+- [Knowledge Graph](.claude/docs/knowledge-graph.md) - retired KuzuDB graph layer and current inspection model
 - [Transactions](.claude/docs/transactions.md) — Transaction layer detayı
 - [Compile Coordination](.claude/docs/compile-coordination.md) — Live Coding vs full restart
 - [MVP Roadmap](.claude/docs/mvp-roadmap.md) — Phase 1 + Phase 2 milestone breakdown, risk register
-- [Decisions (ADR)](.claude/decisions/) — Architectural Decision Records (17 ADRs · son: ADR-017 multi-editor-routing-impl)
+- [Decisions (ADR)](.claude/decisions/) — Architectural Decision Records (18 ADRs · son: ADR-018 remove-kuzudb-graph-layer)
 
 ## Kritik Dersler Özeti (lessons.md'den)
 

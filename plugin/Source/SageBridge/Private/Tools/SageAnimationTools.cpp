@@ -20098,11 +20098,9 @@ FSageToolDispatch::FOutcome RemoveLayerFunctionImpl(const TSharedPtr<FJsonObject
         return FSageToolDispatch::FOutcome::MakeSuccess(R);
     }
 
-    // Best-effort orphan implementer detection deferred — Sage's knowledge
-    // graph gives a more reliable answer (DEPENDS_ON references). The _warning
-    // surface here is a heuristic hint only. Production: run
-    // animation.list_implemented_layers across known children before the
-    // remove, or use `references_to(<interface_path>)` from the graph layer.
+    // Best-effort orphan implementer detection is intentionally conservative.
+    // Production: run animation.list_implemented_layers across known child
+    // AnimBPs before removing an AnimLayerInterface function.
     TArray<TSharedPtr<FJsonValue>> Orphans;
 
     const int32 NodeCount = DeclGraph->Nodes.Num();
@@ -20127,7 +20125,7 @@ FSageToolDispatch::FOutcome RemoveLayerFunctionImpl(const TSharedPtr<FJsonObject
     R->SetNumberField(TEXT("removed_node_count"), NodeCount);
     R->SetArrayField(TEXT("orphan_implementers"), Orphans);
     R->SetStringField(TEXT("_warning"),
-        TEXT("orphan implementer detection deferred — child AnimBPs that already implemented this function will retain their override graphs. Run animation.list_implemented_layers across known children, or use Sage knowledge graph references_to(<interface_path>) for a reliable list."));
+        TEXT("orphan implementer detection deferred - child AnimBPs that already implemented this function will retain their override graphs. Run animation.list_implemented_layers across known children before cleanup."));
     R->SetBoolField(TEXT("compiled"), bCompiled);
     return FSageToolDispatch::FOutcome::MakeSuccess(R);
 }

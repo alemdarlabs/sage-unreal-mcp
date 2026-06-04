@@ -1,5 +1,7 @@
 # MVP Roadmap — TAMAMLANDI
 
+> Note: ADR-018 retired the KuzuDB-backed Phase 2 graph layer. This file keeps historical roadmap context; active build/runtime scope must follow ADR-018.
+
 > **Status: Phase 1 + Phase 2 + Phase 3 + Phase 4 COMPLETE** (2026-04-28 · 82 commit · 443 tool)
 > Bu belge orijinal planı kayıt altına alır. Her milestone tamamlanmıştır.
 > Kanıtlama: `git log --oneline` · `grep -rh RegisterHandler plugin/.../Tools/ | wc -l`
@@ -60,11 +62,11 @@
 
 **Phase 1 Exit Criteria:** ✓ TÜM SAĞLANDI
 
-## Phase 2 — Knowledge Layer ✓ TAMAMLANDI
+## Phase 2 - Retired Knowledge Layer (superseded by ADR-018)
 
 **Gerçek süre:** ~1 hafta. **Hedef durum ulaşıldı.**
 
-### Milestone 2.1 — KuzuDB Integration ✓
+### Milestone 2.1 - Retired KuzuDB Integration (superseded by ADR-018)
 - KuzuDB embedded init, slot-scoped database files
 - `GraphStore` trait + `KuzuGraphStore` impl
 - Schema migration framework (forward-only, `_SchemaVersion` node)
@@ -91,7 +93,7 @@
 - Tier-aware response shaping (T1 satisfies most; T2/T3 only if requested)
 - Pagination + cursor + 8K token cap (per ADR-007)
 
-### Milestone 2.5 — Cypher Subset Layer 2 ✓
+### Milestone 2.5 - Retired Cypher Subset Layer 2 (superseded by ADR-018)
 - KuzuDB parser AST whitelist walk
 - Mutation operator rejection (`CREATE`/`DELETE`/`SET`/`MERGE`/`REMOVE`)
 - Bounded `*1..N` enforcement (max 5 default, 10 override)

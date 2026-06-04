@@ -169,33 +169,19 @@ Non-exhaustive list. Items grouped by domain.
 | `inspect_transaction(tx_id)` | Full transaction detail |
 | `revert_transaction(tx_id)` | Compensating revert |
 
-### Knowledge Graph (3-Layer API)
+### Retired Knowledge Graph Tools
 
-3-layer architecture per [ADR-011](../decisions/adr-011-query-dsl.md): high-level tools, Cypher subset for advanced queries, mutation tools separately.
+ADR-018 removed the KuzuDB-backed graph API. These tools are no longer active:
 
-**Layer 1 — High-level tools (token-cheap, sandboxed)**
-
-| Tool | Purpose |
+| Removed tool | Replacement direction |
 |---|---|
-| `impact_of(asset_or_class, _max_depth?)` | What depends on this? Reverse `depends_on` traversal |
-| `references_to(target, _kind?)` | Inbound references (hard / soft / redirector) |
-| `class_hierarchy(class, _direction?)` | UClass parent / child tree |
-| `find_by_class(class_pattern, _module?)` | Asset / instance enumeration |
-| `find_unused(asset_kind?)` | Assets with no `depends_on` incoming |
+| `index_slot`, `index_status` | Live editor/project inspection; no persistent Kuzu index |
+| `impact_of`, `references_to` | AssetRegistry-backed asset/reference tools and domain diagnostics |
+| `find_unused` | Domain-specific asset queries and editor/project cleanup tools |
+| `class_hierarchy` | `list_classes`, `reflect_class`, `find_implementers`, C++ source search |
+| `query_graph` | Narrow MCP tools and source-backed inspection |
 
-**Layer 2 — Cypher subset (advanced)**
-
-| Tool | Purpose |
-|---|---|
-| `query(cypher, params?, _max_depth?, _no_cap?)` | Custom graph query — read-only Cypher subset |
-
-Cypher subset rules:
-- ✅ `MATCH`, `RETURN`, `WHERE`, `WITH`, `ORDER BY`, `LIMIT`, `SKIP`, `OPTIONAL MATCH`, aggregation (`COUNT`, `SUM`, `AVG`, `COLLECT`), parameters (`$param`)
-- ❌ `CREATE`, `DELETE`, `SET`, `MERGE`, `REMOVE`, `CALL`, unbounded `*`, multi-statement
-- Bounded traversal `*1..N` mandatory: default max `*1..5`, override max `*1..10`
-- Result auto-truncated at ~8K tokens with `refine_hint`. `_no_cap: true` to override
-
-**Layer 3 — Mutation tools** (listed separately in `Modification` sections above): `modify_actor_property`, `spawn_actor`, `delete_actor`, `bulk_modify`, vb. Cypher mutation operatörleri yasak — mutation tools üzerinden auditable + transactional.
+Future persistent query/index APIs require a fresh ADR.
 
 ## Token Optimization Principles
 
@@ -206,11 +192,11 @@ See [ADR-007](../decisions/adr-007-token-optimization.md) for full rationale. Ap
 3. **Pagination + cursor** — list tools default limit 50
 4. **ID-first responses** — return refs, expand separately
 5. **Smart truncation** — `…` with `show_full(ref)` to retrieve
-6. **Tier-aware queries** — T1 satisfies most; T2/T3 omitted unless requested
+6. **Source-backed inspection** - prefer live Unreal/source/domain tools before mutation
 7. **Streaming** — long-running outputs over SSE chunks
 8. **Hard cap** — ~8K tokens; auto-truncate + `refine_query` hint
 9. **Compact encoding** — asset paths to numeric IDs in queries
-10. **Query DSL** — Cypher subset; only requested traversal returns
+10. **Tool-specific diagnostics** - prefer narrow domain tools over broad ad-hoc query surfaces
 
 ## Error Codes
 

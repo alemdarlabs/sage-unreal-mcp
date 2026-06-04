@@ -27,14 +27,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ---- MSVC CRT: force /MD even in Debug --------------------------------------
-# kuzu prebuilt (third_party/kuzu/kuzu_shared.dll) is release-CRT linked
-# (MSVCP140.dll, ucrt). Linking Sage as /MDd causes STL container destructors
-# crossing the kuzu DLL boundary to trip _Big_allocation_sentinel (xmemory
-# line 209 debug assertion: "invalid argument"). Forcing /MD project-wide
-# fixes the ABI mismatch and implicitly sets _ITERATOR_DEBUG_LEVEL=0.
-# Verified via `dumpbin /imports` 2026-05-02; matches kuzu issue #5545.
-# CMP0091 (CMake >= 3.15) makes this a single set() instead of patching
-# every target's compile flags.
+# Keep one CRT model across Sage and imported binary dependencies. This avoids
+# Debug/Release CRT boundary mismatches in Windows builds while preserving the
+# same runtime model used by packaged distribution binaries.
+# CMP0091 (CMake >= 3.15) makes this a single set() instead of patching every
+# target's compile flags.
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:>DLL")
     # Even in Debug, link the *release* variant of every imported target
@@ -117,30 +114,6 @@ find_package(ixwebsocket   CONFIG REQUIRED)
 if(WIN32 AND TARGET ixwebsocket::ixwebsocket)
     set_property(TARGET ixwebsocket::ixwebsocket APPEND PROPERTY
                  INTERFACE_LINK_LIBRARIES bcrypt)
-endif()
-
-# ---- KuzuDB (prebuilt via scripts/fetch-kuzu.sh) ----------------------------
-# vcpkg has no kuzu port; we use the upstream prebuilt release archive.
-set(KUZU_DIR "${CMAKE_SOURCE_DIR}/third_party/kuzu")
-if(NOT EXISTS "${KUZU_DIR}/kuzu.hpp")
-    message(FATAL_ERROR
-        "KuzuDB not found at ${KUZU_DIR}.\n"
-        "Run scripts/fetch-kuzu.sh (or .ps1 on Windows) before configuring.")
-endif()
-if(APPLE)
-    set(KUZU_LIB_NAME "libkuzu.dylib")
-elseif(UNIX)
-    set(KUZU_LIB_NAME "libkuzu.so")
-elseif(WIN32)
-    set(KUZU_LIB_NAME "kuzu_shared.dll")
-endif()
-add_library(kuzu::kuzu SHARED IMPORTED GLOBAL)
-set_target_properties(kuzu::kuzu PROPERTIES
-    IMPORTED_LOCATION "${KUZU_DIR}/${KUZU_LIB_NAME}"
-    INTERFACE_INCLUDE_DIRECTORIES "${KUZU_DIR}")
-if(WIN32)
-    set_target_properties(kuzu::kuzu PROPERTIES
-        IMPORTED_IMPLIB "${KUZU_DIR}/kuzu_shared.lib")
 endif()
 
 # ---- Subdirectories ---------------------------------------------------------

@@ -318,7 +318,7 @@ FSageToolDispatch::FOutcome ReflectClassImpl(const TSharedPtr<FJsonObject>& Args
         Result->SetArrayField(TEXT("functions"), Fns);
     }
 
-    // Immediate children (one hop — class_hierarchy walks deeper).
+    // Immediate children (one hop). Use list_classes with base_class for broader walks.
     {
         const bool bIncludeChildren = Args->GetBoolField(TEXT("include_children"))
                                    || !Args->HasField(TEXT("include_children"));

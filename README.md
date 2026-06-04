@@ -21,18 +21,18 @@ Part of the **Sage** family of engine MCP servers:
 - **443 MCP tool handlers** in the Unreal plugin (SageBridgeSubsystem)
 - **457 tool schemas** in the C++23 server (`tools/list` fully populated; **444 of them carry an optional `_editor` parameter** for multi-editor per-call routing — see ADR-017)
 - **UE-MCP parity:** 445 / 448 actions covered (99.3%) — 3 N/A (feedback + demo categories)
-- **Knowledge graph live** on test slot: 8 359 assets · 16 093 DEPENDS_ON edges · 8 337 UClass nodes
+- **KuzuDB graph layer removed** by ADR-018; project understanding now comes from live Unreal inspection, reflection, AssetRegistry-backed tools, source search, and domain-specific diagnostics
 - **Multi-editor per-call routing**: tool calls can target a specific connected editor by `_editor: "<session_id|label|instance_id|project-name>"`; falls back to active pointer or single-editor implicit; ambiguity errors when neither set
 - **First real-MCP-client dogfooding loop**: 11 gaps reported and fixed in a single session (2026-04-29) — `bp.full_dump` (atomic Blueprint snapshot), `project.create_cpp_class` `bootstrap_module` (BP→C++ scaffold), `restart_editor` `rebuild_project_modules` (Mac UBT compile), schema-generator brace-init bug fix (235 schemas), and more
 - Tested on UE 5.7.4 (Mac); Windows port present in code paths, first real run pending
 - Both binaries build clean: `scripts/build-plugin.sh` (UAT) / `scripts/build-plugin.ps1` (Windows) + `cmake --build --preset debug`
-- 17 Architectural Decision Records under [`.claude/decisions/`](.claude/decisions/)
+- 18 Architectural Decision Records under [`.claude/decisions/`](.claude/decisions/)
 
 ## What this is
 
-Most AI dev tools today are *execution layers* — they let an AI run commands. Sage adds an **intelligence layer** alongside execution: an agent that *understands* the engine project (asset graph, class hierarchy, reference topology, impact analysis) and uses that understanding to give precise, safe answers and edits.
+Most AI dev tools today are *execution layers* — they let an AI run commands. Sage focuses on source-backed Unreal operations: live editor inspection, reflection, AssetRegistry-backed discovery, source search, and safe transactional edits.
 
-Concretely, Sage exposes Unreal Engine to MCP clients (Claude Code, Cursor, etc.) through a persistent C++ server that maintains a Kuzu-backed knowledge graph of the project, mediates safe transactional edits via Unreal's native UTransactor, and survives editor restarts (compile/Live Coding cycles, multi-editor sessions).
+Concretely, Sage exposes Unreal Engine to MCP clients (Claude Code, Cursor, etc.) through a persistent C++ server that routes tools to connected editor instances, mediates safe transactional edits via Unreal's native UTransactor, and survives editor restarts (compile/Live Coding cycles, multi-editor sessions).
 
 ## Documentation
 
@@ -42,9 +42,9 @@ Codebase instructions and design docs live under `.claude/`:
 - [`.claude/docs/architecture.md`](.claude/docs/architecture.md) — system topology and lifecycle
 - [`.claude/docs/tech-stack.md`](.claude/docs/tech-stack.md) — language, library, build choices
 - [`.claude/docs/api-spec.md`](.claude/docs/api-spec.md) — MCP tool catalog and transport protocols
-- [`.claude/docs/database-schema.md`](.claude/docs/database-schema.md) — KuzuDB graph + SQLite tables
+- [`.claude/docs/database-schema.md`](.claude/docs/database-schema.md) — active SQLite/audit storage and retired KuzuDB notes
 - [`.claude/docs/project-structure.md`](.claude/docs/project-structure.md) — folder layout and conventions
-- [`.claude/docs/knowledge-graph.md`](.claude/docs/knowledge-graph.md) — 3-tier indexing strategy
+- [`.claude/docs/knowledge-graph.md`](.claude/docs/knowledge-graph.md) — retired KuzuDB graph layer and current inspection approach
 - [`.claude/docs/transactions.md`](.claude/docs/transactions.md) — transaction layer detail
 - [`.claude/docs/compile-coordination.md`](.claude/docs/compile-coordination.md) — Live Coding vs full restart
 - [`.claude/docs/bp-cpp-conversion-pipeline.md`](.claude/docs/bp-cpp-conversion-pipeline.md) — 10-gate BP→C++ migration playbook + tool reference

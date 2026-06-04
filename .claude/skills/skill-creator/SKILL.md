@@ -3,52 +3,46 @@ name: skill-creator
 description: Generates new Claude Skills in Anthropic Agent Skills format with proper frontmatter, scoped description, and structured sections. Invoke when the user wants to add a new skill to .claude/skills/ in Sage.
 ---
 
-# Skill Creator (Meta)
+# Skill Creator
 
 ## Overview
 
-Produces ready-to-use Claude Skills in Anthropic Agent Skills format, dropped at `.claude/skills/<name>/SKILL.md`.
-
-**Keywords**: skill, creator, meta, anthropic, agent-skills, claude
+Produces ready-to-use Claude Skills in Anthropic Agent Skills format at `.claude/skills/<name>/SKILL.md`.
 
 ## Anthropic Format Reference
 
 ```markdown
 ---
 name: <kebab-case-name>
-description: <one-line; trigger conditions; ≤1024 chars>
+description: <one-line trigger condition, 50-1024 chars>
 ---
 
 # <Title Case Name>
 
 ## Overview
-## Keywords
-## Output Format
 ## Instructions
 ## Constraints
 ```
 
-Frontmatter accepts only `name` and `description` (no `license`, no other fields unless Anthropic adds them).
+Frontmatter accepts only `name` and `description`.
 
 ## Output Format
 
-- Folder name (kebab-case, matches `name` field)
-- Full SKILL.md content per the Anthropic structure above
-- Description tuned with "Invoke when..." pattern for clean triggering
+- Folder name in kebab-case
+- Full `SKILL.md` content
+- Description tuned with an "Invoke when..." trigger
 
 ## Instructions
 
-- Ask for the skill's purpose and trigger condition explicitly
-- Pick a clear `name` (kebab-case, no `-skill` suffix — convention in this repo)
-- Write `description` as a model-invocation hint: **action + context**
-  - Good: "Reviews C++ code for memory safety. Invoke when reviewing server or plugin source."
-  - Bad: "Code reviewer." (too short, won't trigger reliably)
-- Structure body per the reference template
-- For Sage: include token discipline note and project-specific guidance (UE, C++23, CMake/vcpkg, KuzuDB) where relevant
+- Ask for the skill purpose and trigger condition when not provided.
+- Pick a clear `name`; do not add a redundant `-skill` suffix.
+- Write `description` as a model-invocation hint.
+- Include Sage-specific guidance only when relevant: Unreal, C++23, CMake/vcpkg, MCP protocol, plugin packaging, source-backed inspection, ADR discipline.
+- Do not mention KuzuDB as an active project dependency; it was removed by ADR-018.
 
 ## Constraints
 
-- Description must be 50-1024 characters
-- Frontmatter only `name` + `description` — nothing else
-- Output must be drop-in ready: no further editing required
-- Token discipline: skill body itself should respect Sage's principles (concise, ID-first)
+- Description must be 50-1024 characters.
+- Frontmatter only has `name` and `description`.
+- Output must be drop-in ready.
+- Keep the skill body concise.

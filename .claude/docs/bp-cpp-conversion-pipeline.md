@@ -120,7 +120,7 @@ AnimBPs see a typed-down variable but call a function that doesn't exist
 on the parent class — every call is a compile error.
 
 **Exit gate**:
-- All parent C++ classes resolve in `class_hierarchy`
+- All parent C++ classes resolve through `list_classes`, `reflect_class`, or C++ source inspection
 - All BP-side variables that match a parent UPROPERTY name share the
   parent's type (no "BP_X_C → UX downgrade" pending)
 - Build succeeded after the parent class was last edited

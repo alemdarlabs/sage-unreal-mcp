@@ -8,8 +8,6 @@
 #include "SageBridgeSubsystem.generated.h"
 
 class FSageWebSocketClient;
-struct FAssetData;
-class FJsonObject;
 
 /**
  * Lifecycle owner. Created automatically when the editor loads the plugin
@@ -52,16 +50,6 @@ private:
     void RegisterBuiltinHandlers();
 
     void BuildClientFromSettings();
-
-    // AssetRegistry delta hooks (Phase 2.3b). Bound on Initialize, unbound
-    // on Deinitialize. Each fires a bridge `event` envelope so the server
-    // can patch the slot's knowledge graph in place.
-    void BindAssetRegistryDeltaHooks();
-    void UnbindAssetRegistryDeltaHooks();
-    void OnAssetAddedHook(const FAssetData& Data);
-    void OnAssetRemovedHook(const FAssetData& Data);
-    void OnAssetRenamedHook(const FAssetData& Data, const FString& OldObjectPath);
-    void SendDeltaEvent(const FString& Kind, TSharedRef<FJsonObject> Payload);
 
     TSharedPtr<FSageWebSocketClient> Client;
     FSageToolDispatch                ToolDispatch;
