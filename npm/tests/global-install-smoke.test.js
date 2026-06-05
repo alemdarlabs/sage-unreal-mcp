@@ -7,6 +7,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
 
+const { samePath } = require('../lib/install');
 const { npmInvocation } = require('../lib/npm_command');
 const { resolveServerBinary } = require('../lib/paths');
 
@@ -162,8 +163,8 @@ const mcp = run(process.execPath, [installedCli, 'mcp'], {
 const mcpResponses = mcp.stdout.trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
 const statusResponse = mcpResponses.find((response) => response.id === 2);
 assert.ok(statusResponse, mcp.stdout);
-assert.equal(statusResponse.result.structuredContent.env.SAGE_PROJECT_ROOT, projectRoot);
-assert.equal(statusResponse.result.structuredContent.env.SAGE_REPO_ROOT, projectRoot);
+assert.equal(samePath(statusResponse.result.structuredContent.env.SAGE_PROJECT_ROOT, projectRoot), true);
+assert.equal(samePath(statusResponse.result.structuredContent.env.SAGE_REPO_ROOT, projectRoot), true);
 assert.equal(statusResponse.result.structuredContent.project.looks_like_unreal_project, true);
 const aboutResponse = mcpResponses.find((response) => response.id === 3);
 assert.ok(aboutResponse, mcp.stdout);
