@@ -3,6 +3,7 @@
 #include "mcp/error_codes.h"
 #include "mcp/tool.h"
 #include "mcp/tool_registry.h"
+#include "util/env.h"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -180,9 +181,9 @@ fs::path weakAbs(const fs::path& p) {
 }
 
 fs::path envPath(const char* name) {
-    const char* v = std::getenv(name);
-    if (v == nullptr || *v == '\0') return {};
-    return weakAbs(fs::path{v});
+    const std::string value = sage::util::envValue(name);
+    if (value.empty()) return {};
+    return weakAbs(fs::path{value});
 }
 
 fs::path defaultRepoRoot() {
@@ -1258,11 +1259,11 @@ ToolResult UnifiedStatus(const Json& params) {
     out["project"] = pathStatusJson(project);
     out["project"]["looks_like_unreal_project"] = looksLikeProjectPath(project);
     out["env"] = {
-        {"SAGE_REPO_ROOT", std::getenv("SAGE_REPO_ROOT") ? std::getenv("SAGE_REPO_ROOT") : ""},
-        {"SAGE_UE_ROOT", std::getenv("SAGE_UE_ROOT") ? std::getenv("SAGE_UE_ROOT") : ""},
-        {"SAGE_PROJECT_ROOT", std::getenv("SAGE_PROJECT_ROOT") ? std::getenv("SAGE_PROJECT_ROOT") : ""},
-        {"SAGE_HTTP_PORT", std::getenv("SAGE_HTTP_PORT") ? std::getenv("SAGE_HTTP_PORT") : ""},
-        {"SAGE_WS_PORT", std::getenv("SAGE_WS_PORT") ? std::getenv("SAGE_WS_PORT") : ""}
+        {"SAGE_REPO_ROOT", sage::util::envValue("SAGE_REPO_ROOT")},
+        {"SAGE_UE_ROOT", sage::util::envValue("SAGE_UE_ROOT")},
+        {"SAGE_PROJECT_ROOT", sage::util::envValue("SAGE_PROJECT_ROOT")},
+        {"SAGE_HTTP_PORT", sage::util::envValue("SAGE_HTTP_PORT")},
+        {"SAGE_WS_PORT", sage::util::envValue("SAGE_WS_PORT")}
     };
 
     Json git;
@@ -1278,8 +1279,8 @@ ToolResult UnifiedStatus(const Json& params) {
 
     out["server"] = {
         {"cwd", weakAbs(fs::current_path()).generic_string()},
-        {"data_dir", std::getenv("SAGE_DATA_DIR") ? std::getenv("SAGE_DATA_DIR") : ""},
-        {"log_level", std::getenv("SAGE_LOG_LEVEL") ? std::getenv("SAGE_LOG_LEVEL") : ""}
+        {"data_dir", sage::util::envValue("SAGE_DATA_DIR")},
+        {"log_level", sage::util::envValue("SAGE_LOG_LEVEL")}
     };
     out["ok"] = out["repo_root"].value("exists", false);
     return out;

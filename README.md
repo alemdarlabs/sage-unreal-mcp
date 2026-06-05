@@ -93,7 +93,7 @@ available. During `sage bootstrap` or `sage init`, it resolves or downloads the
 
 ## Release Target
 
-`v0.1.11` is the next release target for cross-platform server assets,
+`v0.1.12` is the next release target for cross-platform server assets,
 zero-config Codex onboarding, project plugin version checks, and MCP-native Sage
 guidance tools. `v0.1.6` was the last Windows-only native asset release.
 
@@ -103,12 +103,12 @@ npm view @alemdarlabs/sage-mcp version dist.tarball
 
 Release assets:
 
-- `sage-server-0.1.11-win32-x64.zip`
-- `sage-server-0.1.11-linux-x64.tar.gz`
-- `sage-server-0.1.11-darwin-arm64.tar.gz`
-- `sage-server-0.1.11-darwin-x64.tar.gz`
-- `sagebridge-plugin-0.1.11-source.tar.gz`
-- `alemdarlabs-sage-mcp-0.1.11.tgz`
+- `sage-server-0.1.12-win32-x64.zip`
+- `sage-server-0.1.12-linux-x64.tar.gz`
+- `sage-server-0.1.12-darwin-arm64.tar.gz`
+- `sage-server-0.1.12-darwin-x64.tar.gz`
+- `sagebridge-plugin-0.1.12-source.tar.gz`
+- `alemdarlabs-sage-mcp-0.1.12.tgz`
 - `checksums.txt`
 
 The next release pipeline produces platform-specific `sage-server` assets for

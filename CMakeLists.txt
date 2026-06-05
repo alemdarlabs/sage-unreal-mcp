@@ -13,7 +13,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(sage-unreal-mcp
-    VERSION 0.1.11
+    VERSION 0.1.12
     DESCRIPTION "Sage MCP server for Unreal Engine"
     HOMEPAGE_URL "https://github.com/alemdarlabs/sage-unreal-mcp"
     LANGUAGES CXX

@@ -19,6 +19,7 @@
 #include "transport/http_sse_server.h"
 #include "transport/stdio_mcp.h"
 #include "util/crash_handler.h"
+#include "util/env.h"
 #include "version.h"
 
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -71,17 +72,17 @@ extern "C" void signalHandler(int signal) {
 }
 
 [[nodiscard]] std::string envOr(const char* name, std::string fallback) {
-    const char* v = std::getenv(name);
-    return (v != nullptr && *v != '\0') ? std::string{v} : std::move(fallback);
+    std::string value = sage::util::envValue(name);
+    return !value.empty() ? std::move(value) : std::move(fallback);
 }
 
 [[nodiscard]] int envIntOr(const char* name, int fallback) {
-    const char* v = std::getenv(name);
-    if (v == nullptr || *v == '\0') return fallback;
+    const std::string value = sage::util::envValue(name);
+    if (value.empty()) return fallback;
     try {
-        return std::stoi(std::string{v});
+        return std::stoi(value);
     } catch (const std::exception&) {
-        spdlog::warn("Env {}={} not a valid integer; using default {}", name, v, fallback);
+        spdlog::warn("Env {}={} not a valid integer; using default {}", name, value, fallback);
         return fallback;
     }
 }
@@ -484,8 +485,10 @@ int main(int argc, char* argv[]) {
         logger = spdlog::stdout_color_mt("sage");
     } else {
         try {
-            const std::string tmp = std::getenv("TEMP") ? std::getenv("TEMP")
-                                  : std::getenv("TMPDIR") ? std::getenv("TMPDIR")
+            const std::string tempDir = sage::util::envValue("TEMP");
+            const std::string tmpDir = sage::util::envValue("TMPDIR");
+            const std::string tmp = !tempDir.empty() ? tempDir
+                                  : !tmpDir.empty() ? tmpDir
                                   : "/tmp";
             const std::string logPath = tmp + "/sage-stdio.log";
             auto stderrSink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();

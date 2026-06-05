@@ -1,6 +1,7 @@
 #include "tools/sage_guidance_tools.h"
 
 #include "mcp/error_codes.h"
+#include "util/env.h"
 #include "version.h"
 
 #include <spdlog/spdlog.h>
@@ -26,8 +27,7 @@ namespace fs = std::filesystem;
 using Json = nlohmann::json;
 
 [[nodiscard]] std::string envValue(const char* name) {
-    const char* value = std::getenv(name);
-    return (value != nullptr && *value != '\0') ? std::string{value} : std::string{};
+    return sage::util::envValue(name);
 }
 
 [[nodiscard]] std::string lower(std::string_view text) {

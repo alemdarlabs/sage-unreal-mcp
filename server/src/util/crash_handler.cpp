@@ -1,4 +1,5 @@
 #include "util/crash_handler.h"
+#include "util/env.h"
 
 #ifdef _WIN32
 
@@ -22,10 +23,12 @@ namespace {
 std::wstring crashDumpDir() {
     namespace fs = std::filesystem;
     fs::path base;
-    if (const char* env = std::getenv("SAGE_DATA_DIR"); env != nullptr && *env != '\0') {
-        base = fs::path(env) / "crashdumps";
-    } else if (const char* lad = std::getenv("LOCALAPPDATA"); lad != nullptr && *lad != '\0') {
-        base = fs::path(lad) / "CrashDumps" / "sage-server";
+    const std::string dataDir = sage::util::envValue("SAGE_DATA_DIR");
+    const std::string localAppData = sage::util::envValue("LOCALAPPDATA");
+    if (!dataDir.empty()) {
+        base = fs::path(dataDir) / "crashdumps";
+    } else if (!localAppData.empty()) {
+        base = fs::path(localAppData) / "CrashDumps" / "sage-server";
     } else {
         base = fs::path("crashdumps");
     }
