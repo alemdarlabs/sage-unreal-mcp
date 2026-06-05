@@ -124,6 +124,7 @@ runSage(['init', projectPath, '--ue-root', fakeUeRoot]);
 const pluginRoot = path.join(projectRoot, 'Plugins', 'SageBridge');
 assert.equal(fs.existsSync(path.join(pluginRoot, 'SageBridge.uplugin')), true);
 assert.equal(fs.existsSync(path.join(pluginRoot, 'Source')), true);
+assert.equal(readJson(path.join(pluginRoot, 'SageBridge.uplugin')).VersionName, readJson(path.join(repoRoot, 'package.json')).version);
 
 const project = readJson(projectPath);
 assert.equal(project.Plugins.some((plugin) => plugin.Name === 'SageBridge' && plugin.Enabled === true), true);

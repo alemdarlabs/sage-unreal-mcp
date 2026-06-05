@@ -181,6 +181,7 @@ sage setup codex [options]
 sage bootstrap [Project.uproject] [options]
 sage init <Project.uproject> [options]
 sage update
+sage update <Project.uproject>
 sage update --plugin <Project.uproject>
 ```
 
@@ -194,6 +195,15 @@ Common `init` options:
 --mcp-config <path>      Write MCP config somewhere other than <project>/.mcp.json
 --no-mcp-config          Install plugin without writing MCP config
 ```
+
+`sage update` without a project only repairs or downloads the machine-level
+native server for the installed npm package. `sage update <Project.uproject>` is
+the project-level update path: it verifies the server binary, refuses to copy
+`SageBridge` while that Unreal project is open, installs the matching plugin
+package under `Plugins/SageBridge`, enables the plugin in the `.uproject`, and
+prints the installed plugin version. `sage doctor` reports the installed
+`SageBridge` version versus the current Sage CLI version and suggests
+`sage update "<Project.uproject>"` when they diverge.
 
 Common `setup codex` options:
 

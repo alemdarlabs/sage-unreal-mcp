@@ -18,6 +18,7 @@ struct EditorSession {
     std::string project_id;
     std::string project_path;
     std::string engine_version;   // full "5.7.4" for diagnostics
+    std::string plugin_version;   // SageBridge VersionName from the plugin descriptor
     std::int64_t pid = 0;
 
     std::chrono::system_clock::time_point connected_at;

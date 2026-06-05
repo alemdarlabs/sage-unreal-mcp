@@ -1086,6 +1086,7 @@ int main(int argc, char* argv[]) {
             {"project_id",     s.project_id},
             {"project_path",   s.project_path},
             {"engine_version", s.engine_version},
+            {"plugin_version", s.plugin_version},
             {"pid",            s.pid},
         };
     };
@@ -4955,6 +4956,7 @@ int main(int argc, char* argv[]) {
                         {"project_id",        s.project_id},
                         {"project_path",      s.project_path},
                         {"engine_version",    s.engine_version},
+                        {"plugin_version",    s.plugin_version},
                         {"pid",               s.pid},
                     };
                 };
@@ -5002,6 +5004,7 @@ int main(int argc, char* argv[]) {
                 {"project_path",   s.project_path},
                 {"project_id",     s.project_id},
                 {"engine_version", s.engine_version},
+                {"plugin_version", s.plugin_version},
                 {"pid",            s.pid},
             };
             mcpServer.publishNotification("notifications/message", nlohmann::json{

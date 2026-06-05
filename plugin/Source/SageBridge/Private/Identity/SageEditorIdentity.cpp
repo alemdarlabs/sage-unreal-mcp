@@ -5,9 +5,23 @@
 
 #include "Dom/JsonObject.h"
 #include "HAL/PlatformProcess.h"
+#include "Interfaces/IPluginManager.h"
 #include "Misc/App.h"
 #include "Misc/EngineVersion.h"
 #include "Misc/Guid.h"
+
+namespace
+{
+FString ResolveSageBridgePluginVersion()
+{
+    const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("SageBridge"));
+    if (Plugin.IsValid() && !Plugin->GetDescriptor().VersionName.IsEmpty())
+    {
+        return Plugin->GetDescriptor().VersionName;
+    }
+    return TEXT("unknown");
+}
+}
 
 FSageEditorIdentity FSageEditorIdentity::Snapshot()
 {
@@ -56,6 +70,7 @@ TSharedRef<FJsonObject> FSageEditorIdentity::ToHandshakeJson() const
     const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
     Root->SetStringField(TEXT("type"),    TEXT("hello"));
     Root->SetStringField(TEXT("version"), TEXT("0.1.0"));
+    Root->SetStringField(TEXT("plugin_version"), ResolveSageBridgePluginVersion());
     Root->SetStringField(TEXT("slot_id"), SlotId);
     Root->SetObjectField(TEXT("editor"),  Editor);
     // asset_registry_hash deferred to Phase 2 (Knowledge layer indexing)

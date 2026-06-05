@@ -358,6 +358,7 @@ void BridgeServer::handleHello(ix::WebSocket& ws,
     EditorSession s;
     s.session_id     = session_id;
     s.slot_id        = hello.slot_id;
+    s.plugin_version = hello.plugin_version;
     s.connected_at   = std::chrono::system_clock::now();
     s.last_heartbeat = s.connected_at;
     s.ws             = &ws;  // ADR-004 §2: per-call routing needs ws-by-session lookup.
@@ -377,8 +378,8 @@ void BridgeServer::handleHello(ix::WebSocket& ws,
     }
 
     spdlog::info(
-        "Bridge handshake: slot={}, label='{}', project='{}', instance='{}', engine={}",
-        s.slot_id, s.label, s.project_path, s.instance_id, s.engine_version);
+        "Bridge handshake: slot={}, label='{}', project='{}', instance='{}', engine={}, plugin={}",
+        s.slot_id, s.label, s.project_path, s.instance_id, s.engine_version, s.plugin_version);
 
     // Fire the "connected" callback BEFORE signaling the cv. The callback
     // typically publishes a notifications/message envelope on stdout; if we

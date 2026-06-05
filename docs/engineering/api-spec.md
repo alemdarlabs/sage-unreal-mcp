@@ -72,6 +72,7 @@ which is the deterministic blocking-tool path.
 {
   "type": "hello",
   "version": "0.1.0",
+  "plugin_version": "0.1.4",
   "editor": {
     "id": "MyProject@a3f1",
     "label": "host",

@@ -63,7 +63,7 @@ Use shared HTTP mode only for multi-client debugging, long-running shared sessio
 
 - npm package: small Node launcher, installer, and command surface.
 - Native server binary: downloaded from release assets into `~/.sage-mcp/bin/<version>/<platform>/`.
-- Unreal plugin package: downloaded from release assets into `~/.sage-mcp/plugins/<version>/<platform>/SageBridge`, then copied into target projects by `sage init` / `sage update --plugin`.
+- Unreal plugin package: downloaded from release assets into `~/.sage-mcp/plugins/<version>/<platform>/SageBridge`, then copied into target projects by `sage init` / `sage update <Project.uproject>` / `sage update --plugin`.
 - Runtime data: `~/.sage-mcp`.
 
 ## Public release asset contract
@@ -106,8 +106,9 @@ Development/test overrides:
 | `sage bootstrap [Project.uproject]` | Discover or target an Unreal project, install `SageBridge`, and enable it in `.uproject` without requiring `.mcp.json`. |
 | `sage init <Project.uproject>` | Install plugin, enable it in `.uproject`, and write project `.mcp.json`. |
 | `sage update` | Ensure native binary is installed for this package version. |
-| `sage update --plugin [Project.uproject]` | Ensure a plugin package is available and install it into the discovered or target project. |
-| `sage doctor [Project.uproject]` | Validate binary, discovered project, plugin, and optional MCP config paths. |
+| `sage update <Project.uproject>` | Ensure the native binary exists, verify the target editor is closed, and install the matching `SageBridge` into the project. |
+| `sage update --plugin [Project.uproject]` | Backward-compatible plugin-only update for the discovered or target project. |
+| `sage doctor [Project.uproject]` | Validate binary, discovered project, plugin, plugin version, and optional MCP config paths. |
 | `sage init <Project.uproject> --codex` | Also register global `sage mcp` in Codex. Project context is discovered at launch time. |
 | `sage init <Project.uproject> --claude` | Also register `sage mcp` with Claude Code using project scope by default. |
 | `npm run release:check` | Run JS syntax, npm smoke, global install smoke, release asset extraction, and npm publish dry-run gates. |

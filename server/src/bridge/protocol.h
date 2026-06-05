@@ -37,6 +37,7 @@ enum class MessageType {
 
 struct HelloMessage {
     std::string version;
+    std::string plugin_version;
     std::string slot_id;
     Json editor = Json::object();  // raw editor identity (api-spec.md §Handshake)
     std::optional<std::string> asset_registry_hash;

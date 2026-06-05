@@ -68,9 +68,9 @@ sage init
 ## Plugin Distribution Notes
 
 The plugin is not embedded directly in the npm package by default. Engine and
-platform combinations can make plugin artifacts large. `sage init` and
-`sage update --plugin <project>` resolve the correct plugin package and install
-it into `Plugins/SageBridge/`.
+platform combinations can make plugin artifacts large. `sage init`,
+`sage update <project>`, and `sage update --plugin <project>` resolve the
+correct plugin package and install it into `Plugins/SageBridge/`.
 
 ## Consequences
 

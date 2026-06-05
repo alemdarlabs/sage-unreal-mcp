@@ -17,7 +17,7 @@ const {
   resolveServerBinary,
 } = require('../lib/paths');
 const { platformKey, serverExeName } = require('../lib/platform');
-const { copyRecursive, ensureDir } = require('../lib/file_ops');
+const { copyRecursive, ensureDir, readJson, writeJson } = require('../lib/file_ops');
 
 function usage() {
   return `Usage:
@@ -78,12 +78,20 @@ function stageServer(tempRoot, serverPath) {
   return stage;
 }
 
-function stagePlugin(tempRoot, pluginSource) {
+function patchPluginDescriptorVersion(pluginDest, version) {
+  const descriptorPath = path.join(pluginDest, 'SageBridge.uplugin');
+  const descriptor = readJson(descriptorPath);
+  descriptor.VersionName = version;
+  writeJson(descriptorPath, descriptor);
+}
+
+function stagePlugin(tempRoot, pluginSource, version) {
   const stage = path.join(tempRoot, 'plugin');
   const pluginDest = path.join(stage, 'SageBridge');
   copyRecursive(pluginSource, pluginDest, {
     skipNames: new Set(['HostProject', 'Intermediate', 'Saved', 'DerivedDataCache']),
   });
+  patchPluginDescriptorVersion(pluginDest, version);
   return stage;
 }
 
@@ -122,7 +130,7 @@ function main() {
   const pluginArchive = path.join(outDir, pluginArchiveName(version, key));
 
   archiveDir(stageServer(tempRoot, serverPath), serverArchive);
-  archiveDir(stagePlugin(tempRoot, pluginSource), pluginArchive);
+  archiveDir(stagePlugin(tempRoot, pluginSource, version), pluginArchive);
 
   const checksums = [
     `${sha256(serverArchive)}  ${path.basename(serverArchive)}`,

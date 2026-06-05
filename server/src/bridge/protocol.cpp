@@ -43,6 +43,7 @@ std::expected<HelloMessage, std::string> parseHello(const Json& j) {
 
     HelloMessage h;
     h.version = j["version"].get<std::string>();
+    h.plugin_version = j.value("plugin_version", "");
     h.slot_id = j["slot_id"].get<std::string>();
     if (j.contains("editor") && j["editor"].is_object()) {
         h.editor = j["editor"];

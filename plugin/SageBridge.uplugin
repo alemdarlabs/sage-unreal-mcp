@@ -1,7 +1,7 @@
 {
     "FileVersion": 3,
     "Version": 1,
-    "VersionName": "0.1.0",
+    "VersionName": "0.1.4",
     "FriendlyName": "Sage Bridge",
     "Description": "Sage MCP server bridge for Unreal Engine. Connects the editor to a long-lived Sage server over WebSocket; provides agent-controlled execution and intelligence-layer access.",
     "Category": "Editor",

@@ -20,6 +20,7 @@ function run(args, options = {}) {
       ...process.env,
       SAGE_SKIP_DOWNLOAD: '1',
       SAGE_DATA_DIR: options.dataDir || path.join(os.tmpdir(), 'sage-mcp-test-data'),
+      ...(options.env || {}),
     },
   });
   if (options.allowFailure) return result;
@@ -85,6 +86,7 @@ assert.equal(project.Plugins.some((plugin) => plugin.Name === 'SageBridge' && pl
 const installedPlugin = path.join(tempRoot, 'Plugins', 'SageBridge');
 assert.equal(fs.existsSync(path.join(installedPlugin, 'SageBridge.uplugin')), true);
 assert.equal(fs.existsSync(path.join(installedPlugin, 'Source')), true);
+assert.equal(readJson(path.join(installedPlugin, 'SageBridge.uplugin')).VersionName, version);
 
 const mcp = readJson(mcpPath);
 assert.deepEqual(mcp.mcpServers.sage.command, 'sage');
@@ -153,6 +155,39 @@ assert.equal(
 const doctor = run(['doctor', projectPath, '--json']).stdout;
 const report = JSON.parse(doctor);
 assert.equal(report.ok, true);
+
+const descriptorPath = path.join(installedPlugin, 'SageBridge.uplugin');
+const oldDescriptor = readJson(descriptorPath);
+oldDescriptor.VersionName = '0.0.1';
+fs.writeFileSync(descriptorPath, `${JSON.stringify(oldDescriptor, null, 2)}\n`, 'utf8');
+const outdatedDoctor = run(['doctor', projectPath, '--json'], { allowFailure: true });
+assert.equal(outdatedDoctor.status, 1);
+const outdatedReport = JSON.parse(outdatedDoctor.stdout);
+assert.equal(outdatedReport.ok, false);
+assert.equal(
+  outdatedReport.checks.some((check) => (
+    check.name === 'plugin_version'
+    && check.installed_version === '0.0.1'
+    && check.expected_version === version
+    && check.status === 'outdated'
+  )),
+  true
+);
+assert.equal(
+  outdatedReport.suggestions.some((suggestion) => (
+    suggestion.id === 'update_project_plugin'
+    && suggestion.command === `sage update "${projectPath}"`
+  )),
+  true
+);
+
+const projectUpdate = run(['update', projectPath, '--plugin-source', path.join(repoRoot, 'plugin')], {
+  env: { SAGE_SERVER_PATH: process.execPath },
+});
+assert.match(projectUpdate.stderr, /sage-server ready:/);
+assert.match(projectUpdate.stderr, /SageBridge version:/);
+assert.equal(readJson(descriptorPath).VersionName, version);
+assert.equal(JSON.parse(run(['doctor', projectPath, '--json']).stdout).ok, true);
 
 const nestedDir = path.join(tempRoot, 'Content', 'Maps');
 fs.mkdirSync(nestedDir, { recursive: true });

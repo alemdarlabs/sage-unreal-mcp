@@ -33,7 +33,8 @@ Usage:
   sage init <Project.uproject> [options]    Install plugin and project .mcp.json
   sage bootstrap [Project.uproject]         Install/update SageBridge in current or target project
   sage update                               Ensure native server binary is installed
-  sage update --plugin [Project.uproject]   Install/update SageBridge in current or target project
+  sage update <Project.uproject>            Update SageBridge in a target Unreal project
+  sage update --plugin [Project.uproject]   Alias for project plugin update
   sage doctor [Project.uproject] [--json]   Validate local install and discovered project
 
 Options for init/bootstrap/update --plugin:
@@ -130,17 +131,35 @@ function spawnServer(mode, args) {
 }
 
 async function commandUpdate(args) {
-  if (hasFlag(args, '--plugin')) {
-    const pluginSource = parseOption(args, '--plugin-source');
-    const forceDownload = hasFlag(args, '--force');
-    if (args.length > 1) throw new Error(`Unexpected update --plugin argument: ${args[1]}`);
-    const projectPath = normalizeUproject(resolveProjectArgOrDiscover(args[0]));
-    const result = await installPlugin(projectPath, { pluginSource, forceDownload });
+  const pluginSource = parseOption(args, '--plugin-source');
+  const forceDownload = hasFlag(args, '--force');
+  const pluginMode = hasFlag(args, '--plugin');
+  const serverOnly = hasFlag(args, '--server-only');
+  const projectArg = args.length && !args[0].startsWith('--') ? args.shift() : null;
+  if (args.length) throw new Error(`Unexpected update argument: ${args[0]}`);
+  if (pluginSource && !pluginMode && !projectArg) {
+    throw new Error('--plugin-source requires `sage update <Project.uproject>` or `sage update --plugin [Project.uproject]`');
+  }
+
+  if (pluginMode || projectArg) {
+    if (serverOnly) throw new Error('--server-only cannot be combined with a project plugin update');
+    const projectPath = normalizeUproject(resolveProjectArgOrDiscover(projectArg));
+    if (!pluginMode) {
+      const binary = await ensureServerBinary({ forceDownload });
+      process.stderr.write(`sage-server ready: ${binary}\n`);
+    }
+    const result = await installPlugin(projectPath, {
+      pluginSource,
+      forceDownload,
+      requireEditorClosed: true,
+    });
     process.stderr.write(`SageBridge installed: ${result.dest}\n`);
+    process.stderr.write(`SageBridge version: ${result.installedVersion || '<unknown>'}\n`);
     if (result.backup) process.stderr.write(`Previous plugin backed up: ${result.backup}\n`);
+    process.stderr.write('Restart Unreal Editor if it was open before this update.\n');
     return;
   }
-  const binary = await ensureServerBinary({ forceDownload: hasFlag(args, '--force') });
+  const binary = await ensureServerBinary({ forceDownload });
   process.stderr.write(`sage-server ready: ${binary}\n`);
 }
 
@@ -169,6 +188,7 @@ async function installProject(projectPath, options = {}) {
   process.stderr.write(`Project: ${projectPath}\n`);
   process.stderr.write(`EngineAssociation: ${project.EngineAssociation || '<none>'}\n`);
   process.stderr.write(`SageBridge installed: ${result.dest}\n`);
+  process.stderr.write(`SageBridge version: ${result.installedVersion || '<unknown>'}\n`);
   if (result.backup) process.stderr.write(`Previous plugin backed up: ${result.backup}\n`);
   if (configPath) process.stderr.write(`MCP config updated: ${configPath}\n`);
   process.stderr.write(`Project root: ${root}\n`);
@@ -253,11 +273,25 @@ function commandDoctor(args) {
       reason: 'Project-local .mcp.json contains a stale or incompatible Sage entry.',
     });
   }
+  const pluginVersionCheck = checks.find((check) => check.name === 'plugin_version');
+  const pluginDescriptorCheck = checks.find((check) => check.name === 'plugin_descriptor');
+  if (projectPath && pluginVersionCheck && !pluginVersionCheck.ok && pluginDescriptorCheck && pluginDescriptorCheck.ok) {
+    const command = pluginVersionCheck.status === 'newer_than_cli'
+      ? 'npm install -g @alemdarlabs/sage-mcp@latest'
+      : `sage update "${projectPath}"`;
+    suggestions.push({
+      id: pluginVersionCheck.status === 'newer_than_cli' ? 'update_sage_cli' : 'update_project_plugin',
+      command,
+      reason: `SageBridge ${pluginVersionCheck.installed_version || '<missing>'} does not match Sage CLI ${pluginVersionCheck.expected_version}.`,
+    });
+  }
   if (json) {
     process.stdout.write(`${JSON.stringify({ ok, checks, suggestions }, null, 2)}\n`);
   } else {
     for (const check of checks) {
-      const suffix = check.path || check.version || check.root || '';
+      const suffix = check.name === 'plugin_version'
+        ? `${check.installed_version || '<missing>'} (expected ${check.expected_version})`
+        : check.path || check.version || check.root || '';
       process.stderr.write(`${check.ok ? 'OK ' : 'ERR'} ${check.name}${suffix ? `: ${suffix}` : ''}\n`);
     }
     for (const suggestion of suggestions) {
