@@ -32,8 +32,9 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1.13.0
+      - name: Setup MSVC environment
+        shell: pwsh
+        run: .\scripts\ci\setup-msvc-env.ps1
 
       - name: Resolve version
         id: version

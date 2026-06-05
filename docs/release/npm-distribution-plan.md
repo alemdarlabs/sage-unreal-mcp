@@ -81,11 +81,11 @@ sage-server-<version>-<platform-key>.zip
 sagebridge-plugin-<version>-<platform-key>.zip
 ```
 
-For Windows x64 `0.1.5`:
+For Windows x64 `0.1.6`:
 
 ```text
-sage-server-0.1.5-win32-x64.zip
-sagebridge-plugin-0.1.5-win32-x64.zip
+sage-server-0.1.6-win32-x64.zip
+sagebridge-plugin-0.1.6-win32-x64.zip
 ```
 
 Development/test overrides:

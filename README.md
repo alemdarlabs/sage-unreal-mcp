@@ -93,7 +93,7 @@ available. During `sage bootstrap` or `sage init`, it resolves or downloads the
 
 ## Current Release
 
-`v0.1.5` is the current release for zero-config Codex onboarding, project
+`v0.1.6` is the current release for zero-config Codex onboarding, project
 plugin version checks, and MCP-native Sage guidance tools.
 
 ```powershell
@@ -102,9 +102,9 @@ npm view @alemdarlabs/sage-mcp version dist.tarball
 
 Release assets:
 
-- `sage-server-0.1.5-win32-x64.zip`
-- `sagebridge-plugin-0.1.5-win32-x64.zip`
-- `alemdarlabs-sage-mcp-0.1.5.tgz`
+- `sage-server-0.1.6-win32-x64.zip`
+- `sagebridge-plugin-0.1.6-win32-x64.zip`
+- `alemdarlabs-sage-mcp-0.1.6.tgz`
 - `checksums.txt`
 
 GitHub-hosted Windows runners do not include Unreal Engine. The hosted release
