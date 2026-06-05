@@ -26,7 +26,7 @@ TEST_CASE("parseHello accepts well-formed envelope", "[bridge][protocol]") {
     const nlohmann::json env = {
         {"type",    "hello"},
         {"version", "0.1.0"},
-        {"plugin_version", "0.1.4"},
+        {"plugin_version", "0.1.5"},
         {"slot_id", "abc123"},
         {"editor", {
             {"id",    "MyProject@x"},
@@ -36,7 +36,7 @@ TEST_CASE("parseHello accepts well-formed envelope", "[bridge][protocol]") {
     auto r = parseHello(env);
     REQUIRE(r.has_value());
     REQUIRE(r->version == "0.1.0");
-    REQUIRE(r->plugin_version == "0.1.4");
+    REQUIRE(r->plugin_version == "0.1.5");
     REQUIRE(r->slot_id == "abc123");
     REQUIRE(r->editor["id"] == "MyProject@x");
     REQUIRE(r->editor["label"] == "host");

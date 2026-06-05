@@ -37,7 +37,7 @@ $serverNames = Get-ChildItem $serverRoot -Recurse -Filter '*.cpp' |
     ForEach-Object {
         $text = Read-AllText $_.FullName
         Get-RegexGroupValues $text '\.name\s*=\s*"([^"]+)"'
-        Get-RegexGroupValues $text 'regLocal\(\s*registry\s*,\s*"([^"]+)"'
+        Get-RegexGroupValues $text 'reg(?:ister)?Local\(\s*registry\s*,\s*"([^"]+)"'
         Get-ArrayRegisteredToolNames $text 'const\s+char\*\s+\w*Tools\[\]\s*=\s*\{([\s\S]*?)\};' '"([^"]+)"'
     } |
     Where-Object { $_ -ne 'sage-unreal-mcp' } |
@@ -61,6 +61,7 @@ $serverOnlyExact = @(
 )
 
 $serverOnlyPrefixes = @(
+    'sage.',
     'source.',
     'decision.',
     'risk.',

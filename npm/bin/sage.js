@@ -2,11 +2,13 @@
 'use strict';
 
 const { spawn } = require('node:child_process');
+const fs = require('node:fs');
 const path = require('node:path');
 
 const { configureClaudeMcp } = require('../lib/claude');
 const { configureCodexMcp, ensureCodexMcp } = require('../lib/codex');
 const { ensureServerBinary } = require('../lib/download');
+const { latestPackageVersion } = require('../lib/npm_registry');
 const {
   dataDir,
   packageRoot,
@@ -15,6 +17,7 @@ const {
 } = require('../lib/paths');
 const { discoverUnrealProject, resolveProjectArgOrDiscover } = require('../lib/project_discovery');
 const {
+  compareVersions,
   doctor,
   installPlugin,
   normalizeUproject,
@@ -32,6 +35,7 @@ Usage:
   sage setup codex [options]                Register Sage as a global Codex MCP server
   sage init <Project.uproject> [options]    Install plugin and project .mcp.json
   sage bootstrap [Project.uproject]         Install/update SageBridge in current or target project
+  sage guide [agent] [--json]               Print packaged AI usage guide
   sage update                               Ensure native server binary is installed
   sage update <Project.uproject>            Update SageBridge in a target Unreal project
   sage update --plugin [Project.uproject]   Alias for project plugin update
@@ -54,6 +58,13 @@ Options for setup codex:
   --codex-name <name>      Codex MCP server name. Default: sage
   --codex-command <path>   Codex executable path. Default: codex
   --no-replace             Do not replace an existing non-Sage Codex MCP entry
+
+Options for guide:
+  --agent <name>           codex, claude, cursor, or generic. Default: generic
+  --json                   Print {agent,path,content}
+
+Options for doctor:
+  --offline                Skip npm registry latest-version check
 `;
 }
 
@@ -169,6 +180,35 @@ function codexRegistrationEnv(ueRoot) {
   return env;
 }
 
+function agentGuidePath(agent) {
+  const normalized = String(agent || 'generic').toLowerCase();
+  const files = {
+    generic: path.join(packageRoot(), 'npm', 'agents', 'generic', 'sage-agent-guide.md'),
+    codex: path.join(packageRoot(), 'npm', 'agents', 'codex', 'AGENTS.md'),
+    claude: path.join(packageRoot(), 'npm', 'agents', 'claude', 'CLAUDE.md'),
+    cursor: path.join(packageRoot(), 'npm', 'agents', 'cursor', 'rules.md'),
+  };
+  if (!files[normalized]) {
+    throw new Error(`Unknown guide agent '${agent}'. Supported agents: generic, codex, claude, cursor.`);
+  }
+  return { agent: normalized, path: files[normalized] };
+}
+
+function commandGuide(args) {
+  const json = hasFlag(args, '--json');
+  const agentOption = parseOption(args, '--agent');
+  const positionalAgent = args.length && !args[0].startsWith('--') ? args.shift() : null;
+  if (args.length) throw new Error(`Unexpected guide argument: ${args[0]}`);
+  const guide = agentGuidePath(agentOption || positionalAgent || 'generic');
+  const content = fs.readFileSync(guide.path, 'utf8');
+  if (json) {
+    process.stdout.write(`${JSON.stringify({ agent: guide.agent, path: guide.path, content }, null, 2)}\n`);
+  } else {
+    process.stdout.write(content);
+    if (!content.endsWith('\n')) process.stdout.write('\n');
+  }
+}
+
 async function installProject(projectPath, options = {}) {
   const project = readProject(projectPath);
   const root = projectRoot(projectPath);
@@ -235,18 +275,48 @@ async function commandInit(args) {
   }
 }
 
-function commandDoctor(args) {
+async function commandDoctor(args) {
   const json = hasFlag(args, '--json');
+  const offline = hasFlag(args, '--offline');
   const explicitProject = args[0] || null;
+  if (args.length > (explicitProject ? 1 : 0)) throw new Error(`Unexpected doctor argument: ${args[1]}`);
   const discovered = explicitProject ? null : discoverUnrealProject(process.cwd());
   const projectPath = explicitProject || (discovered && discovered.ok ? discovered.projectPath : null);
   const binary = resolveServerBinary();
+  const localVersion = packageVersion();
   const checks = [
     { name: 'node', ok: true, version: process.version },
-    { name: 'package', ok: true, version: packageVersion(), root: packageRoot() },
+    { name: 'package', ok: true, version: localVersion, root: packageRoot() },
     { name: 'data_dir', ok: true, path: dataDir() },
     { name: 'server_binary', ok: Boolean(binary), path: binary || null },
   ];
+  const latest = await latestPackageVersion({ offline });
+  if (latest.status === 'available') {
+    const comparison = compareVersions(localVersion, latest.version);
+    const latestStatus = comparison === null
+      ? 'unknown'
+      : comparison < 0
+        ? 'outdated'
+        : comparison > 0
+          ? 'newer_than_registry'
+          : 'current';
+    checks.push({
+      name: 'npm_latest',
+      ok: latestStatus !== 'outdated',
+      local_version: localVersion,
+      latest_version: latest.version,
+      status: latestStatus,
+    });
+  } else {
+    checks.push({
+      name: 'npm_latest',
+      ok: true,
+      optional: true,
+      status: latest.status,
+      error: latest.error,
+      http_status: latest.http_status,
+    });
+  }
   if (!explicitProject) {
     checks.push({
       name: 'project_discovery',
@@ -285,12 +355,23 @@ function commandDoctor(args) {
       reason: `SageBridge ${pluginVersionCheck.installed_version || '<missing>'} does not match Sage CLI ${pluginVersionCheck.expected_version}.`,
     });
   }
+  const npmLatestCheck = checks.find((check) => check.name === 'npm_latest');
+  if (npmLatestCheck && npmLatestCheck.status === 'outdated'
+      && !suggestions.some((suggestion) => suggestion.id === 'update_sage_cli')) {
+    suggestions.push({
+      id: 'update_sage_cli',
+      command: 'npm install -g @alemdarlabs/sage-mcp@latest',
+      reason: `Sage CLI ${npmLatestCheck.local_version} is older than npm latest ${npmLatestCheck.latest_version}.`,
+    });
+  }
   if (json) {
     process.stdout.write(`${JSON.stringify({ ok, checks, suggestions }, null, 2)}\n`);
   } else {
     for (const check of checks) {
       const suffix = check.name === 'plugin_version'
         ? `${check.installed_version || '<missing>'} (expected ${check.expected_version})`
+        : check.name === 'npm_latest'
+          ? `${check.local_version || '<unknown>'} (latest ${check.latest_version || check.status})`
         : check.path || check.version || check.root || '';
       process.stderr.write(`${check.ok ? 'OK ' : 'ERR'} ${check.name}${suffix ? `: ${suffix}` : ''}\n`);
     }
@@ -366,6 +447,10 @@ async function main() {
     await commandBootstrap(args);
     return;
   }
+  if (command === 'guide') {
+    commandGuide(args);
+    return;
+  }
   if (command === 'setup') {
     commandSetup(args);
     return;
@@ -375,7 +460,7 @@ async function main() {
     return;
   }
   if (command === 'doctor') {
-    commandDoctor(args);
+    await commandDoctor(args);
     return;
   }
   process.stderr.write(`Unknown command: ${command}\n\n${usage()}`);

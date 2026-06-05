@@ -16,6 +16,7 @@ sage-unreal-mcp/
 |   |-- research/
 |   `-- archive/
 |-- npm/
+|   |-- agents/
 |   |-- bin/
 |   |-- lib/
 |   |-- scripts/

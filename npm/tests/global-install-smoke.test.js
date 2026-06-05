@@ -30,6 +30,7 @@ function run(command, args, options = {}) {
     env: {
       ...process.env,
       SAGE_DATA_DIR: dataDir,
+      SAGE_SKIP_NPM_LATEST: '1',
       SAGE_BINARY_BASE_URL: pathToFileURL(releaseDir).toString(),
       SAGE_PLUGIN_BASE_URL: pathToFileURL(releaseDir).toString(),
       PATH: `${globalBinDir}${path.delimiter}${process.env.PATH || ''}`,
@@ -139,11 +140,15 @@ assert.equal(mcpConfig.mcpServers.sage.env.SAGE_UE_ROOT, fakeUeRoot);
 const doctor = runSage(['doctor', projectPath, '--json']);
 const report = JSON.parse(doctor.stdout);
 assert.equal(report.ok, true);
+const guide = JSON.parse(runSage(['guide', '--agent', 'codex', '--json']).stdout);
+assert.equal(guide.agent, 'codex');
+assert.match(guide.content, /sage\.workflow\.suggest/);
 
 const mcpInput = [
   { jsonrpc: '2.0', method: 'initialize', id: 1, params: {} },
   { jsonrpc: '2.0', method: 'notifications/initialized', params: {} },
   { jsonrpc: '2.0', method: 'tools/call', id: 2, params: { name: 'status', arguments: {} } },
+  { jsonrpc: '2.0', method: 'tools/call', id: 3, params: { name: 'sage.about', arguments: {} } },
 ].map((message) => JSON.stringify(message)).join('\n') + '\n';
 const mcp = run(process.execPath, [installedCli, 'mcp'], {
   cwd: projectRoot,
@@ -156,5 +161,12 @@ assert.ok(statusResponse, mcp.stdout);
 assert.equal(statusResponse.result.structuredContent.env.SAGE_PROJECT_ROOT, projectRoot);
 assert.equal(statusResponse.result.structuredContent.env.SAGE_REPO_ROOT, projectRoot);
 assert.equal(statusResponse.result.structuredContent.project.looks_like_unreal_project, true);
+const aboutResponse = mcpResponses.find((response) => response.id === 3);
+assert.ok(aboutResponse, mcp.stdout);
+assert.equal(aboutResponse.result.structuredContent.name, 'Sage Unreal MCP');
+assert.deepEqual(
+  aboutResponse.result.structuredContent.what_to_do_first.slice(0, 3),
+  ['sage.project.discover', 'sage.doctor', 'sage.capabilities']
+);
 
 console.log('global install smoke ok');

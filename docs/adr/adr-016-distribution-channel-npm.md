@@ -29,7 +29,8 @@ Use `@alemdarlabs/sage-mcp` as the primary distribution package:
 
 ```bash
 npm install -g @alemdarlabs/sage-mcp
-sage init
+sage setup codex
+sage doctor <Project.uproject>
 ```
 
 ## Mechanism
@@ -40,6 +41,9 @@ sage init
 3. The Node.js wrapper launches the native server for MCP clients.
 4. `sage init` installs or updates `SageBridge`, enables it in the target
    `.uproject`, and writes MCP configuration.
+5. `sage guide` exposes packaged operating guides for AI clients.
+6. MCP-native `sage.*` guidance tools make the server self-describing through
+   `tools/list` and tool calls.
 
 ## Secondary Channels
 
@@ -79,6 +83,7 @@ Positive:
 - Cross-platform install through a single command.
 - Low onboarding friction for AI development tool users.
 - Existing npm semver and update workflows.
+- Packaged agent guidance can version with the server and plugin contract.
 - GitHub Releases remain available for direct asset download.
 
 Negative:

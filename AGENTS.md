@@ -50,7 +50,7 @@ Current source audit command:
 
 Current audit result, verified on 2026-06-05:
 
-- `server_tool_count`: 1243
+- `server_tool_count`: 1251
 - `plugin_handler_count`: 1191
 - `plugin_without_schema`: 0
 - `schema_stub_count`: 0
@@ -75,7 +75,7 @@ sage-unreal-mcp/
 |   |-- release/             # npm and binary distribution notes
 |   |-- research/            # Reference parity and market research
 |   `-- archive/             # Historical notes, retired designs, gap logs
-|-- npm/                     # npm package wrapper and postinstall logic
+|-- npm/                     # npm package wrapper, agent guides, and postinstall logic
 |-- plugin/                  # Unreal SageBridge plugin
 |-- scripts/                 # Build, package, smoke, audit helpers
 |-- server/                  # C++23 MCP server
@@ -109,6 +109,37 @@ locations.
 Historical gap logs and old working notes live under
 `docs/archive/working-notes/`. Treat them as evidence, not current truth. Verify
 against source and audit scripts before acting on them.
+
+## AI Client Onboarding Contract
+
+Sage must be discoverable by any MCP-capable AI client without prior private
+context. The npm package carries public agent guides under `npm/agents/`, and
+the server exposes MCP-native guidance tools.
+
+When a fresh Codex, Claude, Cursor, or other MCP client is told to use Sage in
+an Unreal project, the expected first MCP calls are:
+
+1. `sage.about`
+2. `sage.project.discover`
+3. `sage.doctor`
+4. `sage.capabilities`
+5. `list_editors`
+6. `sage.workflow.suggest` with the user's concrete task intent
+
+If the MCP client cannot find its instructions, the CLI fallback is:
+
+```powershell
+sage guide codex
+sage guide generic
+sage doctor <Project.uproject>
+```
+
+`sage.doctor` is the authoritative setup/version check for an installed
+machine: it checks local package state, npm latest version when online, project
+plugin install state, project plugin version, and optional project MCP config.
+If it reports a stale plugin, the fix is `sage update <Project.uproject>`. If
+it reports a stale CLI package, the fix is
+`npm install -g @alemdarlabs/sage-mcp@latest`.
 
 ## Build And Run
 
@@ -162,6 +193,23 @@ Destructive operations against real Unreal projects require discipline:
 - Check source control state before broad mutation.
 - When deployment is requested for target projects, report build, copy, enable,
   and hash verification as separate steps.
+
+For a different Codex working inside an arbitrary Unreal project, "use Sage" or
+"deploy Sage" does not mean manually copying from an old checkout. The expected
+flow is:
+
+1. Discover the project with `sage.project.discover` or `sage doctor`.
+2. Repair install/version drift with `sage update <Project.uproject>`.
+3. Refuse plugin update while the matching Unreal Editor process is open.
+4. Verify editor connectivity with `list_editors` or `wait_for_editor`.
+5. Use `sage.workflow.suggest` to choose the narrowest safe read/write tool
+   sequence for the user's actual project task.
+
+For deployment from this repository into a production Unreal project, the
+Windows plugin deployment contract is still: build/package when the user allows
+builds, copy `SageBridge.uplugin`, `Binaries/<Platform>/`, and `Source/`, ensure
+the target `.uproject` enables `SageBridge`, then hash-check the deployed
+`UnrealEditor-SageBridge.dll` against the packaged DLL before claiming success.
 
 ## Engineering Rules
 

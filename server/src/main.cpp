@@ -14,10 +14,12 @@
 #include "tools/builtin.h"
 #include "tools/phase4_schemas.h"
 #include "tools/restart_orchestrator.h"
+#include "tools/sage_guidance_tools.h"
 #include "tools/source_intelligence_tools.h"
 #include "transport/http_sse_server.h"
 #include "transport/stdio_mcp.h"
 #include "util/crash_handler.h"
+#include "version.h"
 
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/sinks/rotating_file_sink.h>
@@ -41,6 +43,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -503,8 +506,8 @@ int main(int argc, char* argv[]) {
     // negligible at info volume.
     spdlog::flush_on(spdlog::level::info);
 
-    spdlog::info("sage-server starting (version 0.1.0, transport={}, log_level={})",
-                 useHttp ? "http+sse" : "stdio", levelStr);
+    spdlog::info("sage-server starting (version {}, transport={}, log_level={})",
+                 sage::kServerVersion, useHttp ? "http+sse" : "stdio", levelStr);
 
     auto registry = std::make_shared<sage::mcp::ToolRegistry>();
     sage::tools::registerBuiltins(*registry);
@@ -513,7 +516,7 @@ int main(int argc, char* argv[]) {
     spdlog::info("Registered {} built-in tool(s)", registry->size());
 
     sage::mcp::MCPServer mcpServer(
-        sage::mcp::ServerInfo{.name = "sage-unreal-mcp", .version = "0.1.0"},
+        sage::mcp::ServerInfo{.name = "sage-unreal-mcp", .version = std::string{sage::kServerVersion}},
         registry);
 
     // ---- Bridge (plugin ↔ server WebSocket) -----------------------------
@@ -1172,6 +1175,55 @@ int main(int argc, char* argv[]) {
     if (auto r = registry->registerTool(std::move(setActiveEditorTool)); !r.has_value()) {
         spdlog::warn("Failed to register 'set_active_editor'");
     }
+
+    sage::tools::SageGuidanceContext guidanceContext{
+        .serverVersion = std::string{sage::kServerVersion},
+        .protocolVersion = std::string{sage::kProtocolVersion},
+        .transport = useHttp ? "http+sse" : "stdio",
+        .httpEndpoint = std::string{"http://"}
+                      + envOr("SAGE_HTTP_HOST", "127.0.0.1")
+                      + ":"
+                      + std::to_string(envIntOr("SAGE_HTTP_PORT", 7777))
+                      + "/mcp",
+        .bridgeEndpoint = std::string{"ws://"}
+                        + bridge.config().host
+                        + ":"
+                        + std::to_string(bridge.config().port)
+                        + bridge.config().endpoint,
+        .editorSessions = [&bridge, sessionToJson]() {
+            const auto sessions = bridge.snapshotSessions();
+            nlohmann::json items = nlohmann::json::array();
+            for (const auto& s : sessions) items.push_back(sessionToJson(s));
+            return nlohmann::json{{"editors", items}, {"count", items.size()}};
+        },
+        .registrySummary = [registry]() {
+            const auto tools = registry->list();
+            std::size_t remoteCount = 0;
+            std::size_t localCount = 0;
+            nlohmann::json prefixCounts = nlohmann::json::object();
+            for (const auto& tool : tools) {
+                if (tool.remote) {
+                    ++remoteCount;
+                } else {
+                    ++localCount;
+                }
+                std::string prefix = tool.name;
+                const std::size_t dot = prefix.find('.');
+                if (dot != std::string::npos) {
+                    prefix.resize(dot);
+                }
+                const std::size_t current = prefixCounts.value(prefix, std::size_t{0});
+                prefixCounts[prefix] = current + 1;
+            }
+            return nlohmann::json{
+                {"total_tools", tools.size()},
+                {"remote_tools", remoteCount},
+                {"local_tools", localCount},
+                {"prefix_counts", prefixCounts},
+            };
+        },
+    };
+    sage::tools::registerSageGuidanceTools(*registry, std::move(guidanceContext));
 
     // ---- Editor state + selection tools (Milestone 1.3c) ---------------
     auto noArgSchema = nlohmann::json{

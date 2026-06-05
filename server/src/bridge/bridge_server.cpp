@@ -1,6 +1,7 @@
 #include "bridge/bridge_server.h"
 
 #include "mcp/error_codes.h"
+#include "version.h"
 
 #include <ixwebsocket/IXConnectionState.h>
 #include <ixwebsocket/IXWebSocket.h>
@@ -10,6 +11,7 @@
 #include <spdlog/spdlog.h>
 
 #include <cstdio>
+#include <string>
 #include <utility>
 
 namespace sage::bridge {
@@ -403,7 +405,7 @@ void BridgeServer::handleHello(ix::WebSocket& ws,
 
     sessionsCv_.notify_all();  // wake wait_for_editor — AFTER notification published
 
-    ws.send(welcomeMessage(session_id, "0.1.0").dump());
+    ws.send(welcomeMessage(session_id, std::string{sage::kServerVersion}).dump());
 }
 
 void BridgeServer::handleHeartbeat(ix::WebSocket& ws,

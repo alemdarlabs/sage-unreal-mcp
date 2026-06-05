@@ -64,6 +64,12 @@ Validate a project installation:
 sage doctor --json
 ```
 
+Print the packaged AI operating guide:
+
+```powershell
+sage guide codex
+```
+
 `sage bootstrap` installs `SageBridge` under `Plugins/SageBridge` and enables
 the plugin in the `.uproject` without requiring `.mcp.json`. `sage init` does
 the same and also writes project-local MCP config. If a previous
@@ -87,7 +93,8 @@ available. During `sage bootstrap` or `sage init`, it resolves or downloads the
 
 ## Current Release
 
-`v0.1.3` is the next release for the zero-config Codex onboarding flow.
+`v0.1.5` is the current release for zero-config Codex onboarding, project
+plugin version checks, and MCP-native Sage guidance tools.
 
 ```powershell
 npm view @alemdarlabs/sage-mcp version dist.tarball
@@ -95,9 +102,9 @@ npm view @alemdarlabs/sage-mcp version dist.tarball
 
 Release assets:
 
-- `sage-server-0.1.3-win32-x64.zip`
-- `sagebridge-plugin-0.1.3-win32-x64.zip`
-- `alemdarlabs-sage-mcp-0.1.3.tgz`
+- `sage-server-0.1.5-win32-x64.zip`
+- `sagebridge-plugin-0.1.5-win32-x64.zip`
+- `alemdarlabs-sage-mcp-0.1.5.tgz`
 - `checksums.txt`
 
 GitHub-hosted Windows runners do not include Unreal Engine. The hosted release
@@ -138,7 +145,7 @@ logs, and specialized domain tools.
 Current source audit, generated with `scripts/audit-tools.ps1 -Json` on
 2026-06-05:
 
-- `server_tool_count`: 1243
+- `server_tool_count`: 1251
 - `plugin_handler_count`: 1191
 - `plugin_without_schema`: 0
 - `schema_stub_count`: 0
@@ -151,6 +158,21 @@ stubs, and placeholder implementations.
 ```powershell
 .\scripts\audit-tools.ps1 -Json
 ```
+
+### AI Onboarding Tools
+
+Sage is self-describing over MCP. Agents should not need to read this README
+before they can start safely.
+
+| Tool | Purpose |
+|---|---|
+| `sage.about` | Product identity, version, safety model, and first-call sequence. |
+| `sage.status` | Server, environment, project discovery, connected editors, and version alignment. |
+| `sage.doctor` | Actionable setup/version/editor checks with repair commands. |
+| `sage.project.discover` | Locate the Unreal project from `start_path`, `SAGE_PROJECT_ROOT`, or cwd. |
+| `sage.capabilities` | Group tool families and recommend first read-only tools. |
+| `sage.workflow.suggest` | Suggest a safe tool sequence for a natural-language task intent. |
+| `sage.help` / `sage.guide` | Compact operating guide for MCP clients. |
 
 ## Safety Model
 
@@ -178,6 +200,7 @@ sage doctor [Project.uproject] [--json]
 sage mcp [server args...]
 sage server [--http] [server args...]
 sage setup codex [options]
+sage guide [agent] [--json]
 sage bootstrap [Project.uproject] [options]
 sage init <Project.uproject> [options]
 sage update
@@ -203,7 +226,16 @@ the project-level update path: it verifies the server binary, refuses to copy
 package under `Plugins/SageBridge`, enables the plugin in the `.uproject`, and
 prints the installed plugin version. `sage doctor` reports the installed
 `SageBridge` version versus the current Sage CLI version and suggests
-`sage update "<Project.uproject>"` when they diverge.
+`sage update "<Project.uproject>"` when they diverge. It also checks npm latest
+unless `--offline` or `SAGE_SKIP_NPM_LATEST=1` is set, and suggests
+`npm install -g @alemdarlabs/sage-mcp@latest` when the local CLI is stale.
+
+Common `guide` options:
+
+```powershell
+--agent <name>           codex, claude, cursor, or generic
+--json                   Print {agent,path,content}
+```
 
 Common `setup codex` options:
 
@@ -229,6 +261,7 @@ Common `setup codex` options:
 | `SAGE_SKIP_CODEX_SETUP` | Skip postinstall Codex MCP registration. |
 | `SAGE_CODEX_SETUP_STRICT` | Set to `1` to make postinstall Codex registration failure fatal. |
 | `SAGE_CODEX_COMMAND` | Override the Codex executable used by setup commands. |
+| `SAGE_SKIP_NPM_LATEST` | Skip `sage doctor` npm registry latest-version check. |
 | `SAGE_PROJECT_ROOT` | Unreal project root passed to the server or discovered by `sage mcp`. |
 | `SAGE_REPO_ROOT` | Workspace root passed to the server. Defaults to the discovered project root when available. |
 | `SAGE_UE_ROOT` | Unreal Engine install root used by build and editor workflows. |

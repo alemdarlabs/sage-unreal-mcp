@@ -41,6 +41,7 @@ clients with default logging UIs surface them without custom handlers:
       "project_path":   "<absolute-path-to-your-project.uproject>",
       "project_id":     "...",
       "engine_version": "5.7.4",
+      "plugin_version": "0.1.5",
       "pid":            12345
     }
   }
@@ -72,7 +73,7 @@ which is the deterministic blocking-tool path.
 {
   "type": "hello",
   "version": "0.1.0",
-  "plugin_version": "0.1.4",
+  "plugin_version": "0.1.5",
   "editor": {
     "id": "MyProject@a3f1",
     "label": "host",
@@ -95,6 +96,13 @@ Non-exhaustive list. Items grouped by domain.
 
 | Tool | Purpose |
 |---|---|
+| `sage.about` | Sage product identity, version, safety model, and recommended first calls. |
+| `sage.status` | Server/project/editor/version status for MCP clients. |
+| `sage.doctor` | Actionable MCP-side setup, plugin, version, and editor checks. |
+| `sage.project.discover` | Discover `.uproject` and project-local SageBridge state from cwd/env/start path. |
+| `sage.capabilities` | Group registered tool families and recommend first read-only tools. |
+| `sage.workflow.suggest` | Recommend a safe tool sequence for a natural-language intent. |
+| `sage.help`, `sage.guide` | Compact operating guide for AI clients. |
 | `list_editors()` | Connected editor instances |
 | `get_editor(id_or_label)` | Editor details |
 | `get_active_editor()` | Currently active editor for this session |

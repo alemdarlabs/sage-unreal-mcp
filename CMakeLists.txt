@@ -13,7 +13,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(sage-unreal-mcp
-    VERSION 0.1.0
+    VERSION 0.1.5
     DESCRIPTION "Sage MCP server for Unreal Engine"
     HOMEPAGE_URL "https://github.com/alemdarlabs/sage-unreal-mcp"
     LANGUAGES CXX
@@ -58,6 +58,11 @@ if(SAGE_SANITIZE AND SAGE_THREAD_SANITIZE)
 endif()
 
 # ---- Interface targets: warnings & sanitizers -------------------------------
+add_library(sage-version INTERFACE)
+target_compile_definitions(sage-version INTERFACE
+    SAGE_SERVER_VERSION="${PROJECT_VERSION}"
+    SAGE_PROTOCOL_VERSION="0.1.0")
+
 add_library(sage-warnings INTERFACE)
 if(MSVC)
     target_compile_options(sage-warnings INTERFACE

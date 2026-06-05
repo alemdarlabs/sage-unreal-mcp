@@ -81,11 +81,11 @@ sage-server-<version>-<platform-key>.zip
 sagebridge-plugin-<version>-<platform-key>.zip
 ```
 
-For Windows x64 `0.1.3`:
+For Windows x64 `0.1.5`:
 
 ```text
-sage-server-0.1.3-win32-x64.zip
-sagebridge-plugin-0.1.3-win32-x64.zip
+sage-server-0.1.5-win32-x64.zip
+sagebridge-plugin-0.1.5-win32-x64.zip
 ```
 
 Development/test overrides:
@@ -95,6 +95,7 @@ Development/test overrides:
 - `SAGE_SERVER_PATH`
 - `SAGE_PLUGIN_SOURCE`
 - `SAGE_SKIP_DOWNLOAD=1`
+- `SAGE_SKIP_NPM_LATEST=1`
 
 ## Commands
 
@@ -103,12 +104,13 @@ Development/test overrides:
 | `sage mcp` | Start native server in stdio mode for MCP clients. |
 | `sage server --http` | Start native server in HTTP+SSE mode. |
 | `sage setup codex` | Register or repair the global Codex MCP entry as `sage mcp`. |
+| `sage guide [agent]` | Print packaged AI operating guides for generic MCP clients, Codex, Claude, or Cursor. |
 | `sage bootstrap [Project.uproject]` | Discover or target an Unreal project, install `SageBridge`, and enable it in `.uproject` without requiring `.mcp.json`. |
 | `sage init <Project.uproject>` | Install plugin, enable it in `.uproject`, and write project `.mcp.json`. |
 | `sage update` | Ensure native binary is installed for this package version. |
 | `sage update <Project.uproject>` | Ensure the native binary exists, verify the target editor is closed, and install the matching `SageBridge` into the project. |
 | `sage update --plugin [Project.uproject]` | Backward-compatible plugin-only update for the discovered or target project. |
-| `sage doctor [Project.uproject]` | Validate binary, discovered project, plugin, plugin version, and optional MCP config paths. |
+| `sage doctor [Project.uproject]` | Validate binary, npm latest version, discovered project, plugin, plugin version, and optional MCP config paths. |
 | `sage init <Project.uproject> --codex` | Also register global `sage mcp` in Codex. Project context is discovered at launch time. |
 | `sage init <Project.uproject> --claude` | Also register `sage mcp` with Claude Code using project scope by default. |
 | `npm run release:check` | Run JS syntax, npm smoke, global install smoke, release asset extraction, and npm publish dry-run gates. |
@@ -129,13 +131,17 @@ Development/test overrides:
 12. Add automatic Codex CLI registration during postinstall and explicit repair via `sage setup codex`; project `.mcp.json` remains available for Claude/Cursor-style workspace MCP configs.
 13. Add explicit Claude Code registration via `sage init --claude` for users who prefer `claude mcp add` over passive project config discovery.
 14. Add `npm run release:check` as the shared local/CI release gate.
+15. Add packaged agent guides plus MCP-native `sage.about`, `sage.status`,
+    `sage.doctor`, `sage.project.discover`, `sage.capabilities`,
+    `sage.workflow.suggest`, `sage.help`, and `sage.guide` so AI clients can
+    learn Sage directly from `tools/list` and tool calls.
 
 ## Known follow-ups
 
 - Windows/macOS code-signing.
 - Full macOS/Linux release matrix.
 - Auth/license gate for runtime use after binary starts.
-- Protocol/version compatibility check between server and plugin.
+- Protocol/version compatibility hard failure policy between server and plugin.
 - `restart_editor` packaging contract: it currently expects `SAGE_REPO_ROOT` for build scripts. Binary distribution should either bundle the required scripts or make project-module rebuild use installed plugin/project paths directly.
-- MCP-native `sage.bootstrap_project` tool, if we want the Codex model to repair
+- MCP-native `sage.bootstrap_project` mutation tool, if we want agents to repair
   missing `SageBridge` without shelling out to `sage bootstrap`.

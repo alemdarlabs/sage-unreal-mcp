@@ -19,6 +19,7 @@ function run(args, options = {}) {
     env: {
       ...process.env,
       SAGE_SKIP_DOWNLOAD: '1',
+      SAGE_SKIP_NPM_LATEST: '1',
       SAGE_DATA_DIR: options.dataDir || path.join(os.tmpdir(), 'sage-mcp-test-data'),
       ...(options.env || {}),
     },
@@ -68,6 +69,11 @@ process.exit(2);
 
 const version = run(['--version']).stdout.trim();
 assert.match(version, /^\d+\.\d+\.\d+$/);
+
+const codexGuide = run(['guide', 'codex', '--json']);
+const codexGuideJson = JSON.parse(codexGuide.stdout);
+assert.equal(codexGuideJson.agent, 'codex');
+assert.match(codexGuideJson.content, /sage\.doctor/);
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'sage-cli-smoke-'));
 const projectPath = path.join(tempRoot, 'SmokeProject.uproject');

@@ -35,6 +35,7 @@ target_link_libraries(sage-transport
 add_library(sage-tools STATIC
     src/tools/builtin.cpp
     src/tools/phase4_schemas.cpp
+    src/tools/sage_guidance_tools.cpp
     src/tools/source_intelligence_tools.cpp
 )
 target_include_directories(sage-tools
@@ -42,7 +43,7 @@ target_include_directories(sage-tools
 target_compile_features(sage-tools PUBLIC cxx_std_23)
 target_link_libraries(sage-tools
     PUBLIC  sage-mcp
-    PRIVATE sage-warnings sage-sanitizers)
+    PRIVATE sage-version sage-warnings sage-sanitizers)
 
 
 # ---- bridge library (plugin↔server WebSocket, ADR-015) ----
@@ -55,7 +56,7 @@ target_include_directories(sage-bridge
 target_compile_features(sage-bridge PUBLIC cxx_std_23)
 target_link_libraries(sage-bridge
     PUBLIC  sage-mcp ixwebsocket::ixwebsocket
-    PRIVATE sage-warnings sage-sanitizers)
+    PRIVATE sage-version sage-warnings sage-sanitizers)
 
 # ---- executable ----
 add_executable(sage-server
@@ -65,7 +66,7 @@ add_executable(sage-server
 )
 target_link_libraries(sage-server
     PRIVATE sage-transport sage-tools sage-bridge
-            sage-warnings sage-sanitizers)
+            sage-version sage-warnings sage-sanitizers)
 if(WIN32)
     # crash_handler.cpp uses MiniDumpWriteDump (dbghelp). #pragma comment
     # already pulls dbghelp.lib in MSVC; keep an explicit link for clarity

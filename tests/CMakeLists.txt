@@ -5,11 +5,13 @@ add_executable(sage-tests
     unit/test_tool_registry.cpp
     unit/test_server.cpp
     unit/test_bridge_protocol.cpp
+    unit/test_sage_guidance_tools.cpp
 )
 target_link_libraries(sage-tests
     PRIVATE sage-bridge
             sage-tools
             Catch2::Catch2WithMain
+            sage-version
             sage-warnings
             sage-sanitizers)
 target_compile_features(sage-tests PRIVATE cxx_std_23)

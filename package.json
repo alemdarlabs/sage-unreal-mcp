@@ -1,6 +1,6 @@
 {
   "name": "@alemdarlabs/sage-mcp",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Sage MCP server for Unreal Engine",
   "homepage": "https://github.com/alemdarlabs/sage-unreal-mcp",
   "license": "UNLICENSED",
@@ -16,6 +16,7 @@
     "sage": "npm/bin/sage.js"
   },
   "files": [
+    "npm/agents/",
     "npm/bin/",
     "npm/lib/",
     "npm/scripts/",
