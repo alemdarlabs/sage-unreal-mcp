@@ -19,7 +19,10 @@ const packDir = path.join(tempRoot, 'npm-pack');
 const sageCommand = process.platform === 'win32'
   ? path.join(prefix, 'sage.cmd')
   : path.join(prefix, 'bin', 'sage');
-const installedCli = path.join(prefix, 'node_modules', '@alemdarlabs', 'sage-mcp', 'npm', 'bin', 'sage.js');
+const globalPackageRoot = process.platform === 'win32'
+  ? path.join(prefix, 'node_modules')
+  : path.join(prefix, 'lib', 'node_modules');
+const installedCli = path.join(globalPackageRoot, '@alemdarlabs', 'sage-mcp', 'npm', 'bin', 'sage.js');
 const globalBinDir = process.platform === 'win32' ? prefix : path.join(prefix, 'bin');
 
 function run(command, args, options = {}) {

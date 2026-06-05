@@ -92,11 +92,11 @@ The server binary is platform-specific. The `SageBridge` plugin package is
 source-based and platform-independent; it is always installed into projects as
 `Plugins/SageBridge`, never as the release asset file name.
 
-For Windows x64 `0.1.8`:
+For Windows x64 `0.1.9`:
 
 ```text
-sage-server-0.1.8-win32-x64.zip
-sagebridge-plugin-0.1.8-source.tar.gz
+sage-server-0.1.9-win32-x64.zip
+sagebridge-plugin-0.1.9-source.tar.gz
 ```
 
 For compatibility with older releases, the installer can fall back to legacy
