@@ -123,6 +123,33 @@ function Add-GitHubPathEntry {
   Add-Content -LiteralPath $GitHubPathPath -Value $Entry
 }
 
+function Split-PathList {
+  param(
+    [string]$PathValue
+  )
+
+  if ([string]::IsNullOrWhiteSpace($PathValue)) {
+    return @()
+  }
+
+  return $PathValue -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+}
+
+function Normalize-PathEntry {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Entry
+  )
+
+  return $Entry.Trim().Trim('"').TrimEnd([char[]]@('\', '/'))
+}
+
+$OriginalPathEntries = Split-PathList -PathValue $env:Path
+$OriginalPathSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($PathEntry in $OriginalPathEntries) {
+  [void]$OriginalPathSet.Add((Normalize-PathEntry -Entry $PathEntry))
+}
+
 $VsDevCmd = Resolve-VsDevCmd
 $Output = & cmd.exe /s /c "`"$VsDevCmd`" -arch=$Architecture -host_arch=$HostArchitecture && set"
 $CmdExitCode = Get-NativeExitCode
@@ -151,8 +178,13 @@ foreach ($RequiredName in @('PATH', 'VCTOOLSINSTALLDIR', 'WINDOWSSDKDIR')) {
   }
 }
 
-foreach ($PathEntry in ($EnvValues['PATH'].Value -split ';')) {
-  Add-GitHubPathEntry -Entry $PathEntry
+$AddedPathEntryCount = 0
+foreach ($PathEntry in (Split-PathList -PathValue $EnvValues['PATH'].Value)) {
+  $NormalizedPathEntry = Normalize-PathEntry -Entry $PathEntry
+  if (-not $OriginalPathSet.Contains($NormalizedPathEntry)) {
+    Add-GitHubPathEntry -Entry $PathEntry
+    $AddedPathEntryCount++
+  }
 }
 
 $AllowedEnvironmentVariables = @(
@@ -200,4 +232,4 @@ if ($EnvValues.ContainsKey('VCTOOLSVERSION')) {
   $ToolsetVersion = $EnvValues['VCTOOLSVERSION'].Value
 }
 
-Write-Host "MSVC environment ready. VCToolsVersion=$ToolsetVersion"
+Write-Host "MSVC environment ready. VCToolsVersion=$ToolsetVersion PathEntriesAdded=$AddedPathEntryCount"

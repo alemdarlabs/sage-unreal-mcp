@@ -36,6 +36,18 @@ jobs:
         shell: pwsh
         run: .\scripts\ci\setup-msvc-env.ps1
 
+      - name: Verify build shell
+        shell: pwsh
+        run: |
+          where.exe cl
+          where.exe node
+          node --version
+          npm --version
+          cmd.exe /d /s /c "node --version"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
       - name: Resolve version
         id: version
         shell: pwsh
