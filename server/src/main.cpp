@@ -142,7 +142,7 @@ public:
         std::lock_guard lk(mu_);
         auto it = jobs_.find(jobId);
         if (it == jobs_.end()) return std::nullopt;
-        return toJsonLocked(*it->second, includeResult);
+        return std::make_optional<nlohmann::json>(toJsonLocked(*it->second, includeResult));
     }
 
     nlohmann::json list(int limit, bool includeCompletedDetails) const {
@@ -174,7 +174,7 @@ public:
         }
         nlohmann::json out = toJsonLocked(*jobs_.at(jobId), /*includeResult=*/true);
         out["wait_timed_out"] = !isTerminalLocked(*jobs_.at(jobId));
-        return out;
+        return std::make_optional<nlohmann::json>(std::move(out));
     }
 
     std::optional<nlohmann::json> logs(const std::string& jobId,
@@ -196,7 +196,7 @@ public:
             {"log_count", entries.size()},
             {"logs", arr},
         };
-        return out;
+        return std::make_optional<nlohmann::json>(std::move(out));
     }
 
     std::optional<nlohmann::json> cancel(const std::string& jobId) {
@@ -213,7 +213,8 @@ public:
                         nlohmann::json::object());
         cv_.notify_all();
         spdlog::warn("jobs: cancel requested job_id={} tool={}", job.id, job.tool);
-        return toJsonLocked(job, /*includeResult=*/true);
+        return std::make_optional<nlohmann::json>(
+            toJsonLocked(job, /*includeResult=*/true));
     }
 
 private:
@@ -399,7 +400,10 @@ private:
             {"data", std::move(data)},
         });
         if (job.logs.size() > 500) {
-            job.logs.erase(job.logs.begin(), job.logs.begin() + (job.logs.size() - 500));
+            const auto removeCount =
+                static_cast<std::vector<nlohmann::json>::difference_type>(
+                    job.logs.size() - 500U);
+            job.logs.erase(job.logs.begin(), job.logs.begin() + removeCount);
             for (std::size_t i = 0; i < job.logs.size(); ++i) {
                 job.logs[i]["seq"] = i;
             }
@@ -4997,8 +5001,8 @@ int main(int argc, char* argv[]) {
                 const int timeoutMs = std::clamp(
                     params.value("timeout_ms", 120000), 100, 600000);
 
-                auto sessionToJson = [](const sage::bridge::EditorSession& s,
-                                        bool already) -> nlohmann::json {
+                auto waitSessionToJson = [](const sage::bridge::EditorSession& s,
+                                            bool already) -> nlohmann::json {
                     return {
                         {"already_connected", already},
                         {"session_id",        s.session_id},
@@ -5016,7 +5020,7 @@ int main(int argc, char* argv[]) {
                 // Fast path: matching editor already in sessions_.
                 for (const auto& s : bridge.snapshotSessions()) {
                     if (!slotFilter || s.slot_id == *slotFilter) {
-                        return sessionToJson(s, /*already=*/true);
+                        return waitSessionToJson(s, /*already=*/true);
                     }
                 }
 
@@ -5030,7 +5034,7 @@ int main(int argc, char* argv[]) {
                             ? "no editor with matching slot_id connected within timeout"
                             : "no editor connected within timeout"));
                 }
-                return sessionToJson(*session, /*already=*/false);
+                return waitSessionToJson(*session, /*already=*/false);
             },
             .remote = false,
         };
