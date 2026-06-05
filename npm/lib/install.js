@@ -28,6 +28,25 @@ function projectRoot(projectPath) {
   return path.dirname(projectPath);
 }
 
+function canonicalPath(value) {
+  if (!value) return null;
+  const resolved = path.resolve(value);
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function samePath(left, right) {
+  const a = canonicalPath(left);
+  const b = canonicalPath(right);
+  if (!a || !b) return false;
+  return process.platform === 'win32'
+    ? a.toLowerCase() === b.toLowerCase()
+    : a === b;
+}
+
 function engineAssociation(project) {
   return project.EngineAssociation || '';
 }
@@ -238,13 +257,13 @@ function doctor(projectArg) {
       if (sageConfig) {
         checks.push({
           name: 'mcp_env_project_root',
-          ok: sageEnv.SAGE_PROJECT_ROOT === projectRoot(projectPath),
+          ok: samePath(sageEnv.SAGE_PROJECT_ROOT, projectRoot(projectPath)),
           path: configPath,
           value: sageEnv.SAGE_PROJECT_ROOT || null,
         });
         checks.push({
           name: 'mcp_env_repo_root',
-          ok: sageEnv.SAGE_REPO_ROOT === projectRoot(projectPath),
+          ok: samePath(sageEnv.SAGE_REPO_ROOT, projectRoot(projectPath)),
           path: configPath,
           value: sageEnv.SAGE_REPO_ROOT || null,
         });
@@ -267,5 +286,6 @@ module.exports = {
   projectRoot,
   readPluginDescriptor,
   readProject,
+  samePath,
   upsertProjectMcpConfig,
 };

@@ -8,6 +8,7 @@ const { spawnSync } = require('node:child_process');
 
 const { claudeMcpAddArgs, commandLine: claudeCommandLine } = require('../lib/claude');
 const { codexMcpAddArgs, windowsCommandLine } = require('../lib/codex');
+const { samePath } = require('../lib/install');
 
 const repoRoot = path.resolve(__dirname, '..', '..');
 const cli = path.join(repoRoot, 'npm', 'bin', 'sage.js');
@@ -199,7 +200,7 @@ const nestedDir = path.join(tempRoot, 'Content', 'Maps');
 fs.mkdirSync(nestedDir, { recursive: true });
 const discoveredDoctor = JSON.parse(run(['doctor', '--json'], { cwd: nestedDir }).stdout);
 assert.equal(discoveredDoctor.ok, true);
-assert.equal(discoveredDoctor.checks.some((check) => check.name === 'project_discovery' && check.path === projectPath), true);
+assert.equal(discoveredDoctor.checks.some((check) => check.name === 'project_discovery' && samePath(check.path, projectPath)), true);
 
 const bootstrapRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'sage-bootstrap-smoke-'));
 const bootstrapProjectPath = path.join(bootstrapRoot, 'BootstrapSmoke.uproject');

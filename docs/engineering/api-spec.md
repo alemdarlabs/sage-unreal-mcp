@@ -41,7 +41,7 @@ clients with default logging UIs surface them without custom handlers:
       "project_path":   "<absolute-path-to-your-project.uproject>",
       "project_id":     "...",
       "engine_version": "5.7.4",
-      "plugin_version": "0.1.9",
+      "plugin_version": "0.1.10",
       "pid":            12345
     }
   }
@@ -73,7 +73,7 @@ which is the deterministic blocking-tool path.
 {
   "type": "hello",
   "version": "0.1.0",
-  "plugin_version": "0.1.9",
+  "plugin_version": "0.1.10",
   "editor": {
     "id": "MyProject@a3f1",
     "label": "host",
