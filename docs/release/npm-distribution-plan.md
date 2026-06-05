@@ -62,8 +62,12 @@ Use shared HTTP mode only for multi-client debugging, long-running shared sessio
 ## Package split
 
 - npm package: small Node launcher, installer, and command surface.
-- Native server binary: downloaded from release assets into `~/.sage-mcp/bin/<version>/<platform>/`.
-- Unreal plugin package: downloaded from release assets into `~/.sage-mcp/plugins/<version>/<platform>/SageBridge`, then copied into target projects by `sage init` / `sage update <Project.uproject>` / `sage update --plugin`.
+- Native server binary: downloaded from release assets into
+  `~/.sage-mcp/bin/<version>/<platform>/`.
+- Unreal plugin source package: downloaded from release assets into
+  `~/.sage-mcp/plugins/<version>/source/SageBridge`, then copied into target
+  projects by `sage init` / `sage update <Project.uproject>` /
+  `sage update --plugin`.
 - Runtime data: `~/.sage-mcp`.
 
 ## Public release asset contract
@@ -77,16 +81,27 @@ https://github.com/alemdarlabs/sage-unreal-mcp/releases/download/v<version>
 Runtime asset names:
 
 ```text
-sage-server-<version>-<platform-key>.zip
-sagebridge-plugin-<version>-<platform-key>.zip
+sage-server-<version>-win32-x64.zip
+sage-server-<version>-darwin-arm64.tar.gz
+sage-server-<version>-darwin-x64.tar.gz
+sage-server-<version>-linux-x64.tar.gz
+sagebridge-plugin-<version>-source.tar.gz
 ```
 
-For Windows x64 `0.1.6`:
+The server binary is platform-specific. The `SageBridge` plugin package is
+source-based and platform-independent; it is always installed into projects as
+`Plugins/SageBridge`, never as the release asset file name.
+
+For Windows x64 `0.1.7`:
 
 ```text
-sage-server-0.1.6-win32-x64.zip
-sagebridge-plugin-0.1.6-win32-x64.zip
+sage-server-0.1.7-win32-x64.zip
+sagebridge-plugin-0.1.7-source.tar.gz
 ```
+
+For compatibility with older releases, the installer can fall back to legacy
+platform-named source plugin assets such as
+`sagebridge-plugin-0.1.6-win32-x64.zip`.
 
 Development/test overrides:
 
@@ -139,7 +154,8 @@ Development/test overrides:
 ## Known follow-ups
 
 - Windows/macOS code-signing.
-- Full macOS/Linux release matrix.
+- Validate the full Windows/Linux/macOS release matrix on hosted runners before
+  promoting the next npm version.
 - Auth/license gate for runtime use after binary starts.
 - Protocol/version compatibility hard failure policy between server and plugin.
 - `restart_editor` packaging contract: it currently expects `SAGE_REPO_ROOT` for build scripts. Binary distribution should either bundle the required scripts or make project-module rebuild use installed plugin/project paths directly.

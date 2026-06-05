@@ -10,18 +10,35 @@ on:
         description: 'Release version without v prefix. Empty means package.json version.'
         required: false
         type: string
+
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
-  windows-assets:
-    runs-on: windows-latest
+  server-assets:
+    name: Server asset (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: win32-x64
+            runner: windows-2025-vs2026
+            os: windows
+          - platform: linux-x64
+            runner: ubuntu-24.04
+            os: linux
+          - platform: darwin-arm64
+            runner: macos-15
+            os: macos
+          - platform: darwin-x64
+            runner: macos-15-intel
+            os: macos
     env:
-      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
-      SAGE_BUILD_PLATFORM: Win64
-      CC: cl
-      CXX: cl
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
 
     steps:
       - name: Checkout
@@ -33,10 +50,12 @@ jobs:
           node-version: '22'
 
       - name: Setup MSVC environment
+        if: ${{ matrix.os == 'windows' }}
         shell: pwsh
         run: .\scripts\ci\setup-msvc-env.ps1
 
-      - name: Verify build shell
+      - name: Verify Windows build shell
+        if: ${{ matrix.os == 'windows' }}
         shell: pwsh
         run: |
           where.exe cl
@@ -47,6 +66,38 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
+
+      - name: Verify Unix build shell
+        if: ${{ matrix.os != 'windows' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
+          cmake --version
+          uname -a
+
+      - name: Verify runner platform (Windows)
+        if: ${{ matrix.os == 'windows' }}
+        shell: pwsh
+        run: |
+          $Expected = "${{ matrix.platform }}"
+          $Actual = node -p "process.platform + '-' + process.arch"
+          if ($Actual -ne $Expected) {
+            throw "Runner platform mismatch: expected $Expected, got $Actual"
+          }
+
+      - name: Verify runner platform (Unix)
+        if: ${{ matrix.os != 'windows' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${{ matrix.platform }}"
+          actual="$(node -p "process.platform + '-' + process.arch")"
+          if [ "$actual" != "$expected" ]; then
+            echo "Runner platform mismatch: expected $expected, got $actual" >&2
+            exit 1
+          fi
 
       - name: Resolve version
         id: version
@@ -65,17 +116,8 @@ jobs:
           }
           "version=$Version" >> $env:GITHUB_OUTPUT
 
-      - name: Verify npm publish token
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-        shell: pwsh
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if (-not $env:NODE_AUTH_TOKEN) {
-            throw "NPM_TOKEN secret is required before pushing release tags. Add an npm automation token as a repository secret."
-          }
-
-      - name: Install build tools
+      - name: Install Windows build tools
+        if: ${{ matrix.os == 'windows' }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -93,50 +135,217 @@ jobs:
           & "$RepoVcpkg\bootstrap-vcpkg.bat" -disableMetrics
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Configure server
+      - name: Install Linux build tools
+        if: ${{ matrix.os == 'linux' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          git clone https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
+          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$VCPKG_ROOT" >> "$GITHUB_ENV"
+
+      - name: Install macOS build tools
+        if: ${{ matrix.os == 'macos' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ninja >/dev/null 2>&1; then
+            brew install ninja
+          fi
+          git clone https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
+          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$VCPKG_ROOT" >> "$GITHUB_ENV"
+
+      - name: Configure server (Windows)
+        if: ${{ matrix.os == 'windows' }}
         shell: pwsh
         run: cmake --preset release
 
-      - name: Build server
+      - name: Configure server (Unix)
+        if: ${{ matrix.os != 'windows' }}
+        shell: bash
+        run: cmake --preset release
+
+      - name: Build server (Windows)
+        if: ${{ matrix.os == 'windows' }}
         shell: pwsh
         run: cmake --build --preset release --target sage-server
 
-      - name: Build native tests
+      - name: Build server (Unix)
+        if: ${{ matrix.os != 'windows' }}
+        shell: bash
+        run: cmake --build --preset release --target sage-server
+
+      - name: Build native tests (Windows)
+        if: ${{ matrix.os == 'windows' }}
         shell: pwsh
         run: cmake --build --preset release --target sage-tests
 
-      - name: Run native tests
+      - name: Build native tests (Unix)
+        if: ${{ matrix.os != 'windows' }}
+        shell: bash
+        run: cmake --build --preset release --target sage-tests
+
+      - name: Run native tests (Windows)
+        if: ${{ matrix.os == 'windows' }}
         shell: pwsh
         run: ctest --preset release --output-on-failure
 
-      - name: Note Unreal plugin packaging mode
-        shell: pwsh
-        run: |
-          Write-Host "GitHub-hosted Windows runners do not include Unreal Engine."
-          Write-Host "This workflow packages the source SageBridge plugin asset."
-          Write-Host "Binary BuildPlugin packaging requires a self-hosted Windows runner with Unreal Engine installed."
+      - name: Run native tests (Unix)
+        if: ${{ matrix.os != 'windows' }}
+        shell: bash
+        run: ctest --preset release --output-on-failure
 
-      - name: Release readiness check
+      - name: Release readiness check (Windows)
+        if: ${{ matrix.os == 'windows' }}
         shell: pwsh
         run: npm run release:check
 
-      - name: Package release assets
+      - name: Release readiness check (Unix)
+        if: ${{ matrix.os != 'windows' }}
+        shell: bash
+        run: npm run release:check
+
+      - name: Package server asset (Windows)
+        if: ${{ matrix.os == 'windows' }}
         shell: pwsh
         run: |
           node npm/scripts/package-assets.js `
             --version "${{ steps.version.outputs.version }}" `
-            --out "dist/release-assets/v${{ steps.version.outputs.version }}"
+            --platform "${{ matrix.platform }}" `
+            --out "dist/release-assets/v${{ steps.version.outputs.version }}" `
+            --skip-plugin `
+            --no-checksums
 
-      - name: Pack npm package
+      - name: Package server asset (Unix)
+        if: ${{ matrix.os != 'windows' }}
+        shell: bash
+        run: |
+          node npm/scripts/package-assets.js \
+            --version "${{ steps.version.outputs.version }}" \
+            --platform "${{ matrix.platform }}" \
+            --out "dist/release-assets/v${{ steps.version.outputs.version }}" \
+            --skip-plugin \
+            --no-checksums
+
+      - name: Upload server artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sage-server-${{ matrix.platform }}
+          path: dist/release-assets/v${{ steps.version.outputs.version }}/*
+
+  source-plugin:
+    name: Source plugin asset
+    runs-on: ubuntu-24.04
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Resolve version
+        id: version
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist/npm | Out-Null
+          $Version = "${{ github.event.inputs.version }}"
+          if (-not $Version) {
+            $Version = "${{ github.ref_name }}" -replace '^v', ''
+          }
+          if (-not $Version -or $Version -eq "main") {
+            $Version = (Get-Content package.json | ConvertFrom-Json).version
+          }
+          $PackageVersion = (Get-Content package.json | ConvertFrom-Json).version
+          if ($Version -ne $PackageVersion) {
+            throw "Release version '$Version' must match package.json version '$PackageVersion'"
+          }
+          "version=$Version" >> $env:GITHUB_OUTPUT
+
+      - name: Package source plugin asset
+        shell: bash
+        run: |
+          node npm/scripts/package-assets.js \
+            --version "${{ steps.version.outputs.version }}" \
+            --out "dist/release-assets/v${{ steps.version.outputs.version }}" \
+            --skip-server \
+            --no-checksums
+
+      - name: Upload source plugin artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sagebridge-plugin-source
+          path: dist/release-assets/v${{ steps.version.outputs.version }}/*
+
+  publish:
+    name: Publish release
+    runs-on: ubuntu-24.04
+    needs:
+      - server-assets
+      - source-plugin
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $Version = "${{ github.ref_name }}" -replace '^v', ''
+          $PackageVersion = (Get-Content package.json | ConvertFrom-Json).version
+          if ($Version -ne $PackageVersion) {
+            throw "Release version '$Version' must match package.json version '$PackageVersion'"
+          }
+          "version=$Version" >> $env:GITHUB_OUTPUT
+
+      - name: Verify npm publish token
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NPM_TOKEN secret is required before publishing @alemdarlabs/sage-mcp." >&2
+            exit 1
+          fi
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist/release-assets/v${{ steps.version.outputs.version }}
+          merge-multiple: true
+
+      - name: Write checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "dist/release-assets/v${{ steps.version.outputs.version }}"
+          rm -f checksums.txt
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Pack npm package
+        shell: bash
+        run: |
+          mkdir -p dist/npm
           npm pack --pack-destination dist/npm
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: sage-release-assets-win32-x64
+          name: sage-release-assets
           path: |
             dist/release-assets/v${{ steps.version.outputs.version }}/*
             dist/npm/*.tgz
@@ -150,13 +359,9 @@ jobs:
             dist/npm/*.tgz
 
       - name: Publish npm package
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-        shell: pwsh
+        shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          if (-not $env:NODE_AUTH_TOKEN) {
-            throw "NPM_TOKEN secret is required to publish @alemdarlabs/sage-mcp"
-          }
-          npm config set //registry.npmjs.org/:_authToken "$env:NODE_AUTH_TOKEN"
+          npm config set //registry.npmjs.org/:_authToken "$NODE_AUTH_TOKEN"
           npm publish --access public

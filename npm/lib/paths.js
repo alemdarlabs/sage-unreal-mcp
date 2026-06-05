@@ -28,10 +28,10 @@ function binInstallDir(version = packageVersion(), key = platformKey()) {
 }
 
 function installedServerPath(version = packageVersion(), key = platformKey()) {
-  return path.join(binInstallDir(version, key), serverExeName());
+  return path.join(binInstallDir(version, key), serverExeName(key));
 }
 
-function pluginInstallDir(version = packageVersion(), key = platformKey()) {
+function pluginInstallDir(version = packageVersion(), key = 'source') {
   return path.join(dataDir(), 'plugins', version, key, 'SageBridge');
 }
 

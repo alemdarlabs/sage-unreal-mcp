@@ -7,11 +7,11 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const { pluginArchiveName, serverArchiveName } = require('../lib/download');
+const { npmInvocation } = require('../lib/npm_command');
 const { packageVersion } = require('../lib/paths');
 const { platformKey, serverExeName } = require('../lib/platform');
 
 const repoRoot = path.resolve(__dirname, '..', '..');
-const npmCli = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -35,7 +35,8 @@ function run(command, args, options = {}) {
 }
 
 function npm(args, options = {}) {
-  return run(process.execPath, [npmCli, ...args], options);
+  const invocation = npmInvocation();
+  return run(invocation.command, [...invocation.args, ...args], options);
 }
 
 function listJsFiles(dir) {
@@ -50,7 +51,8 @@ function listJsFiles(dir) {
 
 function extractArchive(archive, dest) {
   fs.mkdirSync(dest, { recursive: true });
-  if (process.platform === 'win32') {
+  const lower = archive.toLowerCase();
+  if (lower.endsWith('.zip') && process.platform === 'win32') {
     run('powershell.exe', [
       '-NoProfile',
       '-ExecutionPolicy',
@@ -58,9 +60,15 @@ function extractArchive(archive, dest) {
       '-Command',
       `Expand-Archive -LiteralPath ${JSON.stringify(archive)} -DestinationPath ${JSON.stringify(dest)} -Force`,
     ], { quiet: true });
-  } else {
-    run('tar', ['-xzf', archive, '-C', dest], { quiet: true });
+    return;
   }
+
+  if (lower.endsWith('.zip')) {
+    run('unzip', ['-q', archive, '-d', dest], { quiet: true });
+    return;
+  }
+
+  run('tar', ['-xzf', archive, '-C', dest], { quiet: true });
 }
 
 function assertFile(file) {
@@ -90,7 +98,7 @@ function main() {
   npm(['run', 'package:assets', '--', '--out', outDir]);
 
   const serverZip = path.join(outDir, serverArchiveName(version, key));
-  const pluginZip = path.join(outDir, pluginArchiveName(version, key));
+  const pluginZip = path.join(outDir, pluginArchiveName(version));
   assertFile(serverZip);
   assertFile(pluginZip);
   assertFile(path.join(outDir, 'checksums.txt'));
@@ -99,7 +107,7 @@ function main() {
   const pluginExtract = fs.mkdtempSync(path.join(os.tmpdir(), 'sage-release-check-plugin-'));
   extractArchive(serverZip, serverExtract);
   extractArchive(pluginZip, pluginExtract);
-  assertFile(path.join(serverExtract, serverExeName()));
+  assertFile(path.join(serverExtract, serverExeName(key)));
   assertFile(path.join(pluginExtract, 'SageBridge', 'SageBridge.uplugin'));
   assertDir(path.join(pluginExtract, 'SageBridge', 'Source'));
 

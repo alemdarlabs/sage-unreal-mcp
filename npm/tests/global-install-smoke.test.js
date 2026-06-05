@@ -7,6 +7,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
 
+const { npmInvocation } = require('../lib/npm_command');
 const { resolveServerBinary } = require('../lib/paths');
 
 const repoRoot = path.resolve(__dirname, '..', '..');
@@ -15,7 +16,6 @@ const dataDir = path.join(tempRoot, 'data');
 const prefix = path.join(tempRoot, 'prefix');
 const releaseDir = path.join(tempRoot, 'release-assets');
 const packDir = path.join(tempRoot, 'npm-pack');
-const npmCli = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
 const sageCommand = process.platform === 'win32'
   ? path.join(prefix, 'sage.cmd')
   : path.join(prefix, 'bin', 'sage');
@@ -43,7 +43,8 @@ function run(command, args, options = {}) {
 }
 
 function runNpm(args) {
-  return run(process.execPath, [npmCli, ...args]);
+  const invocation = npmInvocation();
+  return run(invocation.command, [...invocation.args, ...args]);
 }
 
 function runSage(args) {

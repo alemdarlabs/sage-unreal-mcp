@@ -23,7 +23,7 @@ function defaultReleaseBaseUrl(version = packageVersion()) {
 }
 
 function serverArchiveName(version = packageVersion(), key = platformKey()) {
-  return `sage-server-${version}-${key}.${archiveExt()}`;
+  return `sage-server-${version}-${key}.${archiveExt(key)}`;
 }
 
 function serverArchiveUrl(version = packageVersion(), key = platformKey()) {
@@ -31,15 +31,26 @@ function serverArchiveUrl(version = packageVersion(), key = platformKey()) {
   return `${base.replace(/\/$/, '')}/${serverArchiveName(version, key)}`;
 }
 
-function pluginArchiveName(version = packageVersion(), key = platformKey()) {
-  return `sagebridge-plugin-${version}-${key}.${archiveExt()}`;
+function pluginArchiveName(version = packageVersion()) {
+  return `sagebridge-plugin-${version}-source.tar.gz`;
 }
 
-function pluginArchiveUrl(version = packageVersion(), key = platformKey()) {
+function legacyPluginArchiveName(version = packageVersion(), key = platformKey()) {
+  return `sagebridge-plugin-${version}-${key}.${archiveExt(key)}`;
+}
+
+function pluginArchiveUrl(version = packageVersion()) {
   const base = process.env.SAGE_PLUGIN_BASE_URL
     || process.env.SAGE_BINARY_BASE_URL
     || defaultReleaseBaseUrl(version);
-  return `${base.replace(/\/$/, '')}/${pluginArchiveName(version, key)}`;
+  return `${base.replace(/\/$/, '')}/${pluginArchiveName(version)}`;
+}
+
+function legacyPluginArchiveUrl(version = packageVersion(), key = platformKey()) {
+  const base = process.env.SAGE_PLUGIN_BASE_URL
+    || process.env.SAGE_BINARY_BASE_URL
+    || defaultReleaseBaseUrl(version);
+  return `${base.replace(/\/$/, '')}/${legacyPluginArchiveName(version, key)}`;
 }
 
 function downloadFile(url, dest) {
@@ -90,8 +101,14 @@ function downloadFile(url, dest) {
   });
 }
 
-function extractArchive(archivePath, destDir) {
-  ensureDir(destDir);
+function archiveFormat(archivePath) {
+  const lower = archivePath.toLowerCase();
+  if (lower.endsWith('.zip')) return 'zip';
+  if (lower.endsWith('.tar.gz') || lower.endsWith('.tgz')) return 'tar.gz';
+  throw new Error(`Unsupported archive format: ${archivePath}`);
+}
+
+function extractZipArchive(archivePath, destDir) {
   if (process.platform === 'win32') {
     const ps = spawnSync('powershell.exe', [
       '-NoProfile',
@@ -101,14 +118,27 @@ function extractArchive(archivePath, destDir) {
       `Expand-Archive -LiteralPath ${JSON.stringify(archivePath)} -DestinationPath ${JSON.stringify(destDir)} -Force`,
     ], { stdio: 'inherit' });
     if (ps.status !== 0) throw new Error(`Expand-Archive failed with exit ${ps.status}`);
-  } else {
-    const tar = spawnSync('tar', ['-xzf', archivePath, '-C', destDir], { stdio: 'inherit' });
-    if (tar.status !== 0) throw new Error(`tar extraction failed with exit ${tar.status}`);
+    return;
   }
+
+  const unzip = spawnSync('unzip', ['-q', archivePath, '-d', destDir], { stdio: 'inherit' });
+  if (unzip.status !== 0) throw new Error(`unzip extraction failed with exit ${unzip.status}`);
 }
 
-function findExtractedServer(destDir) {
-  const direct = path.join(destDir, serverExeName());
+function extractArchive(archivePath, destDir) {
+  ensureDir(destDir);
+  if (archiveFormat(archivePath) === 'zip') {
+    extractZipArchive(archivePath, destDir);
+    return;
+  }
+
+  const tar = spawnSync('tar', ['-xzf', archivePath, '-C', destDir], { stdio: 'inherit' });
+  if (tar.status !== 0) throw new Error(`tar extraction failed with exit ${tar.status}`);
+}
+
+function findExtractedServer(destDir, key = platformKey()) {
+  const expectedName = serverExeName(key);
+  const direct = path.join(destDir, expectedName);
   if (fs.existsSync(direct)) return direct;
   const stack = [destDir];
   while (stack.length) {
@@ -116,10 +146,39 @@ function findExtractedServer(destDir) {
     for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
       const child = path.join(current, entry.name);
       if (entry.isDirectory()) stack.push(child);
-      else if (entry.name === serverExeName()) return child;
+      else if (entry.name === expectedName) return child;
     }
   }
   return null;
+}
+
+async function downloadFirstAvailable(candidates, tmpDir) {
+  let lastError = null;
+  for (const candidate of candidates) {
+    const archivePath = path.join(tmpDir, candidate.name);
+    try {
+      await downloadFile(candidate.url, archivePath);
+      return archivePath;
+    } catch (error) {
+      fs.rmSync(archivePath, { force: true });
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error('No archive candidates were available.');
+}
+
+function archiveNameFromUrlOrPath(value, fallback) {
+  try {
+    const parsed = new URL(value);
+    const name = path.basename(parsed.pathname);
+    if (name) return name;
+  } catch {
+    const name = path.basename(value);
+    if (name) return name;
+  }
+
+  return fallback;
 }
 
 function findExtractedPlugin(destDir) {
@@ -157,8 +216,8 @@ async function ensureServerBinary(options = {}) {
   await downloadFile(url, archivePath);
   const extractDir = path.join(tmpDir, 'extract');
   extractArchive(archivePath, extractDir);
-  const extracted = findExtractedServer(extractDir);
-  if (!extracted) throw new Error(`Archive did not contain ${serverExeName()}`);
+  const extracted = findExtractedServer(extractDir, key);
+  if (!extracted) throw new Error(`Archive did not contain ${serverExeName(key)}`);
   const installDir = binInstallDir(version, key);
   ensureDir(installDir);
   for (const entry of fs.readdirSync(path.dirname(extracted), { withFileTypes: true })) {
@@ -173,7 +232,7 @@ async function ensureServerBinary(options = {}) {
 async function ensurePluginPackage(options = {}) {
   const version = options.version || packageVersion();
   const key = options.platformKey || platformKey();
-  const target = pluginInstallDir(version, key);
+  const target = pluginInstallDir(version, 'source');
   if (fs.existsSync(path.join(target, 'SageBridge.uplugin')) && !options.forceDownload) return target;
 
   if (process.env.SAGE_PLUGIN_SOURCE && fs.existsSync(path.join(process.env.SAGE_PLUGIN_SOURCE, 'SageBridge.uplugin'))) {
@@ -187,9 +246,15 @@ async function ensurePluginPackage(options = {}) {
   if (fs.existsSync(path.join(sourcePlugin, 'SageBridge.uplugin')) && !options.forceDownload) return sourcePlugin;
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sage-plugin-'));
-  const archivePath = path.join(tmpDir, pluginArchiveName(version, key));
-  const url = process.env.SAGE_PLUGIN_URL || pluginArchiveUrl(version, key);
-  await downloadFile(url, archivePath);
+  const archivePath = process.env.SAGE_PLUGIN_URL
+    ? path.join(tmpDir, archiveNameFromUrlOrPath(process.env.SAGE_PLUGIN_URL, pluginArchiveName(version)))
+    : await downloadFirstAvailable([
+      { name: pluginArchiveName(version), url: pluginArchiveUrl(version) },
+      { name: legacyPluginArchiveName(version, key), url: legacyPluginArchiveUrl(version, key) },
+    ], tmpDir);
+  if (process.env.SAGE_PLUGIN_URL) {
+    await downloadFile(process.env.SAGE_PLUGIN_URL, archivePath);
+  }
   const extractDir = path.join(tmpDir, 'extract');
   extractArchive(archivePath, extractDir);
   const extracted = findExtractedPlugin(extractDir);
@@ -207,6 +272,9 @@ module.exports = {
   downloadFile,
   ensurePluginPackage,
   ensureServerBinary,
+  extractArchive,
+  legacyPluginArchiveName,
+  legacyPluginArchiveUrl,
   pluginArchiveName,
   pluginArchiveUrl,
   serverArchiveName,

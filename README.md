@@ -91,10 +91,11 @@ native `sage-server` binary into `~/.sage-mcp` and registers Codex when
 available. During `sage bootstrap` or `sage init`, it resolves or downloads the
 `SageBridge` plugin package for the target Unreal project.
 
-## Current Release
+## Release Target
 
-`v0.1.6` is the current release for zero-config Codex onboarding, project
-plugin version checks, and MCP-native Sage guidance tools.
+`v0.1.7` is the next release target for cross-platform server assets,
+zero-config Codex onboarding, project plugin version checks, and MCP-native Sage
+guidance tools. `v0.1.6` was the last Windows-only native asset release.
 
 ```powershell
 npm view @alemdarlabs/sage-mcp version dist.tarball
@@ -102,15 +103,23 @@ npm view @alemdarlabs/sage-mcp version dist.tarball
 
 Release assets:
 
-- `sage-server-0.1.6-win32-x64.zip`
-- `sagebridge-plugin-0.1.6-win32-x64.zip`
-- `alemdarlabs-sage-mcp-0.1.6.tgz`
+- `sage-server-0.1.7-win32-x64.zip`
+- `sage-server-0.1.7-linux-x64.tar.gz`
+- `sage-server-0.1.7-darwin-arm64.tar.gz`
+- `sage-server-0.1.7-darwin-x64.tar.gz`
+- `sagebridge-plugin-0.1.7-source.tar.gz`
+- `alemdarlabs-sage-mcp-0.1.7.tgz`
 - `checksums.txt`
 
-GitHub-hosted Windows runners do not include Unreal Engine. The hosted release
-workflow packages the source `SageBridge` plugin asset; binary `RunUAT
-BuildPlugin` packaging requires a self-hosted Windows runner with Unreal Engine
-installed.
+The next release pipeline produces platform-specific `sage-server` assets for
+Windows x64, Linux x64, macOS arm64, and macOS x64, plus one platform-independent
+source `SageBridge` plugin asset.
+
+The plugin release asset is a download artifact only. Project installation
+always uses the Unreal layout `Plugins/SageBridge`; version, platform, and
+`source` labels never become project folder names. GitHub-hosted runners do not
+include Unreal Engine, so binary `RunUAT BuildPlugin` packaging remains a
+self-hosted runner concern.
 
 ## Architecture
 
@@ -325,12 +334,12 @@ Release tags are `v<package.json version>`.
 
 On a tag push, GitHub Actions:
 
-1. Configures the Windows MSVC toolchain.
-2. Builds `sage-server`.
-3. Builds and runs native tests.
-4. Runs npm smoke and release checks.
-5. Packages release assets.
-6. Uploads GitHub Release assets.
+1. Builds `sage-server` on Windows x64, Linux x64, macOS arm64, and macOS x64.
+2. Builds and runs native tests on each server runner.
+3. Runs npm smoke and release checks on each server runner.
+4. Packages one platform-specific server asset per runner.
+5. Packages one platform-independent source `SageBridge` plugin asset.
+6. Merges artifacts, writes `checksums.txt`, and uploads GitHub Release assets.
 7. Publishes `@alemdarlabs/sage-mcp` to npm.
 
 `NPM_TOKEN` must be configured as a GitHub repository secret. For accounts with
