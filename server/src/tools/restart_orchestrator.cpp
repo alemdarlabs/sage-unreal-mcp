@@ -84,6 +84,20 @@ std::string quoteShellArg(const fs::path& value) {
     return quoteShellArg(value.string());
 }
 
+std::string errnoMessage(int errorCode) {
+#if defined(_WIN32)
+    char buffer[256]{};
+    if (strerror_s(buffer, sizeof(buffer), errorCode) == 0 && buffer[0] != '\0') {
+        return std::string{buffer};
+    }
+    return "errno " + std::to_string(errorCode);
+#else
+    const char* message = std::strerror(errorCode);
+    return message != nullptr ? std::string{message}
+                              : "errno " + std::to_string(errorCode);
+#endif
+}
+
 fs::path normalizeRepoRoot(fs::path root) {
     root = root.lexically_normal();
     // Some launch configs accidentally pass .../sage-unreal-mcp/scripts as
@@ -394,7 +408,7 @@ ScriptResult runShell(const std::string& cmd) {
 
     FILE* pipe = ::popen((cmd + " 2>&1").c_str(), "r");
     if (pipe == nullptr) {
-        out.lastOutput = "popen failed: " + std::string{std::strerror(errno)};
+        out.lastOutput = "popen failed: " + errnoMessage(errno);
         return out;
     }
     char chunk[4096];
@@ -472,7 +486,7 @@ bool killEditor(pid_t pid, std::chrono::seconds graceWindow) {
     return !processAlive(pid);
 #else
     if (::kill(pid, SIGTERM) != 0 && errno != ESRCH) {
-        spdlog::warn("restart_editor: SIGTERM failed pid={}: {}", pid, std::strerror(errno));
+        spdlog::warn("restart_editor: SIGTERM failed pid={}: {}", pid, errnoMessage(errno));
     }
 
     const auto deadline = std::chrono::steady_clock::now() + graceWindow;
@@ -484,7 +498,7 @@ bool killEditor(pid_t pid, std::chrono::seconds graceWindow) {
     spdlog::warn("restart_editor: pid={} still alive after {}s, sending SIGKILL",
                  pid, graceWindow.count());
     if (::kill(pid, SIGKILL) != 0 && errno != ESRCH) {
-        spdlog::error("restart_editor: SIGKILL failed pid={}: {}", pid, std::strerror(errno));
+        spdlog::error("restart_editor: SIGKILL failed pid={}: {}", pid, errnoMessage(errno));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     return !processAlive(pid);
