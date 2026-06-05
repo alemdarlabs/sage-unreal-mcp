@@ -32,17 +32,18 @@ function Resolve-VsDevCmd {
   if ($ProgramFilesX86) {
     $VsWhere = Join-Path $ProgramFilesX86 'Microsoft Visual Studio\Installer\vswhere.exe'
     if (Test-Path -LiteralPath $VsWhere) {
-      $VsInstall = & $VsWhere `
+      $VsWhereOutput = & $VsWhere `
         -latest `
         -products '*' `
         -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-        -property installationPath |
-        Select-Object -First 1
+        -property installationPath
 
-      if ($LASTEXITCODE -ne 0) {
-        throw "vswhere.exe failed with exit code $LASTEXITCODE."
+      $VsWhereExitCode = Get-NativeExitCode
+      if ($VsWhereExitCode -ne 0) {
+        throw "vswhere.exe failed with exit code $VsWhereExitCode."
       }
 
+      $VsInstall = $VsWhereOutput | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
       if ($VsInstall) {
         $VsDevCmd = Join-Path $VsInstall.Trim() 'Common7\Tools\VsDevCmd.bat'
         if (Test-Path -LiteralPath $VsDevCmd) {
@@ -69,6 +70,15 @@ function Resolve-VsDevCmd {
   }
 
   throw 'Visual Studio with VC++ x64 tools was not found.'
+}
+
+function Get-NativeExitCode {
+  $Variable = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+  if (-not $Variable -or $null -eq $Variable.Value) {
+    return 0
+  }
+
+  return [int]$Variable.Value
 }
 
 function Add-GitHubEnvValue {
@@ -115,8 +125,9 @@ function Add-GitHubPathEntry {
 
 $VsDevCmd = Resolve-VsDevCmd
 $Output = & cmd.exe /s /c "`"$VsDevCmd`" -arch=$Architecture -host_arch=$HostArchitecture && set"
-if ($LASTEXITCODE -ne 0) {
-  exit $LASTEXITCODE
+$CmdExitCode = Get-NativeExitCode
+if ($CmdExitCode -ne 0) {
+  exit $CmdExitCode
 }
 
 $EnvValues = @{}
